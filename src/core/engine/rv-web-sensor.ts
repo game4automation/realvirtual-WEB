@@ -337,13 +337,14 @@ registerComponent({
   schema: RVWebSensor.schema,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    hoverable: true,
-    hoverEnabledByDefault: true,   // ← enable hover/click out of the box
-    selectable: true,
-    // The "Web Sensors" filterLabel is kept for the dedicated SensorToolPanel + future filters.
-    filterLabel: 'Web Sensors',
-    badgeColor: '#66bb6a',   // matches BADGE_COLORS.Sensor (green)
-    tooltipType: 'web-sensor',
+    pick: 'select',     // hover/click out of the box
+    ui: {
+      // The "Web Sensors" filter is kept for the dedicated SensorToolPanel + future filters.
+      filter: 'Web Sensors',
+      category: 'sensors',
+      badge: '#66bb6a',   // matches BADGE_COLORS.Sensor (green)
+      tooltip: 'web-sensor',
+    },
   },
   create: (node) => new RVWebSensor(node),
   afterCreate: (inst, node) => {

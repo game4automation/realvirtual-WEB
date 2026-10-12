@@ -39,6 +39,30 @@ import type { Object3D } from 'three';
 export interface KinematicMechanismHandle {
   /** The mechanism's own node — identity + logging context. */
   readonly node: Object3D;
+  /**
+   * Topology generation, bumped by every `build()` (plan-467 F7, SOL R1 #9).
+   *
+   * A rebuild after an authoring edit REORDERS the link table, so a cached
+   * `linkIndex` from before the rebuild points at a DIFFERENT link — the
+   * external load would silently land on the wrong body. Consumers store the
+   * version alongside the index and drop entries whose version has moved on.
+   *
+   * Optional: a future manager may have no topology at all.
+   */
+  readonly topologyVersion?: number;
+  /**
+   * Every node this mechanism's links OWN, with the link index that owns it.
+   *
+   * "Owns" is wider than "is a descendant of": a link may stand for a whole
+   * kinematic GROUP whose members live elsewhere in the scene and are moved by
+   * the write-back as followers (SOL R1 #8). A consumer that only walked link
+   * subtrees would miss exactly those, and a gripper jaw registered as a group
+   * member would be invisible to physics.
+   *
+   * Enumeration order is link order, then subtree pre-order, then followers.
+   * Optional so a manager without link topology stays valid.
+   */
+  forEachOwnedNode?(cb: (node: Object3D, linkIndex: number) => void): void;
 }
 
 /**
@@ -62,6 +86,39 @@ export interface KinematicManagerLike {
   notifyBuilt?(mechanism: KinematicMechanismHandle): void;
   /** Number of currently registered mechanisms (diagnostics / tests). */
   readonly size: number;
+
+  /**
+   * External contact load on ONE link, for the inverse dynamics (plan-467 F7).
+   *
+   * PLAIN DATA ONLY, on purpose: this is the physics → mechanism direction
+   * across the AGPL boundary (the mirror of `MechanismForcesSnapshot` going the
+   * other way), so no Rapier and no solver type may appear in the signature.
+   *
+   * `fx…fz` is the force in N; `mx…mz` is the moment in N·m about the **world
+   * origin** — the same reference point the RNEA's `inward_pass` already
+   * accumulates about (SOL R1 #3). Passing a moment about the link would be
+   * position-dependent and silently wrong for a translated mechanism.
+   *
+   * The caller sets the CURRENT total per link every tick (it does not
+   * accumulate); a link with no contact is set to zero. Optional — a manager
+   * without inverse dynamics simply does not implement it.
+   */
+  setExternalLinkLoad?(
+    mechanism: KinematicMechanismHandle,
+    linkIndex: number,
+    fx: number, fy: number, fz: number,
+    mx: number, my: number, mz: number,
+  ): void;
+
+  /**
+   * Subscribe to topology changes — fired after `notifyBuilt()` and on
+   * `unregister()` (plan-467 F7). Returns an unsubscribe function.
+   *
+   * The physics side uses it to drop its node→link mapping the moment the link
+   * table can have been reordered, instead of discovering the staleness later
+   * as a load on the wrong link. Optional.
+   */
+  onTopologyChanged?(cb: (mechanism: KinematicMechanismHandle) => void): () => void;
 }
 
 let _manager: KinematicManagerLike | null = null;
@@ -111,6 +168,14 @@ export interface MechanismFindingView {
 /** One joint row as the panel renders it. */
 export interface MechanismJointView {
   nodePath: string;
+  /**
+   * The concrete joint component key on the node (`KinematicJoint`,
+   * `KinematicJoint_1`, … — the per-node ordinal, plan-504). Two joints on one
+   * node are two rows, and every authoring command addresses its row by this
+   * key. Optional only for hand-built views (tests); absent means the first
+   * joint on the node, `KinematicJoint`.
+   */
+  componentType?: string;
   name: string;
   jointType: string;
   bodyAName: string | null;
@@ -181,6 +246,65 @@ export interface MechanismLinkView {
   massSource: string;
   /** Non-empty when the value is a degraded estimate; shown next to it, never hidden. */
   massWarning: string;
+  /** plan-501 F1 — true while an inertia override is authored (valid or not). */
+  inertiaOverridden?: boolean;
+  /** plan-501 F1 — the effective tensor `[Ixx,Iyy,Izz,Ixy,Ixz,Iyz]` about the COM, kg·mm². */
+  inertiaLocalKgMm2?: number[];
+  /** plan-501 F1 — non-empty when the authored override is unusable (hard finding, no fallback). */
+  inertiaFinding?: string;
+}
+
+/**
+ * One link's centre of mass, in the WORLD frame — the input of one small marker (plan-472).
+ *
+ * World and not local: `MechanismLinkView.comLocalMm` is the authored truth, but a millimetre
+ * triple in the local frame of a link that is itself rotated and nested is not something anyone
+ * can check by looking. The projection into world space happens once, on the private side, where
+ * the link's matrix lives.
+ */
+export interface MechanismCogContributionView {
+  /** Registry path of the link — the marker's key and the panel's cross-reference. */
+  nodePath: string;
+  /** Centre of mass in the world frame, millimetres. */
+  comWorldMm: [number, number, number];
+  massKg: number;
+  /** `mesh` | `estimated` | `override` | `unknown` — drives the marker's style, never hidden. */
+  comSource: string;
+  /** True when the link belongs to more than one mechanism; the marker is drawn dashed. */
+  ambiguous: boolean;
+}
+
+/**
+ * The centre of gravity of a whole mechanism in its CURRENT pose (plan-472).
+ *
+ * Derived, never stored: it depends on where the machine stands, so a value written into the
+ * document would be a value for a pose nobody is looking at. Computed per request on the private
+ * side from cached local mass properties and fresh world matrices.
+ *
+ * Everything except the number itself is here so the number can be JUDGED. A centre of gravity
+ * that quietly omits three links is not a slightly worse answer — it is a correct answer for a
+ * different machine. Hence `contributingLinks`/`totalLinks`/`skippedLinks`, `estimated` for a
+ * value resting on bounding boxes, and `ambiguousOwnership` for one whose inputs may have been
+ * computed for a neighbouring mechanism.
+ */
+export interface MechanismCogView {
+  totalMassKg: number;
+  /** World-frame centre of gravity in millimetres, or `null` when NOTHING contributed. */
+  cogWorldMm: [number, number, number] | null;
+  contributingLinks: number;
+  totalLinks: number;
+  /** Every link left out, with a reason a user can act on ("no body", "no mass", …). */
+  skippedLinks: { nodePath: string; reason: string }[];
+  /** True as soon as one contribution came from a bounding box or a hull, not the mesh. */
+  estimated: boolean;
+  /** True when a contributing link is a link of more than one mechanism. */
+  ambiguousOwnership: boolean;
+  /** Link warnings, verbatim and prefixed with the link, plus the ownership note. */
+  warnings: string[];
+  /** Per contributing link — what the small link-COM markers are drawn from. */
+  contributions: MechanismCogContributionView[];
+  /** Millimetres per scene unit, so a consumer can place a marker without assuming 1000. */
+  unityToMm: number;
 }
 
 /** One mechanism as the panel renders it. */
@@ -199,6 +323,12 @@ export interface MechanismView {
   joints: MechanismJointView[];
   /** Links in blob index order, with their mass properties (plan-412). */
   links: MechanismLinkView[];
+  /**
+   * The mechanism's centre of gravity in its current pose (plan-472), or `null` when the private
+   * side cannot produce one (an unbuilt mechanism). Recomputed on every `list()`, which is what
+   * makes "this is a request" true for the panel poll and for MCP alike.
+   */
+  cog: MechanismCogView | null;
   findings: MechanismFindingView[];
 }
 
@@ -273,6 +403,68 @@ export interface MechanismForcesSnapshot {
   redundant: boolean;
   channels: MechanismForceChannelView[];
   joints: MechanismJointForceView[];
+  /**
+   * Magnitude of the external contact load carried by each link, in newtons,
+   * in blob link order — the same order as {@link MechanismView.links}, so the
+   * panel indexes both with one loop (plan-467 F11).
+   *
+   * This is the payload the physics side measured on the machine in the tick
+   * that fed the LAST inverse-dynamics evaluation: `|F|` of the world wrench
+   * the registry summed per link (`setExternalLinkLoad`), not a stored
+   * authoring value. All zeros whenever physics is off, which is every public
+   * deployment — the panel then shows nothing rather than a column of "0.0 N".
+   *
+   * Only the force magnitude crosses: the moment travels with it into the
+   * solver, where it already shows up in the drive and bearing channels, and a
+   * second moment column in the table would report the same physics twice.
+   */
+  externalLoadN: number[];
+}
+
+// ─── Mechanism paths (plan-729) ─────────────────────────────────────────────
+
+/** One waypoint of a {@link MechanismPathView}, in path order. */
+export interface MechanismWaypointView {
+  /** Node path as authored in the path's `Path` list. */
+  nodePath: string;
+  name: string;
+  /** False when the reference does not resolve to a MechanismTarget (yet). */
+  resolved: boolean;
+  interpolation: 'Linear' | 'PointToPoint' | null;
+  /** mm/s (Linear) or speed factor (PointToPoint); null = path default. */
+  speedToTarget: number | null;
+  waitForSeconds: number;
+  /** The waypoint's world position in millimetres, null when unresolved. */
+  worldPositionMm: [number, number, number] | null;
+}
+
+/** One MechanismPath as the panel and MCP render it. */
+export interface MechanismPathView {
+  nodePath: string;
+  name: string;
+  /** Node path of the driven KinematicMechanism, null when unresolved. */
+  mechanismPath: string | null;
+  /** Node path of the link whose origin follows the path, null when unresolved. */
+  targetLinkPath: string | null;
+  loopPath: boolean;
+  speedOverride: number;
+  /** mm/s */
+  linearSpeedToTarget: number;
+  /** mm/s² */
+  linearAcceleration: number;
+  waypoints: MechanismWaypointView[];
+  /** plan-511 — the path is always drawn in the viewer (not only while selected). */
+  showPath: boolean;
+  // Runtime status
+  active: boolean;
+  finished: boolean;
+  /** True after a hard stop (unreachable waypoint, branch flip, solver lost). */
+  failed: boolean;
+  reachable: boolean;
+  /** Index of the next waypoint to reach. */
+  numTarget: number;
+  /** Reason of the last hard stop, '' when none. */
+  lastError: string;
 }
 
 /** The private side's panel API. Transient calls make no document ops. */
@@ -347,6 +539,115 @@ export interface MechanismUiBridge {
    * scene traversal: the bridge already holds the links.
    */
   linkNodes(mechanismPath: string): { path: string; node: Object3D }[];
+
+  /**
+   * Every registered MechanismPath with its waypoints and runtime status
+   * (plan-729). Optional so an older / fake bridge stays a valid implementation;
+   * consumers treat a missing method as "no paths".
+   */
+  listPaths?(): MechanismPathView[];
+
+  // ── Drive sizing (plan-501). All optional, like listPaths: an older / fake bridge stays valid.
+
+  /** Every MechanismTrajectory with its configuration, findings and last / running sizing run. */
+  listTrajectories?(): MechanismTrajectoryView[];
+  /** Parse a sampled-path CSV (time, X, Y, Z) — pure, no document change. */
+  parseTrajectoryCsv?(text: string): MechanismTrajectoryCsvView;
+  /**
+   * Start the sizing run of one trajectory; resolves when it ended. One run per mechanism at a
+   * time — a second start answers with `run-in-progress`. TRANSIENT: no document op.
+   */
+  runTrajectory?(trajectoryPath: string): Promise<MechanismTrajectoryView | { error: string }>;
+  /** Cancel a running sizing run. Returns false when none was running. */
+  cancelTrajectoryRun?(trajectoryPath: string): boolean;
+  /** Downsampled series of the last run (null when there is none). */
+  trajectorySeries?(trajectoryPath: string, maxPoints: number): MechanismTrajectorySeriesView | null;
+  /** SERVOsoft axis texts of the last run, or the export gate's findings. */
+  exportTrajectory?(trajectoryPath: string):
+    { ok: true; files: MechanismTrajectoryExportFile[] } | { ok: false; findings: MechanismTrajectoryFindingView[] };
+}
+
+// ─── Drive-sizing trajectories (plan-501) ───────────────────────────────────
+
+/** A reason a trajectory cannot be run, played or exported. */
+export interface MechanismTrajectoryFindingView {
+  code: string;
+  message: string;
+}
+
+/** Key figures of one driven axis of a sizing run. */
+export interface MechanismTrajectoryAxisView {
+  jointPath: string;
+  jointName: string;
+  kind: 'revolute' | 'prismatic';
+  /** 'N·m' (revolute) or 'N' (prismatic). */
+  torqueUnit: string;
+  peakTau: number;
+  peakTauTimeS: number;
+  rmsTau: number;
+  /** rad/s | m/s */
+  peakQd: number;
+  /** rad/s² | m/s² */
+  peakQdd: number;
+}
+
+/** State of the current or last sizing run of one trajectory. */
+export interface MechanismTrajectoryRunView {
+  state: 'running' | 'done' | 'invalid' | 'aborted' | 'refused';
+  /** 0..1 while running. */
+  progress: number;
+  sampleCount: number;
+  completedSampleCount: number;
+  failureSampleIndex: number | null;
+  failureReason: string | null;
+  runtimeMs: number;
+  maxBlockMs: number;
+  maxAnchorErrorMm: number;
+  axes: MechanismTrajectoryAxisView[];
+  /** True when the trajectory or the mechanism changed since the run — export is refused. */
+  stale: boolean;
+  /** The export gate's findings; empty = exportable. */
+  exportFindings: MechanismTrajectoryFindingView[];
+}
+
+/** One MechanismTrajectory as the panel and MCP render it. */
+export interface MechanismTrajectoryView {
+  nodePath: string;
+  name: string;
+  mechanismPath: string | null;
+  targetLinkPath: string | null;
+  sampleCount: number;
+  intervalMs: number;
+  outputIntervalMs: number;
+  durationS: number;
+  frame: 'z-up' | 'y-up';
+  tcpOffsetMm: [number, number, number];
+  payloadMassKg: number;
+  payloadOffsetMm: [number, number, number];
+  findings: MechanismTrajectoryFindingView[];
+  run: MechanismTrajectoryRunView | null;
+  /** plan-511 — the trajectory is always drawn in the viewer (not only while selected). */
+  showPath: boolean;
+}
+
+/** Downsampled series of a finished run (≤ maxPoints per series) for MCP / charts. */
+export interface MechanismTrajectorySeriesView {
+  timeS: number[];
+  axes: { jointName: string; q: number[]; qd: number[]; qdd: number[]; tau: number[] }[];
+  /** Every k-th sample was taken. */
+  stride: number;
+}
+
+/** Result of parsing a trajectory CSV (no document change). */
+export type MechanismTrajectoryCsvView =
+  | { ok: true; samples: number[]; sampleCount: number; intervalMs: number; warnings: string[] }
+  | { ok: false; error: string };
+
+/** One exported SERVOsoft axis file. */
+export interface MechanismTrajectoryExportFile {
+  fileName: string;
+  jointPath: string;
+  text: string;
 }
 
 let _uiBridge: MechanismUiBridge | null = null;

@@ -8,22 +8,26 @@
  * superordinate LINEAR drive does not move the pivot of the subordinate
  * ROTARY axis along with it, so that axis rotates about the wrong point.
  *
- * The suspicion under test is the loader's home-pose window
- * (rv-scene-loader.ts Phase 8a, ~line 1634):
+ * History of the defect: the loader's home-pose window (Phase 8a) used to run
  *
  *     drive.currentPosition = drive.StartPosition;
  *     drive.applyToNode();
  *
- * This neutralises `StartPosition` but NOT `Offset` — `applyToNode()` keeps
- * adding it (rv-drive.ts:610). A drive carrying an Offset therefore stands
- * displaced by exactly that Offset while Phase 8b re-parents the kinematic
- * group with world-preserving `attach()`. The child's local transform is
- * then measured against the displaced parent, and `refreshBaseTransform()`
- * caches that as its home — the Offset is frozen out of the child.
+ * which neutralised `StartPosition` but NOT `Offset` — `applyToNode()` keeps
+ * adding it. A drive carrying an Offset therefore stood displaced by exactly
+ * that Offset while Phase 8b re-parented the kinematic group with
+ * world-preserving `attach()`; the child's local transform was measured
+ * against the displaced parent and cached as its home — the Offset was frozen
+ * out of the child.
  *
- * The scene is built so both parts are COINCIDENT as authored: `DirectPart`
- * is a plain child of the linear drive, `RotPart` reaches the same drive
- * through the kinematic group. Whatever the Offset does, it must do to both.
+ * Since plan-754/757 the re-parenting happens in `prepare` of the recipe (the
+ * `Kinematic` pre-bake hook), BEFORE any drive exists, and the `Drive` hook
+ * stamps the authored home the init reads; the runtime home-pose window is
+ * gone (plan-757 Phase 3 commit B). The claim is the same, the load is the
+ * BAKED one now: the scene is built so both parts are COINCIDENT as authored —
+ * `DirectPart` is a plain child of the linear drive, `RotPart` reaches the same
+ * drive through the kinematic group. Whatever the Offset does, it must do to
+ * both. `DirectPart` is claimed `chunk` so it survives the bake as a node.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -37,6 +41,8 @@ import {
   Vector3,
 } from 'three';
 import { loadGLB } from '../src/core/engine/rv-scene-loader';
+import { BakeRegistry } from '../src/core/engine/rv-bake-registry';
+import { createPickBuildPort } from '../src/core/engine/rv-pick-build-port';
 import { objectToGlb } from '../src/core/import/rv-import-object';
 
 /** mm → m, mirrors MM_TO_METERS in rv-constants. */
@@ -92,18 +98,27 @@ async function loadFixture(offsetMm: number): Promise<{
 }> {
   const glb = await buildFixture(offsetMm);
   const scene = new Scene();
-  const result = await loadGLB(`memory://lop68-offset-${offsetMm}.glb`, scene, { data: glb });
+  const result = await loadGLB(`memory://lop68-offset-${offsetMm}.glb`, scene, {
+    data: glb,
+    bakeRegistry: new BakeRegistry(),
+    bakePickPort: createPickBuildPort({ createWorker: () => null }),
+    // A plain mesh would be merged into Axis1's mover chunk; the claim keeps
+    // it a node so its world position can be read (plan-754 D17).
+    bakeClaims: [{ path: 'Cell/Axis1/DirectPart', role: 'chunk' }],
+  });
   result.root.updateMatrixWorld(true);
+  expect(result.bakedAsset).not.toBeNull();
 
   const axis1 = result.root.getObjectByName('Axis1')!;
   const rotAxis = result.root.getObjectByName('RotAxis')!;
-  const directPart = result.root.getObjectByName('DirectPart')!;
-  expect(rotAxis.parent).toBe(axis1); // Phase 8b really ran
+  const directPart = result.root.getObjectByName('DirectPart');
+  expect(directPart, 'the claimed DirectPart survives the bake as a node').toBeDefined();
+  expect(rotAxis.parent).toBe(axis1); // the Kinematic hook really ran
 
   return {
     axis1World: axis1.getWorldPosition(new Vector3()),
     pivotWorld: rotAxis.getWorldPosition(new Vector3()),
-    directWorld: directPart.getWorldPosition(new Vector3()),
+    directWorld: directPart!.getWorldPosition(new Vector3()),
   };
 }
 
@@ -127,15 +142,18 @@ describe('LOP-68 — Drive.Offset and the pivot of a nested rotary axis', () => 
     //   direct = [-0.2, 0, 0]   ← rides along with the node, consistent
     //   pivot  = [-0.1, 0, 0]   ← one Offset behind the part it belongs to
     //
-    // Two distinct defects, one root cause — Phase 8a leaves `Offset` applied:
-    //  1. applyKinematicParenting Pass 3 calls refreshBaseTransform() on EVERY
-    //     drive in the affected subtree, including the kinematic node's own
-    //     drive, which was never re-parented. It stands at basePosition+Offset,
-    //     so that becomes the new basePosition and Phase 10e adds the Offset a
-    //     second time.
-    //  2. The group member is attached world-preserving against that displaced
-    //     parent, so the Offset is frozen out of the child — its pivot lags by
-    //     exactly one Offset, and the rotary axis turns about the wrong point.
+    // Two distinct defects, one root cause — the old Phase 8a left `Offset`
+    // applied while the runtime re-parent pass ran (both deleted since):
+    //  1. its Pass 3 called refreshBaseTransform() on EVERY drive in the
+    //     affected subtree, including the kinematic node's own drive, which
+    //     was never re-parented. It stood at basePosition+Offset, so that
+    //     became the new basePosition and the restore added the Offset again.
+    //  2. The group member was attached world-preserving against that
+    //     displaced parent, so the Offset was frozen out of the child — its
+    //     pivot lagged by exactly one Offset, and the rotary axis turned about
+    //     the wrong point.
+    // In the recipe the hook re-parents before any drive exists, so neither
+    // can happen — this pins that it stays so.
     expect(axis1World.length()).toBeCloseTo(offsetMm * MM, 6);
     // A plain child rides along, by construction of the scene graph.
     expect(directWorld.distanceTo(axis1World)).toBeLessThan(1e-6);

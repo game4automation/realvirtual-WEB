@@ -186,11 +186,35 @@ export type RvMergeMeshOp = WithHeader<MergeMeshOp>;
 
 // ─── Composite ──────────────────────────────────────────────────────────
 
+/**
+ * Metadata of a history entry (plan-590). Lives on the COMPOSITE — the one
+ * record a transaction produces — and survives the flattening of nested
+ * composites (`RvDocument.endTransaction` lifts it to the top level).
+ */
+export interface RvOpMeta {
+  /**
+   * The signal-rename journal this entry belongs to. An entry carrying it is
+   * one third of a stores-spanning operation (model + CONNECT + planner):
+   * `RvDocument` hands its undo/redo to the history interceptor instead of
+   * replaying only the model part.
+   */
+  journalId?: string;
+}
+
 /** origin: both — same form in both vocabularies; composites never nest. */
 export interface RvCompositeOp extends RvOpHeader {
   kind: 'composite';
   label: string;
   ops: RvPrimitiveOp[];
+  /** Optional entry metadata (plan-590) — absent on every ordinary composite. */
+  meta?: RvOpMeta;
+}
+
+/** The signal-rename journal id of a history entry, if it carries one (plan-590). */
+export function journalIdOf(op: RvOp | null | undefined): string | undefined {
+  if (!op || op.kind !== 'composite') return undefined;
+  const id = op.meta?.journalId;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
 }
 
 // ─── The union ──────────────────────────────────────────────────────────
@@ -322,18 +346,22 @@ export type RvAssetPrimitiveOp = Extract<RvPrimitiveOp, { kind: RvAssetOpKind }>
 // child instead of crashing. Both halves are pinned by
 // `rv-op-single-vocabulary.test.ts`.
 
-function compositeOf(label: string, ops: RvPrimitiveOp[]): RvCompositeOp {
-  return { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'composite', label, ops };
+function compositeOf(label: string, ops: RvPrimitiveOp[], meta?: RvOpMeta): RvCompositeOp {
+  const op: RvCompositeOp = { id: freshOpId(), ts: Date.now(), schemaV: 1, kind: 'composite', label, ops };
+  // Only a meta that says something is written: an ordinary composite keeps
+  // exactly its old shape (persisted logs, op-equality tests).
+  if (meta && meta.journalId) op.meta = { ...meta };
+  return op;
 }
 
 /** Build a composite from SCENE-lineage primitives. */
-export function makeSceneComposite(label: string, ops: RvScenePrimitiveOp[]): RvCompositeOp {
-  return compositeOf(label, ops);
+export function makeSceneComposite(label: string, ops: RvScenePrimitiveOp[], meta?: RvOpMeta): RvCompositeOp {
+  return compositeOf(label, ops, meta);
 }
 
 /** Build a composite from ASSET-lineage primitives. */
-export function makeAssetComposite(label: string, ops: RvAssetPrimitiveOp[]): RvCompositeOp {
-  return compositeOf(label, ops);
+export function makeAssetComposite(label: string, ops: RvAssetPrimitiveOp[], meta?: RvOpMeta): RvCompositeOp {
+  return compositeOf(label, ops, meta);
 }
 
 /** Build a composite for the given document mode — the shared-helper form. */
@@ -341,10 +369,11 @@ export function makeComposite(
   mode: 'scene' | 'asset',
   label: string,
   ops: RvPrimitiveOp[],
+  meta?: RvOpMeta,
 ): RvCompositeOp {
   return mode === 'scene'
-    ? makeSceneComposite(label, ops as RvScenePrimitiveOp[])
-    : makeAssetComposite(label, ops as RvAssetPrimitiveOp[]);
+    ? makeSceneComposite(label, ops as RvScenePrimitiveOp[], meta)
+    : makeAssetComposite(label, ops as RvAssetPrimitiveOp[], meta);
 }
 
 // ─── Persisted-record normalisation (schema evolution, NOT a shim) ──────

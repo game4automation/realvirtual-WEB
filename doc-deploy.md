@@ -1,5 +1,9 @@
 # Building & Deploying
 
+> **Applies to:** Community self-hosting first; later sections describe maintainer operations that require private tools and credentials.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 *Guide for building realvirtual WEB locally for testing, publishing it with realvirtual's own pipeline, and self-hosting it on your own infrastructure.*
 
 > **The important distinction:** *building* produces a `dist/` folder on your machine and publishes nothing. *Deploying* builds **and** uploads that build somewhere. The built-in `npm run deploy` is **realvirtual's own** publish pipeline — it targets realvirtual's Bunny CDN account and goes live at `web.realvirtual.io`. If you are not realvirtual, you do not have those credentials; see [Deploy it yourself](#7-deploy-it-yourself).
@@ -22,7 +26,7 @@ npm run build                # produce dist/ locally
 npm run preview              # check the production build before deploying
 ```
 
-`npm run build` runs `vite build`, writes `dist/`, and stops. The output stays on disk — share it, inspect it, host it yourself (see section 7), or run `npm run preview` against it. Nothing is uploaded.
+`npm run build` runs `vite build`, writes `dist/`, and stops. The output stays on disk — share it, inspect it, host it yourself (see Deploy it yourself), or run `npm run preview` against it. Nothing is uploaded.
 
 ### Build tiers & feature gating (`RV_INTERNAL`)
 
@@ -63,6 +67,177 @@ The same pattern is reusable if you develop on top of realvirtual WEB yourself: 
 
 ---
 
+<a id="7-deploy-it-yourself"></a>
+
+## Deploy it yourself
+
+realvirtual WEB is the open standard for browser-based 3D HMI in manufacturing. You can run your own deployment two ways: reuse the built-in tool with your own Bunny account, or treat the build as plain static files and host them anywhere.
+
+> **AGPL obligations apply to self-hosting.** realvirtual WEB is licensed under the **GNU Affero General Public License v3 (AGPL-3.0)**. Deploying it on your own infrastructure — including serving it as a network service — triggers the AGPL: you must publish your **complete project** under AGPL-3.0 and make it freely available. This includes all source code, configuration, and **all content delivered through the application**, such as GLB model files, `settings.json`, and plugins. This applies whether the application is served over a network or distributed directly.
+
+> The "Powered by realvirtual WEB" watermark and the realvirtual logo must remain visible and unmodified in all AGPL deployments. Removing or modifying branding requires a commercial license.
+
+> **Keeping a project private?** To self-host with proprietary models, private configuration, or closed plugins — or to remove branding — use a [commercial license](https://realvirtual.io/en/company/license). See the [README license section](README.md#license) for the canonical terms.
+
+### Use the built-in tool with your own Bunny account
+
+The deploy tool is account-agnostic by design. Every account-specific value comes from environment variables — nothing is hardcoded that you cannot override. Point it at your own Bunny Storage by setting your own credentials:
+
+```bash
+# Required — your own Bunny Storage zone
+export BUNNY_STORAGE_KEY=your-storage-zone-password
+export BUNNY_STORAGE_ZONE=your-storage-zone-name
+
+# Optional — only needed to purge your CDN cache after upload
+export BUNNY_ACCOUNT_KEY=your-account-api-key
+export BUNNY_PULL_ZONE_ID=your-pull-zone-id
+
+# Optional — region, sub-path, analytics
+export BUNNY_REGION=storage.bunnycdn.com
+export BUNNY_REMOTE_PATH=                 # empty = storage-zone root; or e.g. demo
+export GA_MEASUREMENT_ID=                 # empty = no analytics
+
+npm run deploy                            # builds + uploads to YOUR zone
+```
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `BUNNY_STORAGE_KEY` | yes | Your storage-zone password |
+| `BUNNY_STORAGE_ZONE` | yes | Your storage-zone name |
+| `BUNNY_ACCOUNT_KEY` | for purge | Your account API key |
+| `BUNNY_PULL_ZONE_ID` | for purge | Your pull-zone id |
+| `BUNNY_REGION` | no | Your region (default `storage.bunnycdn.com`) |
+| `BUNNY_REMOTE_PATH` | no | Sub-path prefix (default empty = zone root) |
+| `GA_MEASUREMENT_ID` | no | Your own GA4 id, or leave empty |
+
+With those set, every upload, list, delete, and purge targets **your** account. The printed `web.realvirtual.io` lines (private mode and the CI workflow) are cosmetic and do not affect where files land — substitute your own pull-zone hostname. If you serve under a fixed sub-path with absolute asset URLs, add `--base /your-path/`.
+
+> **`--base` on Windows: run it from PowerShell.** Git Bash / MSYS rewrites a standalone `/demo/` argument into a Windows path (`C:/Program Files/Git/demo/`) before Node ever sees it. Baked into `index.html`, that produces a build which uploads and reports success while every asset 404s live. `assertSaneBase()` rejects a mangled base **before** anything is built or uploaded — a valid base is `./` or a simple URL path such as `/demo/`, never one with a drive letter, backslash or spaces. Fix it by running the deploy from PowerShell, or by prefixing the Bash command with `MSYS_NO_PATHCONV=1`.
+
+### Host the static `dist/` anywhere
+
+`npm run build` emits a self-contained static single-page app into `dist/`: `index.html`, hashed JS/CSS under `assets/`, and everything from `public/` (including `models/*.glb`, `settings.json`, and `models.json`). With the default relative base (`./`), the whole `dist/` tree can be served from a domain **root** or **any sub-path** without rebuilding. To "deploy it yourself," copy the contents of `dist/` to a web root and serve them as static files.
+
+```bash
+npm run build                # produce dist/
+# copy dist/* to your web root, then serve over http(s)
+```
+
+| Host | How |
+|------|-----|
+| **nginx** | Copy `dist/` to the document root; add an SPA fallback and the MIME/cache rules below (see example) |
+| **Apache** | Copy `dist/` to the DocumentRoot; add `.htaccess` with a rewrite to `/index.html` and `AddType application/wasm .wasm` / `AddType model/gltf-binary .glb` (needs `AllowOverride All`) |
+| **AWS S3 + CloudFront** | `aws s3 sync dist/ s3://bucket --delete`; set `Content-Type` on upload (S3 misguesses `.wasm`/`.glb`); map CloudFront 403/404 → `/index.html` (200) for SPA fallback; add bucket CORS and forward the `Origin` header |
+| **Netlify** | Build `npm run build`, publish dir `dist`; add `public/_redirects` (`/*  /index.html  200`) and `public/_headers` for cache/COOP-COEP |
+| **Vercel** | Auto-detects Vite (`dist`); add `vercel.json` rewrite `"/(.*)" → "/index.html"` and custom headers |
+| **Cloudflare Pages** | `npx wrangler pages deploy dist` or Git integration; `_headers` file for cache/COOP-COEP; watch the per-file size cap for large GLBs |
+| **GitHub Pages** | Set Vite `base` to `'/<repo>/'`, publish `dist/`, copy `index.html` to `404.html` for SPA fallback; cannot set HTTP headers (no COOP/COEP, no custom MIME) |
+| **Local — `vite preview`** | `npm run preview` serves `dist/` on `localhost:4173` with correct MIME types and SPA fallback already wired — the most faithful local check |
+| **Local — `npx serve -s`** | From `dist/`, `npx serve -s` (single-page mode → fallback to `index.html`); use HTTPS for WebXR/secure-context testing |
+| **Local — `python -m http.server`** | `cd dist && python -m http.server 8000` — quick smoke test only; no SPA fallback, may misreport `.glb`/`.wasm` MIME |
+
+> `file://` does **not** work — `GLTFLoader` fetch is blocked by CORS (origin `null`) and WebXR/camera APIs are disabled. Always serve over an http(s) server, even locally.
+
+### Server caveats (apply to any host)
+
+| Concern | What to do |
+|---------|-----------|
+| **MIME types** | Serve `.glb` as `model/gltf-binary`, `.gltf` as `model/gltf+json`, `.wasm` as `application/wasm`. Many servers default to `application/octet-stream`, which downloads the GLB instead of loading it and makes `WebAssembly.instantiateStreaming` fail with *"Incorrect response MIME type"* |
+| **SPA fallback** | A hard refresh on a deep link must return `index.html` (HTTP 200), not 404. Use `try_files`/rewrite/`_redirects`/`404.html` per host. A blanket fallback also turns missing assets into HTML 200s — scope it so that `library/**`, `models/**` and `*.glb` / `*.kin.json` / `*.splat` / `*.ksplat` / `*.ply` keep real 404s (on Bunny: **no** global "404 → index.html, rewrite to 200" edge rule; condition it on path/extension). An HTML page served under a GLB url is exactly what the viewer's blob cache used to store as "the asset" |
+| **CORS** | If GLBs are served from a different origin than the page, the asset response needs `Access-Control-Allow-Origin` (and `GET, HEAD`). Same-origin serving avoids CORS entirely. On S3, also forward/cache the `Origin` header in CloudFront |
+| **Cache-Control** | Hashed files in `assets/` are safe to cache forever: `public, max-age=31536000, immutable`. `index.html` is **not** hashed — set `no-cache` so users do not get stale HTML pointing at deleted chunks |
+| **HTTPS / secure context** | WebXR (VR/AR) and camera access require a secure context: HTTPS or `localhost`. Plain `http://` on a real domain disables them. All cloud hosts provide free TLS; for local XR use an HTTPS dev server |
+| **COOP/COEP** | Only needed if you use `SharedArrayBuffer` / threaded WASM. Then set `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`) — but COEP makes cross-origin assets require CORS/CORP. If you do **not** use SharedArrayBuffer, do not add these headers |
+| **Large GLB** | Enable gzip/brotli and include `model/gltf-binary`/`model/gltf+json` in the compressible types (many servers compress text only). Mind per-file upload caps (nginx `client_max_body_size`, host limits) |
+| **Base path** | Default base is `./` (relative) — serve from root or any sub-path without rebuilding. For absolute-rooted asset URLs under a fixed sub-path, build with `--base /your-path/` (or set Vite `base`) and put the SPA fallback under that sub-path too |
+
+### Hosting a GLB for a shared link (`?glb=`)
+
+A shared link (see doc-webviewer.md § *Shared asset links*) may point at any
+host. The viewer runs on **your** origin and fetches the file from **theirs**,
+so exactly one thing decides whether it works: **CORS on the GLB response.**
+Everything else — MIME type included — the loader does not care about.
+
+Measured with `curl -I` against a foreign `Origin` (2026-08-05):
+
+| Host | `Access-Control-Allow-Origin` | Verdict |
+|---|---|---|
+| `raw.githubusercontent.com` | `*` | works. Serves `application/octet-stream`, which is irrelevant to `GLTFLoader` |
+| Bunny pull zone (`web.realvirtual.io`) | `*` | works; also allows/exposes `Range` |
+| Firebase Storage (`…?alt=media`) | yes | works — it is what the viewer's own demo GLB is served from |
+| A default nginx/Apache/IIS on your own domain | **usually absent** | **the common failure**: an empty viewport |
+
+For your own server, the whole fix is one header on the file:
+
+```nginx
+location ~* \.glb$ {
+    add_header Access-Control-Allow-Origin "*" always;
+    add_header Access-Control-Allow-Methods "GET, HEAD" always;
+    types { model/gltf-binary glb; }
+}
+```
+
+A missing header surfaces as a named error in the info card ("… did not allow
+this page to read the file (CORS)") rather than as a blank screen, so the
+support question answers itself. Note the browser cannot tell a CORS refusal
+from an unreachable host — the message names the likely cause and the host,
+and stops there.
+
+Two more things worth knowing before publishing a link:
+
+- **Size.** The fetch enforces a 250 MB budget on the *streamed body*.
+  `Content-Length` is only a hint (absent under chunked transfer, wrong behind
+  a rewriting proxy), so an oversize file is cut mid-transfer, not waved through.
+- **Redirects are fine**, and they do not widen the budget: the count runs
+  downstream of every hop.
+
+Links that we host (`?glb=s:<id>`) need none of this — they are resolved to a
+short-lived signed URL at runtime. That path needs the share backend; its HTTP
+contract is `src/core/share/rv-share-backend-contract.md`.
+
+### nginx example
+
+```nginx
+# /etc/nginx/mime.types — add these so GLB/WASM load correctly:
+#   model/gltf-binary  glb;
+#   model/gltf+json    gltf;
+#   application/wasm   wasm;
+
+server {
+    listen 443 ssl http2;
+    server_name viewer.example.com;
+    root /var/www/app;          # contents of dist/ copied here
+    index index.html;
+
+    # Compress GLB/WASM (text types are compressed by default)
+    gzip on;
+    gzip_types text/css application/javascript application/json
+               application/wasm model/gltf-binary model/gltf+json;
+
+    # SPA history fallback — deep links resolve to index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Hashed assets: cache forever
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+    }
+
+    # Entry point: never cache stale HTML
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+    }
+}
+```
+
+---
+
+## Maintainer operations
+
+The remaining deployment procedures use realvirtual infrastructure or private tools.
+Community self-hosters do not need these steps.
+
 ## 2. realvirtual's deploy pipeline (publishes to web.realvirtual.io)
 
 > **This is realvirtual's own pipeline.** `npm run deploy` builds the app and uploads it to **realvirtual's** Bunny CDN account, where it goes live at `web.realvirtual.io`. It only writes to that account when `BUNNY_STORAGE_KEY` (realvirtual's secret storage-zone password) is provided. A third party does **not** have that key — a bare `npm run deploy` with no environment configured fails fast with `Missing required env BUNNY_STORAGE_KEY` before anything is uploaded. To publish your own build, point the tool at your own account or host the static files yourself — see [Deploy it yourself](#7-deploy-it-yourself).
@@ -70,8 +245,8 @@ The same pattern is reusable if you develop on top of realvirtual WEB yourself: 
 `npm run deploy` maps to `node scripts/bunny-deploy.mjs`. It **builds** the app (public build, `VITE_PUBLIC_BUILD=1`) and then **uploads** the result to Bunny CDN.
 
 ```bash
-npm run deploy                       # build + upload to the configured remote path
 npm run deploy -- --path demo        # upload under a specific remote path prefix
+npm run deploy -- --root             # deliberate deploy at the zone root (refused without the flag)
 npm run deploy -- --dry-run          # stage only; build and upload nothing
 npm run deploy -- --demo --path demo --base /demo/   # hosted demo of the COMMERCIAL product
 ```
@@ -86,88 +261,176 @@ The remote path comes from `BUNNY_REMOTE_PATH` (default empty = storage-zone roo
 
 What happens, in order:
 
-1. **Stage** — `stageFilteredSourceTree()` (`scripts/_workspace-lib.mjs`) copies an allowlisted source tree into a fresh temp directory (`rv-customer-workspace-*` under the system temp folder). Only the public demo profile (core tier, no project) carries the demo documents and `public/aasx/` along; see [What the public demo ships extra](#what-the-public-demo-ships-extra).
-2. **Build in the staging workspace** — `npm ci` **inside that temp workspace**, then `npm run build` with `VITE_PUBLIC_BUILD=1`. The fresh `npm ci` installs into an empty `node_modules` and routinely runs for **several minutes with no output** — that silence is the install, not a hang. The build output is stamped with `.rv-build-provenance.json` (source-tree hash, mode, project) and re-checked by `assertBuildProvenance()` before a single byte is uploaded. Your working `dist/` is neither read nor written.
-3. **Model allowlist** — the public CDN ships **only the official demo models**: top-level `models/*.glb` whose filename starts with `DemoRealvirtual` are kept, the planner library under `models/library/**` is always kept, and every other top-level GLB (test fixtures, helper/MU GLBs, stray models) is pruned together with its hashed `assets/` duplicate. `models.json` is rewritten to the kept models so the model selector lists exactly what is shipped. See [Public model allowlist](#public-model-allowlist).
+1. **Stage** — `stageFilteredSourceTree()` (`scripts/_workspace-lib.mjs`) copies an allowlisted source tree into a fresh temp directory (`rv-customer-workspace-*` under the system temp folder). Only the public demo profile (core tier, no project) carries the demo documents and `public/aasx/` along; see [What the public demo ships extra](#current-project-layout-by-delivery-channel). The staging directory is removed on every exit path — also when staging, the build or the upload fails. Set `RV_KEEP_STAGING=1` to keep it for inspection; the log then names the path.
+2. **Build in the staging workspace** — `npm ci` **inside that temp workspace**, then `npm run build` with `VITE_PUBLIC_BUILD=1`. The fresh `npm ci` installs into an empty `node_modules` and routinely runs for **several minutes with no output** — that silence is the install, not a hang. Deploys to `--path dev` and `--path demo-beta` skip it when they can: they reuse a machine-local `node_modules` cache keyed by the lockfiles **and** the Node major/ABI, platform and architecture, and log `build-cache: hit` (or `rebuild` on the first run after a change). `/demo`, `--root` and private deploys always install fresh. Parallel local builds share that cache safely: a build holds a reader lease on its cache profile until it ends, and a profile is only deleted — on a failed restore, or when it has been unused for 30 days — while nobody reads it. The build output is stamped with `.rv-build-provenance.json` (source-tree hash, mode, project) and re-checked by `assertBuildProvenance()` before a single byte is uploaded. Your working `dist/` is neither read nor written.
+3. **Model allowlist** — the demo manifest in `demo-realvirtual/project.json` declares its documents; the app-level component library stays under `library/`. The deploy applies its manifest-based pruning and verifies that referenced GLBs remain present. Legacy root-manifest/prefix behavior is compatibility handling, not the current directory layout. See [Public model allowlist](#public-model-allowlist).
 4. **Dev-only prune** — documents the manifest marks `devOnly: true` are dropped from `dist/`, file and manifest row alike. See [Public dev-only prune](#public-dev-only-prune).
-5. **Sign + inject** — GLBs are signed when `RV_SIGN_PRIVATE_KEY` is configured (see [GLB signing](#glb-signing-and-password-protection)), then the GA id, the news feed URL and the SEO tags are written into the built artifact only.
-6. **Diff** — the remote file list is fetched; unchanged files (same size) are skipped. `*.html`, `settings.json`, `models.json` and `manifest.json` are always re-uploaded, and so is every GLB once signing is active (re-signing is size-preserving, so a size diff would skip it). `*.map` files are never uploaded.
-7. **Upload** — changed files are uploaded; assets first, `index.html` last, so the live site never points at missing assets mid-deploy. Remote files that no longer exist locally are then deleted, so the zone matches the build.
-8. **Purge** — the CDN cache is purged once (only if something was uploaded, and only when the account/pull-zone purge credentials are present).
+5. **Sign + stamp + inject** — GLBs are signed when `RV_SIGN_PRIVATE_KEY` is configured (see [GLB signing](#glb-signing-and-password-protection)); **then** every `catalog.json` in the build output is re-stamped with the `sha256` + `sizeBytes` of the bytes that now ship (`stampCatalogHashes`, see [Library catalog hashes](#library-catalog-hashes-and-the-post-deploy-probe-plan-508)); then the GA id, the news feed URL and the SEO tags are written into the built artifact only.
+6. **Diff** — the deploy first takes the **publish lock** of its target (`rv-publish-<zone>:<prefix>`, a Windows named pipe) and holds it until after the probe and the demo smoke (steps 9 and 10); a second local deploy to the same target waits with `waiting for publish lock …` (see [Automatic /dev deploys](#automatic-dev-deploys)). Inside the lock it reads the **currently published** `catalog.json` and selects every catalogued file (`glbUrl` and `splatUrl`) whose hash changed — regardless of size (no published catalog: all of them). Then the remote file list is fetched; unchanged files (same size) are skipped. `*.html`, `settings.json`, `models.json`, `manifest.json`, `project.json` and every `catalog.json` are always re-uploaded, and so is every GLB once signing is active (re-signing is size-preserving, so a size diff would skip it). `*.map` files are never uploaded.
+7. **Upload** — changed files are uploaded in parallel (`RV_DEPLOY_CONCURRENCY`, default 8, and at most `RV_DEPLOY_MAX_INFLIGHT_BYTES`, default 64 MB, of file data in flight — a larger file uploads alone). Every `catalog.json` waits until **all** other asset uploads have finished and goes next — so a failed binary leaves the OLD catalog remote and the next run's hash diff selects the binary again. Every `*.html` file follows after that, one by one, `index.html` last, so the live site never points at missing assets mid-deploy. If an asset upload still fails after its retries, the deploy stops there: no HTML, no deletions. Remote files that no longer exist locally are then deleted (also in parallel, at most 8); a delete Bunny refuses is counted and reported but never stops the deploy or the purge. Storage requests retry up to three times with backoff and honour `Retry-After`. The remote listing retries too and **fails the deploy** on an auth, network or server error instead of continuing half-blind — only a missing prefix (404, the first deploy to a new path) counts as empty.
+8. **Cache rules + purge** (plan-598) — first the pull zone is made to carry the two browser-cache **edge rules** (`ensureEdgeRules`, idempotent, recognised by their `rv-webviewer:` description; `RV_DEPLOY_EDGE_RULES=0` skips it): `*/assets/*` — Vite's content-hashed output — gets `Cache-Control: public, max-age=31536000, immutable`; HTML (`*.html`, folder URLs), manifests (`*.json`), models (`*.glb`), `draco/*` (fixed file names) and everything under a hosted project's `p/` (published verbatim, its own `p/assets/` is not hashed) get `no-cache`, i.e. they revalidate. Then only what this deploy **changed** is purged: one URL purge (`POST /purge?url=…&async=true`) per uploaded **or deleted** non-hashed file under the deploy's public URL (an `index.html` also purges its folder URL); hashed assets need none — a change is a new name. The zone purge is the fallback: a partly applied deploy (a stale file could not be deleted), more than 500 URLs, or a failed URL purge. Nothing happens without the account/pull-zone credentials. The edge-rule parameters (`BUNNY_EDGE_ACTION` in `scripts/_bunny-lib.mjs`) must be verified once against `GET /pullzone/{id}` before the first live run; check the result with `curl -I <base>assets/<file>.js` (→ `immutable`) and `curl -I <base>demo-realvirtual/project.json` (→ `no-cache`).
+   The deploy also writes the **manifest preload** into `index.html` (`manifestPreloadFor` / `injectManifestPreload`) — the committed `index.html` carries none, because the right manifest depends on the channel: public demo `demo-realvirtual/project.json`, root/customer deploy `project.json`, hosted `p/project.json`, and a **password** deploy none at all (no project request may leave before the password gate).
+9. **Probe** — still inside the lock, the live host is asked three things (`probePublishedAssets`): a missing asset answers 404 (Bunny's HTML error page is accepted, a 200 is not), `library/catalog.json` is byte-equal to the build output, and the first catalogued asset hashes to its catalog `sha256`. Any finding fails the deploy with exit 1 and a plain-text cause; `--skip-probe` skips it (offline runs). A failed probe stops the deploy before the demo smoke.
+10. **Demo smoke** (plan-503) — still inside the publish lock and after the probe, the deploy opens every `demos` document of the demo manifest on the **live** target with Playwright and runs two visitor journeys. The build is already live at this point; the smoke only reports. Details below.
+
+#### The demo smoke after every public deploy
+
+Every public deploy (`--path dev`, `--path demo`, `--path demo-beta`, `--root`; also the `/dev` watcher) ends with `scripts/rv-demo-smoke.mjs` against `RV_PUBLIC_BASE_URL` (default `https://web.realvirtual.io`) plus the remote prefix — e.g. `https://web.realvirtual.io/dev/`. `--dry-run` and `--private` never run it; `--no-smoke` skips it (log: `smoke : skipped (--no-smoke)`).
+
+1. The deploy writes `expected.json` = `{ pair, baseUrl, demos, fingerprint }` from the **staging** `dist/` it just uploaded (after SEO injection and pruning): sha256 of `index.html` and of `demo-realvirtual/project.json`, and the byte size of every `demos` GLB. A local rebuild is never byte-identical to a deploy, so nothing else is ever used as the expectation.
+2. The runner checks the runtime (`node_modules/playwright/cli.js` and a `chromium*` folder under `PLAYWRIGHT_BROWSERS_PATH`), the reachability of the demo manifest, and polls up to 60 s (every 2 s, `Cache-Control: no-cache`) until the CDN serves exactly those bytes — GLB sizes by `HEAD` with `Accept-Encoding: identity`, because Bunny sends no `Content-Length` for a gzip response and never an `ETag` for a GLB.
+3. It runs `playwright test --project=prod-demo` directly through the CLI (no `npm run e2e`, no test lock), 1 worker, 1 retry, 120 s per test (180 s for the planner journey, which boots the demo twice), 10 min in total:
+   - `demo-smoke.spec.ts` — every `demos` document boots: model loaded, no page/console error, no Problems panel, no 404 other than the root `project.json`/`models.json` probes and optional `*.kin.json` sidecars;
+   - `hmi-journey.spec.ts` — the HMI demo runs **by itself** (pixel diff of the moving machine, threshold calibrated by `e2e/prod-demo-calibration/`), the bottom bar and the hierarchy panel work;
+   - `planner-journey.spec.ts` — `ChainConveyor_1m` is dragged with the real mouse, moves > 0.1 m, nothing else moves, and after a reload it is back at its start position (the `?doc=` demo is read-only — contract `transient`).
+
+   The specs only **read** `window.viewer`; they click no 3D buttons and set no signals. Analytics requests are aborted and the consent gate is accepted, so a smoke run never counts as a visitor.
+4. The runner always writes `smoke-result.json` (status `ok | failed | skipped`, `reason`, `failures[]` with attachment paths, `flaky[]`, per-step timings); the raw Playwright report sits next to it as `playwright-report.json`, screenshots and traces under `artifacts/`. A test that is missing, skipped or filtered counts as `incomplete` — green only when all expected tests ran.
+
+**Where the output goes:** `RV_SMOKE_OUT_DIR` when set (the watcher: `<root>\last-smoke\`), otherwise `<repo>/.smoke/<ISO time>/` (gitignored) — never inside the staging tree, which the deploy deletes. The log ends with `SMOKE_STATUS=<status>` and `SMOKE_REPORT=<path>`.
+
+**Failure reasons** (`reason` in `smoke-result.json`): `runtime-missing`, `unreachable`, `stale-cdn` (the CDN did not serve the uploaded bytes within 60 s — a finding, not noise), `expected-unreadable`, `timeout` (the `line` reporter output is kept as `partialLog`), `crashed`, `report-unreadable`, `incomplete`, `tests`. There is no silent skip: only `--no-smoke` skips.
+
+**Exit codes of `bunny-deploy.mjs`:**
+
+| Exit | Meaning | What to do |
+|------|---------|------------|
+| `0` | Deploy OK; demo smoke OK or skipped (`--no-smoke`, `--dry-run`, `--private`) | nothing |
+| `3` | Deploy OK — **the build is live** — but the demo smoke FAILED | read `smoke-result.json`; roll back by re-deploying the previous tag (there is no automatic rollback) |
+| `1` | Deploy failed (build, guard, upload, lock, post-deploy probe …) | as before |
+
+**Running the smoke by hand** needs a recorded stand — `npm run smoke:prod` refuses to start without one:
+
+```powershell
+npm run smoke:prod -- --expected <root>\last-smoke\expected.json                      # the watcher's last /dev deploy
+npm run smoke:prod -- --expected .smoke\<time>\expected.json --out .smoke\manual      # a release deploy's stand
+```
+
+`--dist <dir>` exists only for the deploy path (the uploaded staging `dist/`); there is no default `dist/` and no "live confirms itself" mode. Reading a red result: see `doc-web-debugging.md` § *A demo is red on /dev/*.
+
+### Library catalog hashes and the post-deploy probe (plan-508)
+
+Every entry of a library `catalog.json` may carry two optional fields next to `glbUrl` / `splatUrl`:
+
+| Field | Meaning |
+|---|---|
+| `sha256` | SHA-256 of the file behind `glbUrl` / `splatUrl` — hex, lowercase, 64 characters. The viewer's blob cache keys on it and verifies every download against it. It is **never** a resolution key: a reference resolves by id/path exactly as before. |
+| `sizeBytes` | Size of that file in bytes (diagnostics; the probe falls back to it for an entry without a hash). |
+
+Who writes them: `scripts/build-local-library-catalog.mjs` (runs in `prebuild` — the unsigned dev bytes, correct for `vite dev`), `scripts/build-library-catalog.mjs` (the GitHub library; downloads each GLB once to hash it), and the deploy's `stampCatalogHashes` **after** signing — signing changes every GLB at the same size, and a hash stamped before it would make every signed library GLB a "hash mismatch" in every browser. A catalog without the fields stays valid: the viewer then keeps its url-keyed, revalidating cache path. The private deploy stamps its staging tree too (after signing and, when password-protected, encryption — the hash describes the bytes the browser downloads).
+
+The post-deploy probe (public deploys) asks the live host, with a cache-busting `rv-probe` query on the catalog and asset requests:
+
+1. `GET <base>library/__rv-probe-missing__.glb` must answer **404** — any content type; Bunny's standard `text/html` error page is accepted (observed 2026-09-27), since the status is what keeps a missing asset out of the viewer's cache. A 200 (any type) means a global SPA fallback / "rewrite 404 to 200" rule is catching asset paths — fix the pull zone's edge rules; any other status fails too. The path is reserved: a build output that contains it is refused.
+2. `GET <base>library/catalog.json` must answer 200 with JSON **byte-equal** to `dist/library/catalog.json` — catches a size-skipped upload or a stale edge copy (e.g. purge credentials missing).
+3. The first catalogued asset must answer 200 as `model/gltf-binary` or `application/octet-stream`, and its bytes must hash to the catalog `sha256` — catches a size-preserving re-sign that was not stamped.
+
+Private (`--private`) deploys are stamped but not probed.
 
 > **Tip:** `--dry-run` means different things in the two modes, and the public one is deliberately cheap. A **public** dry run stages the filtered source tree, prints the single line `[dry-run] filtered public source staged; no build/upload performed`, deletes the staging directory and returns — it does **not** build, and it prints **no** allowlist report, no zone and no file list. A **private** dry run does print mode, zone and remote prefix (plus the encryption/signing lines) before it stops short of staging and uploading.
 
-### What the public demo ships extra
+### Third-party licence notices (plan-544)
 
-`includePublicDemoContent` (`scripts/_workspace-lib.mjs`) is the one staging switch that separates realvirtual's own demo from a customer artifact. It is on for the two **hosted demo** forms — the plain public deploy (core tier, no project key) and `--demo` (commercial tier, no project key), which passes it explicitly — and it is what lets the demo **documents** — `public/*.glb` named by `public/project.json`, DemoRealvirtualWeb and DemoPlanner among them — and `public/aasx/` (the AAS supplier demos: Festo, SEW, Bosch) into the staged tree. (`public/scenes/` was a second, curated Examples catalogue beside the manifest; plan-731 removed the folder and its `index.json`.) Every customer delivery and every private project deploy filters both out: they are demo content, not product.
+Every build writes two files into the root of `dist/` (and `dist-embed/`): `THIRD-PARTY-NOTICES.txt`
+— name, version, licence, copyright, notes and the deduplicated licence texts of every third-party
+component that is actually shipped — and `third-party-notices.json` (the same inventory plus the
+`mode`, for scripts). The settings footer links the text file ("Open-source licenses"), relative to the
+deploy base. Both are plain dist-root files: every channel — Bunny public/demo/private, the hosted and
+password-protected deploys (never encrypted), the embed release (`embed-deploy.mjs` refuses to publish
+without them), customer workspaces (built by the customer) and the CONNECT `webui.zip` — carries them.
 
-The `--demo` staging differs from a customer delivery in one more way: `workspaceFiles: false`. A CDN deploy publishes code, not a repository, so no README, setup/start scripts, recipes or CONNECT helpers are generated — and the core `public/settings.json` survives untouched, which is the artifact the GA and news injection then writes into.
+**Where the list comes from.** `scripts/vite-plugin-third-party-notices.mjs` records the modules of every
+emitted chunk and asset — main build **and** every worker pass (it is registered in `plugins` and
+`worker.plugins` of `vite.config.ts` and `vite.embed.config.ts` with one shared collector) — maps each
+module to its npm package (`node_modules`, nearest named `package.json`), adds the hand-maintained
+`third-party/manual-components.json` entries whose `match` globs hit a module, an asset or a `public/`
+file (Draco decoder, three.js-vendored libs, the PDF.js worker, the HDRI, demo FMU, …), and applies the
+licence policy. The shared core is `scripts/lib/rv-third-party-notices.mjs` (also used by CONNECT).
+`npm run dev` answers `/THIRD-PARTY-NOTICES.txt` with a *development preview* from the lockfile.
 
-### Every channel ships a manifest (plan-735)
+**occt-import-js (LGPL-2.1-only) is a loose file, never bundled.** When the STEP-import worker is part of
+the build, `occtLooseFilePlugin` (vite.config.ts) copies `node_modules/occt-import-js/dist/occt-import-js.js`
+and `.wasm` byte-for-byte to `dist/occt/`; the worker loads them at runtime from `<base>occt/` (dev: served
+from node_modules). Those files carry our memory limit patch (`scripts/patch-occt-memory.mjs`, 2 GB → 4 GB
+heap ceiling), so the manual-list entry declares `"modified": "memory limit patch"` and the notices say so
+next to the name. A customer may replace both files with an interface-compatible build.
 
-There is no longer any channel on which the viewer works out what it has by looking around. Each one publishes a `project.json` at its deploy root, and that file is the only statement of what the delivery contains:
+**Policy.** `third-party/license-policy.json` (public, mirrored — never a private package or vendor name):
+`allowed` SPDX ids, `dynamicOnly` (LGPL — allowed only as a separate, replaceable library, never bundled
+into a JS chunk), `exceptions` and `vendorTerms`, each with `reason`, `decidedBy`, `date`. Exceptions for
+private-tier packages live in `realvirtual-WebViewer-Private~/third-party/license-policy.json`, read only
+when the private tree is part of the build. An entry with `decidedBy: "proposed"` is a proposal: it never
+silences a violation. Unknown/missing licences or texts, non-allowed licences, bundled LGPL, third-party
+GPL/AGPL and **stale** entries (public policy: every tier; private policy: private tier only) are
+violations. An entry is stale only when it covers nothing the product can ship: an approval for a
+component the product *declares* (any manual-list entry, any dependency of the root or the Private
+`package.json`) but this build does not ship — the demo AASX files in a customer workspace, an
+internal-tier package in a customer build — is not stale (CONNECT: any manual-list entry, e.g. the
+Windows-only vendor DLLs in the linux build). The number of exceptions has a shrink-only ceiling (`EXCEPTION_CEILING` in
+`tests/third-party-notices.node.test.ts`) — raising it needs Thomas' approval.
 
-| Channel | Where its `project.json` comes from |
-| --- | --- |
-| Dev checkout | `public/demo-realvirtual/project.json`, checked in (plan-737) |
-| Bunny public / `--demo` | `public/demo-realvirtual/` → `dist/demo-realvirtual/` (Vite copies `public/` recursively) |
-| CONNECT embed | `public/demo-realvirtual/` → payload, staged by `realvirtual-Connect~/tools/stage-public.mjs` (migrated onto this layout by plan-739 Phase 8; `-PublicDemo` now asserts the folder against the shipped manifest, `-Public` carries no demo folder at all) |
-| Customer, project-bearing | `projects/<key>/project.json`, plus their own `models.json` on a CDN deploy |
-| Customer, projectless (`kind: standard`) | **generated at staging time** into `realvirtual-web/public/project.json` |
-| Foreign host (`discover: true`) | its own `project.json` — otherwise there is no project (see below) |
+**Modes.** `enforce` fails the build on any violation; `warn` builds, puts a *Policy violations* section at
+the top of the file and records `"mode": "warn"` in the JSON. `RV_NOTICES_MODE=warn|enforce` always wins.
+Without it our own staged builds (`runBuild`: Bunny, delivery, CONNECT staging — they set
+`RV_NOTICES_RELEASE_BUILD=1`) and the embed build use the release default, a plain `npm run build`
+(local, customer workspace) uses `warn`. **Until plan-544 Phase 6 the release default is `warn` too**
+(`RELEASE_DEFAULT_MODE` in the core). `bunny-deploy.mjs` and `embed-deploy.mjs` print the mode and a
+loud banner when it is `warn` or the notices are missing. `RV_NOTICES_MODE=warn` is the emergency switch;
+there is no `off`. CONNECT has its own switch, `-p:ThirdPartyNoticesMode=warn|enforce`
+(`doc-connect.md` § *Third-party licence notices*).
 
-Two consequences worth knowing before you touch a staging script:
+**Customer workspaces.** The plugin, the core, the policies (public + Private) and the licence texts are
+delivered; the customer's `npm run build` generates the notices in `warn` mode. A customer may add
+`realvirtual-web/third-party/license-policy.customer.json` (same format, never stale-checked): we never
+ship one and every snapshot keeps the customer's copy.
 
-- **The build-time glob is gone.** `import.meta.glob('/public/models/*.glb')` used to seed the model catalogue from whatever sat in the dev checkout, and `BundledBackend` used to turn that into a synthetic project when a deploy had no manifest. Both are removed. A deploy root that serves no readable `project.json` has **no project**: `readManifest()` returns `null` and logs a named line naming the three causes it cannot tell apart (404, CORS, `file://`). This includes a *foreign* host that publishes `models.json` but no manifest — a deliberate, accepted narrowing of plan-700 F12.
-- **The generated projectless manifest is vendor-owned and sits outside `projects/`.** It is written by `writeGeneratedDeliveryManifest()` in `scripts/_workspace-lib.mjs`, *after* `copyCore()` has filtered the demo's own `public/project.json` out of the delivery — the order is load-bearing, since generating it earlier would delete it. It carries a `_generated` header saying so, the delivered README repeats it, and every update replaces it wholesale. That is the point: a standard customer who wants documents of their own creates a project under `projects/`, which is the only place an update never touches.
+### Current project layout by delivery channel
+
+| Channel | Manifest and document location |
+|---|---|
+| Community/dev checkout | `public/demo-realvirtual/project.json` and its relative document files |
+| Hosted demo | `dist/demo-realvirtual/` is published as `demo-realvirtual/` |
+| CONNECT public demo | The bundled `demo-realvirtual/` project; a projectless CONNECT build may omit it |
+| Generated customer workspace | A demo can be seeded as `projects/demo-realvirtual/`; customer projects live under `projects/<key>/` |
+| Customer project deployment | The selected project's root manifest and relative assets |
+| Projectless generated viewer | A generated `realvirtual-web/public/project.json`, distinct from the source demo |
+| Foreign host | Its own readable manifest and documents; no synthetic project is inferred from loose files |
+
+`includePublicDemoContent` controls demo content in a staged hosted build.
+Customer staging can copy the demo separately through `copyDemoRealvirtualFolder`;
+that is distinct from copying it into the viewer's `public/` folder. The app-level
+library remains `public/library/`, independently of the demo project.
+
+The build-time `public/models/*.glb` catalogue scan is gone. A missing/invalid
+manifest does not synthesize a project. Check the exact requested URL, CORS and
+JSON when a project is unavailable. A directory containing GLBs is not sufficient.
 
 ### Public model allowlist
 
-A public deploy publishes only the official demo models. `public/models/` in the dev tree may hold test fixtures, helper GLBs, and work-in-progress models; none of those should reach the public CDN. (Since plan-735 they are also simply invisible to the viewer unless a manifest declares them — the folder is storage, not a catalogue.)
+For a maintained public CDN deployment, the demo's own manifest controls its
+published model list. Current builds read `dist/demo-realvirtual/project.json`;
+a root `dist/project.json` is a compatibility fallback for older build layouts.
+`RV_PUBLIC_MODEL_PREFIX` remains an explicit maintainer override, and the legacy
+prefix fallback applies when no usable manifest is present. These deploy filters
+are not a way to register a new Community project document.
 
-**Since plan-726 the curator is the demo's own manifest**, `public/project.json`. Its `documents[]` is the single source of truth for what the demo contains, on every channel — the hosted site, the CONNECT bundle and the dev checkout all boot from that one file — so the deploy reads it instead of keeping a second, independent list. The old filename prefix survives underneath it, in two roles that are still needed: as the answer for a `dist/` that carries no manifest, and as the `RV_PUBLIC_MODEL_PREFIX` override.
-
-Precedence, highest first:
-
-1. `RV_PUBLIC_MODEL_PREFIX` — an operator overriding one deploy. It stays on top so it remains a usable rollback lever.
-2. `dist/project.json` `documents[]` — the demo's own statement of what it is.
-3. The built-in prefix list — only for a `dist/` with no manifest at all.
-
-> This fixed a live defect. `DemoRobotIK.glb` is a demo model and is listed in the manifest, but it matches neither built-in prefix — so every public and `--demo` deploy before plan-726 silently deleted it before upload.
-
-The rule, applied to the built `dist/` after the build and before upload:
-
-- **Kept** — the `models/*.glb` the manifest declares (or, without a manifest, top-level `models/*.glb` whose filename starts with `DemoRealvirtual`), plus the entire planner standard library under `models/library/**`.
-- **Pruned** — every other top-level `models/*.glb` and the content-hashed copy Vite also emits under `assets/`. The hyphen-boundary match means pruning e.g. `EuropalletEmpty` never touches the library's `Europallet*` assets.
-- **`models.json`** — rewritten to the kept models so the model selector shows exactly what is shipped (the build-time glob otherwise bakes every dev GLB filename into the selector, leaving 404 ghost entries).
-
-The prune is logged (`keep` / `prune` lines), with the curator named on the header line so it is visible which of the three rules applied. **To ship a model on the public demo, add it to `public/demo-realvirtual/project.json`** — the filename no longer matters. Override the manifest for one deploy with the `RV_PUBLIC_MODEL_PREFIX` environment variable. This applies to the **public** deploy only — private projects already stage their own models, and a plain `npm run build` for self-hosting keeps every model. (A public `--dry-run` never reaches this step, see the tip above.)
+The standard library is app-level, under `library/`, and is not the demo's model
+folder. `publicDemoManifestMisses()` verifies the declared GLB files after pruning;
+its current implementation in `scripts/_bunny-lib.mjs` is the deploy contract.
+A plain local build and the maintained CDN deploy have different staging/pruning
+steps. Never infer published content just from loose development files.
 
 ### The demo manifest is a deploy artifact
 
-`public/project.json` ships to the deploy root and is read there by
-`BundledBackend.readManifest()`. Three consequences worth knowing:
+The current source demo manifest is copied to `demo-realvirtual/project.json` on
+the host. Manifest responses must revalidate rather than use immutable caching.
+The CDN upload logic treats `project.json` specially by basename, including nested
+project manifests. Publish all referenced files with the manifest and verify paths
+case-sensitively on the host. See [Migration](doc-migration.md) for the old layout.
 
-- **It is never cached like a build asset.** It lives at a fixed URL and a
-  curator's edit — renaming a document, swapping the start document — routinely
-  leaves the byte count unchanged, so a size-only diff would skip it. It is in
-  `ALWAYS_UPLOAD_FILES` and the pull zone is purged after the upload. The client
-  fetches it with `cache: "no-cache"` (revalidate, 304 on an unchanged file) —
-  never `immutable`.
-- **A contradiction aborts the deploy.** After both pruning passes,
-  `publicDemoManifestMisses()` checks that every `models/` and `scenes/`
-  document the manifest names is actually in `dist/`. The comparison is
-  case-sensitive, because the storage zone is: a `Models/…` typo passes on a
-  Windows dev machine and 404s on the CDN. This runs on the **public** path only
-  — a private customer deploy publishes no root manifest.
-- **It never reaches a customer delivery.** `copyCore()` filters it out
-  alongside `scenes/` and `aasx/` unless `includePublicDemoContent` is set. It
-  needed its own filter branch: every other exclusion there matches a
-  subdirectory, and a top-level file would sail straight past them onto the
-  customer's deploy root — where it would be read as *their* project.
-
-**Rollback** is cheap for content mistakes and expensive for code ones. The
-difference matters enough to have its own runbook — see below.
+The demo copy in a generated customer workspace is a separate project folder;
+its presence does not make it the customer's own project or make an HTTP backend
+writable. See [Projects and saving](doc-projects.md).
 
 ### Rolling back the demo
 
@@ -225,7 +488,7 @@ white page), and restoring the file reverses it.
 
 #### 2. Deploy allowlist — the env override outranks the manifest
 
-`RV_PUBLIC_MODEL_PREFIX` sits **above** `dist/project.json` in the precedence
+`RV_PUBLIC_MODEL_PREFIX` sits **above** the current `dist/demo-realvirtual/project.json` (or a legacy root `dist/project.json`) in the precedence
 list precisely so it stays usable as a rollback lever. Use it when the manifest
 is right but the shipped model set is not, or to get a correct site out while
 the manifest question is still open.
@@ -362,49 +625,121 @@ same rule as the button, so there is no way to keep one without the other.
 
 ## 3. Deploy a private project
 
-Private customer projects publish to an unguessable URL `web.realvirtual.io/{code}/`, isolated from the public demo. Each project lives in its own folder under the private projects directory and carries its own GLB models.
+Private customer projects publish as a **hosted deploy** (plan-759) to an unguessable URL `web.realvirtual.io/{code}/`, isolated from the public demo. The project is a **folder**, and the deploy publishes that folder:
+
+```
+{code}/index.html, assets/, settings.json   ← the runtime (dist/, without the public demo's models/, scenes/, library/)
+{code}/p/**                                 ← the project folder, byte for byte, minus the deny list
+```
 
 ```bash
 npm run deploy:private -- --list                       # list available private projects
 npm run deploy:private -- --project "Customer XY"      # build + publish one project
 ```
 
-The private deploy stages the build together with the project's own GLBs (the public demo models are excluded), generates the project `settings.json` and `models.json`, uploads everything to `{code}/`, and uploads any extra project assets to `{code}/private-assets/`. On success it records the publish under `provenance.lastPublishedBy['bunny-private']` in `project.json` (and mirrors the timestamp into the legacy `lastPublished` field).
+The viewer boots the served project through `settings.json` (`projectUrl: "p/"`) exactly as the appliance does with `?projectUrl=` (§6b): the dashboard, the document list, every `cad/`, `scenes/` or root-level document and the project's assets come from `p/project.json` and the files beside it. There is **no `models.json`, no `scenes/index.json` and no `private-assets/`** any more — a folder name inside the project is a place, not a type. The root of a hosted deploy always opens the project's **dashboard**; a document opens through its own `?doc=<id>` link (`settings.defaultModel` is not consulted).
 
-What comes from where:
+What the stager does, in order: `validate-project.mjs` (mandatory — a CDN upload cannot be undone, so a committed secret or a broken manifest fails before the build), the filtered private build, the verbatim copy (`copyProjectVerbatim`, with `lstat` — a symlink is never followed, it is skipped and reported), the per-file GLB signing/encryption below, the generated `settings.json`, a printed **preflight** (every document the manifest names — and whether it is on disk —, every removed file with its reason, every skipped symlink, every file above 256 MB), ONE upload pass (`p/**` enters the pool first, `settings.json` goes last with the catalogs), and a reconcile of `{code}/` against the staging listing: whatever the staging did not produce is deleted, a previous layout's `models/`, `models.json` and `private-assets/` included. On success it records `provenance.lastPublishedBy['bunny-private']` with `layout: "hosted-v2"` in `project.json`.
 
-| Published file | Source |
-|----------------|--------|
-| `models.json` | **The `models/` folder UNION the manifest's root-level GLB documents** (`projectModelNames()`, plan-720). The folder can never be shortened by the manifest — every GLB in `models/` belongs to the project and nobody should have to register one (plan-700 P0-3). It can only be LENGTHENED, by a `documents[]` entry naming an existing root-level `.glb`, which is the layout the viewer writes today and which the folder glob structurally cannot see. Entries under `scenes/`/`library/` are excluded — those folders are staged whole. A declared file that is missing, or a folder GLB with no manifest row, is logged rather than silently dropped |
-| `scenes/index.json` | The manifest's scene documents (`documentsInSection(project, "scenes")` — a legacy projection, see doc-persistence §2.0-13), for entries marked `baseKind: "published"` whose `path` is a `.glb` directly under `scenes/`. A project whose manifest lists none keeps whatever `index.json` its `scenes/` folder already had. **Legacy since plan-731:** realvirtual's own deploys ship no such file — their examples are ordinary `documents[]` rows. It is still written for a customer project that keeps its scenes in a folder, and still READ by a `discover` backend pointed at a foreign root |
-| `settings.json` | Generated, on top of the project's own `settings/project-settings.json` when it has one. The project file is a **base**: `projectAssetsPath`, `analytics`, `encryption` and `generated` are written afterwards and always win, so a project file can add settings but can never re-enable analytics or aim the assets path elsewhere |
+**The deny list** (`_rv-guards.mjs` → `hostedDeployDenyReason()`, one rule for the Bunny deploy and the CONNECT embed): secrets (`isSecretPath`), the folders `.git`, `.trash`, `.cad-cache`, `node_modules`, editor leftovers (`*.bak`, `*.tmp`, OS noise), plugin **sources** (`*.ts`, `*.tsx`, `tsconfig*.json` — the compiled bundle ships in the runtime, the source is realvirtual's), the publish artefact rule (`project-config.json`, `llm.json`, `comments.json`, RAG `index/`/`runtime/`, `*.key`) — and the project's own `.rvprojectignore` on top. `project.json` is **never** removed; the stager refuses to continue if it were.
 
-Every private deploy — and every public one, and every CONNECT embed — runs `validate-project.mjs`
-first. A CDN upload cannot be undone, so a committed secret or a broken manifest has to fail before
-the build, not be noticed after it.
+`settings.json` is generated on top of the project's own `settings/project-settings.json` when it has one. The project file is a **base**: `projectUrl`, `projectAssetsPath`, `analytics`, `encryption` and `generated` are written afterwards and always win, and a `defaultModel` from it is dropped.
 
 Set the private projects root with `--projects-dir <dir>` or the `BUNNY_PRIVATE_PROJECTS_DIR` environment variable.
 
 ### GLB signing and password protection
 
-Two independent protections can be armed on a deploy. Both are configured **only** through the environment — never as a CLI argument, because arguments land in process lists, shell history and CI logs.
+Two independent protections can be armed on a deploy. Signing is configured through the environment; the password lives in the **customer register** (plan-759 D6b), with the environment as a one-off override. Neither is ever a CLI argument — arguments land in process lists, shell history and CI logs.
 
-| Env | Effect |
-|-----|--------|
-| `RV_SIGN_PRIVATE_KEY` | Ed25519 private key (PKCS#8 PEM, or that PEM base64-encoded). Every GLB in the artifact is signed in place with an `rv_sig` provenance signature. Unset = models ship unsigned, and the deploy says so |
-| `RV_SIGN_CUSTOMER_CERT` | Path to an `RV-KEY-V1` customer certificate JSON, so the signature is attributed to the customer organisation instead of the realvirtual root key. The certificate's public key must match `RV_SIGN_PRIVATE_KEY` |
-| `RV_DEPLOY_PASSWORD` | Private deploys only. Encrypts the project's GLBs with **AES-256-GCM** |
-| `RV_DEPLOY_FRAGMENT` | Reuses a given 32-byte fragment secret instead of generating a fresh one, so an in-place re-publish keeps the existing link working |
+| Source | Effect |
+|--------|--------|
+| `RV_SIGN_PRIVATE_KEY` (env) | Ed25519 private key (PKCS#8 PEM, or that PEM base64-encoded). Every GLB in the artifact is signed in place with an `rv_sig` provenance signature. Unset = models ship unsigned, and the deploy says so |
+| `RV_SIGN_CUSTOMER_CERT` (env) | Path to an `RV-KEY-V1` customer certificate JSON, so the signature is attributed to the customer organisation instead of the realvirtual root key. The certificate's public key must match `RV_SIGN_PRIVATE_KEY` |
+| `hosted.password` (register `customers/<slug>.json`) | Encrypts every GLB below `p/` — and the project AASX `aasx/*.aasx` plus `aasx/index.json` (plan-596) — with **AES-256-GCM**. The customer is found through `delivery.projects` |
+| `hosted.fragment` (register) | The 32-byte `#k=` link factor, base64url. Absent on the first encrypted publish → the CLI mints one and **writes it back** so the customer's link survives every later publish. Rotating it is a hand edit, never a side effect |
+| `RV_DEPLOY_PASSWORD`, `RV_DEPLOY_FRAGMENT` (env) | Override the register halves for one run (a project no register entry claims can only be armed this way) |
 
-Signing runs over the **final** artifact set, after the allowlist and prune steps, on both the public and the private path. Because re-signing and re-encryption are size-preserving, signed and encrypted GLBs deliberately bypass the size-only upload diff.
+Without a password the deploy goes out in plaintext and says so in red. `/customers show` prints the password masked; the doctor warns when a project was published as `hosted-v2` and its entry has no `hosted.password`.
 
-With `RV_DEPLOY_PASSWORD` set, the published URL carries the fragment secret:
+Signing runs over the plaintext GLB first, encryption wraps the signed bytes. Because re-signing and re-encryption are size-preserving, signed and encrypted GLBs deliberately bypass the size-only upload diff.
+
+**Project AASX (plan-596).** With a password, `aasx/*.aasx` (flat, like the viewer's scan) and `aasx/index.json` are encrypted exactly like the GLBs (`encryptablePathsBelow`, same salt, path as `hkdfInfo`). Signing stays on `.glb` — an AASX or a JSON index is never signed. Every file the staging encrypted is uploaded on every publish regardless of its size: the stager reports them `p/`-relative (`aasx/a.aasx`), the deploy translates them to staging paths (`p/aasx/a.aasx`, `hostedForcedUploadRels`) and unites them with the catalog-hash diff. `aasx/index.json` is an always-upload file in any case, encrypted or not. On an unencrypted deploy the viewer opens an AASX with HTTP range reads (directory + the few XML parts); on an encrypted one the whole file is downloaded and decrypted before zip.js reads it — the detail of a large AASX is slower there, the index stays small. `curl` on `p/aasx/<file>.aasx` of a password deploy returns an `RVE1` envelope, not a ZIP header.
+
+The crypto form of a hosted deploy: **one PBKDF2 salt per publish** (one key derivation, held per salt in the tab), every envelope header carries the file's `p/`-relative path as `hkdfInfo` (bound into each chunk's AAD, so chunks of two files under the same key are not interchangeable), 96-bit random IVs per 16 MiB chunk, and a tiny **key probe** in `settings.json` (`encryption.probe`, an envelope over a fixed plaintext with the publish salt). The boot gate derives the key once from the probe's header, verifies it there, and only then reads the project — no document is fetched before the password is right, and a `?doc=` link cannot bypass the gate. Every GLB byte path of the served project (the backend, the blob URLs it hands out, the model cache — which bypasses its persistent blob cache on an encrypted deploy) goes through the one decrypt seam `src/core/persistence/rv-served-bytes.ts`.
+
+The published URL carries the fragment secret:
 
 ```
 https://web.realvirtual.io/{code}/#k=<fragment>
 ```
 
-That fragment is **half** the key; the password is the other half and is never logged. Send the link and the password through **separate channels**. Without `RV_DEPLOY_FRAGMENT`, every re-publish mints a new fragment and invalidates the old link.
+That fragment is **half** the key; the password is the other half and is never logged. Send the link and the password through **separate channels**. `project.json` and the plugin bundle stay plaintext (D4): document names and sizes are readable before the password, the geometry is not.
+
+### Encrypted share link
+
+A single GLB can be shared confidentially **without** building a private deploy per recipient
+(plan-560). The share CLI encrypts it into the same RVE1 envelope a hosted deploy uses (password +
+`#k=` fragment, AES-256-GCM, 16 MiB chunks), uploads it to the realvirtual fileshare and prints a
+link to the **public demo**:
+
+```
+https://web.realvirtual.io/demo/?glb=https%3A%2F%2Ffiles.realvirtual.io%2Fdl%2F<token>%2Ffile#k=<fragment>
+```
+
+The viewer recognises the envelope in its `?glb=` boot, asks for the password, and opens the model.
+
+```bash
+npm run share:encrypt -- model.glb --upload                 # encrypt, upload (30 days), print the link
+npm run share:encrypt -- model.glb --upload --expiry-days 0 # permanent link
+npm run share:encrypt -- model.glb                          # offline: FRAGMENT + FILE, no upload
+npm run share:encrypt -- model.glb --file-url https://cdn.example.com/model.rve.glb   # self-hosted file
+npm run share:encrypt -- --link-only --file-url https://…  # link for an already encrypted file
+```
+
+| Option / variable | Effect |
+|-------------------|--------|
+| `--out <file>` | Envelope path; default `<name>.rve.glb` next to the input |
+| `--upload` | Upload to the fileshare (create-upload-url → PUT → confirm-upload) |
+| `--expiry-days <n>` | Fileshare expiry, default `30`; `0` = permanent |
+| `--file-url <url>` | Where the envelope is served when you host it yourself (mutually exclusive with `--upload`) |
+| `--base <url>` | Viewer the link opens, default `https://web.realvirtual.io/demo/` |
+| `--link-only` | Build a link for an existing envelope — no re-encryption, no new password. Needs `--file-url` and `RV_SHARE_FRAGMENT` |
+| `RV_SHARE_PASSWORD` (env) | Password (min. 12 characters). Unset = a random 20-character password is generated |
+| `RV_SHARE_FRAGMENT` (env) | `--link-only`: the `FRAGMENT` an earlier run printed |
+| `RV_FILESHARE_API_KEY` / `RV_FILESHARE_API_KEY_FILE` (env) | Fileshare Bearer key, or a file holding it (default `E:/firebase-files/.api-key`) |
+
+Output contract: with a file URL stdout carries exactly one line `LINK <viewer link>`; without one
+it carries `FRAGMENT <b64url>` and `FILE <path>`. Every encrypting run writes
+`PASSWORD (send via a separate channel): …` to **stderr**. Secrets are never arguments, the
+fragment is never written to a file, the password never to stdout. **Send the link and the
+password through separate channels** — the ciphertext is public and the link alone opens nothing.
+
+What the recipient sees and what it means:
+
+- **Commercial builds only.** The decryptor is a customer-tier feature (`share-decrypt` in
+  `tier-manifest.json`), so `/demo` (built with `--demo`) and customer deploys open the link. The
+  public/community edition shows *"This model is encrypted and cannot be opened in this edition."*
+- **Opened with the password = trusted for this session.** Interface auto-connect and live signals
+  are allowed, the trust banner says *"Opened with password — live connections enabled for this
+  session."* and offers no revoke. Nothing is stored: no trust-store record, no scene keys.
+- **The card.** It shows *Encrypted*; its download hands out the **encrypted** file (plaintext never
+  leaves the page as a file); *Open in realvirtual WEB* and *Add to my library* are not offered,
+  because both would re-fetch the URL without the key.
+- **Errors land on the card:** missing `#k=` → *"The link is incomplete (missing key)."*, Cancel →
+  *"Opening was cancelled."*, damaged envelope → *"The file is damaged or was tampered with."* A wrong
+  password keeps the prompt open (*"Wrong password or damaged file."* — a damaged first chunk cannot
+  be told apart).
+
+Limits: the envelope must stay within the viewer's 250 MB `?glb=` budget (the CLI refuses a larger
+one before uploading) and warns above 100 MiB plaintext (mobile browsers). An envelope whose header
+demands more than 1,000,000 PBKDF2 iterations is refused without deriving anything. A bare
+`https://files.realvirtual.io/dl/<token>` (the human landing page) is pointed at `…/file`
+automatically. Every viewer open counts as a fileshare download.
+
+**Prerequisite (open, plan-560 Phase 5):** the fileshare route `/dl/<token>/file` must answer
+cross-origin GETs with `Access-Control-Allow-Origin: *` on **every** response (302, OPTIONS, 404/410).
+Until the Cloud Function sends it, the browser reports the link as a CORS failure; a self-hosted
+envelope (`--file-url`) needs the same header (see *Hosting a GLB for a shared link*).
 
 ### Opening a project hosted elsewhere
 
@@ -446,9 +781,15 @@ All credentials come from environment variables — there is no key stored in th
 | `RV_PUBLIC_TEST_SCENE_PREFIX` | no | Fallback prune prefix for a `dist/` whose manifest has no `devOnly` rows (default `Test`) |
 | `RV_SIGN_PRIVATE_KEY` | no | Ed25519 PKCS#8 key (PEM or base64 PEM) used to sign every published GLB. Unset = models ship unsigned |
 | `RV_SIGN_CUSTOMER_CERT` | no | Path to an `RV-KEY-V1` customer certificate, so signatures are attributed to the customer org |
-| `RV_DEPLOY_PASSWORD` | no | Private deploys: AES-256-GCM password protection for the project's GLBs. Env only — never a CLI argument |
-| `RV_DEPLOY_FRAGMENT` | no | Reuses an existing fragment secret so the `#k=` link survives a re-publish |
-| `RV_BUILD_CACHE` | no | Root for the staged-build `node_modules` cache (default: system temp). Only used by `--fast` staged builds, e.g. `scripts/deliver.mjs --fast` |
+| `RV_DEPLOY_PASSWORD` | no | Private deploys: one-off override of the register's `hosted.password` (AES-256-GCM for every GLB). Env only — never a CLI argument |
+| `RV_DEPLOY_FRAGMENT` | no | One-off override of the register's `hosted.fragment` (the `#k=` link factor) |
+| `RV_BUILD_CACHE` | no | Root for the staged-build `node_modules` cache (default: system temp). Used by `--path dev` / `--path demo-beta` deploys and by `--fast` staged builds, e.g. `scripts/deliver.mjs --fast` |
+| `RV_DEPLOY_CONCURRENCY` | no | Parallel storage requests per deploy (default `8`). Stale deletes are capped at 8 regardless |
+| `RV_DEPLOY_MAX_INFLIGHT_BYTES` | no | Upper bound for the summed size of files uploading at once, in bytes (default `67108864` = 64 MB). A single larger file uploads alone |
+| `RV_KEEP_STAGING` | no | `1` keeps the temporary `rv-customer-workspace-*` staging directory after the deploy — including a failed one — and logs its path |
+| `RV_DEPLOY_LOCK_TIMEOUT_SECONDS` | no | How long a public deploy waits for a busy publish lock before it gives up, in seconds (default `1200` = 20 min; `0` = one attempt). The deploy aborts before any remote access |
+| `RV_DEPLOY_PREPUBLISH_TIMEOUT_SECONDS` | no | Upper bound for staging + build of a public deploy, checked right before the publish lock (unset = no limit). The /dev watcher sets `900` for its deploys |
+| `RV_DEPLOY_LOCK` | no | `0` publishes **without** the publish lock — honoured only on non-Windows machines, where the named-pipe lock does not exist. Use it only when no other deploy can target the same prefix |
 | `VITE_BASE` | no | Build-time base path (default `./`). Settable per-run via `--base` |
 
 These mirror the values configured in the Unity Editor under **Tools > realvirtual > Export > WebViewer Tools** (Publish tab, stored there as EditorPrefs). If you rotate a key, update both places so the two deploy paths stay in sync.
@@ -461,7 +802,77 @@ These mirror the values configured in the Unity Editor under **Tools > realvirtu
 
 ## 5. Continuous deployment
 
-There is none — deliberately. All deploys run locally via the CLI (`npm run deploy`, `scripts/embed-deploy.mjs`, the deploy skills); the runner-based `.github/workflows/` were removed 2026-08-28. They dated from the retired github-dev repo, only ever executed (and failed) on the public mirror, and Forgejo — today's integration remote — does not run them. A fork that wants CI deployment writes its own workflow around `npm run deploy` with its own Bunny credentials as repository secrets.
+There is no runner-based CI — deliberately. All deploys run locally via the CLI (`npm run deploy`, `scripts/embed-deploy.mjs`, the deploy skills); the runner-based `.github/workflows/` were removed 2026-08-28. They dated from the retired github-dev repo, only ever executed (and failed) on the public mirror, and Forgejo — today's integration remote — does not run them. A fork that wants CI deployment writes its own workflow around `npm run deploy` with its own Bunny credentials as repository secrets.
+
+The one automatic deploy is realvirtual's internal `/dev` channel: a local watcher on the developer machine publishes every push to `main` — see below.
+
+### Automatic /dev deploys
+
+`https://web.realvirtual.io/dev/` follows `main` on its own (plan-488). A watcher, `scripts/dev-deploy-watch.mjs`, runs as a scheduled task in the developer's Windows session every 3 minutes and at logon. Each tick:
+
+1. takes the watcher's own instance lock (`rv-dev-deploy-watcher`) — a tick still running makes the next one end silently;
+2. checks the switch (the file `<root>\enabled`);
+3. runs `git fetch origin main` (2 min limit) in **its own two clones** of the WebViewer and the Private repo — never in your working tree. Pushes from any machine, session or worktree count; a push to only one of the two repos is enough;
+4. compares the SHA pair with the last deployed one and, when it moved, **reserves** the attempt in `state.json` before anything runs, resets both clones hard to exactly the captured pair (`git clean -ffdxq -e node_modules` — the smoke runtime survives), makes sure the **smoke runtime** of the web clone is current (see [Demo smoke on /dev](#demo-smoke-on-dev)), and runs `scripts/bunny-deploy.mjs --demo --path dev` from the clone as a non-detached child. Several pushes between two ticks collapse into one deploy of the newest pair;
+5. books the result: exit `0` is `DEPLOY OK` + the smoke line, exit `3` is `DEPLOY OK` + `SMOKE FAILED` (the pair **is** deployed — no backoff, no redeploy), anything else is `DEPLOY FAILED`.
+
+Every tick writes one line to `<root>\watch.log` (`IDLE`, `DEPLOY START`, `DEPLOY OK … duration=`, `SMOKE OK|FAILED|SKIPPED … failures=<n> (see …smoke-result.json)`, `RUNTIME INSTALL`, `RUNTIME FAILED`, `DEPLOY FAILED`, `GIVING UP`, `FETCH FAILED`, `FETCH RECOVERED after <n> failed ticks`, `STALE LOCK REMOVED <clone>/<path> age=<min>m [(after kill)]`, `STALE LOCK NOT REMOVED …`, `STALE GC PID …`, `LOCK SWEEP REFUSED …`, `NOTIFY FAILED …`, `SKIP …` incl. `SKIP git-locked <clone>/<path> age=<s>s`); the output of the last deploy is in `<root>\last-deploy.log`. `<root>` defaults to `rv-dev-deploy` next to the workspace root (`<WS>\..\rv-dev-deploy`).
+
+#### Installation
+
+Run the installer **from the canonical checkout** (a worktree or clone is refused), in the Windows session that should run the watcher. Look at the dry run first:
+
+```powershell
+Set-Location "Assets\realvirtual-WebViewer~"
+node scripts/dev-deploy-watch.mjs --install --dry-run     # prints every step and the task XML, changes nothing
+node scripts/dev-deploy-watch.mjs --install               # optional: --root <dir>, --credentials <file> (repeatable)
+```
+
+`--install` resolves every path once and writes it absolute into `<root>\config.json` (a clone has no `.plastic` ancestor, so nothing is derived at runtime), clones both repos into `<root>\clones\` with the same `core.autocrlf` as the checkout (so the build cache key matches), copies the watcher, `rv-publish-lock.mjs` and `rv-notify.mjs` to `<root>\bin\`, installs the smoke runtime once (`npm ci --ignore-scripts` in the web clone, `playwright install chromium --only-shell` into `<root>\playwright-browsers\`), creates the switch and registers the task `rv-dev-deploy-watch`. Credentials default to `.env.production` and `.env` of the checkout (first file that sets a key wins, like `npm run deploy`); the watcher hands their values to the deploy as environment and logs only **whether** `BUNNY_STORAGE_KEY`, `BUNNY_STORAGE_ZONE`, `BUNNY_ACCOUNT_KEY` and `BUNNY_PULL_ZONE_ID` are present. Without the two storage keys no deploy starts.
+
+The task runs the **installed copy** in `<root>\bin\`, not the file in the repo: a push that breaks the watcher can only fail one deploy, never stop the automation. After changing `dev-deploy-watch.mjs` run `--install` again — it is idempotent (existing clones are verified, a paused switch stays paused, the task is re-registered).
+
+Task settings: "run only when user is logged on", every 3 minutes plus at logon, no second instance (`IgnoreNew`), **no execution time limit** (a scheduler kill could cut a deploy between stale-delete and purge), runs on battery, never wakes the machine, catches up missed runs. The action is `conhost.exe --headless "<node>" "<root>\bin\dev-deploy-watch.mjs" --config "<root>\config.json"`, so no console window flashes every 3 minutes.
+
+#### Everyday use
+
+```powershell
+node <root>\bin\dev-deploy-watch.mjs --status        # switch, status (idle/deployed/in-flight/backoff/failed), last result; --json for scripts
+node <root>\bin\dev-deploy-watch.mjs --disable       # pause (removes <root>\enabled); --enable resumes
+node <root>\bin\dev-deploy-watch.mjs --retry         # reset the attempt counter of a failed pair
+node <root>\bin\dev-deploy-watch.mjs --retry-smoke   # re-run ONLY the demo smoke against the last deployed stand
+node <root>\bin\dev-deploy-watch.mjs --uninstall     # remove the task; clones, state and log stay
+node <root>\bin\dev-deploy-watch.mjs --purge         # remove the task and delete <root> (refused while a tick runs)
+```
+
+**Session binding.** The task only runs while the Windows session exists. Disconnecting an RDP connection keeps the session and the watcher running; signing out or rebooting pauses it until the next logon, whose first tick catches up.
+
+**Failures.** A failed deploy is retried for the same SHA pair after 3 and then 15 minutes — at most **3 attempts**. Then the pair is `failed`, the log says `GIVING UP`, and `/dev` stays as it is until the next push (a new pair always starts again at attempt 1) or `--retry`. The attempt is counted before the deploy starts, so a killed watcher or a crash still uses it up; if `state.json` cannot be written, no deploy starts at all. An unreadable `state.json` also stops deploys (logged as `STATE UNREADABLE`); a corrupt one is moved to `state.corrupt-<timestamp>.json` and the watcher starts fresh. A failed deploy may have changed `/dev` partially — the next successful one synchronizes it completely. Limits apply only **before** publishing: `git fetch` 2 min, staging + build 15 min (the deploy checks it right before taking the publish lock), waiting for the publish lock 20 min. The publish window itself is never cut off.
+
+**Self-heal and blocked notifications (plan-547).** A git that is killed mid-operation (the 2-minute limit force-kills the whole git process tree) leaves its lock file behind, and every later git command in that clone then fails at once — on 2026-09-28 that silently stopped `/dev` for five days. The watcher therefore heals stale locks itself, in two places and only while it holds its own instance lock: right after killing a timed-out git it removes the lock files of **that** clone without any age check (`STALE LOCK REMOVED … (after kill)`), and at the start of every tick, before the fetch, it sweeps both clones (`.git/*.lock`, `.git/refs/**/*.lock`, `.git/objects/info/**/*.lock`, `.git/objects/pack/*.lock`) and removes every lock older than `staleLockMinutes` (`config.json`, default 10). A younger lock is left alone and ends the tick as `SKIP git-locked` — like a failed fetch, it uses no attempt. A stale `gc.pid` is only logged; a clone path that fails the reset guard (not a configured clone, or a junction) is refused and logged. Two situations that need a human now raise a Windows notification once: `GIVING UP` (title *DEPLOY BLOCKED*, with the pair, the error and the `--retry` hint) and the third `FETCH FAILED` tick in a row (title *FETCH FAILING*, with the last error). `state.json` keeps the streak as `fetchFailures`; a successful fetch of both clones resets it to 0, and `--status` shows `fetch fails : <n>` while it is above 0 (`--json`: `fetchFailures`). The installed copy only learns this after `--install`.
+
+#### Demo smoke on /dev
+
+Every `/dev` deploy runs the [demo smoke](#the-demo-smoke-after-every-public-deploy), so the watcher is also the daily check of `main`: a regression in a public demo shows up minutes after the push.
+
+- **Result.** `state.json` keeps `lastSmoke` (`status`, `reason`, up to 10 failures, `reportPath`) for the pair it belongs to; `--status` shows it as `last smoke : OK|FAILED|SKIPPED <time> <pair> — <first failure>`. The output of the last smoke is in `<root>\last-smoke\` (`smoke-result.json`, `expected.json`, `playwright-report.json`, `artifacts\`), overwritten per run. Exit 3 without a readable `smoke-result.json` is booked as `failed` / `report-unreadable`; a deploy that ran no smoke at all is `skipped`, never `ok`.
+- **Notification.** When the smoke turns red (any status → `failed`), a Windows balloon notification names the first failing test and the report path. A lasting red does not notify again; `--status` shows it every time. Notifications come from `rv-notify.mjs` (PowerShell `NotifyIcon`, no module, no npm package) and are visible because the task runs in the logged-on session.
+- **Runtime.** The smoke runs from the web clone, which has no `node_modules` of its own. Each tick checks `node_modules/playwright/cli.js`, a `chromium*` folder under `<root>\playwright-browsers\` and the SHA-256 of `package-lock.json` (`state.json` → `runtime.lockHash`); when anything is missing or the lockfile moved, it runs `npm ci --ignore-scripts` and `playwright install chromium --only-shell` (10 min limit each, output in `<root>\last-runtime.log`, log line `RUNTIME INSTALL`). `--ignore-scripts` is required: the `postinstall` would run `npm ci` in the private clone, which has no `.npmrc`. A failed install logs `RUNTIME FAILED` and notifies; the deploy still runs and its smoke then ends `runtime-missing`. The headless shell alone (262 MB) is enough for the smoke.
+- **Retry without a deploy.** A smoke that was red for an infrastructure reason is not repeated by the next tick (the pair counts as deployed). `--retry-smoke` runs only the runner against `<root>\last-smoke\expected.json` — the stand the deploy wrote right after its purge, so it exists even when the smoke died at `runtime-missing` — waits for a running tick (watcher lock), books `lastSmoke` for the pair named in that file and deploys nothing. Its output is in `<root>\last-retry-smoke.log`.
+- **Install once more.** The installed copy only learns all this after `--install` (it copies `rv-notify.mjs` too and writes `browsersPath`/`smokeOutDir` into `config.json`).
+
+#### The publish lock — a contract
+
+Every public deploy (`npm run deploy`, `/deploy-web`, `/deploy-web-beta`, the watcher) holds a lock from **before** listing the remote files until **after** the purge (the zone-root `robots.txt` of `/demo` included), the post-deploy probe and the demo smoke that follow it — a public deploy holds its lock a few minutes longer since plan-503; `--no-smoke` shortens it in an emergency. Without it, a manual `/deploy-web-beta` running while the watcher publishes would list the watcher's fresh assets and delete them as stale. A manual deploy therefore **waits** for a running watcher deploy (`waiting for publish lock rv-publish-…`, up to `RV_DEPLOY_LOCK_TIMEOUT_SECONDS`, default 20 min) and then publishes.
+
+The lock is a **Windows named pipe** owned by the deploy process — the operating system releases it when that process ends, however it ends; there is no lock file to clean up. Its name is the contract between the installed watcher copy and every deploy script version, so it must not change:
+
+| Lock | Name |
+|------|------|
+| Publish lock of a public deploy | `rv-publish-<storage zone>:<remote prefix>` — zone and prefix lower-cased, prefix without leading/trailing slashes, e.g. `rv-publish-realvitual-web:dev`; the zone root is `rv-publish-<zone>:` |
+| Watcher instance lock | `rv-dev-deploy-watcher` |
+
+`/dev` and `/demo` use different locks and never block each other. Names are limited to 200 characters. On a non-Windows machine the publish lock does not exist: a public deploy there refuses to run unless `RV_DEPLOY_LOCK=0` says explicitly that nothing else publishes to the same target.
 
 ---
 
@@ -484,7 +895,7 @@ therefore what a project update costs.**
 
 | Target | Where the project lives | A project update is | Docs |
 |---|---|---|---|
-| **CDN** (`web.realvirtual.io`) | inside the published bundle | a re-publish | this file, §2 / §3 |
+| **CDN** (`web.realvirtual.io`) | as a **folder** under `{code}/p/` next to the runtime (private, plan-759); inside the bundle (public demo) | a re-publish | this file, §2 / §3 |
 | **CONNECT embed** | inside the delivered `.exe` | a new build | `Assets/realvirtual-Connect~/doc-connect.md` |
 | **Customer workspace** | the customer's own repo, built locally | `npm run build` | §"Customer source delivery" |
 | **Appliance** (on-premise box) | served as a **folder**, fed by `git push` | **a push — no build** | `../realvirtual-WebViewer-Private~/appliance/doc-appliance.md` |
@@ -509,175 +920,15 @@ Two consequences worth knowing even if you never touch a box:
   `omitDefaultModel` leaves the key out entirely, `modeLock` writes the kiosk lock. Both are
   opt-in; without them the function produces exactly the file it always did.
 
-This is the first deploy target of the project-based model, which is why it gets a section
-here rather than only in the appliance runbook: the direction of travel is that a project is a
-folder with a manifest, not a bundle with a model baked into it.
+This was the first deploy target of the project-based model, which is why it gets a section
+here rather than only in the appliance runbook: a project is a folder with a manifest, not a
+bundle with a model baked into it. Since plan-759 the private CDN deploy (§3) and the CONNECT
+embed follow the same layout — runtime beside the folder, `settings.json` naming it — with the one
+difference that they need no loader: the runtime sits at the root and `projectUrl: "p/"` points
+next door.
 
 ---
 
-## 7. Deploy it yourself
-
-realvirtual WEB is the open standard for browser-based 3D HMI in manufacturing. You can run your own deployment two ways: reuse the built-in tool with your own Bunny account, or treat the build as plain static files and host them anywhere.
-
-> **AGPL obligations apply to self-hosting.** realvirtual WEB is licensed under the **GNU Affero General Public License v3 (AGPL-3.0)**. Deploying it on your own infrastructure — including serving it as a network service — triggers the AGPL: you must publish your **complete project** under AGPL-3.0 and make it freely available. This includes all source code, configuration, and **all content delivered through the application**, such as GLB model files, `settings.json`, and plugins. This applies whether the application is served over a network or distributed directly.
-
-> The "Powered by realvirtual WEB" watermark and the realvirtual logo must remain visible and unmodified in all AGPL deployments. Removing or modifying branding requires a commercial license.
-
-> **Keeping a project private?** To self-host with proprietary models, private configuration, or closed plugins — or to remove branding — use a [commercial license](https://realvirtual.io/en/company/license). See the [README license section](README.md#license) for the canonical terms.
-
-### 7a. Use the built-in tool with your own Bunny account
-
-The deploy tool is account-agnostic by design. Every account-specific value comes from environment variables — nothing is hardcoded that you cannot override. Point it at your own Bunny Storage by setting your own credentials:
-
-```bash
-# Required — your own Bunny Storage zone
-export BUNNY_STORAGE_KEY=your-storage-zone-password
-export BUNNY_STORAGE_ZONE=your-storage-zone-name
-
-# Optional — only needed to purge your CDN cache after upload
-export BUNNY_ACCOUNT_KEY=your-account-api-key
-export BUNNY_PULL_ZONE_ID=your-pull-zone-id
-
-# Optional — region, sub-path, analytics
-export BUNNY_REGION=storage.bunnycdn.com
-export BUNNY_REMOTE_PATH=                 # empty = storage-zone root; or e.g. demo
-export GA_MEASUREMENT_ID=                 # empty = no analytics
-
-npm run deploy                            # builds + uploads to YOUR zone
-```
-
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `BUNNY_STORAGE_KEY` | yes | Your storage-zone password |
-| `BUNNY_STORAGE_ZONE` | yes | Your storage-zone name |
-| `BUNNY_ACCOUNT_KEY` | for purge | Your account API key |
-| `BUNNY_PULL_ZONE_ID` | for purge | Your pull-zone id |
-| `BUNNY_REGION` | no | Your region (default `storage.bunnycdn.com`) |
-| `BUNNY_REMOTE_PATH` | no | Sub-path prefix (default empty = zone root) |
-| `GA_MEASUREMENT_ID` | no | Your own GA4 id, or leave empty |
-
-With those set, every upload, list, delete, and purge targets **your** account. The printed `web.realvirtual.io` lines (private mode and the CI workflow) are cosmetic and do not affect where files land — substitute your own pull-zone hostname. If you serve under a fixed sub-path with absolute asset URLs, add `--base /your-path/`.
-
-> **`--base` on Windows: run it from PowerShell.** Git Bash / MSYS rewrites a standalone `/demo/` argument into a Windows path (`C:/Program Files/Git/demo/`) before Node ever sees it. Baked into `index.html`, that produces a build which uploads and reports success while every asset 404s live. `assertSaneBase()` rejects a mangled base **before** anything is built or uploaded — a valid base is `./` or a simple URL path such as `/demo/`, never one with a drive letter, backslash or spaces. Fix it by running the deploy from PowerShell, or by prefixing the Bash command with `MSYS_NO_PATHCONV=1`.
-
-### 7b. Host the static `dist/` anywhere
-
-`npm run build` emits a self-contained static single-page app into `dist/`: `index.html`, hashed JS/CSS under `assets/`, and everything from `public/` (including `models/*.glb`, `settings.json`, and `models.json`). With the default relative base (`./`), the whole `dist/` tree can be served from a domain **root** or **any sub-path** without rebuilding. To "deploy it yourself," copy the contents of `dist/` to a web root and serve them as static files.
-
-```bash
-npm run build                # produce dist/
-# copy dist/* to your web root, then serve over http(s)
-```
-
-| Host | How |
-|------|-----|
-| **nginx** | Copy `dist/` to the document root; add an SPA fallback and the MIME/cache rules below (see example) |
-| **Apache** | Copy `dist/` to the DocumentRoot; add `.htaccess` with a rewrite to `/index.html` and `AddType application/wasm .wasm` / `AddType model/gltf-binary .glb` (needs `AllowOverride All`) |
-| **AWS S3 + CloudFront** | `aws s3 sync dist/ s3://bucket --delete`; set `Content-Type` on upload (S3 misguesses `.wasm`/`.glb`); map CloudFront 403/404 → `/index.html` (200) for SPA fallback; add bucket CORS and forward the `Origin` header |
-| **Netlify** | Build `npm run build`, publish dir `dist`; add `public/_redirects` (`/*  /index.html  200`) and `public/_headers` for cache/COOP-COEP |
-| **Vercel** | Auto-detects Vite (`dist`); add `vercel.json` rewrite `"/(.*)" → "/index.html"` and custom headers |
-| **Cloudflare Pages** | `npx wrangler pages deploy dist` or Git integration; `_headers` file for cache/COOP-COEP; watch the per-file size cap for large GLBs |
-| **GitHub Pages** | Set Vite `base` to `'/<repo>/'`, publish `dist/`, copy `index.html` to `404.html` for SPA fallback; cannot set HTTP headers (no COOP/COEP, no custom MIME) |
-| **Local — `vite preview`** | `npm run preview` serves `dist/` on `localhost:4173` with correct MIME types and SPA fallback already wired — the most faithful local check |
-| **Local — `npx serve -s`** | From `dist/`, `npx serve -s` (single-page mode → fallback to `index.html`); use HTTPS for WebXR/secure-context testing |
-| **Local — `python -m http.server`** | `cd dist && python -m http.server 8000` — quick smoke test only; no SPA fallback, may misreport `.glb`/`.wasm` MIME |
-
-> `file://` does **not** work — `GLTFLoader` fetch is blocked by CORS (origin `null`) and WebXR/camera APIs are disabled. Always serve over an http(s) server, even locally.
-
-### Server caveats (apply to any host)
-
-| Concern | What to do |
-|---------|-----------|
-| **MIME types** | Serve `.glb` as `model/gltf-binary`, `.gltf` as `model/gltf+json`, `.wasm` as `application/wasm`. Many servers default to `application/octet-stream`, which downloads the GLB instead of loading it and makes `WebAssembly.instantiateStreaming` fail with *"Incorrect response MIME type"* |
-| **SPA fallback** | A hard refresh on a deep link must return `index.html` (HTTP 200), not 404. Use `try_files`/rewrite/`_redirects`/`404.html` per host. A blanket fallback also turns missing assets into HTML 200s — scope it if you want real `/assets/*` 404s |
-| **CORS** | If GLBs are served from a different origin than the page, the asset response needs `Access-Control-Allow-Origin` (and `GET, HEAD`). Same-origin serving avoids CORS entirely. On S3, also forward/cache the `Origin` header in CloudFront |
-| **Cache-Control** | Hashed files in `assets/` are safe to cache forever: `public, max-age=31536000, immutable`. `index.html` is **not** hashed — set `no-cache` so users do not get stale HTML pointing at deleted chunks |
-| **HTTPS / secure context** | WebXR (VR/AR) and camera access require a secure context: HTTPS or `localhost`. Plain `http://` on a real domain disables them. All cloud hosts provide free TLS; for local XR use an HTTPS dev server |
-| **COOP/COEP** | Only needed if you use `SharedArrayBuffer` / threaded WASM. Then set `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`) — but COEP makes cross-origin assets require CORS/CORP. If you do **not** use SharedArrayBuffer, do not add these headers |
-| **Large GLB** | Enable gzip/brotli and include `model/gltf-binary`/`model/gltf+json` in the compressible types (many servers compress text only). Mind per-file upload caps (nginx `client_max_body_size`, host limits) |
-| **Base path** | Default base is `./` (relative) — serve from root or any sub-path without rebuilding. For absolute-rooted asset URLs under a fixed sub-path, build with `--base /your-path/` (or set Vite `base`) and put the SPA fallback under that sub-path too |
-
-### Hosting a GLB for a shared link (`?glb=`)
-
-A shared link (see doc-webviewer.md § *Shared asset links*) may point at any
-host. The viewer runs on **your** origin and fetches the file from **theirs**,
-so exactly one thing decides whether it works: **CORS on the GLB response.**
-Everything else — MIME type included — the loader does not care about.
-
-Measured with `curl -I` against a foreign `Origin` (2026-08-05):
-
-| Host | `Access-Control-Allow-Origin` | Verdict |
-|---|---|---|
-| `raw.githubusercontent.com` | `*` | works. Serves `application/octet-stream`, which is irrelevant to `GLTFLoader` |
-| Bunny pull zone (`web.realvirtual.io`) | `*` | works; also allows/exposes `Range` |
-| Firebase Storage (`…?alt=media`) | yes | works — it is what the viewer's own demo GLB is served from |
-| A default nginx/Apache/IIS on your own domain | **usually absent** | **the common failure**: an empty viewport |
-
-For your own server, the whole fix is one header on the file:
-
-```nginx
-location ~* \.glb$ {
-    add_header Access-Control-Allow-Origin "*" always;
-    add_header Access-Control-Allow-Methods "GET, HEAD" always;
-    types { model/gltf-binary glb; }
-}
-```
-
-A missing header surfaces as a named error in the info card ("… did not allow
-this page to read the file (CORS)") rather than as a blank screen, so the
-support question answers itself. Note the browser cannot tell a CORS refusal
-from an unreachable host — the message names the likely cause and the host,
-and stops there.
-
-Two more things worth knowing before publishing a link:
-
-- **Size.** The fetch enforces a 250 MB budget on the *streamed body*.
-  `Content-Length` is only a hint (absent under chunked transfer, wrong behind
-  a rewriting proxy), so an oversize file is cut mid-transfer, not waved through.
-- **Redirects are fine**, and they do not widen the budget: the count runs
-  downstream of every hop.
-
-Links that we host (`?glb=s:<id>`) need none of this — they are resolved to a
-short-lived signed URL at runtime. That path needs the share backend; its HTTP
-contract is `src/core/share/rv-share-backend-contract.md`.
-
-### nginx example
-
-```nginx
-# /etc/nginx/mime.types — add these so GLB/WASM load correctly:
-#   model/gltf-binary  glb;
-#   model/gltf+json    gltf;
-#   application/wasm   wasm;
-
-server {
-    listen 443 ssl http2;
-    server_name viewer.example.com;
-    root /var/www/app;          # contents of dist/ copied here
-    index index.html;
-
-    # Compress GLB/WASM (text types are compressed by default)
-    gzip on;
-    gzip_types text/css application/javascript application/json
-               application/wasm model/gltf-binary model/gltf+json;
-
-    # SPA history fallback — deep links resolve to index.html
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    # Hashed assets: cache forever
-    location /assets/ {
-        add_header Cache-Control "public, max-age=31536000, immutable";
-    }
-
-    # Entry point: never cache stale HTML
-    location = /index.html {
-        add_header Cache-Control "no-cache";
-    }
-}
-```
-
----
 
 ## Command reference
 
@@ -689,12 +940,30 @@ server {
 | `--list` | List private projects and exit |
 | `--path <prefix>` | Public remote path prefix (overrides `BUNNY_REMOTE_PATH`) |
 | `--projects-dir <dir>` | Private projects root |
-| `--base <path>` | Vite base path (`VITE_BASE`), e.g. `/demo/`. Validated by `assertSaneBase()` — see the MSYS warning in [7a](#7a-use-the-built-in-tool-with-your-own-bunny-account) |
+| `--base <path>` | Vite base path (`VITE_BASE`), e.g. `/demo/`. Validated by `assertSaneBase()` — see the MSYS warning in [7a](#use-the-built-in-tool-with-your-own-bunny-account) |
 | `--force` | Skip the diff, upload everything |
 | `--dry-run` | Stage only — build and upload nothing (public prints one line; private prints mode/zone/remote) |
 | `--no-purge` | Skip the cache purge |
+| `--skip-probe` | Skip the post-deploy probe (plan-508) — for offline or dry runs; normally a probe finding fails the deploy |
+| `--no-smoke` | Skip the post-deploy demo smoke (public deploys only; exit code stays `0`) |
 
 `--no-build` was removed: it throws immediately, because a deploy must build from the filtered staging tree.
+
+Tuning through the environment, not flags (see [Credentials](#4-credentials)):
+
+| Variable | Effect |
+|----------|--------|
+| `RV_DEPLOY_CONCURRENCY` | Parallel uploads/deletes (default `8`) |
+| `RV_DEPLOY_MAX_INFLIGHT_BYTES` | Byte budget of the upload pool (default 64 MB) |
+| `RV_KEEP_STAGING` | `1` keeps the staging directory, also after a failure |
+| `RV_DEPLOY_LOCK_TIMEOUT_SECONDS` | Wait for a busy publish lock (default `1200` s) |
+| `RV_DEPLOY_PREPUBLISH_TIMEOUT_SECONDS` | Staging + build limit before the publish lock (default: none) |
+| `RV_PUBLIC_BASE_URL` | Host of the demo smoke URL (default `https://web.realvirtual.io`) |
+| `RV_SMOKE_OUT_DIR` | Output dir of the demo smoke (default `<repo>/.smoke/<time>/`; the watcher sets `<root>\last-smoke`) |
+| `RV_SMOKE_PAIR` | `{ "web": …, "private": … }` recorded in `expected.json` (set by the watcher) |
+| `PLAYWRIGHT_BROWSERS_PATH` | Where the smoke finds Chromium (the watcher sets `<root>\playwright-browsers`) |
+
+Exit codes: `0` OK, `1` deploy failed, `3` deployed but the demo smoke failed — see [The demo smoke after every public deploy](#the-demo-smoke-after-every-public-deploy).
 
 ## Customer source delivery
 
@@ -725,7 +994,7 @@ delivery needs them; the CLI around it stays private. Shape, in short:
   "status": "active",
   "forgejo": { "org": "…", "repo": "…", "team": "…", "permission": "write" },
   "contacts": [{ "login": "…", "email": "…", "role": "developer", "status": "active" }],
-  "licensing": { "connect": { "issuer": "portal", "keyRef": "connectLicenseKey" } },
+  "licensing": { "connect": { "issuer": "portal", "key": "LIC-XXXX-XXXX-XXXX" } },
   "delivery": {
     "channel": "git-workspace",   // git-workspace | hosted-link
     "tier": "commercial",         // entitlement profile out of tier-manifest.json
@@ -733,7 +1002,10 @@ delivery needs them; the CLI around it stays private. Shape, in short:
     "projects": ["acme-line1"],   // empty for a `standard` customer
     "connectChannel": "stable"    // CONNECT lane pinned for this customer
   },
-  "secretsRef": "customers/acme.secrets.json"
+  "inference": {                  // optional: the Requesty pair for this customer
+    "requestyApiKey": "…",
+    "requestyBaseUrl": "https://api.scaleway.ai/v1"
+  }
 }
 ```
 
@@ -742,10 +1014,21 @@ delivery needs them; the CLI around it stays private. Shape, in short:
 empty `projects` array and `permission: "read"`, and is the only kind allowed to share the common
 `rv-commercial/realvirtual-commercial` repository — one team per customer, named after the slug.
 
-Secret values are **never** in the register: `connectLicenseKey`, `requestyApiKey` and
-`requestyBaseUrl` resolve from the environment first, then from the gitignored
-`customers/<slug>.secrets.json` (`secretsRef`). A credential-shaped value found inside the register
-itself is a hard error, not a warning. The remote URL is assembled from `forgejo.org` /
+Everything a delivery needs is IN the entry (2026-09-13): the CONNECT licence as
+`licensing.connect.key`, the Requesty pair as `inference`. Both used to sit in a gitignored
+`customers/<slug>.secrets.json`, the licence additionally in a SOPS copy in the knowledge base that
+no code ever read — three places for one string, synchronised by hand and regularly out of sync.
+
+Neither value is a secret FROM the customer: we issue the licence and hand it over, and `bundle-rag`
+embeds the Requesty credentials into their delivered `project-config.json` regardless. The sidecar
+bought no protection, only a second mechanism. `REQUESTY_API_KEY` / `REQUESTY_BASE_URL` still win at
+run time — a one-off run against another gateway, not a storage location.
+
+The scan for credential-shaped values in the register still runs: `licensing.connect.key` and
+`inference.requestyApiKey` are two exact exempt paths, so a token or password anywhere else in the
+entry is a hard error, not a warning.
+
+The remote URL is assembled from `forgejo.org` /
 `forgejo.repo` plus a hub base URL — the register holds no host name. Resolving that base URL is
 two steps and no third (plan-739): the `RV_FORGEJO_HUB_URL` environment override, otherwise
 `DEFAULT_HUB_URL` from `scripts/_rv-customers.mjs` — the one place the hub is named, imported both
@@ -834,6 +1117,28 @@ node scripts/deliver.mjs toray  --projects all --force --push     # unattended, 
 
 Exit codes are a contract: `0` delivered (nothing of the customer's needed replacing), `1` a
 `--projects` replace was listed and nobody confirmed it, `2` the delivery failed.
+
+### Project scripts are compiled by the delivery (plan-479)
+
+A project may carry its own plugin code, bound to a document by `documents[].scriptRef` (see
+[`doc-scripting.md`](doc-scripting.md), *Project code*). On the customer's machine that code is
+loaded from a compiled **`.js` sibling** next to the `.ts`, because their viewer build never saw the
+source. Producing that sibling is **part of the delivery**, not a step anyone remembers:
+`compileStagedProjectScripts()` (`scripts/generate-customer-workspace.mjs`) runs esbuild over every
+`scriptRef` of every delivered project **in the staged copy** — the throwaway tree the delivery
+assembles anyway, whose contents are committed into the customer clone a few steps later.
+
+Three consequences worth knowing:
+
+- **A script that does not compile stops the delivery**, before anything is committed or pushed. A
+  plugin that silently loads nothing at a customer is precisely the outcome this exists to prevent.
+- **The private source tree stays clean.** No `.js` is ever written beside the `.ts` in the
+  repository, so `deliver.mjs`'s clean-tree assertion still holds and the *next* delivery is not
+  broken by this one. `tests/compile-project-scripts.node.test.ts` pins that with `git status
+  --porcelain`.
+- **`--check` is not the delivery gate.** `npm run build:project-scripts -- <projectDir> --check`
+  only reports (exit 3 on missing or stale) and never produces, so on a clean tree it would fail
+  every delivery on its first run. Its job is verification **between** deliveries.
 
 ### The baseline tag
 
@@ -1051,7 +1356,7 @@ but still present in the unpushed commit range — a plain push publishes that r
 history. Publishing only the end state requires a snapshot commit instead of the range; the guard
 prints the exact command.
 
-> Two documents that used to live here — `doc-render-picking.md` and `PRODUCT.md` — have **moved to
+> Two documents that used to live here — the internal render-picking guide and `PRODUCT.md` — have **moved to
 > the private sibling repository** and are no longer in this tree. They are still listed in
 > `NEVER_DELIVERED_DOCS` (`scripts/_workspace-lib.mjs`), which is harmless: that constant governs the
 > *customer workspace*, and what the *public mirror* publishes is a separate decision. Links to either

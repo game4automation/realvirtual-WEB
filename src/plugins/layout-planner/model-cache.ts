@@ -2,9 +2,11 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * Model loading, caching, and GLB post-processing helpers for the Layout Planner.
+ * Floor/drop helpers of the Layout Planner, plus the re-export of the model
+ * cache that moved to the core (`core/engine/rv-model-cache`).
  *
- * - ModelCache: loads + caches GLB models, returns clones
+ * - ModelCache (re-export): loads + caches GLB models — owned by the viewer's
+ *   placement instancer since 2026-09-17
  * - pivotToFloorCenter: recalculates pivot to bottom-center of full AABB
  * - alignToFloor: shifts a group so its bounding box bottom sits at Y=0
  *
@@ -20,9 +22,6 @@ import {
   Raycaster,
 } from 'three';
 import type { Object3D, Scene, Mesh } from 'three';
-import type { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { disposeSubtree } from './three-utils';
-import { RVAssetBlobCache } from '../../core/engine/rv-asset-blob-cache';
 import { unwrapGltfRoot } from '../../core/engine/rv-gltf-unwrap';
 // Pivot normalization moved to the core (2026-08-31): composition needs the
 // identical definition when it re-grafts a saved placement's content, and the
@@ -247,351 +246,25 @@ function hasAncestorNamed(obj: Object3D, name: string): boolean {
   return false;
 }
 
-/**
- * Placement roots must be transform-neutral: the planner stamps the placement
- * position/rotation/scale directly onto the placed root (materialize/restore
- * paths), which would destroy any intrinsic root transform the asset carries —
- * e.g. the 0.001 mm→m scale a CAD import bakes onto its content root
- * ("way too large" bug for editor-saved CAD assets). Wrap such roots in an
- * identity Group so the intrinsic transform survives inside.
- */
-export function ensureNeutralPlacementRoot(source: Group): Group {
-  const { position: t, quaternion: q, scale: s } = source;
-  const identity =
-    t.x === 0 && t.y === 0 && t.z === 0 &&
-    q.x === 0 && q.y === 0 && q.z === 0 && q.w === 1 &&
-    s.x === 1 && s.y === 1 && s.z === 1;
-  if (identity) return source;
-  const wrapper = new Group();
-  wrapper.name = source.name || 'Asset';
-  wrapper.add(source);
-  return wrapper;
-}
-
-// ─── Model Cache ────────────────────────────────────────────────────────
-
-/** Cache API bucket for all planner GLBs (catalog, GitHub, AM). */
-const GLB_CACHE_BUCKET = 'rv-planner-glbs';
-
-/** Shared blob cache singleton — also exposed for tooling that needs to wipe it. */
-const _glbBlobCache = new RVAssetBlobCache({ bucket: GLB_CACHE_BUCKET });
-
-/** The rejection an aborted `getOrLoad` consumer receives. */
-export class AbortError extends Error {
-  readonly name = 'AbortError';
-  constructor(message = 'Aborted') { super(message); }
-}
-
-/** Reject immediately when the caller is already gone. */
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw new AbortError();
-}
-
-/**
- * Resolve with `work`, or reject as soon as `signal` aborts — WITHOUT
- * cancelling `work` itself. The shared load keeps running for every other
- * consumer (plan-371 H5/R12); this consumer simply stops listening.
- */
-function detachOnAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (!signal) return work;
-  // The abandoned promise must still have a handler, or an eventual rejection
-  // would surface as an unhandled rejection.
-  work.catch(() => { /* owned by whoever still awaits it */ });
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(new AbortError());
-    if (signal.aborted) { onAbort(); return; }
-    signal.addEventListener('abort', onAbort, { once: true });
-    work.then(
-      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
-      (err) => { signal.removeEventListener('abort', onAbort); reject(err); },
-    );
-  });
-}
-
-/**
- * How a decode gets at the bytes it needs (plan-723 §2.3).
- *
- * The cache KEY and the URL the loader reads are two different things. For a
- * plain catalog GLB they happen to be the same string; for a library-registry
- * asset they cannot be, because `LibrarySource.resolveAsset()` mints a FRESH
- * `blob:` URL on every call. Keying the caches on that URL would mean never
- * hitting the cache again (a silent performance defect, not a crash), and the
- * URL carries a `revokeUrl` that somebody has to call.
- *
- * So the state machine keys on an explicit `cacheKey` and asks this callback
- * for the transport when — and only when — it actually has to decode. A cache
- * or in-flight hit never calls it, which is the whole point: a second placement
- * of the same project document must not re-read the backend.
- *
- * `release` is invoked in the success, error AND abort paths — see
- * {@link ModelCache._decode}.
- *
- * The return type is deliberately `T | Promise<T>` and not just `Promise<T>`:
- * the URL path has nothing to await, and awaiting it anyway would push
- * `loadAsync` out of the caller's own tick — which the in-flight dedup tests
- * (plan-371 T17) observe directly, and which nothing about this feature should
- * change.
- */
-export interface AcquiredAsset { url: string; release?: () => void }
-export type AcquireFn = () => AcquiredAsset | Promise<AcquiredAsset>;
-
-function isThenable<T>(value: T | Promise<T>): value is Promise<T> {
-  return typeof (value as Promise<T> | undefined)?.then === 'function';
-}
-
-/** Namespace prefix of a registry-resolved cache key — see {@link resolvedCacheKey}. */
-export const RESOLVED_KEY_PREFIX = 'resolved:';
-
-/**
- * The stable cache key of a library-registry asset (plan-723 §2.3).
- *
- * Namespaced so it can never collide with the URL-keyed half of the same maps:
- * a catalog entry is keyed by its `glbUrl`, and no URL starts with `resolved:`.
- */
-export function resolvedCacheKey(providerId: string, sourceId: string, entryId: string): string {
-  return `${RESOLVED_KEY_PREFIX}${providerId}:${sourceId}:${entryId}`;
-}
-
-/** The URL path's acquire: the key IS the transport, and there is nothing to
- *  release — so it answers synchronously and the decode stays in one tick. */
-function acquireUrl(url: string): AcquireFn {
-  return () => ({ url });
-}
-
-/** The registry path's acquire: forward `revokeUrl` as the release obligation. */
-function acquireResolved(resolve: () => Promise<{ url: string; revokeUrl?(): void }>): AcquireFn {
-  return async () => {
-    const resolved = await resolve();
-    return {
-      url: resolved.url,
-      // Bound here, not passed as a bare method reference: `revokeUrl` closes
-      // over the provider's own handle and must keep its receiver.
-      release: resolved.revokeUrl ? () => resolved.revokeUrl!() : undefined,
-    };
-  };
-}
-
-export class ModelCache {
-  /** Decoded Three.js Group cache — clones are returned to callers. */
-  private _decoded = new Map<string, Group>();
-  /**
-   * In-flight DECODES, keyed by CACHE KEY (plan-371 §2.10, plan-723 §2.3).
-   *
-   * `_decoded` only ever holds finished results, so without this map two
-   * overlapping `getOrLoad` calls for the same key decode the same GLB twice —
-   * exactly the situation the hover prefetch creates (prefetch still running,
-   * drag starts). Three rules keep the map from introducing bugs of its own;
-   * they are spelled out at their enforcement sites in {@link _shared} and
-   * {@link invalidate}.
-   */
-  private _inflight = new Map<string, Promise<Group>>();
-  /**
-   * Invalidation counter per cache key. A decode records the epoch it started under
-   * and refuses to publish into `_decoded` if `invalidate()` has bumped it
-   * meanwhile — dropping the promise from `_inflight` alone is NOT enough,
-   * because the abandoned decode still runs to completion and would otherwise
-   * re-install the very tree the invalidate was meant to evict.
-   */
-  private _epoch = new Map<string, number>();
-  private _loader: GLTFLoader;
-
-  constructor(loader: GLTFLoader) {
-    this._loader = loader;
-  }
-
-  /**
-   * Get a clone of the cached model, loading it first if needed.
-   *
-   * `opts.signal` (plan-371) detaches THIS consumer from the result — it does
-   * NOT cancel the underlying work. That is deliberate: the blob layer beneath
-   * (`RVAssetBlobCache._pending`) de-duplicates in-flight fetches URL-wide, so
-   * a real abort would tear down the download of an unrelated second placement
-   * of the same asset. The load runs to completion, lands in the cache, and
-   * benefits whoever asks next.
-   */
-  async getOrLoad(url: string, opts?: { signal?: AbortSignal }): Promise<Group> {
-    const signal = opts?.signal;
-    throwIfAborted(signal);
-
-    const cached = this._decoded.get(url);
-    if (cached) return cached.clone();
-
-    const source = await detachOnAbort(this._shared(url, acquireUrl(url)), signal);
-    return source.clone();
-  }
-
-  /**
-   * Get a clone of a model that has no stable URL — a library-registry asset
-   * (plan-723 F4).
-   *
-   * `cacheKey` is the asset's stable identity ({@link resolvedCacheKey}); the
-   * volatile `blob:` URL never reaches the caches and never reaches the caller.
-   * `resolve` is called ONLY on a genuine miss, and its `revokeUrl` is called
-   * for us in the success, error and abort paths.
-   *
-   * Two failure shapes, deliberately different:
-   *  - `resolve()` itself throws → there IS no handle, so nothing is revoked
-   *    (`revokeUrl` only exists after a successful return).
-   *  - the load fails after a successful resolve → the handle is released in
-   *    the `finally` like any other outcome.
-   */
-  async getOrLoadResolved(
-    cacheKey: string,
-    resolve: () => Promise<{ url: string; revokeUrl?(): void }>,
-    opts?: { signal?: AbortSignal },
-  ): Promise<Group> {
-    const signal = opts?.signal;
-    throwIfAborted(signal);
-
-    const cached = this._decoded.get(cacheKey);
-    if (cached) return cached.clone();
-
-    const source = await detachOnAbort(this._shared(cacheKey, acquireResolved(resolve)), signal);
-    return source.clone();
-  }
-
-  /**
-   * Warm the caches for `url` without producing a clone — fire-and-forget.
-   *
-   * Called from the library panel's hover intent (plan-371 F8): by the time the
-   * user actually starts dragging, fetch and decode are already under way, and
-   * the drag's own `getOrLoad` joins the very same promise instead of starting
-   * a second one.
-   *
-   * Never rejects: a prefetch that fails is simply a prefetch that did not
-   * help, and the real load re-runs (and re-reports) it moments later.
-   */
-  prefetch(url: string): void {
-    if (!url) return;
-    if (this._decoded.has(url)) return;
-    this._shared(url, acquireUrl(url)).catch(() => { /* speculative — the real load reports */ });
-  }
-
-  /** {@link prefetch} for a registry asset — the mirror of {@link getOrLoadResolved}. */
-  prefetchResolved(cacheKey: string, resolve: () => Promise<{ url: string; revokeUrl?(): void }>): void {
-    if (!cacheKey) return;
-    if (this._decoded.has(cacheKey)) return;
-    this._shared(cacheKey, acquireResolved(resolve))
-      .catch(() => { /* speculative — the real load reports */ });
-  }
-
-  /**
-   * The ONE in-flight decode promise for `cacheKey`, created on first ask.
-   *
-   * RULE 1 — cleanup in every case. Without the settle handler a REJECTED
-   * promise would stay in the map forever, and every later caller (including
-   * `PendingGeometryRegistry.retry()`) would be handed the same stale failure:
-   * a retry that can never succeed, silently. Registering the handler also
-   * means the shared promise always has a rejection handler, so a decode whose
-   * consumers all detached never surfaces as an unhandled rejection.
-   *
-   * RULE 2 — no `signal` here on purpose. Aborting is a per-consumer concern
-   * and is applied one level up in `getOrLoad` via `detachOnAbort`; cancelling
-   * the shared work would tear down an unrelated second placement of the same
-   * asset (the same bug class as H5, one layer higher).
-   */
-  private _shared(cacheKey: string, acquire: AcquireFn): Promise<Group> {
-    const existing = this._inflight.get(cacheKey);
-    if (existing) return existing;
-
-    const decode = this._decode(cacheKey, acquire);
-    this._inflight.set(cacheKey, decode);
-    // `then(settle, settle)` rather than `finally`: it consumes the rejection
-    // instead of re-raising it on a derived promise nobody awaits.
-    const settle = (): void => {
-      if (this._inflight.get(cacheKey) === decode) this._inflight.delete(cacheKey);
-    };
-    decode.then(settle, settle);
-    return decode;
-  }
-
-  /**
-   * Fetch + decode + normalize one GLB into the decoded cache, under
-   * `cacheKey` — which for the URL path IS the url, and for the registry path
-   * is the asset's stable identity (plan-723 §2.3).
-   */
-  private async _decode(cacheKey: string, acquire: AcquireFn): Promise<Group> {
-    const epoch = this._epoch.get(cacheKey) ?? 0;
-
-    // A throwing `acquire()` leaves NO handle behind — there is nothing to
-    // release, and `revokeUrl` does not exist until a resolve returned.
-    // Awaited only when it actually has something to await (see `AcquireFn`).
-    const acquired = acquire();
-    const handle = isThenable(acquired) ? await acquired : acquired;
-    const url = handle.url;
-
-    // Resolve bytes via the generic blob cache (in-memory + Cache API).
-    // For blob: URLs the cache pass-throughs so the GLTFLoader can read
-    // them directly without an extra fetch hop.
-    let loadUrl: string | null = null;
-    try {
-      loadUrl = url.startsWith('blob:')
-        ? url
-        : await _glbBlobCache.getObjectUrl(url);
-
-      const gltf = await this._loader.loadAsync(loadUrl);
-      let source = gltf.scene as Group;
-      // Strip UnityGLTF __root__ wrapper and non-content nodes
-      source = unwrapGltfRoot(source);
-      source = ensureNeutralPlacementRoot(source);
-      // Publish only if this decode has not been invalidated while it ran. The
-      // caller still gets its result — it asked before the invalidate — but the
-      // CACHE must not be repopulated with a superseded tree.
-      if ((this._epoch.get(cacheKey) ?? 0) === epoch) this._decoded.set(cacheKey, source);
-      return source;
-    } finally {
-      // Passthrough rule, unchanged: only an object URL WE minted gets revoked
-      // here. A blob: url handed in from outside is the acquire's property...
-      if (loadUrl !== null && loadUrl !== url) URL.revokeObjectURL(loadUrl);
-      // ...and is released through ITS own obligation, in every outcome —
-      // success, failure and (because `detachOnAbort` never cancels the shared
-      // work) abort.
-      handle.release?.();
-    }
-  }
-
-  /** Fetch raw GLB bytes for a (blob or object) URL. Test seam. */
-  protected async _fetchBytes(url: string): Promise<ArrayBuffer> {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`GLB fetch failed (${resp.status}) for ${url}`);
-    return resp.arrayBuffer();
-  }
-
-  get size(): number { return this._decoded.size; }
-
-  /**
-   * Drop ONE decoded entry (dispose its geometry) — the editor-save
-   * invalidation hook: a re-saved library asset must not be served from the
-   * pre-save decoded tree. No-op on unknown keys.
-   *
-   * Takes a CACHE KEY: a plain url for a catalog GLB, a
-   * {@link resolvedCacheKey} for a registry asset (plan-723 F10).
-   */
-  invalidate(cacheKey: string): void {
-    // RULE 3 (plan-371 §2.10) — TWO steps, and the second is the load-bearing
-    // one. Dropping the promise makes the next ask start a fresh decode; bumping
-    // the epoch stops the abandoned decode (which keeps running regardless)
-    // from publishing the pre-save tree back into `_decoded` when it lands.
-    this._inflight.delete(cacheKey);
-    this._epoch.set(cacheKey, (this._epoch.get(cacheKey) ?? 0) + 1);
-    const entry = this._decoded.get(cacheKey);
-    if (!entry) return;
-    disposeSubtree(entry);
-    this._decoded.delete(cacheKey);
-  }
-
-  /** Clear the persistent browser cache for all planner GLBs. */
-  static async clearPersistentCache(): Promise<void> {
-    await _glbBlobCache.clearPersistent();
-  }
-
-  dispose(): void {
-    for (const [, model] of this._decoded) {
-      disposeSubtree(model);
-    }
-    this._decoded.clear();
-    // In-flight decodes are abandoned, not cancelled — see `_shared`. Their
-    // settle handlers are harmless no-ops once the map is empty.
-    this._inflight.clear();
-  }
-}
+// ─── Model Cache (moved to the core) ────────────────────────────────────
+//
+// `ModelCache` and its helpers live in `core/engine/rv-model-cache` since the
+// placement instancer became viewer-owned (plan-753 structure hardening,
+// 2026-09-17). Re-exported so every existing import keeps working.
+export {
+  ModelCache,
+  AbortError,
+  RESOLVED_KEY_PREFIX,
+  resolvedCacheKey,
+  applyNamingScanToMaster,
+  ensureNeutralPlacementRoot,
+  getDecodeTimings,
+  clearDecodeTimings,
+} from '../../core/engine/rv-model-cache';
+export type {
+  AcquiredAsset,
+  AcquireFn,
+  ModelCacheUberOptions,
+  BakeStats,
+  DecodeTiming,
+} from '../../core/engine/rv-model-cache';

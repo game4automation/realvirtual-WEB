@@ -218,5 +218,7 @@ export class RVDriveSEWMovilink implements IDriveBehavior, RVComponent {
 
 // Register schema so rv-extras-validator auto-derives CONSUMED fields.
 registerComponentSchema('Drive_SEWMovilink', RVDriveSEWMovilink.schema, {
-  badgeColor: '#29b6f6',
+  bake: 'chunk', // sits on the Drive node it extends — moves with it (plan-753 §2.3)
+  authorable: true, // addable in the asset editor on a node that carries a Drive
+  ui: { badge: '#29b6f6' },
 });

@@ -26,11 +26,14 @@ function deps(registry?: SnapPointRegistry): {
   objectMap: Map<string, Object3D>;
   idByObject: WeakMap<Object3D, string>;
   getViewer: () => unknown;
+  getModelRoot: () => Object3D | null;
 } {
   const viewer = registry
     ? { getPlugin: () => ({ getRegistry: () => registry }) }
     : null;
-  return { objectMap: new Map(), idByObject: new WeakMap(), getViewer: () => viewer };
+  // No model root: adoption's name-collision report (plan-736, assertPlacementNameKept)
+  // is skipped — it has its own cases in layout-planner-scene-mutations.test.ts.
+  return { objectMap: new Map(), idByObject: new WeakMap(), getViewer: () => viewer, getModelRoot: () => null };
 }
 
 /** A composed placement: a reference node with a grafted subtree under it. */

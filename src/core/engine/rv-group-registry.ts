@@ -38,6 +38,20 @@ export const ISOLATE_FOCUS_LAYER = 2;
 export const HIGHLIGHT_OVERLAY_LAYER = 3;
 
 /**
+ * Three.js layer bit for the AI agent's camera-body gizmo (plan-740 D-A4).
+ *
+ * The frustum cone + "AI" sprite live on this layer ONLY, so the two viewport
+ * cameras (which enable it) show them while every OTHER camera — the AO clone,
+ * the object analyzer, the agent's own offscreen camera — leaves them out via
+ * {@link disableOverlayLayers}. An agent must never photograph its own eye.
+ *
+ * Layer membership does NOT keep the cone out of picks: `RaycastManager`
+ * enables all layers and filters through its explicit target list, so the cone
+ * additionally carries `userData._agentEyeOverlay` and an exclude filter.
+ */
+export const AGENT_EYE_LAYER = 5;
+
+/**
  * SINGLE SOURCE OF TRUTH for the "on-top UI overlay" layers.
  *
  * These layers hold 3D UI that must NOT influence Screen-Space Ambient
@@ -52,7 +66,9 @@ export const HIGHLIGHT_OVERLAY_LAYER = 3;
  * `_renderOverlayLayers()`. Add a new overlay layer to this array and every
  * render path picks it up automatically via the helpers below.
  */
-export const OVERLAY_LAYERS: readonly number[] = [HIGHLIGHT_OVERLAY_LAYER, MEASUREMENT_LAYER];
+export const OVERLAY_LAYERS: readonly number[] = [
+  HIGHLIGHT_OVERLAY_LAYER, MEASUREMENT_LAYER, AGENT_EYE_LAYER,
+];
 
 /**
  * Disable every overlay layer on a camera so they're excluded from the
@@ -102,19 +118,20 @@ export function markNoAO(object: Object3D): void {
 /**
  * Tag a node and all descendants with ISOLATE_FOCUS_LAYER. Idempotent.
  *
- * Batched render path: sources of BatchedMesh instances carry
+ * Baked in-place model: the staged sources of a chunk carry
  * `layers.mask = 0` (not rendered normally). `layers.enable` gives them the
- * focus bit, so isolated batch sources render individually — and in full
- * color — in the focus pass (pass 3), while the arena keeps drawing the dim
- * backdrop in pass 1. {@link untagIsolateSubtree}'s `layers.disable` restores
+ * focus bit, so isolated sources render individually — and in full color —
+ * in the focus pass (pass 3), while the chunk keeps drawing the dim backdrop
+ * in pass 1. {@link untagIsolateSubtree}'s `layers.disable` restores
  * the 0-mask exactly. No extra bookkeeping needed.
  */
 export function tagIsolateSubtree(root: Object3D): void {
   root.traverse(o => {
-    // BatchedMesh arenas never join the focus pass — their (mask-0) source
-    // meshes get the focus bit instead and render individually in pass 3.
-    // Tagging the arena too would double-draw the same geometry.
-    if (o.userData?._rvBatchedRender) return;
+    // plan-754: EVERY chunk mesh is tagged. The old carve-out skipped the
+    // chunks of an in-place bake, because there the masked source meshes took
+    // the focus bit instead. There are no source meshes any more — a chunk is
+    // the only drawable of the parts it absorbed, so skipping it would leave
+    // them out of the focus pass entirely.
     o.layers.enable(ISOLATE_FOCUS_LAYER);
   });
 }

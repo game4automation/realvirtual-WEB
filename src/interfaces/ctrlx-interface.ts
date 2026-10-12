@@ -17,6 +17,8 @@ import type { InterfaceSettings } from './interface-settings-store';
 export class CtrlXInterface extends WebSocketRealtimeInterface {
   override readonly id: string = 'ctrlx';
   override readonly protocolName: string = 'ctrlX (Bosch Rexroth)';
+  // The ctrlX bridge does not add signals at runtime — the CONNECT re-read stays off here.
+  protected override rediscoverOnUnknownSignal = false;
 
   /**
    * Override URL building to apply ctrlX-specific defaults.

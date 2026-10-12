@@ -21,18 +21,18 @@
  */
 
 import {
-  CanvasTexture,
+  type CanvasTexture,
   Color,
   DoubleSide,
   Mesh,
   MeshBasicMaterial,
   Object3D,
   RingGeometry,
-  Sprite,
-  SpriteMaterial,
+  type Sprite,
   Vector3,
   type Texture,
 } from 'three';
+import { createLabelSprite, drawBoxedLabel, makeLabelCanvas } from './rv-label-sprite';
 
 // ─── Constants ─────────────────────────────────────────────────────
 
@@ -138,16 +138,14 @@ export function buildSourceMarker(opts: BuildSourceMarkerOptions): SourceMarkerH
   ring.userData._isSourceMarker = true;
 
   // ── Label Sprite ──
+  // Built through the shared label factory (rv-label-sprite.ts): overlay
+  // layer, toneMapped:false, supersampled canvas. A bare SpriteMaterial on
+  // layer 0 goes through the composer and gets dimmed/smeared by AO + bloom.
   const labelText = name;
-  const labelTexture = createLabelTexture(labelText, color);
-  const labelMat = new SpriteMaterial({
-    map: labelTexture,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-  });
-  const label = new Sprite(labelMat);
-  label.name = `${name}_sourceMarkerLabel`;
+  const { sprite: label, texture: labelTexture, material: labelMat } = createLabelSprite(
+    createLabelCanvas(labelText, color),
+    { name: `${name}_sourceMarkerLabel`, renderOrder: LABEL_RENDER_ORDER },
+  );
 
   // Sprite scale: width = outer ring diameter * LABEL_WIDTH_FRACTION,
   // height preserves canvas aspect.
@@ -186,62 +184,14 @@ export function buildSourceMarker(opts: BuildSourceMarkerOptions): SourceMarkerH
 }
 
 /**
- * Render the source name into a Canvas, returning a Three.js CanvasTexture.
- * The texture is opaque inside a colored rounded-rect pill on a dark
- * background — same visual language as `rv-annotation-renderer.ts`.
+ * Draw the source name into a supersampled label canvas: colored rounded-rect
+ * pill on a dark background — same visual language as the annotation labels.
  */
-function createLabelTexture(text: string, hexColor: number): CanvasTexture {
-  const canvas = document.createElement('canvas');
-  canvas.width = LABEL_CANVAS_W;
-  canvas.height = LABEL_CANVAS_H;
-  const ctx = canvas.getContext('2d');
-  // Defensive: in headless contexts (extremely rare), 2D context might be
-  // unavailable. Return an empty texture so callers don't crash.
-  if (!ctx) return new CanvasTexture(canvas);
-
-  const w = canvas.width;
-  const h = canvas.height;
+function createLabelCanvas(text: string, hexColor: number): HTMLCanvasElement {
   const colorHex = '#' + hexColor.toString(16).padStart(6, '0');
-  const radius = 8;
-  const border = 3;
-
-  // Colored rounded-rect border
-  ctx.fillStyle = colorHex;
-  roundedRect(ctx, 0, 0, w, h, radius);
-  ctx.fill();
-
-  // Dark interior
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
-  roundedRect(ctx, border, border, w - 2 * border, h - 2 * border, Math.max(0, radius - border));
-  ctx.fill();
-
-  // Text — truncate if too long
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 24px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  const truncated = text.length > 22 ? text.substring(0, 19) + '...' : text;
-  ctx.fillText(truncated, w / 2, h / 2);
-
-  return new CanvasTexture(canvas);
-}
-
-function roundedRect(
-  ctx: CanvasRenderingContext2D,
-  x: number, y: number, w: number, h: number, r: number,
-): void {
-  const radius = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + radius, y);
-  ctx.lineTo(x + w - radius, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
-  ctx.lineTo(x + w, y + h - radius);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
-  ctx.lineTo(x + radius, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
-  ctx.lineTo(x, y + radius);
-  ctx.quadraticCurveTo(x, y, x + radius, y);
-  ctx.closePath();
+  return makeLabelCanvas(LABEL_CANVAS_W, LABEL_CANVAS_H, (ctx, w, h) => {
+    drawBoxedLabel(ctx, w, h, text, colorHex, { font: 'bold 24px sans-serif', border: 3, radius: 8, interior: 'rgba(0, 0, 0, 0.78)', maxChars: 22 });
+  });
 }
 
 // Re-export Texture type so downstream files can refer to the marker's

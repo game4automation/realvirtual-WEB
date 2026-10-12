@@ -81,7 +81,7 @@ describe('§9.7 — MCP / dashboard parity', () => {
     if (!('roots' in loaded)) return;
 
     // The dashboard's own input, spelled the way `ProjectsDashboardHost` spells it.
-    const { configs, knowledge, plainFiles } = await listProjectFiles(backend);
+    const { configs, knowledge, scripts, plainFiles } = await listProjectFiles(backend);
     const hostRoots = buildProjectTree(buildDashboardTree({
       project: {
         id: PROJECT.id,
@@ -91,6 +91,7 @@ describe('§9.7 — MCP / dashboard parity', () => {
         attachments: ['docs/bom.pdf'],
         configs,
         knowledge,
+        scripts,
         plainFiles,
         folders: readProjectFolders(PROJECT),
       },

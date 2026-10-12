@@ -51,11 +51,14 @@ import {
 } from '../rv-scene-record';
 export { WriteQueue } from './write-queue';
 import type { DocumentStat } from '../rv-project-documents';
-import { isConnectConfigPath, isKnowledgeFilePath } from '../rv-project-refs';
+import {
+  isConnectConfigPath,
+  isKnowledgeFilePath,
+  isProjectScriptPath,
+} from '../rv-project-refs';
 import type {
   RvDocumentEntry,
   RvProject,
-  RvProjectAssetEntry,
   RvProjectSceneEntry,
 } from '../rv-project-types';
 
@@ -254,18 +257,22 @@ export interface ProjectBackend extends ProjectReadProvider {
   // along with everything else, each row carrying the `path` that says where it
   // is. (That sentence used to name the `section` field instead; plan-736
   // removed it, because the path was already saying the same thing.)
-  listModels(): Promise<RvProjectAssetEntry[]>;
-  listLibrary(): Promise<RvProjectAssetEntry[]>;
+  //
+  // `listModels()` and `listLibrary()` are gone too (plan-744 Phase 1), for the
+  // same reason and one more of their own. They asked "which documents live in
+  // this FOLDER", which the caller can answer off the row it already has; and
+  // they disagreed with each other about depth — models one level, library
+  // recursive — so a GLB in `models/sub/` existed on disk, existed in the
+  // manifest, and appeared in neither list. {@link listDocuments} is the one
+  // list, and it walks the whole tree.
   /**
-   * The one list (plan-413 §2.4) — everything the three above return, as
-   * documents.
+   * The one list (plan-413 §2.4) — every document the project owns.
    *
-   * It does **not** simply concatenate them, and the difference is where the
-   * folder backend lives: models and library are folder-driven there (dropping
-   * `Machine.glb` into `models/` *is* adding it), while `documents[]` in the
-   * manifest is derived from and mirrored back into the manifest arrays only.
-   * Keeping the two apart is what stops a folder scan from rewriting a
-   * customer's `project.json` with fifty entries nobody asked for.
+   * A backend with a real folder to walk builds it from the FILES, using the
+   * manifest as a metadata overlay: dropping `Machine.glb` into the project
+   * *is* the act of adding it, and a manifest row whose file is gone is a
+   * phantom rather than an entry. A backend with no directory (bundled, HTTP)
+   * answers from its manifest, which is the only honest walk it has.
    *
    * Ids are stable across calls: an entry that arrives without one gets a
    * path-derived id (`stableDocumentId`), never a random one, or a list nothing
@@ -293,6 +300,16 @@ export interface ProjectBackend extends ProjectReadProvider {
    */
   listKnowledgeFiles?(): Promise<string[]>;
   /**
+   * Project-relative paths of every bindable project script — the `scriptRef`
+   * third of {@link listConnectConfigs} / {@link listKnowledgeFiles}
+   * (plan-479 Phase 1).
+   *
+   * The one listing whose rule is folder AND ending rather than ending alone
+   * ({@link isProjectScriptPath}). Optional like its two siblings: a backend
+   * with no folder to walk reports none, and callers read that as "none".
+   */
+  listProjectScripts?(): Promise<string[]>;
+  /**
    * Project-relative paths of EVERY file the project folder holds — the one
    * walk behind the full view (plan-445 F1).
    *
@@ -308,6 +325,10 @@ export interface ProjectBackend extends ProjectReadProvider {
    * helper falls back to the per-ending calls.
    */
   listAllFiles?(): Promise<string[]>;
+  /** Lists project directories, including empty ones, excluding internal paths. */
+  listFolders?(): Promise<string[]>;
+  /** Removes an empty project directory; refuses non-empty directories. */
+  deleteEmptyFolder?(relPath: string): Promise<void>;
   /**
    * Cheap size/mtime/digest for the documents this backend stores — the
    * pre-filter of the classification scan (§2.5, SOL R1-7).
@@ -402,6 +423,28 @@ export interface ProjectBackend extends ProjectReadProvider {
    * Read-only backends implement it too.
    */
   readDocumentUrl(ref: DocRef): Promise<ResolvedBackendBlob | null>;
+  /**
+   * Resolve a document to a LAZY blob — bytes are read only where sliced.
+   *
+   * Optional, and that is the point: it exists for readers that need a few
+   * hundred bytes out of a file that may be tens of megabytes. The header
+   * scan behind {@link classificationOfGlbBlob} is the case it was added for
+   * (plan-751) — it reads 20 bytes plus the glTF JSON chunk, and reaching
+   * that through {@link readDocumentUrl} meant `fetch(url).blob()`, which
+   * materialises the WHOLE file before the slice can narrow it. On a folder
+   * project over a network share that is the difference between a few hundred
+   * KB and every byte of every GLB, on every open.
+   *
+   * A backend implements this only where it can beat a full read. The folder
+   * backend can — a `File` from the File System Access API is already a lazy
+   * handle and `slice()` on it is a ranged read. Backends whose bytes are
+   * remote or already in memory omit it, and callers fall back to
+   * {@link readDocumentUrl}; that fallback is why this is optional rather
+   * than a method every backend has to answer badly.
+   *
+   * Returns null for a document this backend does not hold.
+   */
+  readDocumentBlob?(ref: DocRef): Promise<Blob | null>;
   /** Await any queued write. Safe on a read-only or inactive backend. */
   flush(): Promise<void>;
 }
@@ -501,12 +544,20 @@ export function isInternalProjectPath(relPath: string): boolean {
   return INTERNAL_FOLDERS.includes(segments[0].toLowerCase());
 }
 
-/** The three by-ending lists the project tree needs, from one path list. */
+/** The four classified lists the project tree needs, from one path list. */
 export interface ProjectFileListing {
   /** `*.connect.json`, wherever they sit (plan-718 reference model). */
   configs: string[];
   /** `*.knowledge.md`, same by-ending rule. */
   knowledge: string[];
+  /**
+   * The project's own code — `plugins/**​/*.ts|tsx` (plan-479 Phase 1).
+   *
+   * The one list classified by PLACE as well as by ending; see
+   * {@link isProjectScriptPath} for why. Before plan-479 these paths were
+   * `plainFiles`, which is exactly why they could not be dragged onto anything.
+   */
+  scripts: string[];
   /** Everything else — the inert rows of the full view. */
   plainFiles: string[];
 }
@@ -521,14 +572,18 @@ export interface ProjectFileListing {
 export function classifyProjectFiles(paths: readonly string[]): ProjectFileListing {
   const configs: string[] = [];
   const knowledge: string[] = [];
+  const scripts: string[] = [];
   const plainFiles: string[] = [];
   for (const path of paths) {
     if (isInternalProjectPath(path)) continue;
     if (isConnectConfigPath(path)) configs.push(path);
     else if (isKnowledgeFilePath(path)) knowledge.push(path);
+    // AFTER knowledge on purpose: a `plugins/README.md` is prose about the
+    // code, not code, and the ending decides that before the folder does.
+    else if (isProjectScriptPath(path)) scripts.push(path);
     else plainFiles.push(path);
   }
-  return { configs, knowledge, plainFiles };
+  return { configs, knowledge, scripts, plainFiles };
 }
 
 /**
@@ -541,21 +596,25 @@ export function classifyProjectFiles(paths: readonly string[]): ProjectFileListi
  * which renders as a project with no extra rows rather than as a broken screen.
  */
 export async function listProjectFiles(
-  backend: Pick<ProjectBackend, 'listAllFiles' | 'listConnectConfigs' | 'listKnowledgeFiles'> | null,
+  backend: Pick<
+    ProjectBackend,
+    'listAllFiles' | 'listConnectConfigs' | 'listKnowledgeFiles' | 'listProjectScripts'
+  > | null,
 ): Promise<ProjectFileListing> {
-  if (!backend) return { configs: [], knowledge: [], plainFiles: [] };
+  if (!backend) return { configs: [], knowledge: [], scripts: [], plainFiles: [] };
   if (backend.listAllFiles) {
     try {
       return classifyProjectFiles(await backend.listAllFiles());
     } catch {
-      return { configs: [], knowledge: [], plainFiles: [] };
+      return { configs: [], knowledge: [], scripts: [], plainFiles: [] };
     }
   }
-  const [configs, knowledge] = await Promise.all([
+  const [configs, knowledge, scripts] = await Promise.all([
     backend.listConnectConfigs?.().catch(() => []) ?? Promise.resolve([]),
     backend.listKnowledgeFiles?.().catch(() => []) ?? Promise.resolve([]),
+    backend.listProjectScripts?.().catch(() => []) ?? Promise.resolve([]),
   ]);
-  return { configs, knowledge, plainFiles: [] };
+  return { configs, knowledge, scripts, plainFiles: [] };
 }
 
 // ─── Guards ─────────────────────────────────────────────────────────────

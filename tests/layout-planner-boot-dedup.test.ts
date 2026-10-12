@@ -85,7 +85,7 @@ describe('plan-376 F3 — boot restore places each id exactly once', () => {
   beforeEach(() => {
     localStorage.removeItem(AUTOSAVE_KEY);
     fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
-      new Response(new Blob([new Uint8Array([0])]), {
+      new Response(new Blob([new Uint8Array([0x67, 0x6c, 0x54, 0x46, 2, 0, 0, 0, 12, 0, 0, 0]) /* a bare `glTF` header — the blob cache refuses anything else */]), {
         status: 200,
         headers: { 'Content-Type': 'model/gltf-binary' },
       }),

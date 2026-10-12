@@ -38,10 +38,10 @@ vi.mock('../src/core/engine/rv-local-filesystem', async (importOriginal) => {
   return { ...actual, getFolderHandle: async () => null, putHandle: async () => {} };
 });
 
-vi.mock('../src/core/project/rv-project-workspace', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/core/project/rv-project-workspace')>();
-  return { ...actual, getWorkspaceHandle: async () => null };
-});
+// The workspace engine is gone (plan-743). The demo collision guard now reads
+// the DEMO project's OWN handle, which the rv-local-filesystem mock above
+// already answers with null — so no second mock is needed to keep this file
+// from resolving a folder project it did not set up.
 
 // plan-716 Phase 3: the verb block below SAVES, and a save bakes now. The bytes
 // are irrelevant to every assertion here — what is asserted is where the
@@ -111,6 +111,39 @@ import type { SceneStoreLike } from '../src/core/project/project-store';
 import { legacySceneId } from './helpers/legacy-scene-id';
 
 // ─── Harness ────────────────────────────────────────────────────────────
+
+/**
+ * The fixture models `/models/Demo.glb` / `/models/Tests.glb` do not exist on
+ * the test server. Until plan-508 Vite answered them with its SPA `index.html`
+ * (status 200), and a save embedded that page as the "base bytes". The dev
+ * server now answers a missing asset with 404, so the fixture serves a minimal
+ * real GLB (empty scene) under those two urls and passes everything else on.
+ */
+function minimalGlb(): ArrayBuffer {
+  const json = new TextEncoder().encode(JSON.stringify({ asset: { version: '2.0' }, scene: 0, scenes: [{ nodes: [] }] }));
+  const jsonLength = (json.length + 3) & ~3;
+  const buf = new ArrayBuffer(20 + jsonLength);
+  const view = new DataView(buf);
+  view.setUint32(0, 0x46546c67, true);
+  view.setUint32(4, 2, true);
+  view.setUint32(8, buf.byteLength, true);
+  view.setUint32(12, jsonLength, true);
+  view.setUint32(16, 0x4e4f534a, true);
+  const bytes = new Uint8Array(buf);
+  bytes.fill(0x20, 20);
+  bytes.set(json, 20);
+  return buf;
+}
+function serveFixtureModels(): { mockRestore(): void } {
+  const realFetch = globalThis.fetch.bind(globalThis);
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (/\/models\/(Demo|Tests)\.glb$/.test(new URL(url, location.href).pathname)) {
+      return new Response(minimalGlb(), { status: 200, headers: { 'content-type': 'model/gltf-binary' } });
+    }
+    return realFetch(input as RequestInfo, init);
+  });
+}
 
 const DEMO_URL = '/models/Demo.glb';
 const BUILTIN: SceneBase = { kind: 'builtin', url: DEMO_URL, label: 'Demo' };
@@ -234,7 +267,10 @@ function workspaceDocuments(store: ProjectStore): RvDocumentEntry[] {
   return documentsOf(store.getProject());
 }
 
+let fixtureModels: { mockRestore(): void } | null = null;
+
 beforeEach(async () => {
+  fixtureModels = serveFixtureModels();
   localStorage.clear();
   clearSceneMutationListeners();
   clearAllScenes();
@@ -246,6 +282,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  fixtureModels?.mockRestore();
+  fixtureModels = null;
   uninstallProjectLibraryProvider();
   resetLibrarySourceRegistryForTests();
   clearSceneMutationListeners();

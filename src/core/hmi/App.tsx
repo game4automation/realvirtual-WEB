@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useEffect, useMemo, useSyncExternalStore } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useSyncExternalStore } from 'react';
 import { ThemeProvider } from '@mui/material/styles';
-import { CssBaseline, IconButton, Tooltip } from '@mui/material';
+import { Box, CssBaseline, IconButton, Tooltip } from '@mui/material';
 
 // Inter is the product font (DESIGN.md); without these imports every non-MUI
 // element falls back to the browser default serif.
@@ -13,6 +13,17 @@ import '@fontsource/inter/600.css';
 import '@fontsource/inter/700.css';
 import { VisibilityOff } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
+import {
+  ackRecordingFrame,
+  getRecordingFrame,
+  isRecordingHmiActive,
+  isRecordingOverlayAllowed,
+  subscribeRecordingFrame,
+  subscribeRecordingHmi,
+} from '../engine/rv-recording-hmi';
+import { OperatorPanelController } from './operator-devices/operator-panel-model';
+import type { UISlotEntry } from '../rv-ui-plugin';
+import type { RVViewer } from '../rv-viewer';
 
 // Core HMI components
 import { rvDarkTheme, createBrandedTheme } from './theme';
@@ -30,7 +41,7 @@ import { BottomBar } from './BottomBar';
 import { GroupsOverlay } from './GroupsOverlay';
 
 import { loadVisualSettings } from './visual-settings-store';
-import { useHmiVisible, toggleHmiVisible } from './hmi-visibility-store';
+import { useHmiVisible, toggleHmiVisible, useHmiToggleShortcut } from './hmi-visibility-store';
 import { useUIVisible } from './ui-context-store';
 import { ANNOTATION_PANEL_GATE, CONNECT_PANEL_GATE, ORDER_PANEL_GATE } from './left-panel-visibility';
 import { useHelpShortcut } from './help-context';
@@ -68,6 +79,16 @@ import './rv-ik-path-field-renderer';
 import './rv-ribbon-path-rollers-field-renderer';
 import './rv-custom-runtime-instruction-field-renderer';
 import './rv-node-knowledge-field-renderer';
+import './rv-web-label-text-field-renderer';
+// plan-543: WebOperatorPanel.Config JSON editor (+ the operator-window overlay module)
+import './operator-devices/WebOperatorPanelHost';
+// plan-525: BoxCollider center/size in mm + thin-wall warning
+import './rv-box-collider-field-renderer';
+// plan-498: Fmu inspector renderer, editor attach/detach actions, context menu, tooltip
+import './FmuAttachAction';
+import './rv-fmu-parameters-field-renderer';
+// plan-596: AASLink.AASId picker + "Import AASX…" (project aasx/ folder)
+import './rv-aaslink-aasid-field-renderer';
 
 // Context menu (plugin-extensible right-click / long-press menu)
 import { ContextMenuLayer } from './ContextMenuLayer';
@@ -85,9 +106,13 @@ import { StorageNoticeBanner } from './StorageNoticeBanner';
 import { SigWarningBanner } from './SigWarningBanner';
 import { CommissioningTrustBanner } from './CommissioningTrustBanner';
 import { AutoQualityDialog } from './AutoQualityDialog';
+import { ReloadHintHost } from './reload-hint-store';
 import { NewsDialogHost } from './NewsDialog';
 import { OmniverseStatusOverlay } from './OmniverseStatusOverlay';
+import { AgentActivityRow } from './AgentActivityRow';
 import { AiActivityOverlay } from './AiActivityOverlay';
+import { AgentEyeMonitorBadge } from './AgentEyeMonitorBadge';
+import { AgentEyeMonitorPanel } from './AgentEyeMonitorPanel';
 import { AnnotationEditModal } from './AnnotationEditModal';
 
 // Measurement panel
@@ -121,7 +146,7 @@ import {
 // since plan-373: the Models panel is where the embedded demo is opened and
 // closed, so the gated shell must be able to reach it. The entry id is 'models';
 // 'scene' is the LeftPanelManager slot name, not an activity-bar id.
-const CONNECT_EMBED_ACTIVITY_BAR_ALLOWLIST = ['about', 'models', 'plugin:connect', 'help'] as const;
+const CONNECT_EMBED_ACTIVITY_BAR_ALLOWLIST = ['about', 'models', 'plugin:connect', 'problems', 'help'] as const;
 
 
 
@@ -141,6 +166,7 @@ function useApplyPersistedSettings() {
  */
 function HelpShortcut() {
   useHelpShortcut();
+  useHmiToggleShortcut();
   return null;
 }
 
@@ -157,6 +183,9 @@ export function App() {
   useTooltipStoreConnection();
   const hmiVisible = useHmiVisible();
   const branding = useCustomBranding();
+  // plan-556: a recording of the HMI renders the recording shell — no chrome, a stored
+  // `hmiVisible = false` is overridden (the recording decides what is in the frame).
+  const recording = useSyncExternalStore(subscribeRecordingHmi, isRecordingHmiActive, isRecordingHmiActive);
   const connectEmbed = useSyncExternalStore(
     subscribeConnectEmbedStore,
     getConnectEmbedSnapshot,
@@ -189,6 +218,8 @@ export function App() {
   // ButtonPanel stays visible in planner mode — the planner now contributes
   // its own grid/snap/drop toolbar buttons there (PlannerToolbarButtons.tsx).
   // FPV / XR remain in the hidden list because they own the entire viewport.
+  // The recording shell (plan-556) does not mount the activity bar at all; its full-bleed
+  // viewport comes from the recording style (rv-recording-hmi.ts), so this rule stays untouched.
   const showActivityBar = useUIVisible('activity-bar', { hiddenIn: ['fpv', 'xr'] });
   const showButtonPanel = useUIVisible('button-panel', { hiddenIn: ['fpv', 'xr', 'mode:viewer'] });
   const showMessagePanel = useUIVisible('message-panel', { hiddenIn: ['fpv', 'planner', 'xr', 'mode:editor', 'mode:viewer', 'mode:commissioning'] });
@@ -203,10 +234,12 @@ export function App() {
       {/* Outside both shells on purpose: it must show in the CONNECT embed
           shell too, and staying out of HMIShell keeps it clear of the shell's
           CSS zoom, so the badge holds one size at any UI scale. */}
-      <ServeSessionBadge />
+      {!recording && <ServeSessionBadge />}
       {/* Outside both shells so F1 reaches the docs in the CONNECT embed too. */}
       <HelpShortcut />
-      {isConnectEmbedMinimalShell(connectEmbed) ? (
+      {recording ? (
+        <RecordingHmiShell />
+      ) : isConnectEmbedMinimalShell(connectEmbed) ? (
         <ConnectEmbedMinimalShell />
       ) : (
         <FullHmiShell
@@ -327,7 +360,8 @@ function FullHmiShell({
             bottom on mobile — the only bottom bar there, so no stacking needed. */}
         {hmiVisible && showActivityBar && <ActivityBar />}
         {hmiVisible && showButtonPanel && <ButtonPanel />}
-        {hmiVisible && showMessagePanel && <MessagePanel />}
+        {/* Active machine alarms remain visible in working modes that hide other messages. */}
+        {hmiVisible && <MessagePanel alarmsOnly={!showMessagePanel} />}
         {/* Document problems (plan-703 §2.8) — content-driven: renders nothing
             while the list is empty, so it costs no viewport in the normal case.
             Not gated on `showMessagePanel`: that switch hides MACHINE messages
@@ -354,9 +388,26 @@ function FullHmiShell({
             of the two and must stay on top when both apply. */}
         <CommissioningTrustBanner />
         <AutoQualityDialog />
+        {/* plan-591: the antialias reload hint. Ungated and always mounted —
+            it derives its own visibility from settings vs. renderer and gates
+            itself on touch devices (F13); a condition here would be a second,
+            competing rule. Its own small state, deliberately NOT the shared
+            info overlay (§2.5). */}
+        <ReloadHintHost />
         {showNewsDialog && <NewsDialogHost includeWeb />}
         {showOmniverseStatus && <OmniverseStatusOverlay />}
-        {showAiActivity && <AiActivityOverlay />}
+        {/* Agent Eye Monitor (plan-481). Gated on `hmiVisible` ONLY — not on
+            `mcp.connected` and not on "are there captures": the badge is the
+            only way into the monitor, and hiding it while the history is empty
+            would make the empty state (F8) unreachable exactly when it is the
+            thing worth reading. The panel is always mounted so the auto-open
+            effect can see a new capture number; it renders nothing while
+            closed. */}
+        <AgentActivityRow>
+          {hmiVisible && <AgentEyeMonitorBadge />}
+          {showAiActivity && <AiActivityOverlay />}
+        </AgentActivityRow>
+        {hmiVisible && <AgentEyeMonitorPanel />}
         {hmiVisible && showAnnotationPanel && <AnnotationPanel />}
         {hmiVisible && <MeasurementPanel />}
         {hmiVisible && <ClippingPanel />}
@@ -374,6 +425,87 @@ function FullHmiShell({
         return <C key={i} />;
       })}
     </>
+  );
+}
+
+// ─── Recording shell (plan-556 F3) ───────────────────────────────────────
+
+/**
+ * What the full shell mounts and what a recording does with it (F3 inventory). `kept` = rendered by
+ * the recording shell, `hidden` = not mounted in a recording. tests/rv-recording-hmi.test.tsx
+ * checks every element of `FullHmiShell` (and the App root) is listed here.
+ */
+export const RECORDING_SHELL_INVENTORY: Readonly<Record<string, 'kept' | 'hidden'>> = {
+  // App root
+  ServeSessionBadge: 'hidden', HelpShortcut: 'kept',
+  // FullHmiShell
+  HMIShell: 'hidden', ViewportFrame: 'kept', TooltipLayer: 'hidden', AnchoredPopover: 'hidden',
+  SignalDragGhost: 'hidden', SensorHistoryPanel: 'hidden', ContextMenuLayer: 'hidden', KeyBadgeLayer: 'hidden',
+  InstructionLayer: 'hidden', SetPositionDialog: 'hidden', MobileSelectionSheet: 'hidden', TitleBar: 'hidden',
+  KpiBar: 'hidden', TopBar: 'hidden', ActivityBar: 'hidden', ButtonPanel: 'hidden', MessagePanel: 'hidden',
+  ProblemsPanel: 'hidden', BottomBar: 'hidden', GroupsOverlay: 'hidden', SlotRenderer: 'hidden',
+  SharedViewBanner: 'hidden', GPUWarningBanner: 'hidden', StorageNoticeBanner: 'hidden', SigWarningBanner: 'hidden',
+  CommissioningTrustBanner: 'hidden', AutoQualityDialog: 'hidden', ReloadHintHost: 'hidden',
+  NewsDialogHost: 'hidden',
+  OmniverseStatusOverlay: 'hidden', AgentActivityRow: 'hidden', AgentEyeMonitorBadge: 'hidden',
+  AiActivityOverlay: 'hidden', AgentEyeMonitorPanel: 'hidden', AnnotationPanel: 'hidden', MeasurementPanel: 'hidden',
+  ClippingPanel: 'hidden', OrderPanel: 'hidden', ConnectPanel: 'kept', ConnectEmbedDemoControls: 'hidden',
+  AnnotationEditModal: 'hidden', HmiRestoreButton: 'hidden',
+  // The overlay slot (TopBar renders it normally): only operator panels + the allow-list.
+  'SlotRenderer[overlay]': 'kept',
+};
+
+/** Overlay slot entries a recording keeps: operator panels and allow-listed plugins (F3). */
+export function recordingOverlayEntries(entries: readonly UISlotEntry[], viewer: Pick<RVViewer, 'getPlugin'>): UISlotEntry[] {
+  return entries.filter((e) => {
+    const plugin = e.pluginId ? viewer.getPlugin(e.pluginId) as { controller?: unknown } | undefined : undefined;
+    return isRecordingOverlayAllowed(e.pluginId, plugin?.controller instanceof OperatorPanelController);
+  });
+}
+
+/** The overlay slot of a recording: operator panels + allow-listed entries, nothing else. */
+function RecordingOverlaySlot() {
+  const viewer = useViewer();
+  useSyncExternalStore(viewer.uiRegistry.subscribe, viewer.uiRegistry.getSnapshot);
+  const entries = recordingOverlayEntries(viewer.uiRegistry.getSlotComponents('overlay'), viewer);
+  return (
+    <>
+      {entries.map((entry, i) => {
+        const Comp = entry.component;
+        return <Comp key={`overlay-${entry.pluginId ?? i}-${i}`} viewer={viewer} />;
+      })}
+    </>
+  );
+}
+
+/**
+ * Acknowledges every committed recording frame (the commit barrier of the HMI settle, F4): the
+ * layout effect runs after React committed the render that read the bumped counter.
+ */
+export function RecordingFrameProbe() {
+  const f = useSyncExternalStore(subscribeRecordingFrame, getRecordingFrame, getRecordingFrame);
+  useLayoutEffect(() => { ackRecordingFrame(f); }, [f]);
+  return null;
+}
+
+/**
+ * The shell of a recording (F3): the viewport frame (full-bleed), the operator panels and other
+ * allow-listed overlay entries, the CONNECT panel when it is open, the frame probe. Everything
+ * else of {@link FullHmiShell} is not mounted. Same layering as HMIShell (z-index 1000, the
+ * floating-panel portal root first) at UI zoom 1.
+ */
+export function RecordingHmiShell() {
+  return (
+    <Box
+      data-rv-recording-shell=""
+      sx={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 1000, '& > *': { pointerEvents: 'auto' } }}
+    >
+      <div id="rv-floating-panel-root" style={{ pointerEvents: 'none' }} />
+      <ViewportFrame />
+      <RecordingOverlaySlot />
+      <ConnectPanel />
+      <RecordingFrameProbe />
+    </Box>
   );
 }
 

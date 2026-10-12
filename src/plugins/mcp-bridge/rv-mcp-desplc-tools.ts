@@ -18,7 +18,7 @@
 
 import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
-import { getPlcControl } from '../../core/plc-control';
+import { getPlcControl, getPlcRuntime, type PlcControl } from '../../core/plc-control';
 
 export class McpDesPlcTools {
   constructor(private readonly getViewer: () => RVViewer | undefined) {}
@@ -125,24 +125,45 @@ export class McpDesPlcTools {
   // tools answer with a clear not-available error.
   // ═══════════════════════════════════════════════════════════════════
 
-  @McpTool('Virtual PLC status: run state (stopped/running/error), scan time in ms, last error, and the online watch values (VAR_EXTERNAL variables plus function-block outputs like tDelay.Q as of the last scan). Returns an error when the PLC runtime is not part of this build.', { readOnly: true })
-  async webPlcStatus(): Promise<string> {
-    const plc = getPlcControl();
-    if (!plc) return JSON.stringify({ error: 'PLC not available in this build' });
+  /**
+   * The program a PLC tool addresses: by name / scene path when given, else the
+   * one selected in the PLC editor. Returns an error JSON string when unknown.
+   */
+  private plcFor(program: string | undefined): PlcControl | string {
+    if (program) {
+      const runtime = getPlcRuntime();
+      const ctl = runtime?.program(program) ?? null;
+      if (ctl) return ctl;
+      const names = runtime?.programs().map((p) => p.name) ?? [];
+      return JSON.stringify({ error: `unknown PLC program '${program}'`, programs: names });
+    }
+    return getPlcControl() ?? JSON.stringify({ error: 'PLC not available in this build' });
+  }
+
+  @McpTool('Virtual PLC status of one program: run state, scan time (ms), last error and watch values (VAR_EXTERNAL plus FB outputs like tDelay.Q). Also lists all programs in scan order and outputs written by several programs.', { readOnly: true })
+  async webPlcStatus(
+    @McpParam('program', 'Program name or path (default: editor selection)', 'string', false) program?: string,
+  ): Promise<string> {
+    const plc = this.plcFor(program);
+    if (typeof plc === 'string') return plc;
+    const runtime = getPlcRuntime();
     return JSON.stringify({
       state: plc.state,
       scanTimeMs: +plc.scanTimeMs.toFixed(3),
       lastError: plc.lastError,
       watch: Object.fromEntries(plc.watch()),
+      programs: runtime?.programs().map((p) => ({ name: p.name, path: p.path, order: p.order, selected: p.selected, state: p.state, scanTimeMs: +p.scanTimeMs.toFixed(3), lastError: p.lastError })) ?? [],
+      conflicts: runtime?.conflicts() ?? [],
     });
   }
 
-  @McpTool('Deploy an IEC 61131-3 Structured Text program to the virtual PLC: compile + COLD load (fresh function-block states and memory). Returns all diagnostics (compile errors/warnings + signal-binding warnings); with error diagnostics nothing is loaded and the PLC enters the error state. Deploying never starts scanning — call web_plc_run afterwards.', { readOnly: false })
+  @McpTool('Deploy IEC 61131-3 Structured Text to a PLC program: compile + COLD load (fresh FB states and memory). Returns all diagnostics; with errors nothing is loaded and the program enters the error state. Never starts scanning — call web_plc_run.', { readOnly: false })
   async webPlcDeploy(
     @McpParam('code', 'IEC 61131-3 Structured Text source (PROGRAM ... END_PROGRAM)') code: string,
+    @McpParam('program', 'Program name or path (default: editor selection)', 'string', false) program?: string,
   ): Promise<string> {
-    const plc = getPlcControl();
-    if (!plc) return JSON.stringify({ error: 'PLC not available in this build' });
+    const plc = this.plcFor(program);
+    if (typeof plc === 'string') return plc;
     const diagnostics = await plc.deploy(code);
     return JSON.stringify({
       state: plc.state,
@@ -152,18 +173,22 @@ export class McpDesPlcTools {
     });
   }
 
-  @McpTool('Start cyclic PLC scanning (one scan per 60 Hz sim tick: input snapshot → program pass → output batch write). After an error state this performs a COLD restart with a fresh sandbox and fresh function-block states.', { readOnly: false })
-  async webPlcRun(): Promise<string> {
-    const plc = getPlcControl();
-    if (!plc) return JSON.stringify({ error: 'PLC not available in this build' });
+  @McpTool('Start cyclic scanning of a PLC program (one scan per 60 Hz tick: inputs → program → outputs). After an error this is a COLD restart.', { readOnly: false })
+  async webPlcRun(
+    @McpParam('program', 'Program name or path (default: editor selection)', 'string', false) program?: string,
+  ): Promise<string> {
+    const plc = this.plcFor(program);
+    if (typeof plc === 'string') return plc;
     await plc.run();
     return JSON.stringify({ state: plc.state, lastError: plc.lastError });
   }
 
-  @McpTool('Stop cyclic PLC scanning (WARM stop — program memory and function-block states are kept; outputs keep their last written values).', { readOnly: false })
-  async webPlcStop(): Promise<string> {
-    const plc = getPlcControl();
-    if (!plc) return JSON.stringify({ error: 'PLC not available in this build' });
+  @McpTool('Stop scanning a PLC program (WARM: memory and FB states kept, outputs keep their last values).', { readOnly: false })
+  async webPlcStop(
+    @McpParam('program', 'Program name or path (default: editor selection)', 'string', false) program?: string,
+  ): Promise<string> {
+    const plc = this.plcFor(program);
+    if (typeof plc === 'string') return plc;
     plc.stop();
     return JSON.stringify({ state: plc.state });
   }

@@ -11,6 +11,8 @@
 
 import { Box3, Vector3, type Material, type Object3D } from 'three';
 import { Mesh } from 'three';
+import { chunkMetaOf } from './rv-bake-chunk';
+import { sharedVizGeometries } from './rv-shared-viz-geometry';
 
 // ─── Runtime-rig markers (plan-362, EnergyChain) ─────────────────
 //
@@ -124,6 +126,29 @@ export function isRigRaycastExcluded(node: Object3D): boolean {
 }
 
 /**
+ * First node of `root`'s subtree (pre-order, `root` included) whose name equals
+ * `ref` or — when `ref` is a relative path — its last segment. `skip` excludes
+ * single nodes (not their subtrees). The ONE name-in-subtree lookup: the MU
+ * template resolution of `RVSource` and the bake survival model's
+ * `nameInSubtree` target finder (plan-754) both call it, so the component and
+ * the bake can never disagree about which node a `ThisObjectAsMU` names.
+ */
+export function findByNameInSubtree(
+  root: Object3D,
+  ref: string,
+  skip?: (node: Object3D) => boolean,
+): Object3D | null {
+  const wanted = ref.includes('/') ? ref.slice(ref.lastIndexOf('/') + 1) : ref;
+  let found: Object3D | null = null;
+  root.traverse((child) => {
+    if (found) return;
+    if (skip && skip(child)) return;
+    if (child.name === wanted || child.name === ref) found = child;
+  });
+  return found;
+}
+
+/**
  * Traverse `root` and invoke `cb` for every descendant (and `root` itself,
  * if it is a `Mesh`). Skips non-Mesh nodes.
  *
@@ -232,14 +257,59 @@ export function traverseMeshesWithDepth(
   });
 }
 
+// ─── Chunk bounds seam (plan-756 F6) ─────────────────────────────────
+//
+// After a destructive bake a merged node has NO `Mesh` descendant: its triangles
+// live inside an ancestor's chunk and the only thing that knows where they are is
+// the node table's segment interval. `computeSubtreeAABB` would answer with the
+// 0.1 m fallback cube — a camera focus onto nothing, an isolate box around a
+// point, a gizmo scaled to a speck.
+//
+// The live `BakeRegistry` is viewer STATE, so it cannot be imported here (and a
+// direct import would be a cycle: the registry imports this module's dispose
+// guard). It is injected instead — the same pattern as
+// `setDriveGizmoFallbackResolver` (drive-gizmo-source.ts).
+
+/** What {@link setChunkBoundsSource} installs — `BakeRegistry` implements it. */
+export interface ChunkBoundsSource {
+  /** Union the world-space chunk geometry of `node`'s subtree into `target`;
+   *  `false` = this node has none (not baked, or no live placement). */
+  chunkBoundsOf(node: Object3D, target: Box3): boolean;
+}
+
+let _chunkBounds: ChunkBoundsSource | null = null;
+
+/**
+ * Install (or clear, with `null`) the source of chunk bounds for
+ * {@link computeSubtreeAABB}. Called once per viewer next to
+ * `highlighter.setChunkSource(...)`; a context that never bakes leaves it unset
+ * and every bounds consumer behaves exactly as before plan-756.
+ */
+export function setChunkBoundsSource(source: ChunkBoundsSource | null): void {
+  _chunkBounds = source;
+}
+
+/** Union the baked chunk geometry of `node`'s subtree into `target` through
+ *  the installed source; `false` when no source is installed or the node has
+ *  none. For bounds consumers that walk real meshes themselves (camera fit)
+ *  and need the same fallback {@link computeSubtreeAABB} takes for a node
+ *  whose meshes were merged away by the bake. */
+export function chunkBoundsOfNode(node: Object3D, target: Box3): boolean {
+  return _chunkBounds !== null && _chunkBounds.chunkBoundsOf(node, target);
+}
+
 /**
  * Compute the axis-aligned bounding box of all `Mesh` descendants of `node`,
  * including geometry transforms. Lights, Cameras, Groups, and other non-Mesh
  * children are skipped.
  *
  * The returned object exposes `box` plus pre-computed `size` and `center`
- * Vector3s for convenience. When no mesh descendants exist, the box falls
- * back to a `0.1 × 0.1 × 0.1` cube centered on the node's world position.
+ * Vector3s for convenience. When no mesh descendants exist, a node of a BAKED
+ * model still answers with its geometry: the union of the segment boxes of its
+ * subtree in world space (plan-756 F6), which is conservatively larger than its
+ * triangles and never smaller. Only a node with no meshes AND no segments — a
+ * marker, an empty group, a node of an unbaked tree — falls back to a
+ * `0.1 × 0.1 × 0.1` cube centered on the node's world position.
  * Each component of `size` is clamped to at least `0.001` to avoid
  * zero-scale traps when the result is used as a Three.js scale.
  *
@@ -261,6 +331,10 @@ export function computeSubtreeAABB(
       hasAny = true;
     }
   });
+  if (!hasAny && _chunkBounds !== null) {
+    // Merged into an ancestor's chunk: the segment boxes ARE this node's geometry.
+    hasAny = _chunkBounds.chunkBoundsOf(node, box);
+  }
   if (!hasAny) {
     // Fallback: use node world position as center with minimal size
     const pos = new Vector3();
@@ -286,6 +360,15 @@ export function disposeSubtree(root: Object3D): void {
   const disposed = new Set<unknown>();
   root.traverse((node) => {
     const m = node as Mesh;
+    // Runtime dispose guard (plan-753 F11): a baked chunk geometry is SHARED
+    // by every placement of its asset and owned by the `BakedAsset` — a
+    // placement teardown must never free it, and neither its BVH nor its
+    // material (the uber singleton / the master's textured material).
+    if (m.geometry && chunkMetaOf.has(m.geometry)) return;
+    // Same contract for the shared sensor viz geometries (ray tube, collision
+    // box + edges): refcounted and released by `RVSensor.dispose()`, never by
+    // a tree walk that may only be tearing down ONE of their users.
+    if (m.geometry && sharedVizGeometries.has(m.geometry)) return;
     if (m.geometry && !disposed.has(m.geometry)) {
       disposed.add(m.geometry);
       m.geometry.dispose();

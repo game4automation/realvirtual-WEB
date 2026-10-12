@@ -28,9 +28,11 @@ import { SnapPlacementService } from './snap-placement-service';
 import { SnapMagneticController } from './snap-magnetic-controller';
 import { SnapChainPreview } from './snap-chain-preview';
 import { scanAndRegisterSnaps } from './snap-scanner';
+import { computeProximityPairings, type RebuildSnapInput } from './snap-pairing-rebuild';
 import { snapHoverStore } from './snap-hover-store';
 import { snapToolbarStore } from './snap-toolbar-store';
-import { Vector3, type Object3D } from 'three';
+import { Quaternion, Vector3, type Object3D } from 'three';
+import type { PlacedComponentId } from '../../core/engine/rv-snap-point-registry';
 import {
   _subscribe as subscribeUiContext,
   isContextActive,
@@ -45,6 +47,21 @@ import type { ComponentType } from 'react';
  *  (DEFAULT_MAGNET_RADIUS_M = 0.4) so nearby compatible ports are previewed
  *  early — only those within the pull radius actually snap. */
 const SNAP_APPROACH_RADIUS_M = 5;
+
+/** World-space distance below which two snaps count as mated when the connection
+ *  graph is reconstructed from geometry. Mated snaps are placed exactly
+ *  coincident in-session (the magnetic controller decomposes to an exact pose),
+ *  but the live geometry can drift by up to ~1 cm by the time it is
+ *  reconstructed on reload (drop-to-surface re-adjust, a snap riding a drive
+ *  node, accumulated align recompute). The old 5 mm tolerance silently dropped
+ *  such connections even though they were clearly mated — far stricter than the
+ *  tolerance at which the magnetic system forms (≈400 mm engage) and holds a
+ *  chain. 30 mm comfortably absorbs the drift while staying well below the
+ *  spacing between any two distinct, non-mated compatible ports (≥ a module
+ *  length, typically ≥ 250 mm). The greedy nearest-match in
+ *  `computeProximityPairings` still prefers the closest partner, so widening the
+ *  window does not mis-pair when the true partner is nearer. */
+export const SNAP_PAIR_REBUILD_EPS_M = 0.03;
 
 export class SnapPointPlugin implements RVViewerPlugin {
   readonly id = 'snap-point';
@@ -86,6 +103,10 @@ export class SnapPointPlugin implements RVViewerPlugin {
   private unsubscribeDragStart: (() => void) | null = null;
   private unsubscribeDragTick: (() => void) | null = null;
   private unsubscribeDragEnd: (() => void) | null = null;
+  /** Per-placement re-scan as deferred placements land (plan-757 Phase 2). */
+  private unsubscribePlacementAdded: (() => void) | null = null;
+  /** Connection-graph rebuild once a load's placements have settled. */
+  private unsubscribePlacementsDone: (() => void) | null = null;
   private viewer: RVViewer | null = null;
 
   /** Chain-preview focus: owner root currently hovered (or dragged), if any. */
@@ -194,6 +215,28 @@ export class SnapPointPlugin implements RVViewerPlugin {
     this.unsubscribeDragTick = viewer.on('layout-drag-tick', onTick);
     this.unsubscribeDragEnd = viewer.on('layout-drag-end', onEnd);
 
+    // ── Deferred placements (plan-757 Phase 2) ──────────────────────────────
+    // Since every AssetReference became a placement the VIEWER materialises,
+    // `onModelLoaded` no longer sees the content it is supposed to scan: at
+    // that moment each placement root is still an empty stub, and the
+    // `Snap-*` nodes only appear a second or two later. Worse, the one scan
+    // there records the MODEL ROOT as ownerRoot for everything it does find,
+    // and same-owner snaps can never pair (`b.owner === a.owner` in
+    // computeProximityPairings). Either way the registry ends up without a
+    // single usable pairing, so every Conveyor's downstream interlock reads
+    // "no successor → blocked" and the line stops at the first part.
+    // (Same failure the planner's adopt path fixed on 2026-09-01; the
+    // instancer path bypasses it.) So: re-scan PER PLACEMENT, owned by the
+    // placement root, as each one lands…
+    this.unsubscribePlacementAdded = viewer.on('layout-content-added', (payload) => {
+      if (payload?.root) this.rescanOwner(payload.root);
+    });
+    // …and reconstruct the connection graph once the load has settled, when
+    // both ends of every connection are guaranteed to be in the scene.
+    this.unsubscribePlacementsDone = viewer.on('placements-materialized', (info) => {
+      if (!info?.aborted) this.rebuildPairings();
+    });
+
     // Mode-based activation via ui-context-store
     this.unsubscribeCtx = subscribeUiContext(() => this._applyMode());
     // Apply once at start
@@ -284,6 +327,10 @@ export class SnapPointPlugin implements RVViewerPlugin {
     this.unsubscribeDragTick = null;
     this.unsubscribeDragEnd?.();
     this.unsubscribeDragEnd = null;
+    this.unsubscribePlacementAdded?.();
+    this.unsubscribePlacementAdded = null;
+    this.unsubscribePlacementsDone?.();
+    this.unsubscribePlacementsDone = null;
     this.unsubscribeObjectHover?.();
     this.unsubscribeObjectHover = null;
     this.unsubscribeSelection?.();
@@ -352,6 +399,92 @@ export class SnapPointPlugin implements RVViewerPlugin {
       }
       return out;
     });
+  }
+
+  /**
+   * Re-register every snap under `root` with `root` itself as ownerRoot.
+   *
+   * The owner is what makes a snap pairable: `computeProximityPairings` skips
+   * same-owner candidates, and `findOutputPairings` looks a unit's ports up by
+   * owner root. A subtree scanned as part of a larger root therefore carries a
+   * useless owner, so we drop those entries before re-scanning.
+   *
+   * Idempotent — safe to call again for a placement that is already correct.
+   */
+  rescanOwner(root: Object3D): void {
+    if (!this.registry) return;
+    this.registry.unregisterUnder(root);
+    scanAndRegisterSnaps(root, this.registry, root);
+    this.markerRenderer?.rebuild(this.registry.size);
+  }
+
+  /**
+   * Reconstruct the snap CONNECTION graph (`pairedSnapId` / `occupied`) from
+   * geometry, for every snap that is not already connected.
+   *
+   * Nothing persists the runtime pairing: a restored layout, and since
+   * plan-757 Phase 2 every materialised placement, arrives with the right
+   * transforms but no connections. Two mated snaps are placed exactly
+   * coincident in world space, so the graph can be recovered by proximity.
+   *
+   * Safe to call repeatedly: only unoccupied snaps take part, so connections
+   * established live are never disturbed.
+   *
+   * @param placedIdOf Maps an owner root to the planner's placement id, so the
+   *   occupancy marker names the real placement. Falls back to `snap:<id>`.
+   */
+  rebuildPairings(placedIdOf?: (root: Object3D) => string | null): void {
+    const v = this.viewer;
+    const reg = this.registry;
+    if (!v || !reg) return;
+
+    // Some ports ride on a drive-controlled node (a turntable's rotating
+    // platform owns its connection ports). The two snaps were mated at the
+    // drive's HOME pose, so we must sample there — a drive left rotated moves
+    // the port away from its static partner and the coincidence test fails.
+    // Snapshot, move home, sample, restore.
+    const drives = v.drives ?? [];
+    const restore: { node: Object3D; pos: Vector3; quat: Quaternion }[] = [];
+    for (const d of drives) {
+      restore.push({ node: d.node, pos: d.node.position.clone(), quat: d.node.quaternion.clone() });
+      d.getHomeLocalPosition(d.node.position);
+      d.getHomeLocalQuaternion(d.node.quaternion);
+    }
+    v.scene.updateMatrixWorld(true);
+
+    const wp = new Vector3();
+    const inputs: RebuildSnapInput[] = [];
+    for (const sp of reg.getAll()) {
+      if (sp.occupied) continue; // keep any connection already established live
+      sp.object3D.getWorldPosition(wp);
+      inputs.push({
+        id: sp.id, typeId: sp.typeId, flow: sp.flow,
+        owner: sp.ownerRoot, x: wp.x, y: wp.y, z: wp.z,
+      });
+    }
+
+    for (const r of restore) {
+      r.node.position.copy(r.pos);
+      r.node.quaternion.copy(r.quat);
+    }
+    if (restore.length > 0) v.scene.updateMatrixWorld(true);
+
+    if (inputs.length < 2) return;
+
+    const pairs = computeProximityPairings(inputs, SNAP_PAIR_REBUILD_EPS_M);
+    for (const { aId, bId } of pairs) {
+      const a = reg.getById(aId);
+      const b = reg.getById(bId);
+      if (!a || !b) continue;
+      // Each snap is occupied BY the asset on the OPPOSITE side — the
+      // convention placeAtSnapPoint and the magnetic drag controller use.
+      const aPlaced = (placedIdOf?.(a.ownerRoot) ?? `snap:${a.id}`) as PlacedComponentId;
+      const bPlaced = (placedIdOf?.(b.ownerRoot) ?? `snap:${b.id}`) as PlacedComponentId;
+      reg.markOccupied(a.id, bPlaced);
+      reg.markOccupied(b.id, aPlaced);
+      reg.pair(a.id, b.id);
+    }
+    if (pairs.length > 0) v.markRenderDirty();
   }
 
   // Public accessors for other modules (scene-mutations, picker)

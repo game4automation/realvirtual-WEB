@@ -304,6 +304,78 @@ describe('Szenen-Autosave waehrend der Editor-Projektion', () => {
     store.dispose();
   });
 
+  // The explicit half of R2-Q1. The autosave can wait for the handback; a save
+  // the user asked for cannot, and used to run the ordinary bake anyway — onto
+  // bytes that predate the editor session. Field finding 2026-09-21: new
+  // document → editor → import CAD → "to ground" → Save refused with
+  // `UnwritableTransformError`, and WITHOUT the move it would have "succeeded"
+  // and written the document without the CAD.
+  describe('ein Schreiben WAEHREND der Projektion kommt aus dem autorierten Baum', () => {
+    /** What the editor would export: a tree holding a part imported this session. */
+    async function authoredBytes(): Promise<ArrayBuffer> {
+      const { Group, Mesh, BoxGeometry, MeshStandardMaterial } = await import('three');
+      const { objectToGlb, sceneMirroringLoad } = await import('../src/core/import/rv-import-object');
+      const root = new Group();
+      const part = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
+      part.name = 'Side Cutting';
+      part.position.set(0, 0.5, 0);
+      root.add(part);
+      return objectToGlb(sceneMirroringLoad(root));
+    }
+
+    const moveOp = (): RvScenePrimitiveOp => ({
+      id: `op_mix_${++opSeq}`, ts: 10_000, schemaV: 1,
+      kind: 'transformNode',
+      nodePath: '/Side Cutting',
+      transform: { position: [0, 0.5, 0], quaternion: [0, 0, 0, 1] },
+      prev: { position: [0, 0, 0], quaternion: [0, 0, 0, 1] },
+    } as RvScenePrimitiveOp);
+
+    it('takes the bytes from the registered source and keeps the imported part', async () => {
+      vi.useRealTimers();
+      const store = await bindableStore();
+      const handover = store.beginProjectionHandover()!;
+      const source = vi.fn(authoredBytes);
+      handover.setAuthoredSource(source);
+      // A move of a node the scene's own base bytes have never heard of — the
+      // op that made the old bake refuse the whole save.
+      await store.applyOp(moveOp());
+
+      const glb = await store.exportSceneGlb();
+
+      expect(source).toHaveBeenCalledTimes(1);
+      const { parseGlbChunks } = await import('../src/core/persistence/rv-glb-chunks');
+      const nodes = (parseGlbChunks(glb).json.nodes ?? []) as { name?: string }[];
+      const names = nodes.map((n) => n.name);
+      expect(names).toContain('Side Cutting');
+
+      handover.release();
+      store.dispose();
+    });
+
+    it('refuses rather than silently baking the stale bytes when nobody registered a source', async () => {
+      vi.useRealTimers();
+      const store = await bindableStore();
+      const handover = store.beginProjectionHandover()!;
+      await expect(store.exportSceneGlb()).rejects.toThrow(/open in the editor/);
+      handover.release();
+      store.dispose();
+    });
+
+    it('drops the source with the binding', async () => {
+      vi.useRealTimers();
+      const store = await bindableStore();
+      const handover = store.beginProjectionHandover()!;
+      const source = vi.fn(authoredBytes);
+      handover.setAuthoredSource(source);
+      handover.release();
+      // Back in the scene projection the ordinary bake is the writer again.
+      await store.exportSceneGlb().catch(() => {});
+      expect(source).not.toHaveBeenCalled();
+      store.dispose();
+    });
+  });
+
   it('a bound editor op does not arm the scene writer either', async () => {
     const store = await bindableStore();
     const handover = store.beginProjectionHandover()!;

@@ -84,6 +84,12 @@ export interface ProjectRootInput {
    */
   knowledge?: readonly string[];
   /**
+   * Project-relative paths of the project's own scripts (`plugins/**​/*.ts|tsx`)
+   * — the `scriptRef` third of {@link configs} / {@link knowledge}
+   * (plan-479 Phase 1). Same dedupe rule as both.
+   */
+  scripts?: readonly string[];
+  /**
    * Every REMAINING file of the project folder, from the backend's one walk
    * (plan-445 F1) — internals already filtered by the backend.
    *
@@ -145,6 +151,13 @@ export type DashboardTreeRef =
   /** A knowledge file (`*.knowledge.md`) — classified by ending too. */
   | { kind: 'knowledgeFile'; path: string }
   /**
+   * A bindable project script (`plugins/**​/*.ts|tsx`) — the only kind
+   * classified by FOLDER as well as ending (plan-479 Phase 1). Like the two
+   * above it is inspected rather than opened; what it can do that a plain file
+   * cannot is be dragged onto a document's PLUGIN slot.
+   */
+  | { kind: 'scriptFile'; path: string }
+  /**
    * Any other file of the project folder (plan-445 F1/F2). INERT: it carries a
    * path so the pane can describe it, and no verb at all.
    */
@@ -162,11 +175,11 @@ export type DashboardTreeRef =
  */
 export type DashboardTreeFileRef = Extract<
   DashboardTreeRef,
-  { kind: 'attachment' | 'connectConfig' | 'knowledgeFile' | 'plainFile' }
+  { kind: 'attachment' | 'connectConfig' | 'knowledgeFile' | 'scriptFile' | 'plainFile' }
 >;
 
 const FILE_REF_KINDS = new Set<DashboardTreeRef['kind']>([
-  'attachment', 'connectConfig', 'knowledgeFile', 'plainFile',
+  'attachment', 'connectConfig', 'knowledgeFile', 'scriptFile', 'plainFile',
 ]);
 
 /** {@link DashboardTreeFileRef}, as a narrowing check. */
@@ -381,7 +394,19 @@ export function buildDashboardTree({
       rows.push({ path, name, stripped: true, ref: { kind: 'knowledgeFile', path } });
     }
 
-    // LAST, and only what the four lists above did not claim: everything else
+    for (const raw of project.scripts ?? []) {
+      const path = normalise(raw);
+      if (path === '' || taken.has(path)) continue;
+      // No stripping: `.ts` is part of the file's NAME here, not a classifying
+      // ending the user never chose — `index.ts` next to `index.tsx` are two
+      // different files and the grid has to say which is which.
+      const name = leafOf(path);
+      if (!keep({ name, path })) continue;
+      taken.add(path);
+      rows.push({ path, name, ref: { kind: 'scriptFile', path } });
+    }
+
+    // LAST, and only what the five lists above did not claim: everything else
     // the project folder holds (plan-445 F1). Inert — see `DashboardTreeRef`.
     for (const raw of project.plainFiles ?? []) {
       const path = normalise(raw);

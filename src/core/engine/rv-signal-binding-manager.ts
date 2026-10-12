@@ -167,6 +167,11 @@ interface ElementEntry {
   liveControlled: boolean;
 }
 
+/** Listener of {@link SignalBindingManager.addBindingsChangedListener} (plan-512). */
+export type BindingsChangedListener = (placedId: string, mappings: readonly SignalMapping[]) => void;
+
+const NO_MAPPINGS: readonly SignalMapping[] = Object.freeze([]);
+
 function bindingKey(componentPath: string, slot: string): string {
   return `${componentPath}\u0000${slot}`;
 }
@@ -201,6 +206,15 @@ export class SignalBindingManager {
   /** Optional listener fired whenever an element's binding state may have
    *  changed (used by the badge controller to refresh). */
   onStateChanged: ((placedId: string) => void) | null = null;
+
+  /**
+   * Listeners told once after a WHOLE change of an element's binding set has
+   * completed (plan-512): at the end of {@link applyMappings} and of every public
+   * {@link unbindAll} — the undo-to-empty path of the SignalLinks executor calls
+   * the latter, not the former. Unlike {@link onStateChanged} (one slot, fired
+   * per slot and per liveness tick) this is a set and never fires from `tick`.
+   */
+  private readonly _bindingsChangedListeners = new Set<BindingsChangedListener>();
 
   constructor(store: SignalStore, registry: NodeRegistry) {
     this._store = store;
@@ -256,6 +270,24 @@ export class SignalBindingManager {
     if (this._elements.has(placedId)) return this._elements.get(placedId)!.slots;
     if (node) return resolveBindableSlots(node, this._store, this._registry, this.getElementScope(placedId));
     return [];
+  }
+
+  /**
+   * Subscribe to "the binding set of an element changed" (see
+   * {@link _bindingsChangedListeners}). The listener gets the mapping list the
+   * manager was just handed (`[]` after an unbindAll) — the state it installed,
+   * which a caller that persists AFTER applying has not written yet. Returns
+   * the unsubscribe.
+   */
+  addBindingsChangedListener(cb: BindingsChangedListener): () => void {
+    this._bindingsChangedListeners.add(cb);
+    return () => { this._bindingsChangedListeners.delete(cb); };
+  }
+
+  private _emitBindingsChanged(placedId: string, mappings: readonly SignalMapping[]): void {
+    for (const cb of [...this._bindingsChangedListeners]) {
+      try { cb(placedId, mappings); } catch (e) { console.warn('[SignalBindingManager] bindings-changed listener failed:', e); }
+    }
   }
 
   // ─── bind / unbind ───────────────────────────────────────────────────
@@ -452,6 +484,14 @@ export class SignalBindingManager {
 
   /** Unbind every slot of an element and forget it (relays + state). */
   unbindAll(placedId: string): void {
+    this._unbindAllSilent(placedId);
+    // Also without an element entry: an undo to an empty list must still let a
+    // listener clear what it derived from the previous binding set.
+    this._emitBindingsChanged(placedId, NO_MAPPINGS);
+  }
+
+  /** {@link unbindAll} without the bindings-changed notification (used by applyMappings). */
+  private _unbindAllSilent(placedId: string): void {
     const entry = this._elements.get(placedId);
     if (!entry) return;
     for (const binding of [...entry.bindings.values()]) {
@@ -484,13 +524,41 @@ export class SignalBindingManager {
    * gone" — had nothing on the screen to corroborate it.
    */
   applyMappings(placedId: string, node: Object3D, mappings: readonly SignalMapping[]): SignalMapping[] {
-    this.unbindAll(placedId);
+    this._unbindAllSilent(placedId);
     const entry = this._ensureElement(placedId, node);
+    const { applied, unresolved } = this._resolveMappings(entry.slots, mappings);
+    // Set unconditionally: an element that resolves cleanly must CLEAR a stale
+    // finding from an earlier load, or a repaired binding keeps being reported.
+    if (unresolved.length > 0) this._unresolved.set(placedId, unresolved);
+    else this._unresolved.delete(placedId);
+    for (const m of applied) this.bind(placedId, node, m);
+    this._emitBindingsChanged(placedId, mappings);
+    return applied;
+  }
+
+  /**
+   * What {@link applyMappings} WOULD bind, without binding anything and without
+   * touching the unresolved findings (plan-512). A caller that persists through
+   * a document op — whose executor does the real `applyMappings` — uses it to
+   * keep the unresolvable links of the same target (`mergeAppliedMappings`).
+   * Slots come from the element's cache, or a fresh side-effect-free resolve.
+   */
+  previewMappings(placedId: string, node: Object3D, mappings: readonly SignalMapping[]): SignalMapping[] {
+    const slots = this._elements.get(placedId)?.slots
+      ?? resolveBindableSlots(node, this._store, this._registry, this.getElementScope(placedId));
+    return this._resolveMappings(slots, mappings).applied;
+  }
+
+  /** The resolve loop shared by applyMappings and previewMappings — pure over `slots`. */
+  private _resolveMappings(
+    slots: readonly BindableSlot[],
+    mappings: readonly SignalMapping[],
+  ): { applied: SignalMapping[]; unresolved: UnresolvedMapping[] } {
     const applied: SignalMapping[] = [];
     const unresolved: UnresolvedMapping[] = [];
     for (const mapping of mappings) {
       const requestedKind = mapping.kind ?? 'mapped-signal';
-      const resolves = entry.slots.some((slot) =>
+      const resolves = slots.some((slot) =>
         slot.kind !== 'unavailable'
         && slot.kind === requestedKind
         && slot.slot === mapping.slot
@@ -502,7 +570,7 @@ export class SignalBindingManager {
       // Second pass (case B). It NEVER binds — `findRepairCandidate` returning a
       // path means "a human could confirm this", not "this is it". See
       // rv-binding-repair for why an apparently unique match is not proof.
-      const lookup = findRepairCandidate(mapping, entry.slots.filter(
+      const lookup = findRepairCandidate(mapping, slots.filter(
         (slot): slot is Exclude<BindableSlot, { kind: 'unavailable' }> =>
           slot.kind !== 'unavailable' && slot.kind === requestedKind));
       unresolved.push({
@@ -512,12 +580,7 @@ export class SignalBindingManager {
           : { reason: lookup.reason }),
       });
     }
-    // Set unconditionally: an element that resolves cleanly must CLEAR a stale
-    // finding from an earlier load, or a repaired binding keeps being reported.
-    if (unresolved.length > 0) this._unresolved.set(placedId, unresolved);
-    else this._unresolved.delete(placedId);
-    for (const m of applied) this.bind(placedId, node, m);
-    return applied;
+    return { applied, unresolved };
   }
 
   /**

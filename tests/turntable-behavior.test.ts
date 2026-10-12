@@ -191,11 +191,11 @@ function receiveFromInput(s: ReturnType<typeof setup>, i = 0): void {
 describe('Turntable behavior — hierarchy badge', () => {
   it('registers a TurntableBehavior badge capability', () => {
     const caps = getCapabilities('TurntableBehavior');
-    expect(caps.hierarchyVisible).toBe(true);
-    // plan-200 C1: marker section hidden in inspector; badge + filterLabel stay.
-    expect(caps.inspectorVisible).toBe(false);
-    expect(caps.filterLabel).toBe('Behavior');
-    expect(caps.badgeColor).toBe('#7e57c2');
+    expect(caps.ui.hidden).toBe(true);
+    // plan-200 C1: marker section hidden in inspector; badge + ui.filter stay.
+    expect(caps.pick).toBe('none');
+    expect(caps.ui.filter).toBe('Behavior');
+    expect(caps.ui.badge).toBe('#7e57c2');
   });
 
   it('stamps a TurntableBehavior marker with Drive + Sensor + Belt props', () => {

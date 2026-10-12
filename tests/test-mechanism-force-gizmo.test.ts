@@ -54,6 +54,7 @@ function snapshot(overrides: Partial<MechanismForcesSnapshot> = {}): MechanismFo
         originWorld: [4, 5, 6], axisWorld: [0, 1, 0],
       },
     ],
+    externalLoadN: [],
     ...overrides,
   };
 }

@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-annotate — label overlays for MCP screenshots (`web_screenshot_annotated`).
+ * rv-annotate — Set-of-Mark label overlays for the MCP capture tools.
  *
  * `projectLabelAnchors` is pure math (camera projection + crop/scale mapping)
  * so it is unit-testable without a renderer; `drawAnnotations` draws leader
@@ -11,6 +11,8 @@
 
 import { Vector3 } from 'three';
 import type { Camera } from 'three';
+import { somRadius } from './rv-som-math';
+import type { SomMark } from './rv-som-math';
 
 export interface LabelTarget {
   /** World-space anchor point (usually the node's bounds center). */
@@ -94,6 +96,68 @@ export function drawAnnotations(
     ctx.fillStyle = a.clamped ? '#ffd54f' : '#ffffff';
     ctx.fillText(a.label, bx + 7, by + ph / 2 + 1);
   }
+}
+
+/**
+ * Draw Set-of-Mark discs (plan-740 P2.4).
+ *
+ * Each mark is a filled disc in ITS GROUP'S idmask colour with a dark contrast
+ * ring and the number inside — the colour is what ties a number in the beauty
+ * image to the same number in the mask, which is the whole "number + colour
+ * area beats number alone" result the technique rests on.
+ *
+ * The digit switches between white and black by the disc's luminance rather
+ * than always being white, because the golden-angle palette runs through pale
+ * yellows where white-on-yellow is unreadable at 22 px.
+ *
+ * `colors` is indexed by `mark.groupIndex`; a missing entry falls back to the
+ * annotation accent, so a legend/mask mismatch degrades to a visible mark
+ * rather than to none.
+ */
+export function drawMarks(
+  ctx: CanvasRenderingContext2D,
+  marks: readonly SomMark[],
+  colors: ReadonlyArray<string>,
+  radius?: number,
+): void {
+  const r = radius ?? somRadius(ctx.canvas.width, ctx.canvas.height);
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `700 ${Math.round(r * 1.15)}px system-ui, sans-serif`;
+  for (const m of marks) {
+    const fill = colors[m.groupIndex] ?? '#4fc3f7';
+    if (m.leader) {
+      ctx.beginPath();
+      ctx.moveTo(m.leader[0], m.leader[1]);
+      ctx.lineTo(m.x, m.y);
+      ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.strokeStyle = fill;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+    ctx.stroke();
+    ctx.fillStyle = luminance(fill) > 0.55 ? '#000000' : '#ffffff';
+    ctx.fillText(String(m.n), m.x, m.y + 1);
+  }
+  ctx.restore();
+}
+
+/** Relative luminance of a `#rrggbb` string (Rec. 601, 0..1). */
+export function luminance(hex: string): number {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return 0;
+  const n = parseInt(m[1], 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  return 0.299 * r + 0.587 * g + 0.114 * b;
 }
 
 function roundRect(

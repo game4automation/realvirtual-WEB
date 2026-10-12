@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "id": "prj_community_first_project",
+  "name": "Community first project",
+  "canonicalName": "community-first-project",
+  "createdAt": "2026-09-16",
+  "activeSceneId": null,
+  "settings": {
+    "defaultModel": "triangle.glb"
+  },
+  "documents": [
+    {
+      "id": "doc_triangle_dkqhmg",
+      "name": "Community triangle",
+      "path": "triangle.glb",
+      "scriptRef": "plugins/counter.ts"
+    }
+  ]
+}

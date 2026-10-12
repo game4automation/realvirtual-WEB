@@ -110,6 +110,7 @@ function makeViewer(primaryPath: string | null = null) {
     viewer: {
       registry: {
         getNode: (path: string) => byPath[path] ?? null,
+        resolvePath: (path: string) => byPath[path] ?? null,
         getPathForNode: (n: Object3D) => pathByNode.get(n) ?? null,
       },
       selectionManager: {

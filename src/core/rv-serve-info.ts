@@ -13,6 +13,11 @@
  * The served DIRECTORY is the authority. Branch and plan number are derived
  * metadata: they can disagree with reality, the path cannot.
  *
+ * The served MACHINE is reported next to it, because the path alone stops
+ * being conclusive once a tunnel is involved: a forwarded port serves a remote
+ * dev server under the reader's own `localhost`, and two machines can hold the
+ * same checkout path. Only the serving side can answer this.
+ *
  * Injected at build time by Vite `define` (see vite.config.ts) and set to
  * `null` for every command except `serve` — so a production bundle contains
  * neither the badge nor any machine path. `vite preview` serves the built
@@ -25,6 +30,8 @@
 
 /** Shape of the injected constant. `null` outside the dev server. */
 export interface RVServeInfo {
+  /** Host name of the machine running this dev server. */
+  host: string;
   /** Absolute path of the directory Vite is serving. */
   root: string;
   /** Current git branch of that directory ("" if git is unavailable). */

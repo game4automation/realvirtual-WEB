@@ -45,7 +45,7 @@ import {
 } from '../src/core/hmi/scene/rv-scene-storage';
 import { sceneGlbFileNameFor, type RvProject } from '../src/core/project/rv-project-types';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import { revisionOfBytes } from '../src/core/project/rv-scene-record';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────

@@ -130,24 +130,17 @@ describe('RVTransportSurface — child-sensor geometry excluded from footprint',
     expect(surface.aabb.halfSize.x).toBeCloseTo(1.5, 3);
   });
 
-  it('excludes a baked raycast-BVH helper (it re-bundles belt + sensor geometry)', () => {
-    // The per-Drive raycast BVH bakes the whole drive subtree (belt + sensor)
-    // into one mesh under the surface; counting it would re-add the sensor.
-    const bvh = new Mesh(new BoxGeometry(3.0, 0.5, 0.2), new MeshBasicMaterial());
-    bvh.name = '__raycastBVH_Transport-Z';
-    bvh.userData._rvRaycastBVH = true;
-    const surface = makeSurfaceWithChild(bvh);
+  // plan-754: there is no longer an in-place variant that would DUPLICATE the
+  // belt geometry beside masked sources. A chunk is always the single carrier
+  // of what it absorbed, so it is always counted — main model and placement
+  // alike. (The deleted twin of this case asserted the opposite for the
+  // in-place bake.)
+  it('counts a chunk mesh — the chunk IS the geometry', () => {
+    const chunk = new Mesh(new BoxGeometry(3.0, 0.5, 0.2), new MeshBasicMaterial());
+    chunk.name = 'mover:Transport-Z';
+    chunk.userData._rvBakeChunk = true;
+    const surface = makeSurfaceWithChild(chunk);
     surface.updateAABB();
-    expect(surface.aabb.halfSize.x).toBeCloseTo(0.1, 3); // belt only, not 1.5
-    expect(surface.aabb.halfSize.y).toBeCloseTo(0.05, 3);
-  });
-
-  it('excludes a BatchedMesh render arena', () => {
-    const arena = new Mesh(new BoxGeometry(3.0, 0.5, 0.2), new MeshBasicMaterial());
-    arena.name = '__driveUberBatch_Transport-Z';
-    arena.userData._rvBatchedRender = true;
-    const surface = makeSurfaceWithChild(arena);
-    surface.updateAABB();
-    expect(surface.aabb.halfSize.x).toBeCloseTo(0.1, 3);
+    expect(surface.aabb.halfSize.x).toBeCloseTo(1.5, 3);
   });
 });

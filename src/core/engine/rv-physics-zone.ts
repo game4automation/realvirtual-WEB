@@ -35,8 +35,10 @@
 import { Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
 import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
-import type { AABB } from './rv-aabb';
+import { AABB } from './rv-aabb';
+import { getColliderExtras, isValidBoxDef } from './rv-collider-extras';
 import type { GizmoHandle, GizmoOverlayManager } from './rv-gizmo-manager';
+import { syncColliderGizmo } from './rv-collider-gizmo-sync';
 import type { PhysicsAABB, PhysicsZoneConfig } from './rv-physics-registry';
 
 // ─── Gizmo styling (plan-276 §3.2: cyan, semi-transparent wireframe) ───────
@@ -174,12 +176,16 @@ export class RVPhysicsZone implements RVComponent {
    *  null-check + one warning per missing entry in Phase 3 (F8). */
   StaticColliders: string[] = [];
 
-  /** Loader-provided box volume (BoxCollider extras / mesh bounds); `null`
-   *  when the loader AABB was degenerate (no volume information). */
-  private readonly _boxAabb: AABB | null;
+  /** Box volume (BoxCollider extras of the node — mesh bounds only when the
+   *  node carries no box); `null` when there is no volume information. Replaced
+   *  in place by {@link refreshBounds} (plan-525 §2.4b). */
+  private _boxAabb: AABB | null;
   /** Scene bounds snapshot for WholeScene zones (set by `applySceneBounds`). */
   private _sceneBounds: PhysicsAABB | null = null;
   private _registered = false;
+  /** `init()` ran (a zone ignored for lack of a volume registers once
+   *  {@link refreshBounds} gives it one). */
+  private _initialized = false;
   private _gizmo: GizmoHandle | null = null;
   private _gizmoManager: GizmoOverlayManager | null = null;
 
@@ -200,10 +206,13 @@ export class RVPhysicsZone implements RVComponent {
 
   init(ctx: ComponentContext): void {
     this.node.userData._rvType = 'WebPhysicsZone';
+    this._initialized = true;
+    if (ctx.gizmoManager) this._gizmoManager = ctx.gizmoManager;
 
     // Zone without a box volume AND without WholeScene: warning + ignored
     // (plan-276 §5.4). WholeScene zones register now (holding their F2 slot)
-    // and receive their volume later via applySceneBounds().
+    // and receive their volume later via applySceneBounds(). A box authored
+    // later (plan-525 `refreshBounds`) registers the zone then.
     if (!this.WholeScene && !this._boxAabb) {
       console.warn(
         `[WebPhysicsZone] "${this.node.name}": no BoxCollider extras and WholeScene=false — zone is ignored`,
@@ -217,6 +226,45 @@ export class RVPhysicsZone implements RVComponent {
     }
 
     if (ctx.gizmoManager) this.attachGizmo(ctx.gizmoManager);
+  }
+
+  /**
+   * Re-derive the box volume from EXPLICIT values (plan-525 §2.4b): the live
+   * `RVBoxCollider` fields during a handle preview, the persisted ones after a
+   * field edit / undo. `center` is node-local glTF (X already negated), metres;
+   * `size` metres. `null` (the node's BoxCollider was removed) or a degenerate
+   * size makes the zone inactive with one warning — undo restores it. The zone
+   * keeps its registration slot (F2 order) so an undo never reorders zones.
+   * The gizmo follows at once, no tick needed.
+   */
+  refreshBounds(
+    center: { x: number; y: number; z: number } | null,
+    size: { x: number; y: number; z: number } | null,
+  ): void {
+    if (!center || !size || !isValidBoxDef(center, size)) {
+      if (this._boxAabb) {
+        console.warn(`[WebPhysicsZone] "${this.node.name}": BoxCollider removed or degenerate — zone inactive`);
+      }
+      this._boxAabb = null;
+      this._disposeGizmo();
+      return;
+    }
+    const box = this._boxAabb;
+    if (box) {
+      box.localCenter.set(center.x, center.y, center.z);
+      box.halfSize.set(Math.abs(size.x) / 2, Math.abs(size.y) / 2, Math.abs(size.z) / 2);
+      this.node.updateWorldMatrix(true, false);
+      box.update();
+    } else {
+      this.node.updateWorldMatrix(true, false);
+      // fromBoxCollider takes the Unity-convention centre (it negates X itself).
+      this._boxAabb = AABB.fromBoxCollider(this.node, { x: -center.x, y: center.y, z: center.z }, size);
+    }
+    if (this._initialized && !this._registered) {
+      this._registered = true;
+      RVPhysicsZone.zones.push(this);
+    }
+    this._refreshGizmo();
   }
 
   /** True when this zone participates in overlap queries. */
@@ -270,6 +318,18 @@ export class RVPhysicsZone implements RVComponent {
   attachGizmo(gizmoManager: GizmoOverlayManager): void {
     this._gizmoManager = gizmoManager;
     this._refreshGizmo();
+    syncColliderGizmo(this.node);
+  }
+
+  /**
+   * Field edit on the live instance (inspector, editor `setField`, undo):
+   * `ShowGizmo` creates or removes the zone wireframe and shows / hides the
+   * BoxCollider box on the same node.
+   */
+  reapplyConfig(): void {
+    if (this.ShowGizmo) this._refreshGizmo();
+    else this._disposeGizmo();
+    syncColliderGizmo(this.node);
   }
 
   /** Show/hide the zone wireframe (Settings toggle, F13). */
@@ -307,9 +367,13 @@ export class RVPhysicsZone implements RVComponent {
     );
   }
 
-  dispose(): void {
+  private _disposeGizmo(): void {
     this._gizmo?.dispose();
     this._gizmo = null;
+  }
+
+  dispose(): void {
+    this._disposeGizmo();
     this._gizmoManager = null;
     if (this._registered) {
       this._registered = false;
@@ -317,6 +381,41 @@ export class RVPhysicsZone implements RVComponent {
       if (idx !== -1) RVPhysicsZone.zones.splice(idx, 1);
     }
   }
+}
+
+/**
+ * The zone volume of `node` (plan-525): the node's own BoxCollider wins — the
+ * rv-ODT contract says "the zone volume comes from the node's BoxCollider
+ * extras" — and the loader AABB (mesh bounds first) is only the fallback for a
+ * zone node without a box. Before plan-525 a zone on a MESH node took the mesh
+ * bounds even with a box authored, so the editor's box and the physics volume
+ * could disagree.
+ */
+function zoneVolumeOf(node: Object3D, loaderAabb: AABB | null): AABB | null {
+  for (const col of getColliderExtras(node)) {
+    if (col.kind !== 'box') continue;
+    node.updateWorldMatrix(true, false);
+    return AABB.fromBoxCollider(node, col.center, col.size);
+  }
+  return loaderAabb;
+}
+
+/**
+ * Push a box into the `WebPhysicsZone` of the node at `path`, if there is one
+ * (plan-525 §2.4b) — the ONE entry the `RVBoxCollider` live hook and the editor
+ * executors use. `center` node-local glTF metres, `size` metres; `null` = the
+ * node's BoxCollider is gone. Returns the zone, or null.
+ */
+export function syncPhysicsZoneBounds(
+  registry: { getByPath<T>(type: string, path: string): T | null },
+  path: string,
+  center: { x: number; y: number; z: number } | null,
+  size: { x: number; y: number; z: number } | null,
+): RVPhysicsZone | null {
+  const zone = registry.getByPath<RVPhysicsZone>('WebPhysicsZone', path);
+  if (!zone || typeof zone.refreshBounds !== 'function') return null;
+  zone.refreshBounds(center, size);
+  return zone;
 }
 
 // ─── Self-register for auto-discovery by the scene loader ───────────────────
@@ -329,11 +428,13 @@ registerComponent({
   schema: RVPhysicsZone.schema,
   needsAABB: true,
   capabilities: {
-    hoverable: false,
-    selectable: false,
-    badgeColor: '#26c6da', // cyan — matches the zone wireframe
+    pick: 'none',
+    // plan-525: addable in the asset editor. The editor adds a missing
+    // BoxCollider (1 x 1 x 1 m) on the same node in the same transaction.
+    authorable: true,
+    ui: { badge: '#26c6da' }, // cyan — matches the zone wireframe
   },
-  create: (node, aabb) => new RVPhysicsZone(node, aabb),
+  create: (node, aabb) => new RVPhysicsZone(node, zoneVolumeOf(node, aabb)),
   beforeSchema: (inst, extras) => {
     // rawFields capture (schema mapper has no string-array type) — see class note.
     (inst as RVPhysicsZone).StaticColliders = parseStaticColliderPaths(extras['StaticColliders']);

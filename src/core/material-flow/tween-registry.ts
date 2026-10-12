@@ -166,6 +166,12 @@ interface TweenRecord {
   writePolicy: TweenWritePolicy;
   /** Scalar interpolation profile (DRIVE only; other kinds stay linear). */
   ease: TweenEase;
+  /**
+   * plan-558: optional arc-address sampler for PATH records — the motion
+   * profile position (m) at sim time t. When set, it replaces the linear
+   * `fromS → toS` lerp (accelerating / braking vehicles).
+   */
+  sAt: ((t: number) => number) | null;
 }
 
 /** Module-level interpolation scratch — reused every record, every frame (V3). */
@@ -269,6 +275,7 @@ export class TweenRegistry {
     duration: number,
     muId = -1,
     pathRef = '',
+    sAt: ((t: number) => number) | null = null,
   ): TweenHandle {
     if (!sampler || (!target && muId < 0)) return -1;
     const idx = this._rent();
@@ -284,6 +291,7 @@ export class TweenRegistry {
     r.fromScalar = Number.isFinite(fromS) ? fromS : 0;
     r.toScalar = Number.isFinite(toS) ? toS : 0;
     r.muId = muId;
+    r.sAt = sAt;
     this._active.push(idx);
     return this._encode(idx, r.gen);
   }
@@ -350,16 +358,21 @@ export class TweenRegistry {
    * slower factor is clean (the running tweens then self-correct on the first frame).
    * Skipping the final write too (the old behaviour) stranded finished parts at stale
    * positions — the "wrong animation when leaving FF".
+   *
+   * Returns true when at least one transform was written. The viewer renders on
+   * demand, so the caller must mark the frame dirty — otherwise the parts move
+   * in the scene graph but the screen only repaints on the next user input.
    */
   onRender(
     simNow: number,
     subMode: TweenSubMode,
     ffActive = subMode === 'fastforward',
-  ): void {
+  ): boolean {
     this._ffActive = ffActive;
     const noWrite = subMode === 'fastforward';
     const active = this._active;
     let write = 0; // compaction write cursor
+    let wrote = false;
 
     for (let read = 0; read < active.length; read++) {
       const idx = active[read];
@@ -372,6 +385,7 @@ export class TweenRegistry {
         && !finished
         && (simNow < r.t0 || ffActive);
       if ((!noWrite && !policySuppressesWrite) || finished) {
+        wrote = true;
         const rawP = finished ? 1 : MathUtils.clamp((simNow - r.t0) / (r.t1 - r.t0), 0, 1);
         const p = r.ease === 'scurve' ? rawP * rawP * (3 - 2 * rawP) : rawP;
         if (r.kind === 'pos' && r.posTarget) {
@@ -382,7 +396,9 @@ export class TweenRegistry {
         } else if (r.kind === 'path' && r.posTarget && r.pathSampler) {
           // Arc-length sampling (plan-268 Phase 3): lerp the arc ADDRESS, then
           // sample the position from the path — constant speed on curves.
-          const s = r.fromScalar + (r.toScalar - r.fromScalar) * p;
+          const s = r.sAt
+            ? r.sAt(finished ? r.t1 : Math.min(Math.max(simNow, r.t0), r.t1))
+            : r.fromScalar + (r.toScalar - r.fromScalar) * p;
           r.pathSampler.getAbsPosition(s, _scratch);
           r.posTarget.setPosition(_scratch);
           // Optional pose: orient along the tangent when both sides support it
@@ -407,6 +423,7 @@ export class TweenRegistry {
     }
 
     active.length = write;
+    return wrote;
   }
 
   /**
@@ -520,7 +537,8 @@ export class TweenRegistry {
     if (!best) return false;
     const p = MathUtils.clamp((simNow - best.t0) / Math.max(0.001, best.t1 - best.t0), 0, 1);
     if (best.kind === 'path' && best.pathSampler) {
-      const s = best.fromScalar + (best.toScalar - best.fromScalar) * p;
+      const s = best.sAt ? best.sAt(Math.min(Math.max(simNow, best.t0), best.t1))
+        : best.fromScalar + (best.toScalar - best.fromScalar) * p;
       best.pathSampler.getAbsPosition(s, out);
     } else {
       out.lerpVectors(best.fromVec, best.toVec, p);
@@ -613,7 +631,7 @@ export class TweenRegistry {
         posTarget: null, driveTarget: null, pathSampler: null, pathRef: '',
         fromVec: new Vector3(), toVec: new Vector3(),
         fromScalar: 0, toScalar: 0, muId: -1, gen: 0,
-        writePolicy: 'always', ease: 'linear',
+        writePolicy: 'always', ease: 'linear', sAt: null,
       });
       this._free.push(start + i);
     }
@@ -637,6 +655,7 @@ export class TweenRegistry {
     r.muId = -1;
     r.writePolicy = 'always';
     r.ease = 'linear';
+    r.sAt = null;
     r.gen++;
     this._free.push(idx);
   }
@@ -662,7 +681,8 @@ export class TweenRegistry {
     } else if (r.kind === 'drive' && r.driveTarget) {
       r.driveTarget.setPosition(r.fromScalar + (r.toScalar - r.fromScalar) * p);
     } else if (r.kind === 'path' && r.posTarget && r.pathSampler) {
-      const s = r.fromScalar + (r.toScalar - r.fromScalar) * p;
+      const s = r.sAt ? r.sAt(r.t0 + (r.t1 - r.t0) * p)
+        : r.fromScalar + (r.toScalar - r.fromScalar) * p;
       r.pathSampler.getAbsPosition(s, _scratch);
       r.posTarget.setPosition(_scratch);
       const tgt = r.posTarget as PathTweenTarget;

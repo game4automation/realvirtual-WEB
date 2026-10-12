@@ -60,6 +60,8 @@ const ACCUM_CONTACT_EPS = 1e-4;
  * tools) need no manager and no changes.
  */
 export interface IAccumulationQuery {
+  /** Optional physical obstacles participating in the same contact clamp. */
+  clampStopperTravel?(mu: RVMovingUnit | InstancedMovingUnit, direction: Vector3, distance: number): number;
   /**
    * Collect candidate MUs ahead of `mu` along `moveDir` (world, unit, SIGNED
    * move direction) within `lookahead` metres beyond the MU's AABB, into the
@@ -631,19 +633,6 @@ export class RVTransportSurface implements RVComponent {
     return node.userData?.realvirtual?.Sensor != null;
   }
 
-  /** Baked geometry duplicates created by the raycast-BVH / merge passes
-   *  (`__raycastBVH_*`, `__kinGroupMerge_*`, static-uber merges). They bundle the
-   *  WHOLE drive subtree — including the sensor — into one child of the surface,
-   *  so counting them would re-add the sensor geometry the sensor-prune already
-   *  removed. The original source meshes (hidden by the merge, but with geometry
-   *  intact) are still traversed, so the real belt bounds are unaffected. These
-   *  helpers are built AFTER init, so excluding them also makes the bounds
-   *  order-independent (correct whether computed before or after those passes). */
-  private _isBakedHelper(node: Object3D): boolean {
-    const ud = node.userData;
-    return !!(ud && (ud._rvRaycastBVH || ud._rvBatchedRender));
-  }
-
   /** Accumulate the local-frame AABB of all mesh descendants, PRUNING any
    *  subtree whose root satisfies `prune` or is a baked grouping helper (the
    *  surface node itself is never pruned). Returns null if no mesh geometry found. */
@@ -654,7 +643,10 @@ export class RVTransportSurface implements RVComponent {
     const tmp = new Box3();
     let found = false;
     const visit = (obj: Object3D) => {
-      if (obj !== this.node && (this._isBakedHelper(obj) || prune(obj))) return; // skip this subtree
+      // plan-754: no baked-helper carve-out. The in-place bake used to leave
+      // DUPLICATE chunk meshes beside their masked sources, which had to be
+      // skipped here; a chunk is now the single carrier of its geometry.
+      if (obj !== this.node && prune(obj)) return; // skip this subtree
       const mesh = obj as Mesh;
       if (mesh.isMesh && mesh.geometry) {
         if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
@@ -760,8 +752,10 @@ export class RVTransportSurface implements RVComponent {
   /** Current transport speed in mm/s from the associated Drive */
   get speed(): number {
     if (!this.drive) return 0;
-    // Use drive's actual current speed (respects acceleration ramps)
-    return this.drive.currentSpeed;
+    // Signed actual speed (respects acceleration ramps): a belt driven backward
+    // with DriveTo transports backward, as in Unity. Plain `{ currentSpeed }`
+    // drive stand-ins (tests, planner mocks) have no signedSpeed.
+    return this.drive.signedSpeed ?? this.drive.currentSpeed;
   }
 
   /** Is the surface actively transporting? (either direction — a reversed belt
@@ -905,6 +899,11 @@ export class RVTransportSurface implements RVComponent {
           const allowed = Math.max(0, minFrontGap - minGapM - ACCUM_CONTACT_EPS);
           mu.blocked = allowed < moveDist;
           if (mu.blocked) moveDist = allowed;
+        }
+        const stopperDistance = this.accumulationProvider.clampStopperTravel?.(mu, _accumDir, moveDist) ?? moveDist;
+        if (stopperDistance < moveDist) {
+          mu.blocked = true;
+          moveDist = stopperDistance;
         }
       }
 
@@ -1147,8 +1146,14 @@ registerComponent({
   needsAABB: true,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    badgeColor: '#ffa726',
-    filterLabel: 'Conveyors',
+    // 'chunk' (plan-753 F6): the surface moves as one unit and gets its own
+    // chunk in the new bake. Belt meshes with a scrollable `map` stay
+    // individual at MESH level (`cloneScrollableMaps` clones the map per
+    // instance and scrolls its offset) — see `isMeshLevelKeep` in
+    // rv-bake-pipeline.ts. The OLD pipelines keep treating the type as `keep`
+    // via `LEGACY_KEEP_OVERRIDE` (rv-freeze-static.ts) until plan-753 Phase 4b removed it.
+    bake: 'chunk',
+    ui: { badge: '#ffa726', filter: 'Conveyors', category: 'transport' },
   },
   create: (node, aabb) => new RVTransportSurface(node, aabb!),
   beforeSchema: (inst, extras) => {

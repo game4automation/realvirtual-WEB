@@ -21,6 +21,8 @@
  *   }
  */
 
+import type { DocumentHandle } from '../editor/rv-editor-guard-core';
+
 // ── Metadata types ──
 
 export interface ToolEntry {
@@ -38,6 +40,8 @@ export interface ToolEntry {
   readOnly?: boolean;
   /** Irreversibility hint; drives `annotations.destructiveHint` in discover. */
   destructive?: boolean;
+  /** plan-499: the command(s) this tool is a view of (metadata only, not on the wire). */
+  command?: ToolCommandBinding;
 }
 
 export interface ParamEntry {
@@ -154,6 +158,111 @@ export interface McpToolOptions {
    * write is not, and marking them all would say nothing.
    */
   destructive?: boolean;
+  /**
+   * plan-499: the command (rv-command-registry) this tool body dispatches —
+   * a command id for a 1:1 tool (the wire args ARE the command args), or a
+   * branch table for a multiplexer (`web_editor_pivot`, `web_editor_shortcut`).
+   * Metadata only — never announced to the client. The bridge resolves it ONCE
+   * per call ({@link resolveBinding}) before any choreography, and hands the
+   * result to the body as the trailing `McpCallContext` argument.
+   */
+  command?: ToolCommandBinding;
+}
+
+// ── Command bindings (plan-499) ──
+
+/**
+ * One branch of a multiplexer binding: which wire values select it, which
+ * command it dispatches and how the WIRE params become the COMMAND args.
+ *
+ * WIRE params = the tool's `@McpParam` definitions; COMMAND args = the object
+ * the command's `run()` receives. A branch is the transformation between them.
+ */
+export interface BindingBranch {
+  /** Wire values (after `normalize`) that select this branch, e.g. `{ mode: 'bottom' }`. `{}` = always. */
+  readonly when: Readonly<Record<string, string>>;
+  /** Command id. */
+  readonly id: string;
+  /**
+   * Wire -> command args. Applies defaults. THROWS (with the param name in the
+   * message) when a value listed in `requires` is missing — the binding then
+   * resolves to a refusal and nothing is dispatched.
+   */
+  readonly args: (wire: Readonly<Record<string, unknown>>) => unknown;
+  /** Wire params this branch needs beyond the tool's required ones (e.g. `targetPath`). */
+  readonly requires?: readonly string[];
+  /** Target button for choreography + afterglow; default: the command's own `buttonKey(args)`. */
+  readonly buttonKey?: string | ((wire: Readonly<Record<string, unknown>>) => string | null);
+}
+
+/** A branch table. `normalize` maps the raw wire once (case, aliases) before `when` is matched. */
+export interface BranchBinding {
+  readonly branches: readonly BindingBranch[];
+  readonly normalize?: (wire: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>;
+}
+
+export type ToolCommandBinding = string | BranchBinding;
+
+/** What ONE resolution of a binding produced for one call. */
+export interface ResolvedBinding {
+  /** The chosen command, or null (unbound / no branch matched / a required value is missing). */
+  readonly bound: { readonly id: string; readonly args: unknown; readonly buttonKey: string | null } | null;
+  /** Why `bound` is null when a branch matched but refused (missing required value). */
+  readonly refusal: string | null;
+}
+
+/** Missing-value test shared by the branch tables and the parity gate. */
+export function isMissingWireValue(v: unknown): boolean {
+  return v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+}
+
+/**
+ * Resolve a tool's binding against the call's wire args — THE one resolution
+ * (plan-499 F15). A 1:1 binding passes the wire through; a branch table picks
+ * the first branch whose `when` matches and transforms. `buttonKey` stays null
+ * when the branch does not name one — the registry then asks the command's
+ * own `buttonKey(args)`.
+ */
+export function resolveBinding(
+  binding: ToolCommandBinding | undefined,
+  wire: Readonly<Record<string, unknown>>,
+): ResolvedBinding {
+  if (!binding) return { bound: null, refusal: null };
+  if (typeof binding === 'string') {
+    return { bound: { id: binding, args: { ...wire }, buttonKey: null }, refusal: null };
+  }
+  const w = binding.normalize ? binding.normalize(wire) : wire;
+  for (const br of binding.branches) {
+    const match = Object.entries(br.when).every(([k, v]) => String(w[k] ?? '') === v);
+    if (!match) continue;
+    let args: unknown;
+    try {
+      args = br.args(w);
+    } catch (e) {
+      return { bound: null, refusal: e instanceof Error ? e.message : String(e) };
+    }
+    const bk = typeof br.buttonKey === 'function' ? br.buttonKey(w) : (br.buttonKey ?? null);
+    return { bound: { id: br.id, args, buttonKey: bk }, refusal: null };
+  }
+  return { bound: null, refusal: null };
+}
+
+/**
+ * The per-call context the bridge builds ONCE, before any wait, and appends as
+ * the LAST argument of `method.apply` (plan-499 F21). Bound tool bodies take it
+ * as an optional trailing `ctx?: McpCallContext` and dispatch it unchanged —
+ * no second resolution, no global hand-off.
+ */
+export interface McpCallContext {
+  readonly callId: string;
+  /** The one binding resolution; null = unbound tool or no branch. */
+  readonly bound: ResolvedBinding['bound'];
+  /** Refusal of a matched branch (missing required value), else null. */
+  readonly refusal: string | null;
+  /** Document identity at call begin (R5), null outside a document. */
+  readonly handle: DocumentHandle | null;
+  /** Selection at call begin. */
+  readonly selection: readonly string[];
 }
 
 /**
@@ -186,8 +295,20 @@ export function McpTool(description: string, options?: McpToolOptions) {
       ...(options?.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
       ...(options?.readOnly === undefined ? {} : { readOnly: options.readOnly }),
       ...(options?.destructive ? { destructive: true } : {}),
+      ...(options?.command ? { command: options.command } : {}),
     });
   };
+}
+
+/** plan-499: the raw tool entries of a decorated instance (parity gate, standalone binding). */
+export function listToolEntries(instance: object): readonly ToolEntry[] {
+  const proto = Object.getPrototypeOf(instance);
+  return (proto as Record<symbol, ToolEntry[]>)[TOOL_META_KEY] ?? [];
+}
+
+/** plan-499: the entry of one decorated method, by method name. */
+export function getToolEntry(instance: object, methodKey: string): ToolEntry | undefined {
+  return listToolEntries(instance).find((e) => e.methodKey === methodKey);
 }
 
 /**
@@ -257,14 +378,16 @@ export function generateToolSchemas(instance: object): ToolSchema[] {
 export function buildToolDispatcher(instance: object): Map<string, {
   methodKey: string;
   paramNames: string[];
+  command?: ToolCommandBinding;
 }> {
   const proto = Object.getPrototypeOf(instance);
   const entries: ToolEntry[] = (proto as Record<symbol, ToolEntry[]>)[TOOL_META_KEY] ?? [];
-  const map = new Map<string, { methodKey: string; paramNames: string[] }>();
+  const map = new Map<string, { methodKey: string; paramNames: string[]; command?: ToolCommandBinding }>();
   for (const entry of entries) {
     map.set(entry.name, {
       methodKey: entry.methodKey,
       paramNames: entry.params.map((p) => p.name),
+      ...(entry.command ? { command: entry.command } : {}),
     });
   }
   return map;
@@ -304,8 +427,9 @@ export function buildMultiDispatcher(instances: readonly object[]): Map<string, 
   instance: object;
   methodKey: string;
   paramNames: string[];
+  command?: ToolCommandBinding;
 }> {
-  const map = new Map<string, { instance: object; methodKey: string; paramNames: string[] }>();
+  const map = new Map<string, { instance: object; methodKey: string; paramNames: string[]; command?: ToolCommandBinding }>();
   for (const instance of instances) {
     for (const [name, entry] of buildToolDispatcher(instance)) {
       if (map.has(name)) {

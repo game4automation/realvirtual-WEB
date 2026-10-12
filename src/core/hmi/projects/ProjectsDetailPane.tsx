@@ -385,6 +385,9 @@ export function ProjectsDetailPane({
             }}
           >
             {editValue !== null ? (
+              <Box sx={{ width: '100%', py: 1 }} onBlur={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setEditValue(null);
+              }}>
               <TextField
                 autoFocus
                 fullWidth
@@ -402,12 +405,16 @@ export function ProjectsDetailPane({
                   if (e.key === 'Enter') commitRename();
                   if (e.key === 'Escape') setEditValue(null);
                 }}
-                // Blur cancels rather than commits: a stray click elsewhere
-                // must never rename a file as a side effect.
-                onBlur={() => setEditValue(null)}
                 slotProps={{ input: { sx: { fontSize: 12, fontWeight: 600, height: 24 } } }}
                 inputProps={{ 'aria-label': 'Rename' }}
               />
+              <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+                <Button size="small" variant="contained" onClick={commitRename}
+                  disabled={!editValue.trim()} sx={{ textTransform: 'none' }}>Save name</Button>
+                <Button size="small" onClick={() => setEditValue(null)}
+                  sx={{ textTransform: 'none' }}>Cancel</Button>
+              </Stack>
+              </Box>
             ) : (
               <Typography
                 // A CLICK edits — the name IS the field, not a label with a

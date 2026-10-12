@@ -49,7 +49,8 @@ const PACKAGE_FIXTURE = resolve(
   'Packages', 'io.realvirtual.professional', 'Tests', 'EditMode', 'Ribbon', 'ribbon-vectors.json',
 );
 
-const MODULES = ['ribbon-geometry', 'ribbon-winder-math', 'ribbon-dancer-math'];
+const MODULES = ['ribbon-geometry', 'ribbon-winder-math', 'ribbon-dancer-math',
+  'ribbon-tension-math', 'ribbon-sag-math'];
 
 /** Transpile the three portable modules and import them. */
 async function loadRibbonModules() {
@@ -69,6 +70,18 @@ async function loadRibbonModules() {
 /** A circle literal, spelled the way both ports read it. */
 function circle(cx, cy, r, side) {
   return { cx, cy, r, side };
+}
+
+/**
+ * The same circle with a plan-468 end wrap on it, in RADIANS.
+ *
+ * It is a separate helper rather than a sixth parameter of {@link circle} so
+ * every pre-468 case keeps serialising WITHOUT a `wrapRad` key — which is what
+ * makes their fixture entries byte-identical to the ones the C# side already
+ * reads (a `"wrapRad": null` on 20 cases would be a diff with no meaning).
+ */
+function wrapped(c, wrapDeg) {
+  return { ...c, wrapRad: (wrapDeg * Math.PI) / 180 };
 }
 
 /** Round-trip a value through JSON so the fixture holds exactly what a reader sees. */
@@ -134,6 +147,18 @@ function buildSegmentCases(geometry) {
     ['s-wrap-explicit', [circle(0, 0, 200, 1), circle(900, 0, 120, -1), circle(1800, 0, 200, 1)]],
     ['auto-everything', [circle(0, 0, 250, 0), circle(1100, 450, 90, 0), circle(2300, -450, 90, 0), circle(3300, 0, 250, 0)]],
     ['tight-wrap', [circle(0, 0, 60, 1), circle(300, 260, 60, 0), circle(600, 0, 60, 1)]],
+    // plan-468 end wraps. The three shapes a port can get wrong independently:
+    // the PRE-arc's `a0 = a1 - side*wrapRad` on a CCW end, the POST-arc's sweep
+    // sign on a CW one, and both at once on a chain that also has an inner arc.
+    ['start-wrap-left', [wrapped(circle(0, 0, 400, 1), 270), circle(2000, 0, 150, 1)]],
+    ['end-wrap-right', [circle(0, 0, 200, -1), wrapped(circle(2000, 0, 90, -1), 270)]],
+    ['both-ends-wrapped', [
+      wrapped(circle(0, 0, 450, 1), 180), circle(1500, 600, 100, 0),
+      wrapped(circle(3400, 0, 190, 1), 90),
+    ]],
+    // Over a full turn: the sweep is NOT normalised into [0, 2pi) — the inner-arc
+    // rule would fold 450 deg back to 90 and lose a whole lap of paper.
+    ['start-wrap-over-full-turn', [wrapped(circle(0, 0, 300, -1), 450), circle(2500, 400, 120, -1)]],
     // Errors
     ['too-few-rollers', [circle(0, 0, 100, 1)]],
     ['non-positive-radius', [circle(0, 0, 100, 1), circle(900, 0, 0, 1)]],
@@ -286,12 +311,259 @@ function buildDancerCases(dancer) {
   return { strands, accumulate, position, clamp };
 }
 
+
+/**
+ * Like {@link num}, but collapses a NEGATIVE ZERO onto `+0`.
+ *
+ * `-0` and `0` serialise to the same JSON text but are NOT `Object.is`-equal, so the
+ * drift test comparing a freshly built payload against the parsed file fails on a
+ * value it cannot even show as different. `f'(1)` of the sag profile produces one.
+ */
+function numz(value) {
+  if (!Number.isFinite(value)) return null;
+  return value === 0 ? 0 : value;
+}
+
+/** The thresholds a `classify` / `bandDeviation` case runs against. */
+function thresholds(minStrain, maxStrain, breakStrain, refStrain, tolerance) {
+  return { minStrain, maxStrain, breakStrain, refStrain, tolerance };
+}
+
+/**
+ * The tension mathematics (plan-471): the steady state, the implicit step INCLUDING
+ * its stability branch, the two force conversions, the classification at every
+ * threshold, the band deviation and the unit conversions.
+ */
+function buildTensionCases(tension) {
+  const steady = [
+    [0.01, 800, 784], [0.01, 800, 816], [0.01, 800, 800], [0.01, 800, 900],
+    [0, 800, 800], [0.02, 0, 500], [-0.005, 600, 620],
+    // Undefined: a stopped or reversed exit has no stationary solution.
+    [0.01, 800, 0], [0.01, 800, -400], [Number.NaN, 800, 784],
+  ].map(([epsIn, vA, vB]) => ({
+    epsIn: numz(epsIn), vA, vB, eps: numz(tension.strainSteadyState(epsIn, vA, vB)),
+  }));
+
+  // A SERIES rather than a single step: the whole point of the implicit form is what it
+  // does over many ticks, and the stability row (L = 1 mm, vB = 1000 mm/s, dt = 0.02 s,
+  // i.e. dt*vB/L = 20) is exactly where the explicit form blows up.
+  const step = [
+    ['converging-slack', 0.01, 0.01, 800, 784, 800, 0.02, 20],
+    ['converging-taut', 0.01, 0.01, 800, 816, 800, 0.02, 20],
+    ['stability-short-zone', 0.01, 0.01, 800, 1000, 1, 0.02, 10],
+    ['standing-web-keeps-strain', 0.013, 0.01, 0, 0, 500, 0.02, 5],
+    ['backwards-freezes', 0.013, 0.01, 800, -100, 500, 0.02, 3],
+    ['paused-frame', 0.013, 0.01, 800, 700, 500, 0, 3],
+    ['zero-length', 0.013, 0.01, 800, 700, 0, 0.02, 3],
+    ['entering-strain-passes-through', 0, 0.02, 500, 500, 250, 0.02, 15],
+  ].map(([name, eps0, epsIn, vA, vB, lengthMm, dt, steps]) => {
+    const results = [];
+    let eps = eps0;
+    for (let i = 0; i < steps; i++) {
+      eps = tension.strainStepImplicit(eps, epsIn, vA, vB, lengthMm, dt);
+      results.push(numz(eps));
+    }
+    return { name, eps0, epsIn, vA, vB, lengthMm, dt, steps, results };
+  });
+
+  const fromStrain = [
+    [10, 500, 0.01], [10, 500, 0], [10, 500, -0.02], [0, 500, 0.01], [10, 0, 0.01],
+    [2.5, 1200, 0.035],
+  ].map(([stiffness, widthMm, eps]) => ({
+    stiffness, widthMm, eps, tensionN: numz(tension.tensionFromStrain(stiffness, widthMm, eps)),
+  }));
+
+  const fromTension = [
+    [50, 10, 500], [0, 10, 500], [-25, 10, 500], [50, 0, 500], [50, 10, 0], [42, 2.5, 1200],
+  ].map(([tensionN, stiffness, widthMm]) => ({
+    tensionN, stiffness, widthMm, eps: numz(tension.strainFromTension(tensionN, stiffness, widthMm)),
+  }));
+
+  const dancerLoad = [
+    [100, 2], [100, 1], [100, 3], [0, 2], [-50, 2], [100, 0], [100, 0.5],
+  ].map(([loadN, strands]) => ({
+    loadN, strands, tensionN: numz(tension.tensionFromDancerLoad(loadN, strands)),
+  }));
+
+  const band = thresholds(0, 0.02, 0.07, 0.01, 0.1);
+  const noBreak = thresholds(0, 0.02, Number.POSITIVE_INFINITY, 0.01, 0.1);
+  const zeroTolerance = thresholds(0, 0.02, 0.07, 0.01, 0);
+  // Every threshold from both sides, plus the ordering rule (broken outranks over).
+  const classify = [
+    ['far-slack', -0.02, band], ['just-slack', -1e-9, band], ['at-min', 0, band],
+    ['below-band', 0.005, band], ['at-band-low', 0.009, band], ['in-band-low', 0.0091, band],
+    ['at-ref', 0.01, band], ['in-band-high', 0.0109, band], ['at-band-high', 0.011, band],
+    ['above-band', 0.015, band], ['at-max', 0.02, band], ['just-over', 0.0200001, band],
+    ['far-over', 0.05, band], ['at-break', 0.07, band], ['past-break', 0.09, band],
+    ['break-disabled', 0.5, noBreak], ['zero-tolerance-at-ref', 0.01, zeroTolerance],
+    ['zero-tolerance-below', 0.0099, zeroTolerance], ['nan', Number.NaN, band],
+  ].map(([name, eps, t]) => ({
+    name, eps: numz(eps), thresholds: { ...t, breakStrain: numz(t.breakStrain) },
+    state: tension.classify(eps, t),
+  }));
+
+  const deviation = [
+    ['in-band', 0.01, band], ['at-band-low', 0.009, band], ['halfway-down', 0.0045, band],
+    ['at-min', 0, band], ['past-min', -0.01, band], ['at-band-high', 0.011, band],
+    ['halfway-up', 0.0155, band], ['at-max', 0.02, band], ['past-max', 0.04, band],
+    ['zero-span-low', 0.005, thresholds(0.009, 0.02, 0.07, 0.01, 0.1)],
+    ['zero-span-high', 0.05, thresholds(0, 0.011, 0.07, 0.01, 0.1)],
+    ['nan', Number.NaN, band],
+  ].map(([name, eps, t]) => ({
+    name, eps: numz(eps), thresholds: { ...t, breakStrain: numz(t.breakStrain) },
+    deviation: numz(tension.bandDeviation(eps, t)),
+  }));
+
+  const specific = [
+    [50, 500], [50, 1000], [0, 500], [50, 0], [17.51, 50],
+  ].map(([tensionN, widthMm]) => {
+    const nPerM = tension.specificTension(tensionN, widthMm);
+    return {
+      tensionN, widthMm, nPerM: numz(nPerM), pli: numz(tension.pliFromNPerM(nPerM)),
+    };
+  });
+
+  const tenacity = [
+    [100, 20], [100, 0], [100, 60], [0, 20],
+  ].map(([nPerM, basisWeightGsm]) => ({
+    nPerM, basisWeightGsm, nmPerKg: numz(tension.specificTenacity(nPerM, basisWeightGsm)),
+  }));
+
+  const breakStrain = [
+    [35, 10], [35, 0], [0, 10], [-5, 10], [120, 2.5],
+  ].map(([breakForceNPer50mm, stiffness]) => ({
+    breakForceNPer50mm, stiffness,
+    // Infinity does not survive JSON: `null` is the fixture spelling of "breaking disabled".
+    eps: numz(tension.breakStrain(breakForceNPer50mm, stiffness)),
+  }));
+
+  return {
+    nPerMPerPli: tension.N_PER_M_PER_PLI,
+    minZoneLengthMm: tension.MIN_ZONE_LENGTH_MM,
+    strainSteadyState: steady,
+    strainStepImplicit: step,
+    tensionFromStrain: fromStrain,
+    strainFromTension: fromTension,
+    tensionFromDancerLoad: dancerLoad,
+    classify,
+    bandDeviation: deviation,
+    specificTension: specific,
+    specificTenacity: tenacity,
+    breakStrain,
+  };
+}
+
+/** A plain 3-vector, spelled the way both ports read it. */
+function vec(x, y, z) {
+  return { x, y, z };
+}
+
+/**
+ * The sag mathematics (plan-471 Phase 4): the profile and its derivative at fixed
+ * support points, the depth/excess round trip including the `L/2` cap, the
+ * perpendicular gravity for a horizontal, an oblique and a VERTICAL run, the
+ * proportional excess split and the analytic tangent.
+ */
+function buildSagCases(sag) {
+  const supports = [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1];
+  const profile = [];
+  for (const depthMm of [12, 0, -8, 250]) {
+    for (const s of supports) {
+      profile.push({
+        s, depthMm,
+        f: numz(sag.sagProfile(s, depthMm)),
+        fPrime: numz(sag.sagProfileDerivative(s, depthMm)),
+      });
+    }
+  }
+
+  const depth = [
+    [2, 800], [0.2, 800], [50, 800], [0, 800], [-5, 800], [2, 0],
+    // Past the cap: the quartic would be a loop, so the depth stops at L / 2.
+    [4000, 800], [800, 200],
+  ].map(([excessMm, lengthMm]) => ({
+    excessMm, lengthMm, depthMm: numz(sag.sagDepth(excessMm, lengthMm)),
+  }));
+
+  const excess = [
+    [25, 800], [0, 800], [-25, 800], [400, 800], [25, 0],
+  ].map(([depthMm, lengthMm]) => ({
+    depthMm, lengthMm, excessMm: numz(sag.sagExcess(depthMm, lengthMm)),
+  }));
+
+  const estimated = [
+    [0, 800], [135.9, 800], [136.1, 800], [-200, 800], [100, 0],
+  ].map(([depthMm, lengthMm]) => ({
+    depthMm, lengthMm, estimated: sag.isSagEstimated(depthMm, lengthMm),
+  }));
+
+  const gravity = [
+    ['horizontal-run', vec(0, -9810, 0), vec(1, 0, 0)],
+    ['oblique-run', vec(0, -9810, 0), vec(0.6, 0.8, 0)],
+    ['vertical-run', vec(0, -9810, 0), vec(0, 1, 0)],
+    ['vertical-run-down', vec(0, -9810, 0), vec(0, -1, 0)],
+    ['unnormalised-chord', vec(0, -9810, 0), vec(0, 0, 250)],
+    ['degenerate-chord', vec(0, -9810, 0), vec(0, 0, 0)],
+    ['rotated-frame', vec(6937.2, -6937.2, 0), vec(0, 0, 1)],
+  ].map(([name, g, chord]) => {
+    const out = { x: 0, y: 0, z: 0 };
+    const length = sag.perpGravity(g, chord, out);
+    return { name, g, chord, length: numz(length), dir: { x: numz(out.x), y: numz(out.y), z: numz(out.z) } };
+  });
+
+  const distribute = [
+    ['equal-thirds', [100, 100, 100], 30],
+    ['proportional', [100, 300], 40],
+    ['with-arcs', [250, 0, 150, 0, 600], 80],
+    ['single', [800], 12],
+    ['zero-excess', [100, 200], 0],
+    ['all-empty', [0, 0], 12],
+    ['empty-list', [], 12],
+  ].map(([name, lengthsMm, excessMm]) => {
+    const out = new Array(lengthsMm.length).fill(0);
+    const written = sag.distributeExcess(lengthsMm, excessMm, out);
+    return { name, lengthsMm, excessMm, written, shares: out.map((v) => numz(v)) };
+  });
+
+  const tangent = [
+    ['start', vec(0, 0, 1), vec(0, -1, 0), 0, 40, 800],
+    ['quarter', vec(0, 0, 1), vec(0, -1, 0), 0.25, 40, 800],
+    ['middle', vec(0, 0, 1), vec(0, -1, 0), 0.5, 40, 800],
+    ['three-quarter', vec(0, 0, 1), vec(0, -1, 0), 0.75, 40, 800],
+    ['end', vec(0, 0, 1), vec(0, -1, 0), 1, 40, 800],
+    ['taut', vec(0, 0, 1), vec(0, -1, 0), 0.25, 0, 800],
+    ['diagonal-chord', vec(0.6, 0.8, 0), vec(-0.8, 0.6, 0), 0.3, 25, 500],
+    ['degenerate-length', vec(0, 0, 1), vec(0, -1, 0), 0.25, 40, 0],
+  ].map(([name, chord, sagDir, s, depthMm, lengthMm]) => {
+    const out = { x: 0, y: 0, z: 0 };
+    sag.lineTangentAfterSag(chord, sagDir, s, depthMm, lengthMm, out);
+    return {
+      name, chord, sagDir, s, depthMm, lengthMm,
+      tangent: { x: numz(out.x), y: numz(out.y), z: numz(out.z) },
+    };
+  });
+
+  return {
+    sagC1: sag.SAG_C1,
+    sagEstimatedRatio: sag.SAG_ESTIMATED_RATIO,
+    profile,
+    sagDepth: depth,
+    sagExcess: excess,
+    isSagEstimated: estimated,
+    perpGravity: gravity,
+    distributeExcess: distribute,
+    lineTangentAfterSag: tangent,
+  };
+}
+
 /** The whole payload, without the `generatedAt` header (which is not compared). */
 export async function buildRibbonVectors() {
   const mods = await loadRibbonModules();
   const geometry = mods['ribbon-geometry'];
   const winder = mods['ribbon-winder-math'];
   const dancer = mods['ribbon-dancer-math'];
+  const tension = mods['ribbon-tension-math'];
+  const sag = mods['ribbon-sag-math'];
   return {
     sampleStride: geometry.RIBBON_SAMPLE_STRIDE,
     tangentBetween: buildTangentCases(geometry),
@@ -301,6 +573,8 @@ export async function buildRibbonVectors() {
     sampleArcLength: buildSamplingCases(geometry),
     winder: buildWinderCases(winder),
     dancer: buildDancerCases(dancer),
+    tension: buildTensionCases(tension),
+    sag: buildSagCases(sag),
   };
 }
 

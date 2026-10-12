@@ -8,7 +8,16 @@
         "GenerateIfDistance": 450,
         "PlaceOnTransportSurface": true,
         "ThisObjectAsMU": "",
-        "CollisionRoleForMUs": "None"
+        "CollisionRoleForMUs": "None",
+        "Enabled": true,
+        "GenerateMU": true,
+        "DeleteAllMU": false,
+        "StartInterval": 0,
+        "RandomDistance": false,
+        "RangeDistance": 300,
+        "LimitNumber": false,
+        "MaxNumberMUs": 1,
+        "Mass": 1
       }
     }
   }

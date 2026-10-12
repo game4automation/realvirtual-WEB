@@ -38,7 +38,14 @@ function child(parent: Object3D, name: string, rv?: Record<string, unknown>): Ob
 }
 
 function sel(...paths: string[]): SelectionSnapshot {
-  return { selectedPaths: paths, primaryPath: paths[paths.length - 1] ?? null };
+  // Selection identity is the object since plan-754; `computeQuickEditContext`
+  // reads the paths, so the object fields stay empty here on purpose.
+  return {
+    nodes: [],
+    primaryNode: null,
+    selectedPaths: paths,
+    primaryPath: paths[paths.length - 1] ?? null,
+  };
 }
 
 describe('computeQuickEditContext', () => {

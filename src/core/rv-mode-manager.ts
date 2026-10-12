@@ -46,6 +46,9 @@ export interface ModeDescriptor {
    * Used by authoring workspaces like the asset editor. Rendering is unaffected.
    */
   runtime?: 'simulation' | 'detached';
+  // NB: no `hierarchyScope`. The hierarchy renders the scene graph in every mode
+  // since plan-754 (D11) — the planner's composition projection is gone, and
+  // with it the only reason a mode ever declared how much of the tree it shows.
 }
 
 /** Payload for `mode-changing` / `mode-changed` events. */
@@ -114,6 +117,23 @@ export class ModeManager {
   private _exitGuards = new Map<ModeId, Set<ModeExitGuard>>();
   /** Re-entrancy guard for requestMode (guards may show async dialogs). */
   private _requesting = false;
+  /**
+   * Who currently owns the right to change this workspace's mode, or null.
+   *
+   * The ONE interlock `requestMode`, {@link runExitGuards} and the recents
+   * chain share (plan-478 R3-2). Before it, each had its own: `requestMode`
+   * had `_requesting`, the chain had a module-level in-flight flag, and the two
+   * could not see each other — so a mode dropdown sitting on an async
+   * unsaved-changes dialog and a click on a recent document both believed they
+   * were the only switch in progress, asked their own guards, and then both
+   * switched.
+   *
+   * A TOKEN rather than a boolean, because the holder must be able to re-enter:
+   * the recents chain's own editor handoff calls `requestMode('editor')` while
+   * the chain holds the lock, and a boolean would deadlock exactly the caller
+   * that took it out.
+   */
+  private _switchOwner: symbol | null = null;
 
   constructor(host: ModeHost) {
     this.host = host;
@@ -228,13 +248,88 @@ export class ModeManager {
   }
 
   /**
+   * Run the ACTIVE mode's exit guards for a departure to `to`, without
+   * switching anything. Resolves `false` on the first veto.
+   *
+   * {@link requestMode} is guard-and-switch in one, which is right for a
+   * dropdown but wrong for a chain that must ask permission BEFORE it does
+   * anything at all (plan-478 F3: a veto must cost nothing — no project
+   * switch, no document load). It is also the only way to cover the departure
+   * a chain does not perform itself: the editor handoff
+   * (`openDocumentAsWorkingScene`) leaves editor mode through a bare
+   * `setMode`, which by design bypasses guards, so an editor→editor open would
+   * otherwise pass every exit guard unasked (plan-478 SOL R2 F1).
+   *
+   * The caller of a guard-first chain performs its own switch afterwards with
+   * `setMode`, the departure already authorised. Pass the `token` from
+   * {@link acquireSwitchLock} when you hold the lock; without it a call made
+   * while any other switch is in flight answers `false` rather than asking
+   * guards about a workspace that is already moving (plan-478 R3-2).
+   */
+  async runExitGuards(to: ModeId, token?: symbol): Promise<boolean> {
+    // Respect the shared interlock (plan-478 R3-2). Asking is not switching,
+    // but an answer obtained while ANOTHER switch is mid-flight is an answer
+    // about a workspace that is already moving: the guard would be shown the
+    // mode it is leaving, agree, and by the time the asker acted on it the
+    // other switch would have left that mode anyway. `false` is the safe
+    // reading — the caller's contract is "a veto costs nothing".
+    if (this._switchOwner !== null && token !== this._switchOwner) return false;
+    if (this._requesting) return false;
+    return this._askExitGuards(to);
+  }
+
+  /**
+   * The guard loop itself, with no interlock check — see {@link runExitGuards}.
+   *
+   * Answers `true`/`false` SYNCHRONOUSLY whenever nothing has to be awaited,
+   * and only returns a promise once there is an actual guard to run. That is
+   * not a micro-optimisation, it is the contract {@link requestMode} rests on:
+   * an `async` function body runs synchronously up to its FIRST `await`, so a
+   * `requestMode` on a workspace with no exit guards has always switched the
+   * mode before it returned. Every caller that reads `activeMode` straight
+   * after — the mode dropdown, `useMode`, and the tests that drive them through
+   * a synchronous `act()` — depends on that, and an unconditional `await` here
+   * silently defers the switch by a microtask and breaks all of them.
+   */
+  private _askExitGuards(to: ModeId): boolean | Promise<boolean> {
+    const from = this._active;
+    if (from === null || from === to) return true;
+    const guards = this._exitGuards.get(from);
+    if (!guards || guards.size === 0) return true;
+    return this._askExitGuardsAsync(from, to, [...guards]);
+  }
+
+  /** The awaiting half of {@link _askExitGuards} — reached only with guards. */
+  private async _askExitGuardsAsync(
+    from: ModeId,
+    to: ModeId,
+    guards: readonly ModeExitGuard[],
+  ): Promise<boolean> {
+    for (const guard of guards) {
+      let ok: boolean;
+      try {
+        ok = await guard(from, to);
+      } catch (e) {
+        console.error('[ModeManager] exit guard threw — treating as veto:', e);
+        ok = false;
+      }
+      if (!ok) return false;
+    }
+    return true;
+  }
+
+  /**
    * Guarded, async mode switch — the path every USER-facing switch takes
    * (mode dropdown, "Edit asset" library action, deep links after boot).
    * Runs the current mode's exit guards first; any veto cancels the switch.
    * Resolves `true` when the mode was switched (or already active).
    */
-  async requestMode(id: ModeId): Promise<boolean> {
+  async requestMode(id: ModeId, token?: symbol): Promise<boolean> {
     if (id === this._active) return true;
+    if (this._switchOwner !== null && token !== this._switchOwner) {
+      console.warn(`[ModeManager] requestMode('${id}') ignored — another switch owns the workspace`);
+      return false;
+    }
     if (this._requesting) {
       console.warn(`[ModeManager] requestMode('${id}') ignored — a guarded switch is already in progress`);
       return false;
@@ -245,27 +340,45 @@ export class ModeManager {
     }
     this._requesting = true;
     try {
-      const from = this._active;
-      if (from !== null) {
-        const guards = this._exitGuards.get(from);
-        if (guards) {
-          for (const guard of [...guards]) {
-            let ok: boolean;
-            try {
-              ok = await guard(from, id);
-            } catch (e) {
-              console.error('[ModeManager] exit guard threw — treating as veto:', e);
-              ok = false;
-            }
-            if (!ok) return false;
-          }
-        }
-      }
+      // Awaited ONLY when there is something to await (see `_askExitGuards`).
+      // On the guard-free path this whole method stays synchronous, which is
+      // what every caller that reads `activeMode` on the next line requires.
+      const verdict = this._askExitGuards(id);
+      const allowed = typeof verdict === 'boolean' ? verdict : await verdict;
+      if (!allowed) return false;
       this.setMode(id);
       return this._active === id;
     } finally {
       this._requesting = false;
     }
+  }
+
+  /**
+   * Take the workspace's switch lock, or null when someone already holds it.
+   *
+   * The recents chain calls this FIRST and answers `'busy'` on null — a click
+   * that arrives while a guarded switch is mid-dialog must not start a second
+   * one behind it (plan-478 R3-2). The token is handed down to every
+   * `requestMode` the chain causes (its editor handoff), which is what lets the
+   * holder re-enter while everyone else is refused.
+   *
+   * Always release in a `finally`: a lock leaked by a throwing chain would make
+   * the mode dropdown permanently inert.
+   */
+  acquireSwitchLock(): symbol | null {
+    if (this._switchOwner !== null || this._requesting) return null;
+    this._switchOwner = Symbol('rv-mode-switch');
+    return this._switchOwner;
+  }
+
+  /** Release a lock taken by {@link acquireSwitchLock}. Foreign tokens are ignored. */
+  releaseSwitchLock(token: symbol): void {
+    if (this._switchOwner === token) this._switchOwner = null;
+  }
+
+  /** True while a guarded switch or a lock holder is mid-flight. */
+  get isSwitchLocked(): boolean {
+    return this._switchOwner !== null || this._requesting;
   }
 
   /**
@@ -351,6 +464,7 @@ export class ModeManager {
     this._lockedMode = null;
     this._switching = false;
     this._requesting = false;
+    this._switchOwner = null;
     this._version = 0;
     this._listeners.clear();
     this._exitGuards.clear();

@@ -116,8 +116,10 @@ describe('CONNECT stream + binding lifecycle without a panel (plan-421 phase 4)'
     const plugin = new ConnectPlugin();
     plugins.push(plugin);
     plugin.init();
+    // plan-589: attaching also subscribes the reconcile triggers on the viewer's
+    // event bus, so the stand-in owes `on` and an unsubscribe for the detach.
     plugin.onModelLoaded({} as LoadResult, {
-      signalStore, loadTrust: { trusted: true },
+      signalStore, loadTrust: { trusted: true }, on: vi.fn(() => vi.fn()),
     } as unknown as RVViewer);
     const manager = modelWith(signalStore);
 

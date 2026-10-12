@@ -13,8 +13,8 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { buildTree } from '../src/core/hmi/hierarchy-utils';
-import type { TreeNode } from '../src/core/hmi/hierarchy-utils';
+import type { Object3D } from 'three';
+import { flattenSceneRows, type SceneRowContext, type SceneTreeNode } from '../src/core/hmi/hierarchy-rows';
 import { RvExtrasEditorPlugin } from '../src/core/hmi/rv-extras-editor';
 import {
   makeLayoutTestViewer,
@@ -24,7 +24,6 @@ import {
   unplaceLayoutObject,
   type LayoutTestViewer,
 } from './helpers/test-layout-object';
-import { collectAllTypes, findNode } from './helpers/tree-utils';
 
 /**
  * Build the `editableNodes` array the way the rv-extras-editor plugin would
@@ -48,71 +47,77 @@ function collectEditableNodes(viewer: LayoutTestViewer) {
   return nodes;
 }
 
+/**
+ * The hierarchy rows the panel would render (plan-754): the scene graph itself,
+ * walked only into what is expanded. Replaces `buildTree` + lazy injection —
+ * there is nothing to inject, the children were always there.
+ */
+function sceneRows(viewer: LayoutTestViewer, expanded: Iterable<string> = []) {
+  const scene = viewer.scene as unknown as Object3D;
+  const ctx: SceneRowContext = {
+    getPathForNode: (n: Object3D) => viewer.registry.getPathForNode(n) ?? null,
+    overlay: null,
+    modelRoot: (viewer as { currentModelRoot?: Object3D | null }).currentModelRoot ?? null,
+    hideRuntime: false,
+  };
+  // The scene root itself is never registered, so it has no path key — expand it
+  // by uuid, the way the panel's "root starts open" default does.
+  return flattenSceneRows(scene, new Set([scene.uuid, ...expanded]), ctx)
+    .map((r) => r.node as SceneTreeNode);
+}
+
+/** Rows strictly below `path` (its subtree, as currently rendered). */
+function rowsUnder(rows: SceneTreeNode[], path: string): SceneTreeNode[] {
+  return rows.filter((r) => !!r.path && r.path.startsWith(path + '/'));
+}
+
 describe('plan-191: LayoutObject expand', () => {
   beforeEach(() => {
     localStorage.clear();
   });
 
-  // §9.1 — buildTree Lazy injection ─────────────────────────────────────
+  // §9.1 — expanding a placed LayoutObject (plan-754: the scene graph) ──
 
-  describe('buildTree Lazy injection', () => {
-    it('does NOT inject mesh-only children when LayoutObject is not expanded', () => {
-      // Place a layout object that has BOTH rv_extras children (Drive, Sensor)
-      // and mesh-only children (Mesh1/Mesh2). The rv_extras children appear in
-      // editableNodes and so build into the tree unconditionally; the mesh-only
-      // children may only appear via lazy injection when the parent is expanded.
+  describe('LayoutObject expansion', () => {
+    it('shows no descendants while collapsed, but advertises the caret', () => {
+      // A placed layout object has BOTH rv_extras children (Drive, Sensor) and
+      // mesh-only children (Mesh1/Mesh2). Collapsed, none of them is a row;
+      // the parent row still reports `hasChildren` so the caret renders.
       const viewer = makeLayoutTestViewer();
       placeLayoutObject(viewer, 'id1', 'RollConveyor2m', 'cat:rc');
 
-      const nodes = collectEditableNodes(viewer);
-      // viewer cast: buildTree only reads .registry, makeLayoutTestViewer provides it
-      const treeCollapsed = buildTree(nodes, null, viewer as never, new Set());
-      const layoutNodeCollapsed = findNode(treeCollapsed, (n) => n.types.includes('LayoutObject'));
-      expect(layoutNodeCollapsed).not.toBeNull();
-      // Collapsed: mesh-only children must NOT have been injected
-      const collapsedMeshChildren = layoutNodeCollapsed!.children.filter((c) => c.types.length === 0);
-      expect(collapsedMeshChildren.length).toBe(0);
-      // But the row must still advertise expandability so the caret renders.
-      expect(layoutNodeCollapsed!.canExpandLazy).toBe(true);
+      const collapsed = sceneRows(viewer, ['modelRoot']);
+      const layoutRow = collapsed.find((r) => r.types.includes('LayoutObject'));
+      expect(layoutRow).toBeDefined();
+      expect(layoutRow!.hasChildren).toBe(true);
+      expect(rowsUnder(collapsed, 'modelRoot/RollConveyor2m')).toHaveLength(0);
 
-      // Expanded: mesh-only children must now appear
-      const treeExpanded = buildTree(nodes, null, viewer as never, new Set(['modelRoot/RollConveyor2m']));
-      const layoutNodeExpanded = findNode(treeExpanded, (n) => n.types.includes('LayoutObject'))!;
-      const expandedMeshChildren = layoutNodeExpanded.children.filter((c) => c.types.length === 0);
-      expect(expandedMeshChildren.length).toBeGreaterThan(0);
+      // Expanded: the real children — components AND bare meshes — are rows.
+      const expanded = sceneRows(viewer, ['modelRoot', 'modelRoot/RollConveyor2m']);
+      const children = rowsUnder(expanded, 'modelRoot/RollConveyor2m');
+      expect(children.filter((c) => c.types.length === 0).length).toBeGreaterThan(0);
     });
 
-    it('injects children when LayoutObject is in expandedPaths', () => {
+    it('surfaces the inner Drive and Sensor when expanded', () => {
       const viewer = makeLayoutTestViewer();
       placeLayoutObject(viewer, 'id1', 'RollConveyor2m', 'cat:rc');
 
-      const nodes = collectEditableNodes(viewer);
-      const expanded = new Set(['modelRoot/RollConveyor2m']);
-      const tree = buildTree(nodes, null, viewer as never, expanded);
-      const layoutNode = findNode(tree, (n) => n.types.includes('LayoutObject'));
-      expect(layoutNode).not.toBeNull();
-      expect(layoutNode!.children.length).toBeGreaterThan(0);
-
-      // Drive child must be among injected children
-      const drive = findNode(layoutNode!.children, (c) => c.types.includes('Drive'));
-      expect(drive).not.toBeNull();
-      // Sensor as well
-      const sensor = findNode(layoutNode!.children, (c) => c.types.includes('Sensor'));
-      expect(sensor).not.toBeNull();
+      const rows = rowsUnder(
+        sceneRows(viewer, ['modelRoot', 'modelRoot/RollConveyor2m']),
+        'modelRoot/RollConveyor2m',
+      );
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.some((c) => c.types.includes('Drive'))).toBe(true);
+      expect(rows.some((c) => c.types.includes('Sensor'))).toBe(true);
     });
 
     it('renders mesh-only children with types=[] under an expanded LayoutObject (§9.4)', () => {
       const viewer = makeLayoutTestViewer();
       placeLayoutObject(viewer, 'id1', 'RC', 'cat:rc');
 
-      const nodes = collectEditableNodes(viewer);
-      const tree = buildTree(nodes, null, viewer as never, new Set(['modelRoot/RC']));
-      const layoutNode = findNode(tree, (n) => n.types.includes('LayoutObject'))!;
-      const meshOnly = layoutNode.children.find((c) => c.types.length === 0);
-      expect(meshOnly).toBeDefined();
-      // Expect at least one Mesh1 / Mesh2 entry
-      const meshNames = layoutNode.children.filter((c) => c.types.length === 0).map((c) => c.name);
-      expect(meshNames.length).toBeGreaterThanOrEqual(1);
+      const children = rowsUnder(sceneRows(viewer, ['modelRoot', 'modelRoot/RC']), 'modelRoot/RC');
+      const meshOnly = children.filter((c) => c.types.length === 0);
+      expect(meshOnly.length).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -177,6 +182,8 @@ describe('plan-191: LayoutObject expand', () => {
       rv.LayoutObject.Locked = true;
       const ok = viewer.rvExtrasEditor.updateOverlayField('modelRoot/RC', 'LayoutObject', 'Locked', false);
       expect(ok).toBe(true);
+      // The planner hears the lock change directly (no live component behind LayoutObject).
+      expect(viewer._emitted).toContainEqual({ event: 'layout-lock-changed', payload: { path: 'modelRoot/RC', locked: false } });
     });
   });
 
@@ -262,8 +269,12 @@ describe('plan-191: LayoutObject expand', () => {
 
   // §9.10 — Path sanitization ───────────────────────────────────────────
 
-  describe('Path sanitization (§9.10)', () => {
-    it('replaces "/" in node names with "_" during Three.js child injection', () => {
+  describe('Node names containing "/" (§9.10)', () => {
+    it('shows a child whose NAME contains a slash, addressed by the registry', () => {
+      // The projection used to invent a path per injected child and sanitize
+      // `Door/Frame` into `Door_Frame` on the way. There is no invented path any
+      // more (plan-754): the row IS the object, and whatever path the registry
+      // holds for it is the row's path — one rule instead of two.
       const viewer = makeLayoutTestViewer();
       const glb = makeMockLayoutGLB({
         rootName: 'Item',
@@ -271,47 +282,36 @@ describe('plan-191: LayoutObject expand', () => {
       });
       placeLayoutObject(viewer, 'id1', 'Item', 'cat:item', glb);
 
-      const nodes = collectEditableNodes(viewer);
-      const tree = buildTree(nodes, null, viewer as never, new Set(['modelRoot/Item']));
-      const layoutNode = findNode(tree, (n) => n.types.includes('LayoutObject'))!;
-      // Find a child whose generated path ends with the sanitized name
-      const child = layoutNode.children.find((c) => c.path?.endsWith('/Door_Frame'));
+      const children = rowsUnder(sceneRows(viewer, ['modelRoot', 'modelRoot/Item']), 'modelRoot/Item');
+      const child = children.find((c) => c.object.name === 'Door/Frame');
       expect(child).toBeDefined();
+      expect(child!.path).toBe(viewer.registry.getPathForNode(child!.object));
     });
   });
 
-  // §9.11 — Performance: collapsed buildTree stays near baseline ────────
+  // §9.11 — Performance: the walk is bounded by what is OPEN ────────────
 
   describe('Performance', () => {
-    it('builds tree for a large LayoutObject (50+ mesh children) under 50ms when expanded', () => {
+    it('flattens a large expanded LayoutObject (50+ mesh children) under 50ms', () => {
       const viewer = makeLayoutTestViewer();
       const glb = makeMockLayoutGLB({ rootName: 'Big', meshes: 50 });
       placeLayoutObject(viewer, 'id1', 'Big', 'cat:big', glb);
-      const nodes = collectEditableNodes(viewer);
       const t0 = performance.now();
-      buildTree(nodes, null, viewer as never, new Set(['modelRoot/Big']));
+      sceneRows(viewer, ['modelRoot', 'modelRoot/Big']);
       const elapsed = performance.now() - t0;
       expect(elapsed).toBeLessThan(50);
     });
 
-    it('collapsed buildTree has negligible overhead vs the no-viewer baseline', () => {
+    it('collapsed, the walk never enters the closed subtree at all', () => {
       const viewer = makeLayoutTestViewer();
       const glb = makeMockLayoutGLB({ rootName: 'Big', meshes: 100 });
       placeLayoutObject(viewer, 'id1', 'Big', 'cat:big', glb);
-      const nodes = collectEditableNodes(viewer);
-      // Warmup runs to stabilise JIT
-      for (let i = 0; i < 3; i++) buildTree(nodes, null);
-      for (let i = 0; i < 3; i++) buildTree(nodes, null, viewer as never, new Set());
 
-      const t1 = performance.now();
-      for (let i = 0; i < 5; i++) buildTree(nodes, null);
-      const baseline = performance.now() - t1;
-      const t2 = performance.now();
-      for (let i = 0; i < 5; i++) buildTree(nodes, null, viewer as never, new Set());
-      const withLazy = performance.now() - t2;
-      // Lazy path adds an empty tree-walk; cap at 3x baseline + 5ms slack
-      // (warmup + measurement noise on slow CI runners)
-      expect(withLazy).toBeLessThan(baseline * 3 + 5);
+      const collapsed = sceneRows(viewer, ['modelRoot']);
+      // 100 meshes are in the graph; none of them costs a row while closed.
+      expect(rowsUnder(collapsed, 'modelRoot/Big')).toHaveLength(0);
+      const expanded = sceneRows(viewer, ['modelRoot', 'modelRoot/Big']);
+      expect(expanded.length).toBeGreaterThan(collapsed.length + 50);
     });
   });
 
@@ -343,9 +343,7 @@ describe('plan-191: LayoutObject expand', () => {
     it('tree-expanded view of an "all"-filter tree surfaces sub-drives', () => {
       const viewer = makeLayoutTestViewer();
       placeLayoutObject(viewer, 'id1', 'RC', 'cat:rc');
-      const nodes = collectEditableNodes(viewer);
-      const tree = buildTree(nodes, null, viewer as never, new Set(['modelRoot/RC']));
-      const types = collectAllTypes(tree);
+      const types = new Set(sceneRows(viewer, ['modelRoot', 'modelRoot/RC']).flatMap((r) => r.types));
       expect(types).toContain('Drive');
       expect(types).toContain('Sensor');
     });

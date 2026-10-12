@@ -18,6 +18,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   encodeRvImageWithinBudget,
+  encodeRvImagesWithinBudget,
   enforceEnvelopeBudget,
   exceedsUtf8Budget,
   utf8ByteLength,
@@ -302,5 +303,145 @@ describe('real canvas path', () => {
     const parsed = parsePayload(payload);
     // Either it fit after reduction, or it produced the defined error — never an oversized frame.
     expect(parsed.__rvImage ?? parsed.imageBudgetExceeded).toBeDefined();
+  });
+});
+
+// ─── Multi-channel envelope (plan-740 §9.6) ─────────────────────────────
+
+/**
+ * `web_eye` answers with several ALIGNED images from one pose. Three properties
+ * make that answer usable, and each of them is a way it could silently go wrong:
+ *
+ *   - the budget is measured on the WHOLE envelope (per-image budgeting passes
+ *     five times and then blows the frame once, which closes the bridge),
+ *   - every channel lands on the SAME rung (a per-channel scale would make the
+ *     pixel coordinates of the ID mask stop matching the beauty image, and those
+ *     coordinates are the entire point of the sidecar),
+ *   - channel 1 appears exactly once (an earlier draft carried it in both
+ *     `__rvImage` and `__rvImages[0]` — its base64 twice on the wire).
+ */
+function channelsOf(
+  make: (w: number, h: number) => BudgetImageSource,
+  mimes: Array<'image/png' | 'image/jpeg'>,
+  w = 200, h = 150,
+) {
+  return mimes.map((mime, i) => ({ canvas: make(w, h), mime, channel: `ch${i}` }));
+}
+
+describe('encodeRvImagesWithinBudget — multi-channel envelope', () => {
+  it('puts channel 1 in __rvImage and the rest in __rvImages, never both', () => {
+    const t = tracker();
+    const payload = encodeRvImagesWithinBudget(
+      channelsOf(t.make, ['image/jpeg', 'image/png', 'image/jpeg']),
+      { channels: ['beauty', 'idmask', 'depth'] },
+      t.options,
+    );
+    const p = parsePayload(payload);
+    expect(p.__rvImage).toBeDefined();
+    expect(p.__rvImages).toHaveLength(2);
+    // Disjoint: channel 1 appears ONCE. The continuation array starts at
+    // channel 2, so `ch0` must not be in it — the fakes encode identically,
+    // so this is asserted on identity rather than on the base64.
+    expect(p.__rvImages.map((c: { channel: string }) => c.channel)).not.toContain('ch0');
+    expect(1 + p.__rvImages.length).toBe(3);
+    // Order is the caller's order, and each continuation names its channel.
+    expect(p.__rvImages.map((c: { channel: string }) => c.channel)).toEqual(['ch1', 'ch2']);
+    // The sidecar rides with channel 1 — an old bridge shows image + sidecar.
+    expect(p.__rvImage.channels).toEqual(['beauty', 'idmask', 'depth']);
+    // PNG channels keep their format; a lossy ID mask is not an ID mask.
+    expect(p.__rvImages[0].mimeType).toBe('image/png');
+    expect(p.__rvImage.mimeType).toBe('image/jpeg');
+  });
+
+  it('omits __rvImages entirely for a single channel', () => {
+    const t = tracker();
+    const p = parsePayload(encodeRvImagesWithinBudget(
+      channelsOf(t.make, ['image/jpeg']), { channels: ['beauty'] }, t.options,
+    ));
+    expect(p.__rvImages).toBeUndefined();
+  });
+
+  it('measures the WHOLE envelope, sidecar included, against the budget', () => {
+    const t = tracker();
+    // Two 100×100 channels at quality 0.72 ≈ 7 200 base64 chars each; the fat
+    // sidecar is what pushes the total over, and it must count.
+    const fat = { note: 'x'.repeat(6000) };
+    const budgetBytes = 16_000;
+    const p = parsePayload(encodeRvImagesWithinBudget(
+      channelsOf(t.make, ['image/jpeg', 'image/jpeg'], 100, 100), fat,
+      { ...t.options, budgetBytes },
+    ));
+    expect(p.__rvImage).toBeDefined();
+    // Whatever the ladder chose, the SERIALIZED result fits.
+    expect(utf8ByteLength(JSON.stringify(p))).toBeLessThanOrEqual(budgetBytes);
+    // It only fits because the ladder moved off rung one — two channels at full
+    // quality plus this sidecar are over the budget, and the sidecar is exactly
+    // the half a per-image budget would never have seen.
+    expect(t.encodes.length).toBeGreaterThan(2);
+    expect(t.encodes[t.encodes.length - 1].quality).toBeLessThan(t.encodes[0].quality);
+  });
+
+  it('scales every channel by the same factor so the images stay aligned', () => {
+    const t = tracker();
+    const p = parsePayload(encodeRvImagesWithinBudget(
+      channelsOf(t.make, ['image/jpeg', 'image/jpeg', 'image/jpeg'], 400, 300),
+      {}, { ...t.options, budgetBytes: 40_000 },
+    ));
+    if (p.__rvImage) {
+      for (const extra of p.__rvImages ?? []) {
+        expect(extra.width).toBe(p.__rvImage.width);
+        expect(extra.height).toBe(p.__rvImage.height);
+      }
+    }
+    // Every resize in a rung asks for the same size — no per-channel decision.
+    const byRung = new Map<string, number>();
+    for (const r of t.resizes) {
+      const k = `${r.width}x${r.height}`;
+      byRung.set(k, (byRung.get(k) ?? 0) + 1);
+    }
+    for (const n of byRung.values()) expect(n % 3).toBe(0);
+  });
+
+  it('skips the quality rungs when every channel is PNG', () => {
+    const t = tracker();
+    encodeRvImagesWithinBudget(
+      channelsOf(t.make, ['image/png', 'image/png'], 400, 300),
+      {}, { ...t.options, budgetBytes: 5_000 },
+    );
+    // Quality is meaningless for PNG, so the ladder must not burn three encodes
+    // per size on it — exactly one quality is tried at each scale.
+    const qualities = new Set(t.encodes.map((e) => e.quality));
+    expect(qualities.size).toBe(1);
+    expect(t.resizes.length).toBeGreaterThan(0);
+  });
+
+  it('returns a correlated error naming the channels when nothing fits', () => {
+    const t = tracker(50);
+    const p = parsePayload(encodeRvImagesWithinBudget(
+      channelsOf(t.make, ['image/jpeg', 'image/png'], 800, 600),
+      {}, { ...t.options, budgetBytes: 500 },
+    ));
+    expect(p.__rvImage).toBeUndefined();
+    expect(p.error).toMatch(/fewer channels or a smaller size/);
+    expect(p.imageBudgetExceeded.budgetBytes).toBe(500);
+    expect(p.imageBudgetExceeded.attempts).toBeGreaterThan(0);
+    expect(p.imageBudgetExceeded.channels).toEqual(['ch0', 'ch1']);
+  });
+
+  it('refuses an empty channel list rather than emitting an image-less envelope', () => {
+    expect(parsePayload(encodeRvImagesWithinBudget([], {})).error).toMatch(/No image channels/);
+  });
+
+  it('still hits the envelope backstop when the wrapper escaping tips it over', () => {
+    const t = tracker();
+    // Fits the IMAGE budget but not the outer frame budget once wrapped.
+    const payload = encodeRvImagesWithinBudget(
+      channelsOf(t.make, ['image/jpeg', 'image/jpeg'], 100, 100), {}, t.options,
+    );
+    const frame = JSON.stringify({ type: 'result', id: 7, result: payload });
+    const guarded = enforceEnvelopeBudget(frame, 7, 100);
+    const parsed = parsePayload(guarded);
+    expect(parsed.id).toBe(7);
+    expect(parsed.error).toMatch(/exceeds the 100 byte bridge frame budget/);
   });
 });

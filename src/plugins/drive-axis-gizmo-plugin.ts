@@ -66,7 +66,7 @@ import { subscribeOverlayVisibility, isOverlayVisible } from '../core/overlay-vi
 import type { PerspectiveCamera, OrthographicCamera } from 'three';
 import {
   resolveWorldAxis, perspectiveViewportWorldHeight, computeGizmoScale, minGizmoScale,
-} from './drive-axis-math';
+} from '../core/engine/drive-axis-math';
 
 /** Dedicated drive accent color (plan-249 §6) — deliberately different from the
  *  red/green/blue transform handles so "motion axis" ≠ "transform gizmo". */
@@ -199,6 +199,9 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
 
   private viewer: RVViewer | null = null;
   private unsub: (() => void) | null = null;
+  /** Unsubscribe from `editor-structure-changed` (component add/remove on the
+   *  selected node changes WHICH drives the unchanged selection carries). */
+  private offStructure: (() => void) | null = null;
   /** Unsubscribe from the overlay-visibility store (plan-250). */
   private offOverlay: (() => void) | null = null;
   /** Cached: is the 'gizmos' overlay category currently user-hidden? Updated in
@@ -698,6 +701,17 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
     if (!viewer) return;
     this.unsub?.();
     this.unsub = viewer.on('selection-changed', (s) => this.onSelection(s));
+    // Editor authoring: adding/removing a Drive component (or undo/redo of
+    // that) changes which drives the CURRENT selection carries without any
+    // `selection-changed` — so re-evaluate the selection on structure changes.
+    // Pulled from the selection manager, not `_lastSnap`: same gate rules as
+    // `onActivate`. Without this the gizmo only appeared after deselecting
+    // and reselecting the node the drive was just added to.
+    this.offStructure?.();
+    this.offStructure = viewer.on('editor-structure-changed', () => {
+      const snap = viewer.selectionManager?.getSnapshot();
+      if (snap) this.onSelection(snap);
+    });
     // Overlay-visibility gate (plan-250): react to the 'gizmos' category being
     // switched off in the Display panel. onRender's change-detection then
     // clears/rebuilds the current selection's gizmos. The cached flag is
@@ -727,6 +741,8 @@ export class DriveAxisGizmoPlugin implements RVViewerPlugin {
     this.clearAll();
     this.unsub?.();
     this.unsub = null;
+    this.offStructure?.();
+    this.offStructure = null;
     this.offOverlay?.();
     this.offOverlay = null;
   }

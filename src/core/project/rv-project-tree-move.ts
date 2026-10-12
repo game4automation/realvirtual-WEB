@@ -55,7 +55,9 @@
 
 import type { RvProject } from './rv-project-types';
 import { findDocumentById, moveDocumentPath } from './rv-asset-identity';
+import { retagRecentDocumentPath } from './rv-project-recents-store';
 import { repointDocumentRefs } from './rv-project-refs';
+import { migrateLegacyThumbnailForMove } from '../library/resolve-document-thumbnail';
 import {
   DOCS_INDEX_FILE,
   parseDocsIndex,
@@ -228,6 +230,21 @@ export async function applyTreeMove(
     }
   }
 
+  // ── The thumbnail, carried under the id BEFORE the path goes (plan-744) ──
+  //
+  // The lazy migration in `resolve-document-thumbnail.ts` keys off the OLD
+  // path-mirrored convention, `library/.thumbnails/<rel>.png`, and it can only
+  // find that file while the document still says `library/…`. A document moved
+  // out of `library/` before anything ever rendered its card would therefore
+  // lose its picture for good (Review #5). So the same copy runs here, first,
+  // for the paths that could have one.
+  //
+  // Best-effort in both directions: it never fails a move, and it never
+  // overwrites a sidecar that is already there.
+  for (const step of withIds) {
+    await migrateLegacyThumbnailForMove(io, step.documentId!, step.from);
+  }
+
   for (const step of steps) {
     const bytes = await io.readBytes(step.from);
     if (!bytes) throw new Error(`"${step.from}" could not be read.`);
@@ -253,6 +270,26 @@ export async function applyTreeMove(
         await io.writeDocsIndex(result.index);
         docsIndexRows = result.rewritten;
       }
+    }
+  }
+
+  // ── The recents ring follows the move (plan-482 §2.7) ──
+  //
+  // The SECOND of the two independent ways a document changes place; the other
+  // is `SceneStore.rename`, which writes file and manifest entirely on its own.
+  // Handling only one of them would have fixed the more frequent half of the
+  // problem and left the ring lying in the other.
+  //
+  // Everything needed is already in hand — the manifest that was read above is
+  // the OPEN project's, and each step carries the id whose path just changed —
+  // so nothing is loaded and no permission prompt can be provoked. Only the
+  // path is touched; order, `mode` and `openedAt` are not, because a move is
+  // not an open. Best-effort by construction: `retagRecentDocumentPath` is
+  // inert on anything it cannot name, and a comfort list must never be the
+  // reason a completed move reports failure.
+  if (manifest?.id) {
+    for (const step of withIds) {
+      retagRecentDocumentPath(manifest.id, step.documentId!, step.to);
     }
   }
 

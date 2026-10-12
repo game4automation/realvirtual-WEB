@@ -168,6 +168,7 @@ export function getProjectsDashboardSnapshot(): ProjectsDashboardSnapshot {
 let _everOpened = false;
 
 export function openProjectsDashboard(group?: ProjectsRailGroup): void {
+  setRecentDocumentsOpen(false);
   const first = !_everOpened;
   _everOpened = true;
   publish({
@@ -250,4 +251,71 @@ export function resetProjectsDashboardForTests(): void {
   };
   _everOpened = false;
   _listeners.clear();
+}
+
+// Session-only visibility shared by the activity bar and the dashboard host.
+let recentDocumentsOpen = false;
+let recentDocumentsPinned = false;
+let recentDocumentsHoverOpened = false;
+/**
+ * The keyboard focus is inside the flyout (plan-507 SOL-3).
+ *
+ * A hover-opened flyout closes 800 ms after the pointer leaves it. Since it
+ * carries a search field, that timer would pull the field away mid-word from
+ * someone who clicked in and moved the mouse aside to type. While the focus is
+ * inside, the timer does not start; leaving with the focus restarts it.
+ */
+let recentDocumentsFocusInside = false;
+let recentDocumentsCloseTimer: ReturnType<typeof setTimeout> | undefined;
+export const getRecentDocumentsHoverOpened = () => recentDocumentsHoverOpened;
+export function cancelRecentDocumentsClose(): void {
+  clearTimeout(recentDocumentsCloseTimer);
+}
+export function setRecentDocumentsPinned(pinned: boolean): void {
+  recentDocumentsPinned = pinned;
+  cancelRecentDocumentsClose();
+}
+export function setRecentDocumentsFocusInside(inside: boolean): void {
+  recentDocumentsFocusInside = inside;
+  if (inside) cancelRecentDocumentsClose();
+}
+/**
+ * Open the recents flyout from a hover on the Projects folder.
+ *
+ * Works whether or not the dashboard is open: the recents are a way to jump
+ * to a document from anywhere, the Projects screen included (the popover
+ * rides in the dashboard's shared chrome on both screens). Only the CLICK
+ * that opens the dashboard closes the flyout — {@link openProjectsDashboard} —
+ * so it never lands on top of the screen the user just asked for; the next
+ * hover brings it back.
+ */
+export function openRecentDocumentsOnHover(): void {
+  cancelRecentDocumentsClose();
+  if (recentDocumentsOpen) return;
+  recentDocumentsHoverOpened = true;
+  setRecentDocumentsOpen(true);
+}
+export function scheduleRecentDocumentsClose(): void {
+  cancelRecentDocumentsClose();
+  if (recentDocumentsPinned || !recentDocumentsHoverOpened || recentDocumentsFocusInside) return;
+  recentDocumentsCloseTimer = setTimeout(() => setRecentDocumentsOpen(false), 800);
+}
+const recentDocumentsListeners = new Set<() => void>();
+export const getRecentDocumentsOpen = () => recentDocumentsOpen;
+export function subscribeRecentDocumentsOpen(listener: () => void): () => void {
+  recentDocumentsListeners.add(listener);
+  return () => { recentDocumentsListeners.delete(listener); };
+}
+export function setRecentDocumentsOpen(open: boolean): void {
+  cancelRecentDocumentsClose();
+  if (!open) {
+    recentDocumentsPinned = false;
+    recentDocumentsFocusInside = false;
+  }
+  recentDocumentsOpen = open;
+  recentDocumentsListeners.forEach(listener => listener());
+}
+export function toggleRecentDocumentsOpen(): void {
+  recentDocumentsHoverOpened = false;
+  setRecentDocumentsOpen(!recentDocumentsOpen);
 }

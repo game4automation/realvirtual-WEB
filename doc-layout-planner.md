@@ -1,5 +1,9 @@
 # Layout Planner & Library Objects — realvirtual WEB
 
+> **Applies to:** Community layout planner. The Unity export sections require Unity Professional; commercial asset-editor workflows require the corresponding WEB module.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 This document describes the **Layout Planner** plugin and the **library
 object** pipeline that feeds it: how library objects are authored in Unity,
 how they are exported to GLB, how the Planner discovers and consumes them,
@@ -44,15 +48,14 @@ times).
 
 ### 2.1 Single export
 
-In the Unity Editor:
+This optional workflow requires realvirtual Professional in the Unity Editor:
 
 1. Select the GameObject that should become the library object root.
-2. Open **Window → realvirtual → WebViewer**.
+2. Open **Tools → realvirtual → Export → realvirtual WEB**.
 3. Click **Export as Library Object**.
-4. Pick the destination filename — defaults to the GameObject's name with
-   a `.glb` suffix, inside the WebViewer `public/models/` folder. That folder is
-   the DEV built-in drop, a checkout convenience: to put the asset into a real
-   project, save it into that project from the viewer instead.
+4. Choose a `.glb` destination in your project or library folder. Import it into
+   your project or register it in the library catalogue. A file placed in
+   `public/models/` does not automatically become selectable.
 
 The export uses the multi-root constructor with a single transform, so the
 exported scene has the GameObject itself as the top-level glTF node — no
@@ -80,7 +83,7 @@ By default the WebViewer computes the pivot of a library object from its
 geometry (see §3). To override that with a hand-authored pivot, place an
 empty child GameObject anywhere under the library root and add the
 **Web Pivot** component
-([`Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebPivot.cs`](../../Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebPivot.cs))
+(`Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebPivot.cs` (optional Unity Professional source; not included in Community))
 to it. The child's transform position is the pivot — move it with the
 Scene-view gizmo to wherever the rotation / snap origin should sit
 (typically the floor-center of the base, the centre of a mounting flange,
@@ -233,6 +236,141 @@ A standard Three.js `TransformControls`-based gizmo, with `select` /
 `translate` / `rotate` modes. The gizmo sits at the object's local origin
 — which is exactly the pivot computed in §3. Choosing the right pivot at
 authoring time means the gizmo is always where the user expects.
+
+### How a committed placement renders and picks (plan-745 → plan-753)
+
+> **Since plan-753 Phase 3 a GLB placement is an instance of a BAKED asset.**
+> `viewer.placements.resolveBaked` (→ `ModelCache.getOrLoadBaked`) bakes a library
+> object once per document into a few chunks (uber + textured + one per mover);
+> `viewer.placements.materialize` (→ `BakeRegistry.instantiate`) hangs
+> plain `Mesh`es over those shared geometries under the placement root, rebuilds
+> only the LOGIC nodes (components, snap ports, movers) from the master and
+> clones `keep` meshes (Lamp, Ray, fluid) with their own material. Picking runs
+> through the `PickBackend` (triangle → segment → owner → instance node), the
+> highlight through the `chunk-outline` strategy (whole chunk meshes or pooled
+> drawRange wrapper proxies in the OutlinePass). Persistence is unchanged
+> (reference + transform); the asset editor still opens the master. See
+> `doc-node-paths.md` §9.
+>
+> **Reload of a saved layout = the same instances (plan-753, 2026-09-17):** the
+> loader does NOT compose + bake a planner placement in place. It leaves every
+> `AssetReference` + `PlacementMeta` root empty and marked (`deferPlacements`,
+> always on for runtime loads; editor / `preserveHierarchy` /
+> `preserveAuthoringHierarchy` loads keep the graft), and the placement
+> instancer materialises it after the load from the asset's shared
+> `BakedAsset` — one bake per asset, smaller assets first, occurrences join the
+> in-flight bake. A monolith without references is baked by the loader itself,
+> destructively, and its template IS what gets placed (plan-754).
+
+#### One primitive, core-owned (`viewer.placements`)
+
+Every way a placed reference becomes an instance goes through **one** primitive,
+`PlacementInstancer` in
+[`src/core/engine/rv-placement-instancer.ts`](src/core/engine/rv-placement-instancer.ts).
+The **viewer** owns the single instance (`viewer.placements`) together with the
+document-scoped `ModelCache`
+([`src/core/engine/rv-model-cache.ts`](src/core/engine/rv-model-cache.ts)) — not the
+planner plugin. That is why a viewer **without** the planner (HMI deployments)
+loads a layout document as shared instances too.
+
+| Call | What it is |
+|---|---|
+| `resolveBaked(ref, { signal?, forceSplitNodeIds? })` | THE bake-key derivation: a `project:` id → library registry (`resolvedCacheKey`), else `url \|\| glbUrl` with a bundled `library/…` path re-rooted onto this deploy's `BASE_URL`. One bake per (asset, document). |
+| `materialize(root, baked, { id, label, catalogId, overrides?, pivot? })` | THE order, synchronous, no planner knowledge: thaw root → `LayoutObject` markers → instantiate → subtree markers → shadow flags → floor-centre pivot → `AssetOverrides` (after the pivot) → world matrices → render mode. |
+| `release(root)` | gives the instance back (`BakeRegistry.releaseByRoot`). |
+| `materializeDeferred(entries, hooks?)` / `whenMaterialized()` | the reload queue; `whenMaterialized()` resolves when the queue of the current load is empty — and on a document change, after which orphaned materialisations write nothing. |
+| `clearDocument()` / `dispose()` | document change (called by `RVViewer.clearModel`): abandon the queue, release core-owned instances, THEN retire the bakes (F11). |
+| `state` / `progress` / `sealLoad()` | the **scene-ready contract**: `state` is `'materializing'` while a deferred placement is queued or baking; `progress` = `{ state, total, materialized, pending, missing }`; the viewer calls `sealLoad()` right after `model-loaded`, from where the instancer owes exactly ONE `onSettled` (→ viewer event `placements-materialized`) — also for zero references, `aborted: true` on a document change. |
+
+**Scene-ready contract (plan-753, part 2).** A reopened layout is complete only when the queue
+is empty — 5–16 s after `model-loaded` on an Arburg layout. One state, one event, one join point:
+`viewer.placements.state`, the event `placements-materialized` (once per load) and
+`viewer.whenSceneReady()` (no load in flight AND placements idle; `whenPlacementsMaterialized()`
+on the planner is the same queue). What the core does with it: the fixed-timestep simulation is
+**held** with the pause reason `placements-materializing` (a source must not feed a line whose
+successor conveyor is not there yet — with *Vanish MUs* on, the snap-connectivity gate would delete
+the MUs; the Sim toolbar tooltip names the reason, DevTools shows `Placements: N pending of M`),
+one batched `drives-changed`, the DES re-bind, the ground-disc fit and **one camera re-fit when
+the camera was not moved** since the load framed the (then empty) root. The planner itself needs no
+join: each late registration re-schedules the snap pairing and refreshes the hierarchy panel. The
+save path never reads the scene graph for references (`bakeIntoGlb` = source bytes + op log), so
+an autosave mid-materialisation writes every reference. MCP: `web_document_open` /
+`web_project_open` wait for the join point within a budget and report
+`placements: { total, materialized, pending, missing }` (+ `placementsHint` while `pending > 0`);
+`web_status.placements` is the live state. Plugin-side guidance:
+[doc-extending-webviewer.md](doc-extending-webviewer.md) § *`model-loaded` is not "the scene is complete"*.
+
+Entries and what stays planner-side:
+
+| Entry | Planner code | Around the primitive |
+|---|---|---|
+| floor drop | `placeComponent` | `alignToFloor`, parenting, `registerPlaced`, store + op log |
+| snap drop | `placeAtSnap` → `placeAtSnapPoint` | snap matrix, occupancy / pairing; a rejected drop `release()`s |
+| duplicate / paste | `_clonePlacement` | offset, re-drop, store |
+| draft (warm cache) | `_startGlbDraft` | preview flags, gizmo |
+| draft swap (cold cache) | `_runPendingLoad` → `swapPlacedGeometry` | placeholder teardown, keep `position.y` |
+| restore / undo / op replay | `placeFromRecord` → `_buildPlacementFromRecord` | saved TRS, visibility, bindings |
+| reload | `adoptPlacements` → `placements.materializeDeferred(entries, hooks)` | the hooks: dead-`blob:` url fallback, `registerPlaced('full')`, visibility, marker sync, bindings, missing-reference placeholder |
+
+`registerPlaced` (`integrateSubtree`) is called the same way by all of them; its
+planner-independent middle — naming scan, `processExtras`, deferred logic,
+transport topology, drives, placed behaviors, LogicSteps — is
+`integratePlacedContent` in
+[`src/core/engine/rv-placement-integrate.ts`](src/core/engine/rv-placement-integrate.ts),
+which is also what the viewer runs for a deferred placement when no planner
+claims it. Snap ports, id maps, unique names, aux raycast targets of virtual /
+DES nodes, selection and undo stay in the planner.
+
+**Rule:** never call `BakeRegistry.instantiate()` from the planner, and never
+derive a bake key outside `PlacementInstancer.sourceOf`. A new entry goes into
+the table of `tests/placement-instancer.test.ts`, whose source guard fails on a
+direct `.instantiate(` under `src/plugins/layout-planner/`.
+
+A placement is a **composition unit**, and it is treated as one all the way
+down: in the hierarchy tree, in the render pipeline, and in the pick
+geometry. Three things are worth knowing when touching this area.
+
+**1. The tree shows units, not meshes — because that is all there is.**
+Since plan-754 the hierarchy is not a projection at all: it is the three.js
+scene graph. A placed asset shows as few rows because the destructive bake
+built few nodes — the raw CAD parts of a baked placement do not exist. The
+old `hierarchyScope: 'composition'` projection is gone with it. The asset
+editor loads with `preserveHierarchy`, does not bake, and therefore still
+shows every authored part. See `doc-node-paths.md` §9.
+
+**2. Drag and commit both use the chunks.** The ghost of a dragged library item
+is an instance of the same `BakedAsset` the commit will use (shared geometry,
+no copy), so the preview is exact and the drop is cheap:
+
+| Stage | What happens |
+|---|---|
+| drag / `registerPlaced('light')` | a bake instance under a preview root; no components, no snap ports |
+| commit / `registerPlaced('full')` | components, snap ports, logic — the chunk meshes already render and pick |
+| move (gizmo, undo/redo, MCP) | the node moves; its chunk meshes are children and follow by parent-matrix propagation |
+| delete | `BakeRegistry.release` — the chunk meshes leave the tree; the shared geometry is freed only when the last instance of the asset is gone AND the asset was retired (document change) |
+
+Placing the same catalog asset N times therefore shares ONE set of chunk
+geometries; only the `Mesh` wrappers (a handful per placement) and the logic
+nodes are per placement. A drive subtree inside the placement is its own mover
+chunk, parented under its drive node so it follows the motion.
+
+**3. Picking is per chunk, resolved through the hit segment.** The
+`PickBackend` raycasts every live chunk mesh (the loaded model's and every
+placement's) and resolves the hit triangle in O(1) through its segment to that
+segment's owner node; the planner's ancestor
+override then promotes that node to the placement root for selection. Nothing
+is rebuilt on a drop or a delete — a placement appears and disappears with its
+chunk meshes.
+
+Consequences to respect when editing `scene-mutations.ts`:
+
+- A drop, a snap-drop and a delete must **not** rebuild any scene-wide
+  structure. The only non-baked placements are virtual / DES entries
+  (`buildVirtualNode`), which register their meshes as aux raycast targets —
+  keep that branch symmetric (add on register, remove on delete).
+- Never `dispose()` a chunk geometry from the planner. `disposeSubtree` /
+  `disposeModelSubtree` skip geometries registered in `chunkMetaOf`; the
+  `BakedAsset` refcount (`release` / `retired`) is the only owner.
 
 ---
 
@@ -566,7 +704,9 @@ subscriptions), `rv-layout-active-tab` (last selected tab) and
 and the per-asset snap index `rv-snap-index-v2:<glbUrl>` (§6.6).
 
 **3. The browser Cache API** carries the *bytes*: GLB blobs are cached by
-`ModelCache` in the `rv-planner-glbs` bucket, keyed by URL.
+`ModelCache` in the `rv-assets-glb-v2` bucket, keyed by URL + catalog `sha256`
+(plan-508; URL alone when the catalog has no hash). The old `rv-planner-glbs`
+bucket is deleted the first time the new one is opened.
 
 ---
 
@@ -609,7 +749,7 @@ specific authoring state.
 | `?mode=planner` | Boots a fresh empty scene and opens the Layout Planner in authoring mode. If an explicit `?scene=` or `?model=` is also given, that scene/model loads instead of the empty one and the Planner still opens on top. |
 | `?doc=<doc_…>` | Boots the project document with that id — the form the viewer MINTS for anything the project owns (plan-716 §2.5). `?scene=<id>` still resolves for old links via the permanent alias map, but nothing writes it for a document any more. |
 | `?scene=empty` | Boots a fresh empty scene (no base GLB). The Planner is wired but not auto-opened. |
-| `?doc=new` | Reserved value: same fresh empty scene as `?scene=empty`, meant for the editor entry `?doc=new&mode=editor` — the asset editor then creates a real document in the project in view and opens it directly, without the projects dashboard. Never collides with a stored document (those ids carry the `doc_` prefix). |
+| `?doc=new` | Reserved value: same fresh empty scene as `?scene=empty`, meant for the editor entry `?doc=new&mode=editor` — the asset editor then creates a real document in the project in view (My Workspace if that project is read-only), opens it directly without the projects dashboard and shows the CAD import dialog immediately. Never collides with a stored document (those ids carry the `doc_` prefix). |
 | `?library=<url>` | Appends a catalog source on top of the standard library (§4). Repeatable: `?library=<a>&library=<b>`. Accepts catalog-JSON URLs and GitHub repo-scan URLs. |
 
 A shareable "start planning" link is simply:
@@ -632,8 +772,12 @@ The `?mode=planner` deep-link is handled in
   in the document model.
 - [`doc-extending-webviewer.md`](doc-extending-webviewer.md) — plugin
   system and how layout-planner integrates as a plugin.
+- [`src/core/engine/rv-placement-instancer.ts`](src/core/engine/rv-placement-instancer.ts) —
+  `PlacementInstancer` (`viewer.placements`): `resolveBaked` + `materialize`, the one
+  placement primitive; [`rv-model-cache.ts`](src/core/engine/rv-model-cache.ts) — `ModelCache`;
+  [`rv-placement-integrate.ts`](src/core/engine/rv-placement-integrate.ts) — planner-independent registration.
 - [`src/plugins/layout-planner/model-cache.ts`](src/plugins/layout-planner/model-cache.ts) —
-  `ModelCache`, `pivotToFloorCenter`, `alignToFloor`, `dropToSurface`.
+  `alignToFloor`, `dropToSurface` (+ re-exports of `ModelCache`, `pivotToFloorCenter`).
 - [`src/core/engine/rv-gltf-unwrap.ts`](src/core/engine/rv-gltf-unwrap.ts) —
   `unwrapGltfRoot`. It moved out of `model-cache.ts` because the asset editor
   needs it too; `model-cache.ts` re-exports it, so existing imports still work.
@@ -644,7 +788,7 @@ The `?mode=planner` deep-link is handled in
   chain preview, placement service, library snap index).
 - [`src/core/engine/rv-snap-point-registry.ts`](src/core/engine/rv-snap-point-registry.ts) —
   runtime registry, pairing, occupancy, chain walk.
-- [`Packages/io.realvirtual.professional/Editor/WebViewer/WebViewerToolbar.cs`](../../Packages/io.realvirtual.professional/Editor/WebViewer/WebViewerToolbar.cs) —
+- `Packages/io.realvirtual.professional/Editor/WebViewer/WebViewerToolbar.cs` (optional Unity Professional source; not included in Community) —
   Unity-side export entry points.
-- [`Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebPivot.cs`](../../Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebPivot.cs) —
+- `Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebPivot.cs` (optional Unity Professional source; not included in Community) —
   pivot marker component.

@@ -74,3 +74,23 @@ export function buildThumbnailKey(parts: ThumbnailKeyParts): string {
   if (parts.version) base.push(escapePart(parts.version));
   return base.join(':');
 }
+
+/**
+ * The content version of a project document's preview key.
+ *
+ * Preference order: the backend's file mtime (`statDocuments()`, folder and
+ * browser backends) → the manifest row's `sha256` → its `mtimeMs` → none.
+ * A backend without stats (the bundled one returns `[]` on purpose — a fetch
+ * has no trustworthy mtime) must still get a NEW key when the manifest says
+ * the bytes changed; otherwise the cached render of the old GLB is served for
+ * ever. Undefined means "no version", i.e. the pre-existing version-less key.
+ */
+export function documentThumbnailVersion(
+  stat: { mtime?: number } | undefined,
+  doc: { sha256?: string; mtimeMs?: number } | undefined,
+): string | undefined {
+  if (stat?.mtime !== undefined) return String(stat.mtime);
+  if (doc?.sha256) return doc.sha256;
+  if (doc?.mtimeMs !== undefined) return String(doc.mtimeMs);
+  return undefined;
+}

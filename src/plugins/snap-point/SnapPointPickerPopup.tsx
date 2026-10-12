@@ -15,7 +15,8 @@ import { Box, Paper, Typography, CircularProgress, ButtonBase } from '@mui/mater
 import type { UISlotProps } from '../../core/rv-ui-plugin';
 import type { LibraryCatalogEntry } from '../layout-planner/rv-layout-store';
 import type { LayoutPlannerPlugin } from '../layout-planner';
-import type { SnapPoint } from '../../core/engine/rv-snap-point-registry';
+import { commandRegistry } from '../../core/hmi/rv-command-registry';
+import { SNAP_ATTACH_KEY } from '../layout-planner/planner-commands';
 import { useSnapHoverState, snapHoverStore } from './snap-hover-store';
 import { findCompatibleLibraryAssets } from './library-snap-index';
 import { oppositeDirection } from './snap-name-parser';
@@ -127,21 +128,31 @@ export function SnapPointPickerPopup({ viewer }: UISlotProps): ReactElement | nu
 
     setIsPlacing(true);
     try {
-      // Delegate the actual GLB clone + snap-aligned placement to the planner.
-      // The planner exposes placeAtSnap via a thin shim added in Phase 6.
-      const plannerWithSnap = planner as LayoutPlannerPlugin & {
-        placeAtSnap?: (entry: LibraryCatalogEntry, target: SnapPoint, ownSnapName: string) => Promise<string | null>;
-      };
-      if (typeof plannerWithSnap.placeAtSnap === 'function') {
-        const id = await plannerWithSnap.placeAtSnap(item.entry, target, item.ownSnapName);
-        if (id) {
-          snapHoverStore.closePicker();
-        } else {
-          setErrorMsg('Placement rejected');
-        }
-      } else {
-        setErrorMsg('Snap placement not wired in planner');
+      // plan-499 follow-up: the picker entry is a VIEW of `layout.snapAttach` —
+      // same rule, same refusal text and the same ONE undo step as
+      // `web_layout_snap_attach`. The command addresses the target by
+      // placement id + snap name, so it serves every snap that lives on a
+      // planner placement under a name unique on that placement.
+      const targetId = planner.findPlacedIdByRoot(target.ownerRoot);
+      const snapName = target.object3D.name;
+      const nameIsUnique = registry.getByOwnerRoot(target.ownerRoot)
+        .filter((sp) => sp.object3D.name === snapName).length === 1;
+      if (targetId && nameIsUnique) {
+        const r = await commandRegistry.execute(
+          'layout.snapAttach',
+          { targetId, catalogId: item.entry.id, targetSnapName: snapName },
+          { origin: 'ui', buttonKey: SNAP_ATTACH_KEY, viewer },
+        );
+        if (r.ok) snapHoverStore.closePicker();
+        else setErrorMsg(r.reason);
+        return;
       }
+      // A snap the command cannot address (it lives on the main model, not on
+      // a planner placement, or its name is ambiguous there): the planner's
+      // snap placement directly, exactly as before the command existed.
+      const id = await planner.placeAtSnap(item.entry, target, item.ownSnapName);
+      if (id) snapHoverStore.closePicker();
+      else setErrorMsg('Placement rejected');
     } catch (e) {
       setErrorMsg(String(e));
     } finally {

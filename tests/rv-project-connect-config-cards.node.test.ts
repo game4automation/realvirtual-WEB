@@ -55,13 +55,19 @@ describe('knowledge files — the same by-ending rule (*.knowledge.md)', () => {
     expect(isKnowledgeFilePath('docs/filler.knowledge.md')).toBe(true);
     expect(isKnowledgeFilePath('filler.knowledge.md')).toBe(true);
     expect(isKnowledgeFilePath('Filler.Knowledge.MD')).toBe(true);
-    expect(isKnowledgeFilePath('docs/manual.md')).toBe(false);
+    // Plain Markdown counts as knowledge too (user decision 2026-09-10) — the
+    // dashboard shows one knowledge card for both spellings.
+    expect(isKnowledgeFilePath('docs/manual.md')).toBe(true);
+    expect(isKnowledgeFilePath('docs/manual.txt')).toBe(false);
     expect(isKnowledgeFilePath(`any${KNOWLEDGE_FILE_SUFFIX}`)).toBe(true);
   });
 
   it('strips the ending for display and passes everything else through', () => {
     expect(stripKnowledgeFileSuffix('docs/filler.knowledge.md')).toBe('docs/filler');
-    expect(stripKnowledgeFileSuffix('docs/manual.md')).toBe('docs/manual.md');
+    // The ending a path actually carries is what gets stripped, so a plain
+    // `.md` loses only `.md`.
+    expect(stripKnowledgeFileSuffix('docs/manual.md')).toBe('docs/manual');
+    expect(stripKnowledgeFileSuffix('docs/manual.txt')).toBe('docs/manual.txt');
   });
 
   it('becomes its own ref kind in the dashboard tree, name stripped', () => {

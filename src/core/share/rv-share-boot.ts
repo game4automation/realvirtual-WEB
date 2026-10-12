@@ -48,8 +48,13 @@ import type { ModelProvenance } from '../rv-model-provenance';
 import {
   fetchSharedGlb,
   describeShareFetchError,
+  ShareFetchError,
+  SHARE_DECRYPT_MESSAGES,
   type FetchSharedGlbOptions,
+  type SharedGlbPayload,
 } from './rv-share-fetch';
+import { getSharedGlbDecryptor, ShareDecryptError } from './rv-share-decrypt';
+import { isEncryptedEnvelope } from '../persistence/rv-crypto-utils';
 import { buildSharedGlbInfo, filenameFromUrl, originHostOf } from './rv-share-meta';
 import { beginSharedGlbLoad, setSharedGlb, failSharedGlb } from './rv-share-store';
 import type { EmbeddedOrigin } from '../engine/rv-glb-flatten';
@@ -67,6 +72,7 @@ export interface ShareBootViewer {
     modelName?: string;
     trust: { trusted: boolean; sourceOrigin?: string };
     provenance?: ModelProvenance;
+    identityUrl?: string;
   }): Promise<{ root?: Object3D } | undefined | void>;
   currentModelUrl?: string | null;
 }
@@ -107,6 +113,13 @@ export async function bootSharedGlb(
     const trustRecordKey = target.kind === 'opaque'
       ? shareTrustKeyForId(target.id)
       : shareTrustKeyForUrl(target.url);
+
+    // plan-560: an RVE1 envelope takes its own branch. Everything below it is
+    // the plaintext path, unchanged (F8).
+    if (isEncryptedEnvelope(payload.bytes)) {
+      return await bootEncryptedShare(viewer, url, payload, trustRecordKey, options);
+    }
+
     const digest = await digestOfBytes(payload.bytes);
     // BOTH must match: a decision is about the bytes the user looked at, not
     // about an address somebody else can point elsewhere later.
@@ -150,6 +163,98 @@ export async function bootSharedGlb(
     failSharedGlb(message);
     return { ok: false, error: message };
   }
+}
+
+/**
+ * The encrypted branch of the boot (plan-560 §2.4).
+ *
+ * The decryptor is a SEAM: the public edition installs none and answers with a
+ * sentence instead of loading ciphertext. A commercial build installs the
+ * password prompt. A load opened with the password runs **trusted** (user
+ * decision: password = trusted) — but only for this session: no trust-store
+ * lookup and no record, so a shared link still leaves nothing behind (F10).
+ *
+ * The card keeps the ENVELOPE as its payload, so the download button hands out
+ * the encrypted file and the plaintext never leaves the page as a file.
+ */
+async function bootEncryptedShare(
+  viewer: ShareBootViewer,
+  requestUrl: string,
+  payload: SharedGlbPayload,
+  trustRecordKey: string,
+  options?: ShareBootOptions,
+): Promise<ShareBootResult> {
+  const decryptor = getSharedGlbDecryptor();
+  if (!decryptor) {
+    throw new ShareFetchError('encrypted-unsupported', SHARE_DECRYPT_MESSAGES['encrypted-unsupported']);
+  }
+
+  let plain: ArrayBuffer;
+  try {
+    plain = await decryptor(payload.bytes);
+  } catch (e) {
+    throw toShareDecryptFetchError(e);
+  }
+
+  const digest = await digestOfBytes(plain);
+  const sourceOrigin = originOf(payload.finalUrl).sourceOrigin;
+  // `finalUrl` is usually a short-lived signed storage URL (fileshare 302 →
+  // GCS). It is neither a name nor a place to look for neighbours: the
+  // hierarchy titles the model from `currentModelUrl`, and the loader probes a
+  // `<name>.kin.json` next to any `.glb` url (→ 403 against a signature).
+  // So the loader gets the URL that was ASKED for (a fileshare `/file` route
+  // is not `.glb`, no probe), and the identity is the finalUrl without its
+  // query and without the `.rve` marker.
+  const identityUrl = encryptedIdentityUrl(payload.finalUrl);
+  const result = await viewer.loadModel(requestUrl, {
+    data: plain,
+    identityUrl,
+    modelName: filenameFromUrl(payload.finalUrl).replace(/\.rve$/i, ''),
+    trust: { trusted: true, ...originOf(payload.finalUrl) },
+    provenance: {
+      trusted: true,
+      source: 'share-encrypted',
+      trustRecordKey,
+      ...(digest ? { digest } : {}),
+      ...(sourceOrigin ? { sourceOrigin } : {}),
+    },
+  });
+
+  const userData = (result && typeof result === 'object' && 'root' in result)
+    ? (result as { root?: Object3D }).root?.userData
+    : undefined;
+  viewer.currentModelUrl = identityUrl;
+
+  setSharedGlb(
+    buildSharedGlbInfo({
+      url: payload.finalUrl,
+      userData,
+      embeddedOrigins: options?.embeddedOrigins ?? readEmbeddedOrigins(userData),
+      encrypted: true,
+    }),
+    payload,
+  );
+  return { ok: true };
+}
+
+/** `https://h/p/name.rve.glb?sig…` → `https://h/p/name.glb` (plan-560 follow-up). */
+function encryptedIdentityUrl(finalUrl: string): string {
+  const bare = finalUrl.split(/[?#]/)[0] ?? finalUrl;
+  return bare.replace(/\.rve(\.glb)$/i, '$1');
+}
+
+/** Map a decryptor rejection onto the card's error kinds (plan-560 F6/F7). */
+function toShareDecryptFetchError(e: unknown): ShareFetchError {
+  if (e instanceof ShareFetchError) return e;
+  if (e instanceof ShareDecryptError) {
+    if (e.code === 'link-incomplete') {
+      return new ShareFetchError('link-incomplete', SHARE_DECRYPT_MESSAGES['link-incomplete'], { cause: e });
+    }
+    if (e.code === 'cancelled') {
+      return new ShareFetchError('decrypt-cancelled', SHARE_DECRYPT_MESSAGES['decrypt-cancelled'], { cause: e });
+    }
+  }
+  return new ShareFetchError('decrypt-failed', SHARE_DECRYPT_MESSAGES['decrypt-failed'], { cause: e });
 }
 
 function originOf(url: string): { sourceOrigin?: string } {

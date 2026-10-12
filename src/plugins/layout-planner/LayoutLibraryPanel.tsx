@@ -78,6 +78,9 @@ import { GLOBAL_LIBRARY_PROVIDER_ID } from '../../core/library/global-library-pr
 import { crossSourceKeyOf } from '../../core/hmi/projects/assets-library-groups';
 import { PROJECT_PLACEMENT_PREFIX } from './planner-persistence';
 import { deriveChips, filterByChip } from '../../core/library/library-chips';
+import { commandRegistry } from '../../core/hmi/rv-command-registry';
+import { aiTouchSx, useCommandView } from '../../core/hmi/rv-command-view';
+import { getAiTouchMs } from '../../core/hmi/button-sim-state';
 import { AssetCard } from '../../core/library/AssetCard';
 import { openProjectsDashboard } from '../../core/hmi/projects/projects-dashboard-store';
 import { plannerThumbnailKey } from './planner-thumbnail-key';
@@ -122,7 +125,8 @@ function prefetchableUrl(entry: LibraryCatalogEntry): string | null {
  *  plugin warms it under its stable key instead (plan-723). */
 function warmEntry(plugin: LayoutPlannerPlugin, entry: LibraryCatalogEntry): void {
   const url = prefetchableUrl(entry);
-  if (url) { plugin.modelCache.prefetch(url); return; }
+  // Decode-only warm-up, under the instancer's ONE key derivation.
+  if (url) { plugin.prefetchEntry(entry, { bake: false }); return; }
   if (entry.virtual === true || entry.splatUrl) return;
   plugin.prefetchEntry(entry);
 }
@@ -849,15 +853,33 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
     // Surface placement failures so the click doesn't appear to do nothing
     // when the gaussian-splat library throws (e.g. unsupported format).
     if (entry.splatUrl) {
-      plugin.placeComponent(entry, [0, 0, 0]).catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[LayoutPlanner] Failed to place splat "${entry.name}":`, err);
-        showInfoOverlay(`Splat konnte nicht platziert werden: ${msg}`);
+      // plan-499: the direct place IS `layout.place` — the same command as web_layout_place.
+      void commandRegistry.execute<unknown>(
+        'layout.place', { catalogId: entry.id, x: 0, y: 0, z: 0, onto: null }, { origin: 'ui', ...(viewer ? { viewer } : {}) },
+      ).then((r) => {
+        if (r.ok) return;
+        console.error(`[LayoutPlanner] Failed to place splat "${entry.name}":`, r.reason);
+        showInfoOverlay(`Splat konnte nicht platziert werden: ${r.reason}`);
       });
       return;
     }
     // Toggle: click same entry again to cancel
     plugin.store.setPlacementMode(isPlacing ? null : entry.id);
+  };
+
+  // plan-499: the entry is the (interactive) view of `layout.place` — a click
+  // starts the placement mode (or places a splat), the MCP choreography presses
+  // this card and web_layout_place leaves its afterglow here.
+  const placeView = useCommandView({
+    id: 'layout.place',
+    args: () => ({ catalogId: entry.id, x: 0, y: 0, z: 0, onto: null }),
+    invoke: handleClick,
+    ...(viewer ? { viewer } : {}),
+  });
+  const placeGlow = {
+    ...(placeView.simPhase === 'hover' || placeView.simPhase === 'pressed'
+      ? { outline: '1px solid rgba(79,195,247,0.9)', bgcolor: 'rgba(79,195,247,0.18)' } : null),
+    ...(placeView.touch ? aiTouchSx(placeView.aiTouch, getAiTouchMs()) : null),
   };
 
   const runGeneratePreview = useCallback(async () => {
@@ -932,6 +954,11 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
 
   return (
     <>
+    <Box
+      {...placeView.dataAttrs}
+      aria-description={placeView.touch ? 'Triggered by AI' : undefined}
+      sx={{ borderRadius: 0.5, ...placeGlow }}
+    >
     <AssetCard
       ref={cardRef}
       entry={entry}
@@ -939,11 +966,22 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
       draggable={!isSplat}
       cursor={isSplat ? 'pointer' : (isPlacing ? 'crosshair' : 'grab')}
       selected={isPlacing}
-      tooltip={description ?? ''}
-      tooltipOpen={!!description && hovered && !dragging}
+      // The full name first — the card label is one clipped line — then the
+      // behaviour description when the component has one.
+      tooltip={(
+        <Box sx={{ maxWidth: 320 }}>
+          <Box component="span" sx={{ display: 'block', fontWeight: 600, wordBreak: 'break-word' }}>
+            {entry.name}
+          </Box>
+          {description && (
+            <Box component="span" sx={{ display: 'block', mt: 0.5, opacity: 0.85 }}>{description}</Box>
+          )}
+        </Box>
+      )}
+      tooltipOpen={hovered && !dragging}
       onDragStart={isSplat ? undefined : handleDragStart}
       onDragEnd={isSplat ? undefined : handleDragEnd}
-      onClick={handleClick}
+      onClick={placeView.onClick}
       onContextMenu={handleContextMenu}
       onMouseEnter={() => { setHovered(true); startPrefetchIntent(); }}
       onMouseLeave={() => { setHovered(false); cancelPrefetchIntent(); }}
@@ -984,6 +1022,7 @@ export const ThumbnailCard = memo(function ThumbnailCard({ entry, isPlacing, isP
         </Tooltip>
       )}
     />
+    </Box>
     <Menu
       open={ctxPos !== null}
       onClose={() => setCtxPos(null)}

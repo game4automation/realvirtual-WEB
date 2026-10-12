@@ -175,7 +175,7 @@ export const meshMergeRegistry = {
 
 /** Yield one macrotask via MessageChannel (React-scheduler pattern —
  *  `setTimeout(0)` is clamped to 4 ms+, `requestIdleCallback` is Safari-gated).
- *  Exported for the BatchedMesh arena builders (rv-batched-render.ts). */
+ *  Exported for the bake staging (rv-bake-pipeline.ts). */
 export function yieldMacrotask(): Promise<void> {
   if (typeof MessageChannel === 'undefined') {
     // Non-browser environment (SSR) — a microtask is the best we can do.

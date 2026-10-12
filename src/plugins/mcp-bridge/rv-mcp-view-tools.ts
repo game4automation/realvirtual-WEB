@@ -12,8 +12,15 @@
  * These tools give an AI agent the same primitives a human uses to LOOK at a
  * model: measure a node (bounds), look around (camera focus/orbit), point at
  * things (pick/gaze), reduce clutter (isolate), and read labelled screenshots.
- * The real viewport camera is driven (animated moves) so a watching user sees
- * exactly what the agent does.
+ *
+ * Since plan-740 every one of them drives the AGENT's own camera body
+ * (`viewer.agentEye`) and renders OFFSCREEN through it — never the visible
+ * viewport, and never the drawing buffer. Nothing here animates, waits or
+ * freezes the controls: a human navigating while an agent works sees a small
+ * cone move, not their own view being taken away. Selection and the isolate
+ * dimming stay SHARED (D-U3), because those are document state rather than a
+ * point of view. `web_screenshot` (mcp-bridge-plugin.ts) is the one deliberate
+ * exception in the whole surface: it is still "what the human sees".
  */
 
 import { Box3, Matrix4, Quaternion, Vector3 } from 'three';
@@ -21,17 +28,31 @@ import type { Mesh, Object3D } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { computeSubtreeAABB } from '../../core/engine/rv-traverse-utils';
+import { isChunkMesh, isRuntimeNode } from '../../core/engine/rv-node-classification';
 import { parsePathsParam } from './rv-object-analyzer-math';
 import {
-  captureFrameCanvas, canvasToRvImage, saveCanvasToProject, compositeMontage,
+  canvasToRvImage, canvasesToRvImages, saveCanvasToProject, compositeMontage,
+  type RvImageChannel,
 } from './rv-frame-capture';
-import { computeFlyPose, type CameraPose } from './rv-camera-fly-math';
+import { computeFlyPose } from './rv-camera-fly-math';
+// plan-740: the agent's own camera body, plus the canonical fit formula shared
+// with the viewport's CameraManager so there is exactly one copy of the maths.
+import type { AgentEye } from '../../core/engine/rv-agent-eye';
+import { fitDistanceBothAxesFor } from '../../core/rv-camera-manager';
+import { fitPoseToPoints, type Vec3 as FitVec3 } from './rv-frame-fit-math';
 import {
-  sweepPoses, sampleGrid, summarizeViewHits,
-  DEFAULT_SWEEP_COUNT, DEFAULT_SWEEP_PITCH_DEG, DEFAULT_TOP_N, type ViewNote,
+  sweepPoses, summarizeVisibleGroups,
+  DEFAULT_SWEEP_COUNT, DEFAULT_SWEEP_PITCH_DEG, DEFAULT_TOP_N, type SweepViewNote,
 } from './rv-view-sweep-math';
-import { findPickOwner } from '../../core/engine/rv-pick-owner';
-import { projectLabelAnchors, drawAnnotations, type LabelTarget } from './rv-annotate';
+// plan-740 Phase 3: every perception tool renders through the AGENT camera, on
+// the one shared capture chain (D-U10 / D-A15).
+import {
+  buildVisible, guardAgentCapture, renderAgentChannels, serializeEyeCapture,
+} from './rv-mcp-observe-tools';
+import { defaultGroupBy } from '../../core/engine/rv-idmask-grouping';
+import { EYE_CHANNELS, dedupeChannels, type EyeChannel } from '../../core/engine/rv-eye-channels';
+import { SOM_DEFAULT_CAP, computeMarks } from './rv-som-math';
+import { drawMarks } from './rv-annotate';
 import {
   computeIdenticalPaths,
   computeSameMaterialPaths,
@@ -41,6 +62,48 @@ import {
 
 const r3 = (n: number): number => +n.toFixed(3);
 const vec3 = (v: Vector3): [number, number, number] => [r3(v.x), r3(v.y), r3(v.z)];
+
+/**
+ * Resolve a path against the DOCUMENT first, then the scene graph (plan-754 F11).
+ *
+ * `web_node_tree` and `web_node_find` report the whole graph now, chunk meshes
+ * and runtime objects included, under the name path those nodes would have. The
+ * registry does not know them — so measuring one used to answer "not found" for
+ * a path the agent had just been shown. The fallback walks `children` by name,
+ * the same rule `NodeRegistry.computeNodePath` produces, and is only ever
+ * reached when the registry has no answer; a registered path never changes
+ * meaning.
+ *
+ * Matching is prefix-and-backtrack rather than a `split('/')`, because a chunk
+ * mesh is NAMED after the boundary it merged (`mover:Robot/Axis1|tex:cafe`) and
+ * that name contains separators. Splitting would make exactly the nodes this
+ * fallback exists for unreachable.
+ */
+function walkByName(node: Object3D, rest: string): Object3D | null {
+  for (const child of node.children) {
+    const name = child.name;
+    if (!name) continue;
+    if (rest === name) return child;
+    if (rest.startsWith(`${name}/`)) {
+      const found = walkByName(child, rest.slice(name.length + 1));
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+export function resolveSceneNodeByPath(viewer: RVViewer, path: string): Object3D | null {
+  const registered = viewer.registry?.getNode(path) ?? null;
+  if (registered) return registered;
+  const root = viewer.currentModelRoot ?? viewer.scene ?? null;
+  if (!root || !path) return null;
+  if (path === root.name) return root;
+  if (root.name && path.startsWith(`${root.name}/`)) {
+    const below = walkByName(root, path.slice(root.name.length + 1));
+    if (below) return below;
+  }
+  return walkByName(root, path);
+}
 const num0 = (n: number | undefined): number =>
   typeof n === 'number' && Number.isFinite(n) ? n : 0;
 
@@ -57,13 +120,94 @@ const GROUND_RAY_MAX_M = 50;
  */
 const GROUND_PROBE_UP_M = 10;
 
-// ── web_view_sweep defaults (plan-705 D-A10) ────────────────────────────
-/** Rays per axis for the visibility notes — 7×7 = 49 samples per view. */
-const SWEEP_GRID_N = 7;
-/** Long edge of each captured cell; compositeMontage caps cells at 640 px anyway. */
+// ── web_view_sweep defaults (plan-705 D-A10, plan-740 P3.1) ─────────────
+/** Long edge of each rendered cell; compositeMontage caps cells at 640 px anyway. */
 const SWEEP_CELL_PX = 640;
-const SWEEP_MOVE_MS = 600;
-const SWEEP_SETTLE_MS = 120;
+
+// ── web_view_ortho ────────────────────────────────────────────────────────
+/** Rendered edge of one ortho cell; compositeMontage caps cells at 533 px in a 3-column sheet anyway. */
+// Cell edge of one ortho view. The FLOOR matches web_eye's (2026-09-14): a
+// view too small to read is not a cheaper answer, it is no answer. The CEILING
+// sits above the floor on purpose — with min === max the size parameter would
+// silently do nothing again, which is the exact defect this tool just had.
+/** Meshes sampled for a framing fit — see `_fitPoints`. */
+const FIT_MESH_SAMPLE_CAP = 2000;
+
+const ORTHO_CELL_DEFAULT_PX = 1024;
+const ORTHO_CELL_MIN_PX = 1024;
+const ORTHO_CELL_MAX_PX = 2048;
+/** Frame margin around the part's extents, as a factor of the half-extent. */
+const ORTHO_MARGIN = 1.08;
+/** Smallest half-extent that is framed — a bare pivot still gets a picture. */
+const ORTHO_MIN_HALF_M = 0.01;
+/**
+ * Ortho fov ceiling for the `clip` placement. `fov` is the eye's width
+ * measure in ortho (`halfH = dist·tan(fov/2)`), so a camera sitting right on
+ * the face of a thin plate would need ~180°; the body clamps at 120°, and
+ * 110° keeps a margin below that.
+ */
+const ORTHO_MAX_FOV_DEG = 110;
+
+type OrthoAxis = 'x' | 'y' | 'z';
+
+/**
+ * The six views. `dir` is the unit offset FROM the target TO the camera, the
+ * same spelling (and the same front = +Z convention) as `presetDirection` in
+ * rv-camera-presets-math. `across` names the two box axes that span the
+ * picture, `along` the view axis. Roll follows Three's `lookAt` fallback for
+ * the vertical pair, which puts −Z ("north") at the top of the top view —
+ * identical to the `top` preset — and +Z at the top of the bottom view.
+ */
+const ORTHO_VIEWS: ReadonlyArray<{
+  name: string; label: string; dir: [number, number, number]; across: [OrthoAxis, OrthoAxis]; along: OrthoAxis;
+}> = [
+  { name: 'front',  label: 'front (+Z)',  dir: [0, 0, 1],  across: ['x', 'y'], along: 'z' },
+  { name: 'back',   label: 'back (−Z)',   dir: [0, 0, -1], across: ['x', 'y'], along: 'z' },
+  { name: 'left',   label: 'left (−X)',   dir: [-1, 0, 0], across: ['z', 'y'], along: 'x' },
+  { name: 'right',  label: 'right (+X)',  dir: [1, 0, 0],  across: ['z', 'y'], along: 'x' },
+  { name: 'top',    label: 'top (+Y)',    dir: [0, 1, 0],  across: ['x', 'z'], along: 'y' },
+  { name: 'bottom', label: 'bottom (−Y)', dir: [0, -1, 0], across: ['x', 'z'], along: 'y' },
+];
+
+/**
+ * Position, target and fov of one orthographic view. With `clip` the camera
+ * sits just outside the box face along the view axis, so the eye's near plane
+ * (`max(dist/1000, 5 mm)`) sections the scene at the box and nothing in front
+ * of the part is drawn; the fov is then whatever frames the across-extents
+ * from that short distance, capped so the body's lens clamp cannot bite.
+ * Without `clip` the camera stands two bounding radii out, like the sweep.
+ */
+function orthoViewPose(
+  view: (typeof ORTHO_VIEWS)[number],
+  center: Vector3,
+  extent: Vector3,
+  radius: number,
+  clip: boolean,
+): { px: number; py: number; pz: number; tx: number; ty: number; tz: number; fov: number; halfH: number } {
+  const halfH = Math.max(extent[view.across[0]], extent[view.across[1]], ORTHO_MIN_HALF_M * 2) / 2 * ORTHO_MARGIN;
+  const halfDepth = extent[view.along] / 2;
+  const maxTan = Math.tan((ORTHO_MAX_FOV_DEG * Math.PI) / 360);
+  let dist = clip
+    ? halfDepth * 1.02 + 0.01
+    : Math.max(radius * 2 + halfDepth, ORTHO_MIN_HALF_M * 10);
+  if (halfH / dist > maxTan) dist = halfH / maxTan;
+  const fov = (2 * Math.atan(halfH / dist) * 180) / Math.PI;
+  return {
+    px: center.x + view.dir[0] * dist,
+    py: center.y + view.dir[1] * dist,
+    pz: center.z + view.dir[2] * dist,
+    tx: center.x, ty: center.y, tz: center.z,
+    fov, halfH,
+  };
+}
+
+/** `groupBy` parser with web_eye's semantics: unknown → undefined (the default applies). */
+function normalizeOrthoGroupBy(raw?: string): 'hierarchy' | 'geometry' | 'component' | undefined {
+  const s = (raw ?? '').trim().toLowerCase();
+  return s === 'hierarchy' || s === 'geometry' || s === 'component' ? s : undefined;
+}
+
+/** Long edge of the annotated shot — the historical full-frame capture cap. */
 
 /**
  * Selectable mesh universe for select-similar: every effectively-visible,
@@ -112,7 +256,7 @@ export class McpViewTools {
   // per argument, and cannot say "read-only iff focus=false" — so the conservative value wins.
   // Read-only clients keep web_measure and web_node_shape, which are side-effect free by
   // construction, so nothing is actually unmeasurable.
-  @McpTool('Measure nodes: world AABB (center/size/min/max, meters), node-local box + world quaternion (oriented bounds), mesh count. Also SELECTS and frames the nodes (viewport highlight + camera focus, like a user click + F) unless focus=false. THE numeric grounding for pivot placement, axis positions and part sizes. Paths from web_node_find / web_node_tree.', { readOnly: false })
+  @McpTool('Measure nodes: world AABB (center/size/min/max, meters), node-local box + world quaternion (oriented bounds), mesh count. Also SELECTS the nodes (shared viewport highlight, like a user click) and frames them with the AGENT camera, unless focus=false. THE numeric grounding for pivot placement, axis positions and part sizes. Paths from web_node_find / web_node_tree — including the chunk/runtime nodes those report, which come back flagged and are measured but never selected.', { readOnly: false })
   async webNodeBounds(
     @McpParam('paths', 'Node paths, comma- or newline-separated.') paths: string,
     @McpParam('focus', 'Also select and frame the measured nodes (default true); pass false for measurement only.', 'boolean', false) focus?: boolean,
@@ -128,9 +272,12 @@ export class McpViewTools {
     const resolvedNodes: Object3D[] = [];
     const unionBox = new Box3();
     for (const p of requested) {
-      const node = reg.getNode(p);
+      const node = resolveSceneNodeByPath(v, p);
       if (!node) { unresolved.push(p); continue; }
-      resolvedPaths.push(p);
+      // Only a REGISTERED path may reach the selection below — `selectPaths`
+      // goes through the registry, and a chunk mesh has no entry there.
+      const registered = reg.getPathForNode(node);
+      if (registered !== null) resolvedPaths.push(registered);
       resolvedNodes.push(node);
       node.updateMatrixWorld(true);
       const { box, size, center } = computeSubtreeAABB(node, new Box3());
@@ -161,29 +308,39 @@ export class McpViewTools {
         worldQuaternion: [r3(q.x), r3(q.y), r3(q.z), r3(q.w)],
         worldPosition: vec3(node.getWorldPosition(new Vector3())),
         meshCount,
+        // Same two flags the panel and web_node_tree carry (plan-754 F11).
+        ...(isChunkMesh(node) ? { chunk: true } : {}),
+        ...(isRuntimeNode(node, registered) ? { runtime: true } : {}),
       });
     }
     let selected = 0;
     let framed = false;
     if (focus !== false && resolvedNodes.length > 0) {
+      // Selection stays SHARED with the human (plan-740 D-U3) — only the
+      // framing moved to the agent camera, so a measurement no longer yanks a
+      // watching operator's viewport around.
       if (v.selectionManager) {
         v.selectionManager.selectPaths(resolvedPaths);
         selected = resolvedPaths.length;
       }
-      if (!unionBox.isEmpty()) {
-        v.fitToNodes(resolvedNodes, undefined, { easing: 'easeInOut', duration: 0.6 });
-      } else {
-        // Mesh-less pivots: fitToNodes bails on an empty AABB, so aim at the
-        // pivot position directly, keeping the current view direction.
-        const pivot = new Vector3();
-        for (const n of resolvedNodes) pivot.add(n.getWorldPosition(new Vector3()));
-        pivot.divideScalar(resolvedNodes.length);
-        const state = v.getCameraState();
-        const dir = state.position.clone().sub(state.target).normalize();
-        v.animateCameraTo(pivot.clone().add(dir.multiplyScalar(0.8)), pivot, 0.6, 'easeInOut');
+      const eye = this._eye(v);
+      if (eye) {
+        const pose = eye.pose;
+        const dir = new Vector3(pose.px - pose.tx, pose.py - pose.ty, pose.pz - pose.tz);
+        if (dir.lengthSq() < 1e-12) dir.set(0, 0, 1);
+        dir.normalize();
+        if (!unionBox.isEmpty()) {
+          this._frameEyeToBox(eye, unionBox, dir, resolvedNodes);
+        } else {
+          // Mesh-less pivots have no AABB to fit, so aim at the pivot position
+          // directly from a fixed short distance, keeping the view direction.
+          const pivot = new Vector3();
+          for (const n of resolvedNodes) pivot.add(n.getWorldPosition(new Vector3()));
+          pivot.divideScalar(resolvedNodes.length);
+          this._placeEye(eye, pivot, dir, 0.8);
+        }
+        framed = true;
       }
-      framed = true;
-      await sleep(700);
     }
     return JSON.stringify({
       nodes: out,
@@ -193,58 +350,7 @@ export class McpViewTools {
     });
   }
 
-  @McpTool('Pick what is at a screen position: returns the hit node path, 3D world point, surface normal and distance. In editor mode, path is the EXACT mesh node you see; ownerPath/ownerComponents name the nearest component-bearing ancestor (e.g. the owning Drive) — use web_select(ownerPath) to select that instead. The hit node is also SELECTED (viewport highlight + panels, like a user click) unless select=false. x/y are fractions 0..1 of the canvas (0,0 = top-left). Use to identify parts and get exact 3D coordinates for pivots/axes.', { readOnly: false })
-  async webViewPick(
-    @McpParam('x', 'Horizontal position, fraction 0..1 of canvas width.', 'number') x: number,
-    @McpParam('y', 'Vertical position, fraction 0..1 of canvas height.', 'number') y: number,
-    @McpParam('select', 'Also select the hit node (default true).', 'boolean', false) select?: boolean,
-  ): Promise<string> {
-    return this._pickAt(x, y, select !== false);
-  }
-
-  @McpTool('Pick what is at the CENTER of the current view (the gaze point): hit node path, 3D world point, surface normal, distance. Also selects the hit node unless select=false. Equivalent to web_view_pick at (0.5, 0.5).', { readOnly: false })
-  async webViewGaze(
-    @McpParam('select', 'Also select the hit node (default true).', 'boolean', false) select?: boolean,
-  ): Promise<string> {
-    return this._pickAt(0.5, 0.5, select !== false);
-  }
-
-  private _pickAt(x: number, y: number, select = true): string {
-    const v = this.viewer;
-    const rm = v?.raycastManager;
-    if (!v || !rm) return JSON.stringify({ error: 'No raycast manager' });
-    const rect = v.renderer.domElement.getBoundingClientRect();
-    const fx = Math.min(Math.max(Number(x), 0), 1);
-    const fy = Math.min(Math.max(Number(y), 0), 1);
-    const hit = rm.raycastForRVNodeDetailed({
-      clientX: rect.left + fx * rect.width,
-      clientY: rect.top + fy * rect.height,
-    });
-    if (!hit) return JSON.stringify({ hit: false });
-    const cam = v.camera.position;
-    const p = hit.hitPoint;
-    const dist = Math.hypot(p[0] - cam.x, p[1] - cam.y, p[2] - cam.z);
-    let selected = false;
-    const hitNode = hit.path ? v.registry?.getNode(hit.path) : undefined;
-    if (select && hit.path && v.selectionManager && hitNode) {
-      v.selectionManager.selectPaths([hit.path]);
-      selected = true;
-    }
-    // Owning component node (self included) — with exact-node editor picks,
-    // this is how an agent learns which Drive/component a sub-mesh belongs to.
-    const owner = hitNode && v.registry ? findPickOwner(hitNode, v.registry) : null;
-    return JSON.stringify({
-      hit: true,
-      path: hit.path,
-      point: p.map(r3),
-      normal: hit.hitNormal.map(r3),
-      distance: r3(dist),
-      selected,
-      ...(owner ? { ownerPath: owner.path, ownerComponents: owner.components } : {}),
-    });
-  }
-
-  @McpTool('Isolate nodes visually: only the given subtrees stay bright and interactive, everything else is dimmed; the camera frames the isolated set. Call with empty paths to EXIT isolation. Use before screenshots of buried parts.', { readOnly: false })
+  @McpTool('Isolate nodes visually: only the given subtrees stay bright and interactive, everything else is dimmed. The dimming is SHARED with the user (it is document state), but only the AGENT camera frames the isolated set — the user viewport stays where it is. Call with empty paths to EXIT isolation. Use before captures of buried parts.', { readOnly: false })
   async webViewIsolate(
     @McpParam('paths', 'Node paths to isolate (comma/newline-separated). Empty = exit isolation.', 'string', false) paths: string,
   ): Promise<string> {
@@ -264,87 +370,188 @@ export class McpViewTools {
     if (nodes.length === 0) {
       return JSON.stringify({ error: `Node(s) not found: ${unresolved.join(', ')}` });
     }
-    v.isolateNodes(nodes);
+    // Dimming yes, viewport flight no (plan-740 D-U3): the isolation itself is
+    // shared scene state, the framing belongs to whoever asked for it.
+    v.isolateNodes(nodes, false);
+    let framed = false;
+    const eye = this._eye(v);
+    if (eye) {
+      const box = new Box3().makeEmpty();
+      for (const n of nodes) { n.updateMatrixWorld(true); box.union(computeSubtreeAABB(n, new Box3()).box); }
+      if (!box.isEmpty()) {
+        const pose = eye.pose;
+        const dir = new Vector3(pose.px - pose.tx, pose.py - pose.ty, pose.pz - pose.tz);
+        if (dir.lengthSq() < 1e-12) dir.set(0, 0, 1);
+        dir.normalize();
+        this._frameEyeToBox(eye, box, dir, nodes);
+        framed = true;
+      }
+    }
     return JSON.stringify({
-      isolated: nodes.length, active: true,
+      isolated: nodes.length, active: true, framed,
       ...(unresolved.length ? { unresolved } : {}),
-    });
-  }
-
-  @McpTool('Screenshot with LABELS: captures the current view and pins a labelled marker on each given node (at its bounds center). Optionally crop to one node via cropPath. labels = optional comma-separated custom labels (defaults to each path\'s last segment; pass numbers=true for #1..#n). Ideal for confirming which part is which before kinematizing.', { readOnly: true })
-  async webScreenshotAnnotated(
-    @McpParam('paths', 'Node paths to label, comma- or newline-separated.') paths: string,
-    @McpParam('labels', 'Optional labels, comma-separated, same order as paths.', 'string', false) labels: string,
-    @McpParam('cropPath', 'Optional node path to crop the shot to.', 'string', false) cropPath: string,
-    @McpParam('numbers', 'Label markers #1..#n instead of names.', 'boolean', false) numbers: boolean,
-    @McpParam('savePath', 'Optional PROJECT-relative path to also write the shot as PNG. A bare name lands in "captures/"; a path that names its own folders is taken as given (e.g. "knowledge/MyAsset/views/axis-z.png"). ".png" is appended when missing. Requires an open writable project. The result reports savedPath, or saveError when the write failed.', 'string', false) savePath?: string,
-  ): Promise<string> {
-    const v = this.viewer;
-    if (!v) return JSON.stringify({ error: 'No viewer' });
-    const requested = parsePathsParam(paths);
-    if (requested.length === 0) return JSON.stringify({ error: 'No node paths given' });
-    const customLabels = (labels ?? '').split(',').map(s => s.trim()).filter(Boolean);
-
-    const targets: LabelTarget[] = [];
-    const unresolved: string[] = [];
-    for (let i = 0; i < requested.length; i++) {
-      const p = requested[i];
-      const node = v.registry?.getNode(p);
-      if (!node) { unresolved.push(p); continue; }
-      node.updateMatrixWorld(true);
-      const { center, box } = computeSubtreeAABB(node, new Box3());
-      const label = numbers
-        ? `#${targets.length + 1}`
-        : customLabels[i] ?? p.split('/').filter(Boolean).pop() ?? p;
-      targets.push({ point: box.isEmpty() ? node.getWorldPosition(new Vector3()) : center, label });
-    }
-    if (targets.length === 0) {
-      return JSON.stringify({ error: `Node(s) not found: ${unresolved.join(', ')}` });
-    }
-
-    const r = captureFrameCanvas(v, { path: cropPath || undefined });
-    if ('error' in r) return JSON.stringify({ error: r.error });
-    const src = v.renderer.domElement;
-    const anchors = projectLabelAnchors(
-      v.camera, src.width, src.height, r.crop, r.canvas.width, r.canvas.height, targets,
-    );
-    const ctx = r.canvas.getContext('2d');
-    if (!ctx) return JSON.stringify({ error: 'No 2D context' });
-    drawAnnotations(ctx, anchors);
-    const saved = savePath?.trim() ? await saveCanvasToProject(r.canvas, savePath) : {};
-    return canvasToRvImage(r.canvas, {
-      labels: anchors.map(a => ({ label: a.label, behindCamera: a.behind, offCrop: a.clamped })),
-      ...(unresolved.length ? { unresolved } : {}),
-      ...saved,
     });
   }
 
   // ═══ Camera ═══════════════════════════════════════════════════════════
 
-  @McpTool('Get the current camera state: position, orbit target and the canvas size.', { readOnly: true })
-  async webCameraGet(): Promise<string> {
-    const v = this.viewer;
-    if (!v) return JSON.stringify({ error: 'No viewer' });
-    const state = v.getCameraState();
+  /**
+   * The agent's camera body, spawned on demand (plan-740 D-A18).
+   *
+   * Every camera verb below drives THIS, never `viewer.camera`: a human
+   * orbiting the viewport must not move the agent, and the agent must not drag
+   * the human's view around. `undefined` means the `agent-eye` plugin is not
+   * loaded (the embed viewer), which is a hard error for these tools rather
+   * than a silent fall-back to the viewport.
+   */
+  private _eye(v: RVViewer): AgentEye | null {
+    const eye = v.agentEye;
+    if (!eye) return null;
+    eye.ensure();
+    return eye;
+  }
+
+  /** The camera block every camera verb answers with. */
+  private _eyeReport(v: RVViewer, eye: AgentEye): Record<string, unknown> {
+    const p = eye.pose;
     const el = v.renderer.domElement;
-    return JSON.stringify({
-      position: vec3(state.position),
-      target: vec3(state.target),
-      projection: v.projection,
+    return {
+      position: [r3(p.px), r3(p.py), r3(p.pz)],
+      target: [r3(p.tx), r3(p.ty), r3(p.tz)],
+      projection: p.projection,
+      fov: r3(p.fov),
+      aspect: r3(p.aspect),
+      ...(p.projection === 'orthographic' ? { orthoHalfHeight: r3(eye.orthoHalfHeight) } : {}),
+      attached: eye.attached,
       canvas: { width: el.clientWidth, height: el.clientHeight },
+    };
+  }
+
+  /**
+   * Fit distance for the AGENT lens — same canonical formula and the same 1.25
+   * framing margin `fitToNodes` uses, evaluated with the agent's fov/aspect
+   * instead of the viewport's (they are independent since plan-740).
+   */
+  private _eyeFitDistance(eye: AgentEye, maxDim: number): number {
+    const p = eye.pose;
+    return fitDistanceBothAxesFor(Math.max(maxDim, 0.1), p.fov, p.aspect, 1.25);
+  }
+
+  /**
+   * Pose that frames `box` from `dir` with the AGENT's lens.
+   *
+   * Replaces "largest world edge + 25 % margin, aimed at the box centre", which
+   * left a valve terminal at 54 % of the frame width and 134 px below centre —
+   * see {@link fitPoseToBox} for why both halves of that were wrong.
+   */
+  private _fitBox(
+    eye: AgentEye, box: Box3, dir: Vector3, nodes?: readonly Object3D[],
+  ): { eye: Vector3; target: Vector3 } {
+    const p = eye.pose;
+    const fit = fitPoseToPoints(
+      this._fitPoints(box, nodes),
+      [dir.x, dir.y, dir.z],
+      p.fov, p.aspect,
+    );
+    return {
+      eye: new Vector3(fit.eye[0], fit.eye[1], fit.eye[2]),
+      target: new Vector3(fit.target[0], fit.target[1], fit.target[2]),
+    };
+  }
+
+  /**
+   * Points the fit should frame: the corners of each MESH's own box, falling
+   * back to the subtree's single world AABB when there are no meshes.
+   *
+   * One world-axis AABB around a rotated assembly has large empty corners, so
+   * centring its projection centres the empty box rather than the part — the
+   * valve terminal still came out 122 px right of centre that way. Per-mesh
+   * boxes follow each part's own placement and hug the geometry far more
+   * tightly. Capped because this is per-corner arithmetic and a big assembly
+   * can carry tens of thousands of meshes; the subsample keeps the extremes,
+   * which is all an extent needs.
+   */
+  private _fitPoints(box: Box3, nodes?: readonly Object3D[]): FitVec3[] {
+    const out: FitVec3[] = [];
+    if (nodes && nodes.length > 0) {
+      const meshes: Mesh[] = [];
+      for (const n of nodes) {
+        n.updateMatrixWorld(true);
+        n.traverse((c) => { if ((c as Mesh).isMesh && (c as Mesh).geometry) meshes.push(c as Mesh); });
+      }
+      const step = Math.max(1, Math.ceil(meshes.length / FIT_MESH_SAMPLE_CAP));
+      const corner = new Vector3();
+      for (let i = 0; i < meshes.length; i += step) {
+        const m = meshes[i];
+        const g = m.geometry;
+        if (!g.boundingBox) g.computeBoundingBox();
+        const bb = g.boundingBox;
+        if (!bb || bb.isEmpty()) continue;
+        for (let k = 0; k < 8; k++) {
+          corner.set(
+            k & 1 ? bb.max.x : bb.min.x,
+            k & 2 ? bb.max.y : bb.min.y,
+            k & 4 ? bb.max.z : bb.min.z,
+          ).applyMatrix4(m.matrixWorld);
+          out.push([corner.x, corner.y, corner.z]);
+        }
+      }
+    }
+    if (out.length === 0 && !box.isEmpty()) {
+      for (let k = 0; k < 8; k++) {
+        out.push([
+          k & 1 ? box.max.x : box.min.x,
+          k & 2 ? box.max.y : box.min.y,
+          k & 4 ? box.max.z : box.min.z,
+        ]);
+      }
+    }
+    return out;
+  }
+
+  /** Frame `box` with the agent camera, keeping its current view direction. */
+  private _frameEyeToBox(
+    eye: AgentEye, box: Box3, dir: Vector3, nodes?: readonly Object3D[],
+  ): void {
+    const fit = this._fitBox(eye, box, dir, nodes);
+    eye.setPose({
+      px: fit.eye.x, py: fit.eye.y, pz: fit.eye.z,
+      tx: fit.target.x, ty: fit.target.y, tz: fit.target.z,
     });
   }
 
-  @McpTool('Switch the camera between perspective and orthographic (iso) rendering with a smooth animated transition — same as the view-cube Persp/Iso toggle. mode = perspective | orthographic (aliases: persp, ortho, iso); omit to toggle.', { readOnly: false })
+  /** Aim the agent at `center` from `distance` along `dir` (normalised). */
+  private _placeEye(eye: AgentEye, center: Vector3, dir: Vector3, distance: number): void {
+    eye.setPose({
+      px: center.x + dir.x * distance,
+      py: center.y + dir.y * distance,
+      pz: center.z + dir.z * distance,
+      tx: center.x, ty: center.y, tz: center.z,
+    });
+  }
+
+  @McpTool('Get the AGENT camera state: position, look-at target, projection, fov, aspect and whether the user viewport is currently attached to it. This is the agent\'s own camera body — it is NOT moved by the user navigating the viewport, and moving it does not move their view. canvas reports the user viewport size for reference only.', { readOnly: true })
+  async webCameraGet(): Promise<string> {
+    const v = this.viewer;
+    if (!v) return JSON.stringify({ error: 'No viewer' });
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
+    return JSON.stringify(this._eyeReport(v, eye));
+  }
+
+  @McpTool('Switch the AGENT camera between perspective and orthographic (iso) rendering. mode = perspective | orthographic (aliases: persp, ortho, iso); omit to toggle. In orthographic the frustum half-height is distance x tan(fov/2), reported as orthoHalfHeight in metres. Instant — the user viewport is not switched.', { readOnly: false })
   async webCameraProjection(
     @McpParam('mode', 'perspective | orthographic | iso (omit = toggle).', 'string', false) mode: string,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
     const raw = (mode ?? '').trim().toLowerCase();
+    const current = eye.pose.projection;
     let next: 'perspective' | 'orthographic';
     if (raw === '' || raw === 'toggle') {
-      next = v.projection === 'perspective' ? 'orthographic' : 'perspective';
+      next = current === 'perspective' ? 'orthographic' : 'perspective';
     } else if (raw === 'perspective' || raw === 'persp' || raw === 'p') {
       next = 'perspective';
     } else if (raw === 'orthographic' || raw === 'ortho' || raw === 'iso' || raw === 'o') {
@@ -352,15 +559,12 @@ export class McpViewTools {
     } else {
       return JSON.stringify({ error: `Unknown mode '${mode}' — use perspective | orthographic | iso, or omit to toggle` });
     }
-    if (next === v.projection && !v.isProjectionAnimating) {
-      return JSON.stringify({ projection: v.projection, changed: false });
-    }
-    v.animateProjectionTo(next, 0.45);
-    await sleep(500);
+    if (next === current) return JSON.stringify({ projection: current, changed: false });
+    eye.setLens({ projection: next });
     return JSON.stringify({ projection: next, changed: true });
   }
 
-  @McpTool('Move the camera (animated) to an explicit position looking at a target. Coordinates in meters, world space. The visible viewport camera moves — a watching user sees the same view.', { readOnly: false })
+  @McpTool('Move the AGENT camera to an explicit position looking at a target. Coordinates in meters, world space. fov (5..120 degrees, vertical) and aspect (width/height, 0.2..5) set the lens for every later capture. Instant: the pose is set and the call returns, nothing is animated and the user viewport does not move. The scene shows a small cone where the agent now stands.', { readOnly: false })
   async webCameraSet(
     @McpParam('px', 'Camera position X (m).', 'number') px: number,
     @McpParam('py', 'Camera position Y (m).', 'number') py: number,
@@ -368,23 +572,27 @@ export class McpViewTools {
     @McpParam('tx', 'Look-at target X (m).', 'number') tx: number,
     @McpParam('ty', 'Look-at target Y (m).', 'number') ty: number,
     @McpParam('tz', 'Look-at target Z (m).', 'number') tz: number,
-    @McpParam('durationMs', 'Animation duration in ms (default 600).', 'number', false) durationMs: number,
+    @McpParam('durationMs', 'Ignored since the agent camera moves instantly; kept so older callers still work.', 'number', false) durationMs: number,
+    @McpParam('fov', 'Vertical field of view in degrees, clamped 5..120.', 'number', false) fov?: number,
+    @McpParam('aspect', 'Image aspect (width/height), clamped 0.2..5.', 'number', false) aspect?: number,
   ): Promise<string> {
+    void durationMs;
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const dur = typeof durationMs === 'number' && !Number.isNaN(durationMs)
-      ? Math.max(0, durationMs) / 1000 : 0.8;
-    v.animateCameraTo(new Vector3(px, py, pz), new Vector3(tx, ty, tz), dur, 'easeInOut');
-    await sleep(dur * 1000 + 50);
-    return this.webCameraGet();
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
+    eye.setPose({ px, py, pz, tx, ty, tz, fov, aspect });
+    return JSON.stringify(this._eyeReport(v, eye));
   }
 
-  @McpTool('Frame one or more nodes: animates the camera so they fill the view (keeps the current view direction). THE standard way to look at a part before a screenshot.', { readOnly: false })
+  @McpTool('Frame one or more nodes with the AGENT camera: it moves so they fill its view, keeping its current view direction. THE standard way to look at a part before a capture. Instant, and the user viewport stays where it is.', { readOnly: false })
   async webCameraFocus(
     @McpParam('paths', 'Node paths, comma- or newline-separated.') paths: string,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
     const requested = parsePathsParam(paths);
     const nodes: Object3D[] = [];
     const unresolved: string[] = [];
@@ -395,16 +603,25 @@ export class McpViewTools {
     if (nodes.length === 0) {
       return JSON.stringify({ error: `Node(s) not found: ${unresolved.join(', ') || '(none given)'}` });
     }
-    v.fitToNodes(nodes, undefined, { easing: 'easeInOut', duration: 0.8 });
-    await sleep(900);
+    const box = new Box3().makeEmpty();
+    for (const n of nodes) { n.updateMatrixWorld(true); box.union(computeSubtreeAABB(n, new Box3()).box); }
+    if (box.isEmpty()) {
+      return JSON.stringify({ error: 'The requested node(s) have no geometry to frame (empty bounds).' });
+    }
+    const pose = eye.pose;
+    // Keep the agent's own view direction, exactly like the viewport's Focus.
+    const dir = new Vector3(pose.px - pose.tx, pose.py - pose.ty, pose.pz - pose.tz);
+    if (dir.lengthSq() < 1e-12) dir.set(0, 0, 1);
+    dir.normalize();
+    this._frameEyeToBox(eye, box, dir, nodes);
     return JSON.stringify({
       framed: nodes.length,
-      camera: JSON.parse(await this.webCameraGet()),
+      camera: this._eyeReport(v, eye),
       ...(unresolved.length ? { unresolved } : {}),
     });
   }
 
-  @McpTool('Orbit the camera around a point: yaw (horizontal, degrees, + = counter-clockwise from above), pitch (vertical, degrees, + = up), and an optional distance factor (0.5 = half distance / zoom in, 2 = zoom out). Relative move — ideal for "look at it from the other side". pivot chooses the point: omit for the current orbit target (unchanged behaviour), "selection" for the centre of what is selected, or a node path. Refused while FPV, camera-follow or XR own the camera.', { readOnly: false })
+  @McpTool('Orbit the AGENT camera around a point: yaw (horizontal, degrees, + = counter-clockwise from above), pitch (vertical, degrees, + = up), and an optional distance factor (0.5 = half distance / zoom in, 2 = zoom out). Relative move — ideal for "look at it from the other side". pivot chooses the point: omit for the agent\'s current target, "selection" for the centre of what is selected, or a node path. Instant; the user viewport is untouched.', { readOnly: false })
   async webCameraOrbit(
     @McpParam('yawDeg', 'Horizontal orbit angle in degrees.', 'number') yawDeg: number,
     @McpParam('pitchDeg', 'Vertical orbit angle in degrees (default 0).', 'number', false) pitchDeg: number,
@@ -413,32 +630,30 @@ export class McpViewTools {
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    // D-A2 (plan-705): the three owners write the pose every frame, so an orbit
-    // under them is a silent no-op. Newly applied here — `web_camera_fly` had
-    // the guard and this one did not, which is the inconsistency F9 closes.
-    const refusal = this._refuseIfCameraOwned(v, 'orbiting');
-    if (refusal) return refusal;
-    const state = v.getCameraState();
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
+    // No ownership refusal any more (plan-740 D-A7): FPV, follow and XR own the
+    // VIEWPORT camera, and this no longer touches it.
+    const state = eye.pose;
     // Default is verbatim the old behaviour: the CURRENT target. `pivot` only
     // ever replaces it, so an existing caller sees no change at all.
     const pivotPoint = this._resolvePivot(v, pivot);
     if (pivotPoint && 'error' in pivotPoint) return JSON.stringify(pivotPoint);
-    const target = pivotPoint?.point.clone() ?? state.target.clone();
-    const offset = state.position.clone().sub(target);
+    const target = pivotPoint?.point.clone() ?? new Vector3(state.tx, state.ty, state.tz);
+    const offset = new Vector3(state.px, state.py, state.pz).sub(target);
     const radius = offset.length() * (typeof distanceFactor === 'number' && distanceFactor > 0 ? distanceFactor : 1);
     // Spherical angles: theta = azimuth around +Y, phi = polar from +Y.
-    let theta = Math.atan2(offset.x, offset.z) + (yawDeg || 0) * Math.PI / 180;
+    const theta = Math.atan2(offset.x, offset.z) + (yawDeg || 0) * Math.PI / 180;
     let phi = Math.acos(Math.min(Math.max(offset.y / offset.length(), -1), 1))
       - (pitchDeg || 0) * Math.PI / 180;
     phi = Math.min(Math.max(phi, 0.05), Math.PI - 0.05);
-    const pos = new Vector3(
-      target.x + radius * Math.sin(phi) * Math.sin(theta),
-      target.y + radius * Math.cos(phi),
-      target.z + radius * Math.sin(phi) * Math.cos(theta),
-    );
-    v.animateCameraTo(pos, target, 0.7, 'easeInOut');
-    await sleep(750);
-    return this.webCameraGet();
+    eye.setPose({
+      px: target.x + radius * Math.sin(phi) * Math.sin(theta),
+      py: target.y + radius * Math.cos(phi),
+      pz: target.z + radius * Math.sin(phi) * Math.cos(theta),
+      tx: target.x, ty: target.y, tz: target.z,
+    });
+    return JSON.stringify(this._eyeReport(v, eye));
   }
 
   // ═══ Named views (plan-713 F9) ════════════════════════════════════════
@@ -483,15 +698,15 @@ export class McpViewTools {
     return { point: union.getCenter(new Vector3()), nodes };
   }
 
-  @McpTool('Move the camera to a NAMED view: iso | top | front | back | left | right | home (home = iso). target chooses what to frame — "selection", a node path, or omit for the whole scene. The framing distance is MEASURED from the viewer\'s own fit, so a preset frames exactly as tightly as web_camera_focus does. Refused while FPV, camera-follow or XR own the camera.', { readOnly: false, timeoutMs: 30_000 })
+  @McpTool('Move the AGENT camera to a NAMED view: iso | top | front | back | left | right | home (home = iso). target chooses what to frame — "selection", a node path, or omit for the whole scene. The framing distance uses the same fit formula web_camera_focus does, evaluated with the agent\'s own fov and aspect. Instant; the user viewport is untouched.', { readOnly: false, timeoutMs: 30_000 })
   async webCameraView(
     @McpParam('preset', 'iso | top | front | back | left | right | home') preset: string,
     @McpParam('target', '"selection", a node path, or omit for the whole scene.', 'string', false) target?: string,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const refusal = this._refuseIfCameraOwned(v, 'changing the view');
-    if (refusal) return refusal;
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
     const {
       CAMERA_PRESETS, isCameraPreset, presetPose, applyMeasuredDistance,
     } = await import('./rv-camera-presets-math');
@@ -511,62 +726,34 @@ export class McpViewTools {
     for (const n of nodes) { n.updateMatrixWorld(true); box.union(computeSubtreeAABB(n, new Box3()).box); }
 
     let pose = presetPose(wanted, box);
-    // D-A5 — measure, never re-derive. One `fitToNodes` in the viewer's own
-    // projection and aspect, read back with `getCameraState`; the preset then
-    // keeps that distance and swaps only the direction. A second fit formula
-    // here would drift from the viewer's the first time either changed.
-    if (nodes.length > 0) {
-      try {
-        v.fitToNodes(nodes, undefined, { duration: 0, easing: 'easeInOut' });
-        const measured = v.getCameraState();
-        pose = applyMeasuredDistance(pose, {
-          position: measured.position.clone(), target: measured.target.clone(),
-        });
-      } catch { /* keep the bounding-sphere fallback */ }
+    // plan-740: the old D-A5 step measured the distance by actually running
+    // `fitToNodes` on the VIEWPORT and reading it back. That is exactly the
+    // side effect this plan removes, and the viewport lens is no longer the
+    // agent's anyway. The canonical formula is now shared as a pure function
+    // (`fitDistanceBothAxesFor`), so the distance is computed with the AGENT's
+    // fov/aspect — still one copy of the maths, just the right lens.
+    if (!box.isEmpty()) {
+      const dir = pose.position.clone().sub(pose.target);
+      if (dir.lengthSq() > 1e-12) {
+        const fit = this._fitBox(eye, box, dir.normalize());
+        pose = applyMeasuredDistance(pose, { target: fit.target, position: fit.eye });
+      }
     }
 
-    v.animateCameraTo(pose.position, pose.target, 0.7, 'easeInOut');
-    await sleep(750);
+    this._placeEye(
+      eye, pose.target,
+      pose.position.clone().sub(pose.target).normalize(),
+      pose.distance,
+    );
     return JSON.stringify({
       preset: wanted,
       framed: nodes.length,
       distance: +pose.distance.toFixed(3),
-      camera: JSON.parse(await this.webCameraGet()),
+      camera: this._eyeReport(v, eye),
     });
   }
 
-  /**
-   * Which subsystem owns the camera right now, or null if it is free.
-   *
-   * FPV, follow/sit-on and XR each write the camera pose every frame, so a
-   * scripted move would be silently overwritten in the next tick. A hard error
-   * beats a silent no-op (plan-705 D-A2).
-   */
-  private _cameraOwner(v: RVViewer): 'fpv' | 'follow' | 'xr' | null {
-    if (v.getPlugin<{ id: string; isActive?: boolean }>('fpv')?.isActive) return 'fpv';
-    if (v.cameraFollowMode && v.cameraFollowMode !== 'off') return 'follow';
-    if ((v.getPlugin('webxr') as { isPresenting?: boolean } | undefined)?.isPresenting) return 'xr';
-    return null;
-  }
-
-  /**
-   * The refusal envelope the four camera verbs share, or null when the camera is free.
-   *
-   * `verb` is the trailing phrase of the sentence — 'orbiting', 'changing the
-   * view', 'flying', 'sweeping' — so each tool keeps the wording it always had
-   * (plan-461 V14). The envelope is byte-identical to the four copies it
-   * replaced, key order included, because an MCP client reads these strings.
-   */
-  private _refuseIfCameraOwned(v: RVViewer, verb: string): string | null {
-    const blockedBy = this._cameraOwner(v);
-    if (!blockedBy) return null;
-    return JSON.stringify({
-      error: `Camera is owned by ${blockedBy} — stop it before ${verb}`,
-      blockedBy,
-    });
-  }
-
-  @McpTool('Fly the camera RELATIVE to where it is now: forward/right/up in metres plus yawDeg/pitchDeg in degrees (+yaw = to the left, +pitch = up, clamped at ±85°). Unlike web_camera_orbit — which circles a fixed point — this MOVES THROUGH the plant, which is what a long line needs. ground=true walks instead of flying: forward/right stay horizontal and the camera is held at eyeHeight above the nearest surface below (no wall collision — flying through a wall is allowed). Refused while FPV, camera-follow or XR own the camera.', { readOnly: false, timeoutMs: 30_000 })
+  @McpTool('Fly the AGENT camera RELATIVE to where it is now: forward/right/up in metres plus yawDeg/pitchDeg in degrees (+yaw = to the left, +pitch = up, clamped at ±85°). Unlike web_camera_orbit — which circles a fixed point — this MOVES THROUGH the plant, which is what a long line needs. ground=true walks instead of flying: forward/right stay horizontal and the camera is held at eye height above the nearest surface below (no wall collision — flying through a wall is allowed). Instant; the user viewport is untouched.', { readOnly: false, timeoutMs: 30_000 })
   async webCameraFly(
     @McpParam('forward', 'Metres along the view direction (default 0).', 'number', false) forward?: number,
     @McpParam('right', 'Metres to the right (default 0).', 'number', false) right?: number,
@@ -574,16 +761,20 @@ export class McpViewTools {
     @McpParam('yawDeg', 'Turn in degrees, + = to the left (default 0).', 'number', false) yawDeg?: number,
     @McpParam('pitchDeg', 'Tilt in degrees, + = up, clamped at ±85° (default 0).', 'number', false) pitchDeg?: number,
     @McpParam('ground', 'Walk instead of fly: horizontal moves, eye height above the surface below (default false).', 'boolean', false) ground?: boolean,
-    @McpParam('durationMs', 'Animation duration in ms (default 600).', 'number', false) durationMs?: number,
+    @McpParam('durationMs', 'Ignored since the agent camera moves instantly; kept so older callers still work.', 'number', false) durationMs?: number,
   ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const refusal = this._refuseIfCameraOwned(v, 'flying');
-    if (refusal) return refusal;
-
-    const cur = v.getCameraState();
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
+    // The FPV/follow/XR refusal is gone (plan-740 D-A7): those own the VIEWPORT
+    // camera, and the agent no longer flies it. `attach()` keeps the guard.
+    const cur = eye.pose;
     const next = computeFlyPose(
-      { position: cur.position.clone(), target: cur.target.clone() },
+      {
+        position: new Vector3(cur.px, cur.py, cur.pz),
+        target: new Vector3(cur.tx, cur.ty, cur.tz),
+      },
       { forward, right, up, yawDeg, pitchDeg, ground },
     );
 
@@ -613,14 +804,13 @@ export class McpViewTools {
       }
     }
 
-    const dur = typeof durationMs === 'number' && Number.isFinite(durationMs)
-      ? Math.max(0, durationMs) / 1000 : 0.6;
-    v.animateCameraTo(next.position, next.target, dur, 'easeInOut');
-    await sleep(dur * 1000 + 100);
-
-    const state = JSON.parse(await this.webCameraGet()) as Record<string, unknown>;
+    void durationMs;   // instant since plan-740; parameter kept for old callers
+    eye.setPose({
+      px: next.position.x, py: next.position.y, pz: next.position.z,
+      tx: next.target.x, ty: next.target.y, tz: next.target.z,
+    });
     return JSON.stringify({
-      ...state,
+      ...this._eyeReport(v, eye),
       deltaM: { forward: num0(forward), right: num0(right), up: num0(up) },
       yawDeg: num0(yawDeg),
       pitchDeg: num0(pitchDeg),
@@ -630,20 +820,40 @@ export class McpViewTools {
     });
   }
 
-  @McpTool('Contact sheet of a part: flies 4-8 views evenly around it and returns ONE labelled montage plus a note per view (visible top nodes with coverage, background share, measured camera position). Understands an unknown assembly in a SINGLE call instead of an orbit+screenshot loop, at roughly a fifth of the vision tokens. Each note carries its cameraPosition, so pulling one view up in full resolution is one web_camera_set away. topNodes is a raycast SAMPLE, not a completeness guarantee — thin parts can be missed. Works under WebGPU too. Restores the starting pose unless restore=false.', { readOnly: false, timeoutMs: 120_000 })
+  @McpTool('Contact sheet of a part: renders 4-8 views evenly around it OFFSCREEN through the AGENT camera and returns ONE labelled montage plus a note per view (visible top nodes with coverage and ownerPath, background share, camera position). Understands an unknown assembly in a SINGLE call instead of an orbit+screenshot loop. Coverage is measured on the ID MASK of a depth-tested frame, so it is occlusion-correct rather than ray-sampled. Instant: nothing is animated, neither the user viewport nor the agent body moves. Each note carries its cameraPosition, so pulling one view up is one web_camera_set away. Requires the classic WebGL renderer.', { readOnly: true, timeoutMs: 120_000 })
   async webViewSweep(
     @McpParam('paths', 'Node paths to sweep around, comma/newline-separated. Empty = whole model.', 'string', false) paths?: string,
     @McpParam('count', 'Number of views, clamped to 4..8 (default 6).', 'number', false) count?: number,
     @McpParam('pitchDeg', 'Elevation of every view in degrees (default 20).', 'number', false) pitchDeg?: number,
     @McpParam('yawStartDeg', 'Yaw of the first view (default: current camera azimuth).', 'number', false) yawStartDeg?: number,
-    @McpParam('restore', 'Return to the starting pose afterwards (default true).', 'boolean', false) restore?: boolean,
+    @McpParam('restore', 'Ignored since the sweep renders offscreen and moves no camera; kept so older callers still work.', 'boolean', false) restore?: boolean,
     @McpParam('savePath', 'Optional PROJECT-relative path to also write the montage as PNG (bare name lands in "captures/").', 'string', false) savePath?: string,
     @McpParam('topN', 'Nodes reported per view, max 10 (default 5).', 'number', false) topN?: number,
   ): Promise<string> {
+    void restore;   // offscreen since plan-740; parameter kept for old callers
+    return serializeEyeCapture(() => this._sweep(paths, count, pitchDeg, yawStartDeg, savePath, topN));
+  }
+
+  /**
+   * The sweep body, run inside the shared capture chain (D-A15).
+   *
+   * Everything the old implementation did to the VIEWPORT is gone (D-A7/D-U10):
+   * no `fitToNodes`, no `animateCameraTo`, no 600 ms flight and 120 ms settle
+   * per pose, no `controls.enabled` freeze, no restore, no ownership refusal —
+   * and therefore no `poseDrift` either, because a human orbiting mid-sweep can
+   * no longer change what the frames show. Six poses that took ~4.5 s of pure
+   * waiting are now six offscreen renders.
+   */
+  private async _sweep(
+    paths?: string, count?: number, pitchDeg?: number, yawStartDeg?: number,
+    savePath?: string, topN?: number,
+  ): Promise<string> {
     const v = this.viewer;
     if (!v) return JSON.stringify({ error: 'No viewer' });
-    const refusal = this._refuseIfCameraOwned(v, 'sweeping');
-    if (refusal) return refusal;
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
+    const guard = guardAgentCapture(v, 'web_view_sweep');
+    if (guard) return JSON.stringify({ error: guard });
 
     const requested = parsePathsParam(paths ?? '');
     const nodes: Object3D[] = [];
@@ -661,93 +871,268 @@ export class McpViewTools {
       nodes.push(root);
     }
 
-    const startState = v.getCameraState();
-    const start: CameraPose = {
-      position: startState.position.clone(),
-      target: startState.target.clone(),
-    };
-    // Freeze the orbit controls for the duration: a watching human could
-    // otherwise orbit mid-flight and overwrite the target trajectory, leaving
-    // the cell showing a different pose than the note reports (D-A14 / R12).
-    // Deliberately NOT setSharedViewMode(), which also disables the raycast
-    // manager — exactly the capability the per-view notes need.
-    const controls = v.controls as { enabled?: boolean } | undefined;
-    const controlsWasEnabled = controls?.enabled;
-    if (controls) controls.enabled = false;
+    const reg = v.registry;
+    if (!reg) return JSON.stringify({ error: 'No registry' });
 
-    try {
-      v.fitToNodes(nodes, undefined, { easing: 'easeInOut', duration: 0.8 });
-      await sleep(900);
-      // Radius by RE-MEASURING the canonical fit rather than a second fit
-      // formula — CameraManager.fitDistanceBothAxes must stay the only copy (D-A5).
-      const framed = v.getCameraState();
-      const center = framed.target.clone();
-      const radius = framed.position.distanceTo(framed.target) || 1;
+    // Ring geometry: the union box gives the centre, and the radius comes from
+    // the SAME canonical fit formula `web_camera_focus` uses, evaluated through
+    // the AGENT's lens. The old code got the radius by actually flying the
+    // viewport with `fitToNodes` and reading the distance back — the very side
+    // effect this plan removes, and the viewport's fov/aspect are no longer the
+    // agent's anyway.
+    const box = new Box3().makeEmpty();
+    for (const n of nodes) { n.updateMatrixWorld(true); box.union(computeSubtreeAABB(n, new Box3()).box); }
+    if (box.isEmpty()) {
+      return JSON.stringify({ error: 'The requested node(s) have no geometry to sweep around (empty bounds).' });
+    }
+    const center = box.getCenter(new Vector3());
+    const size = box.getSize(new Vector3());
+    const radius = this._eyeFitDistance(eye, Math.max(size.x, size.y, size.z)) || 1;
 
-      const startYaw = typeof yawStartDeg === 'number' && Number.isFinite(yawStartDeg)
-        ? yawStartDeg
-        : Math.atan2(
-          framed.position.x - center.x, framed.position.z - center.z,
-        ) * 180 / Math.PI;
+    const agent = eye.pose;
+    const startYaw = typeof yawStartDeg === 'number' && Number.isFinite(yawStartDeg)
+      ? yawStartDeg
+      // Default is the AGENT's current azimuth, so view #0 is roughly where the
+      // agent already looks from and the sheet reads as "turning around it".
+      : Math.atan2(agent.px - center.x, agent.pz - center.z) * 180 / Math.PI;
 
-      const poses = sweepPoses(center, radius, {
-        count: typeof count === 'number' ? count : DEFAULT_SWEEP_COUNT,
-        pitchDeg: typeof pitchDeg === 'number' ? pitchDeg : DEFAULT_SWEEP_PITCH_DEG,
-        yawStartDeg: startYaw,
+    const poses = sweepPoses(center, radius, {
+      count: typeof count === 'number' ? count : DEFAULT_SWEEP_COUNT,
+      pitchDeg: typeof pitchDeg === 'number' ? pitchDeg : DEFAULT_SWEEP_PITCH_DEG,
+      yawStartDeg: startYaw,
+    });
+
+    const root = nodes.length === 1 ? nodes[0] : (v.currentModelRoot ?? nodes[0]);
+    const grouping = { groupBy: defaultGroupBy(root) };
+    const frames: HTMLCanvasElement[] = [];
+    const notes: SweepViewNote[] = [];
+
+    for (const pose of poses) {
+      // A TEMPORARY pose per cell: the agent's body does not move, so the cone
+      // a watching human sees stays where the agent put it and the next
+      // `web_eye` still frames what the agent chose.
+      const rendered = await renderAgentChannels(v, {
+        pose: {
+          ...agent,
+          px: pose.position.x, py: pose.position.y, pz: pose.position.z,
+          tx: pose.target.x, ty: pose.target.y, tz: pose.target.z,
+        },
+        size: SWEEP_CELL_PX,
+        channels: ['beauty', 'idmask'],
+        root,
+        idmask: grouping,
       });
+      if ('error' in rendered) return JSON.stringify({ error: rendered.error, view: pose.index });
+      const beauty = rendered.channels.find((c) => c.channel === 'beauty');
+      const idChannel = rendered.channels.find((c) => c.idBuffer);
+      if (!beauty) return JSON.stringify({ error: 'Beauty channel missing', view: pose.index });
+      frames.push(beauty.canvas);
+      // The note comes off the ID MASK of the very frame in the cell (D-A13) —
+      // there is no longer a second sampling pass that could describe a
+      // different pose than the picture shows.
+      const visible = buildVisible(rendered, idChannel?.idBuffer, [], reg);
+      notes.push(summarizeVisibleGroups(
+        pose, visible, typeof topN === 'number' ? topN : DEFAULT_TOP_N,
+      ));
+    }
 
-      const grid = sampleGrid(SWEEP_GRID_N);
-      const tol = Math.max(0.01 * radius, 1e-3);
-      const frames: HTMLCanvasElement[] = [];
-      const notes: ViewNote[] = [];
+    const mont = compositeMontage(frames, poses.map((p) => p.label));
+    if ('error' in mont) return JSON.stringify({ error: mont.error });
+    const saved = savePath?.trim() ? await saveCanvasToProject(mont, savePath) : {};
+    return canvasToRvImage(mont, {
+      views: notes,
+      center: vec3(center),
+      radius: r3(radius),
+      ...(unresolved.length ? { unresolved } : {}),
+      ...saved,
+    }, 'web_view_sweep');
+  }
 
-      for (const pose of poses) {
-        v.animateCameraTo(pose.position, pose.target, SWEEP_MOVE_MS / 1000, 'easeInOut');
-        await sleep(SWEEP_MOVE_MS + SWEEP_SETTLE_MS);
+  // ═══ web_view_ortho ═══════════════════════════════════════════════════
 
-        // Capture BEFORE raycasting: captureFrameCanvas renders synchronously,
-        // so the rays provably see the pose that is in the frame (§2.4).
-        const shot = captureFrameCanvas(v, { maxDim: SWEEP_CELL_PX });
-        if ('error' in shot) return JSON.stringify({ error: shot.error, view: pose.index });
-        frames.push(shot.canvas);
+  @McpTool('Render the six ORTHOGRAPHIC views (front, back, left, right, top, bottom) OFFSCREEN through the AGENT camera into ONE labelled 3×2 mosaic per requested channel (beauty, idmask = flat ID colors + white crease edges, xray = look inside, translucent on black). labels=true marks the idmask mosaic only, capped at topN so every marker has a topNodes entry; beauty stays unannotated and pixel-aligned. The sidecar lists per view the marks, top visible nodes and the camera pose. clip=true (default) puts each camera on the bounding-box face, so a part inside a cabinet still shows. Instant: neither the user viewport nor the agent body moves. Requires the classic WebGL renderer.', { readOnly: true, timeoutMs: 120_000 })
+  async webViewOrtho(
+    @McpParam('paths', 'Node paths, comma/newline-separated. Empty = whole model.', 'string', false) paths?: string,
+    @McpParam('channels', 'Comma-separated: beauty, idmask, xray (default "beauty"). One mosaic per channel.', 'string', false) channels?: string,
+    @McpParam('size', 'Edge of each view in px, 1024..2048 (default 1024); smaller values are raised to 1024. The mosaic is 3 cells wide, so 1024 gives a 3072px sheet — the returned image is downscaled to the transport cap, savePath keeps full size.', 'number', false) size?: number,
+    @McpParam('labels', 'Burn numbered Set-of-Mark markers on the idmask mosaic (default true). beauty is never annotated.', 'boolean', false) labels?: boolean,
+    @McpParam('clip', 'Cut away everything in front of the bounding box (default true); false = views from outside, occluders included.', 'boolean', false) clip?: boolean,
+    @McpParam('groupBy', 'idmask groups: "hierarchy", "geometry" or "component" (default: component when the model has components, else hierarchy).', 'string', false) groupBy?: string,
+    @McpParam('savePath', 'Optional PROJECT-relative path to also write each mosaic as PNG ("<name>.<channel>.png"; bare name lands in "captures/").', 'string', false) savePath?: string,
+    @McpParam('topN', 'Nodes reported per view, max 10 (default 5).', 'number', false) topN?: number,
+  ): Promise<string> {
+    return serializeEyeCapture(() => this._ortho(paths, channels, size, labels, clip, groupBy, savePath, topN));
+  }
 
-        const rm = v.raycastManager;
-        const rect = v.renderer.domElement.getBoundingClientRect();
-        const hits: Array<string | null> = [];
-        for (const [gx, gy] of grid) {
-          const hit = rm?.raycastForRVNodeDetailed({
-            clientX: rect.left + gx * rect.width,
-            clientY: rect.top + gy * rect.height,
-          });
-          hits.push(hit?.path ?? null);
+  /**
+   * The ortho-mosaic body, run inside the shared capture chain (D-A15).
+   *
+   * Each view is a TEMPORARY orthographic pose for the agent eye: the body
+   * itself stays where the agent put it, exactly like the sweep. `clip` places
+   * the camera on the AABB face of the requested nodes, so the eye's own near
+   * plane (`dist/1000`, see EyeChannels._camera) becomes a section plane at the
+   * box — no live-scene mutation, no isolate state, nothing to restore.
+   */
+  private async _ortho(
+    paths?: string, channelsRaw?: string, size?: number, labels?: boolean,
+    clip?: boolean, groupByRaw?: string, savePath?: string, topN?: number,
+  ): Promise<string> {
+    const v = this.viewer;
+    if (!v) return JSON.stringify({ error: 'No viewer' });
+    const eye = this._eye(v);
+    if (!eye) return JSON.stringify({ error: 'No agent eye' });
+    const guard = guardAgentCapture(v, 'web_view_ortho');
+    if (guard) return JSON.stringify({ error: guard });
+    const reg = v.registry;
+    if (!reg) return JSON.stringify({ error: 'No registry' });
+
+    // Channels: same rules as web_eye — default beauty, duplicates collapse,
+    // an unknown name is a hard error rather than a silently missing mosaic.
+    const rawChannels = (channelsRaw ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const wanted: EyeChannel[] = rawChannels.length === 0 ? ['beauty'] : [];
+    for (const name of rawChannels) {
+      if (!(EYE_CHANNELS as readonly string[]).includes(name)) {
+        return JSON.stringify({ error: `Unknown channel "${name}". Valid: ${EYE_CHANNELS.join(', ')}.` });
+      }
+      wanted.push(name as EyeChannel);
+    }
+    const requestedChannels = dedupeChannels(wanted);
+    // The idmask is always rendered: marks and the per-view notes come off it.
+    const renderChannels = dedupeChannels([...requestedChannels, 'idmask']);
+
+    const requested = parsePathsParam(paths ?? '');
+    const nodes: Object3D[] = [];
+    const unresolved: string[] = [];
+    for (const p of requested) {
+      const n = reg.getNode(p);
+      if (n) nodes.push(n); else unresolved.push(p);
+    }
+    if (requested.length > 0 && nodes.length === 0) {
+      return JSON.stringify({ error: `Node(s) not found: ${unresolved.join(', ')}` });
+    }
+    if (nodes.length === 0) {
+      const root = v.currentModelRoot;
+      if (!root) return JSON.stringify({ error: 'No model loaded' });
+      nodes.push(root);
+    }
+
+    const box = new Box3().makeEmpty();
+    for (const n of nodes) { n.updateMatrixWorld(true); box.union(computeSubtreeAABB(n, new Box3()).box); }
+    if (box.isEmpty()) {
+      return JSON.stringify({ error: 'The requested node(s) have no geometry to view (empty bounds).' });
+    }
+    const center = box.getCenter(new Vector3());
+    const extent = box.getSize(new Vector3());
+    const radius = Math.max(extent.length() / 2, ORTHO_MIN_HALF_M);
+
+    const cellPx = Number.isFinite(size)
+      ? Math.max(ORTHO_CELL_MIN_PX, Math.min(ORTHO_CELL_MAX_PX, Math.round(size as number)))
+      : ORTHO_CELL_DEFAULT_PX;
+    const doClip = clip !== false;
+    const root = nodes.length === 1 ? nodes[0] : (v.currentModelRoot ?? nodes[0]);
+    const groupBy = normalizeOrthoGroupBy(groupByRaw) ?? defaultGroupBy(root);
+    const grouping = { groupBy };
+    const cap = Math.max(1, Math.min(10, Math.round(num0(topN) || DEFAULT_TOP_N)));
+
+    const frames = new Map<EyeChannel, HTMLCanvasElement[]>();
+    for (const ch of requestedChannels) frames.set(ch, []);
+    const mimes = new Map<EyeChannel, 'image/png' | 'image/jpeg'>();
+    const views: Array<Record<string, unknown>> = [];
+
+    for (const view of ORTHO_VIEWS) {
+      const pose = orthoViewPose(view, center, extent, radius, doClip);
+      const rendered = await renderAgentChannels(v, {
+        pose: {
+          ...eye.pose,
+          px: pose.px, py: pose.py, pz: pose.pz,
+          tx: pose.tx, ty: pose.ty, tz: pose.tz,
+          fov: pose.fov, aspect: 1, projection: 'orthographic',
+        },
+        size: cellPx,
+        channels: renderChannels,
+        root,
+        idmask: grouping,
+      });
+      if ('error' in rendered) return JSON.stringify({ error: rendered.error, view: view.name });
+
+      // Set-of-Mark + note, both off the SAME idmask buffer (D-A13). Mark
+      // numbers are PER VIEW — each cell is its own picture.
+      const idChannel = rendered.channels.find((c) => c.idBuffer);
+      // Cap the marks at the SAME number the sidecar reports. With the generic
+      // SOM cap the picture carried up to 24 markers while `topNodes` listed at
+      // most `topN` (default 5, max 10), so every mark above that was visible
+      // and unresolvable. Both rank by descending area, so one cap aligns them.
+      const marks = (labels !== false && idChannel?.idBuffer)
+        ? computeMarks(idChannel.idBuffer, rendered.width, rendered.height, cap)
+        : [];
+      // Marks go on the ID MASK ONLY. `beauty` is the channel that answers
+      // "what does this actually look like", so it stays an unannotated
+      // render; the mask is where identity is asked for, and the two frames
+      // are pixel-aligned, so a mark read off the mask locates the same spot
+      // in beauty.
+      if (marks.length > 0) {
+        const colors = rendered.legend.map((l) => l.color);
+        for (const c of rendered.channels) {
+          if (c.channel !== 'idmask') continue;
+          const ctx = c.canvas.getContext('2d');
+          if (ctx) drawMarks(ctx, marks, colors);
         }
-        const measured = v.getCameraState().position.clone();
-        notes.push(summarizeViewHits(
-          pose, hits, typeof topN === 'number' ? topN : DEFAULT_TOP_N, measured, tol,
-        ));
+      }
+      for (const c of rendered.channels) {
+        const list = frames.get(c.channel);
+        if (!list) continue;   // the internal idmask the caller did not ask for
+        list.push(c.canvas);
+        mimes.set(c.channel, c.mime);
       }
 
-      const mont = compositeMontage(frames, poses.map((p) => p.label));
-      if ('error' in mont) return JSON.stringify({ error: mont.error });
-      const saved = savePath?.trim() ? await saveCanvasToProject(mont, savePath) : {};
-      return canvasToRvImage(mont, {
-        views: notes,
-        center: vec3(center),
-        radius: r3(radius),
-        restored: restore !== false,
-        ...(unresolved.length ? { unresolved } : {}),
-        ...saved,
+      const rows = buildVisible(rendered, idChannel?.idBuffer, marks, reg);
+      let covered = 0;
+      for (const row of rows) covered += typeof row.coverage === 'number' ? row.coverage : 0;
+      views.push({
+        view: view.name,
+        cameraPosition: [r3(pose.px), r3(pose.py), r3(pose.pz)],
+        cameraTarget: [r3(pose.tx), r3(pose.ty), r3(pose.tz)],
+        orthoHalfHeight: rendered.camera.orthoHalfHeight ?? r3(pose.halfH),
+        topNodes: rows.slice(0, cap).map((row) => ({
+          ...(typeof row.mark === 'number' ? { mark: row.mark } : {}),
+          path: row.path,
+          ...(typeof row.ownerPath === 'string' ? { ownerPath: row.ownerPath } : {}),
+          coverage: row.coverage,
+        })),
+        background: r3(Math.max(0, 1 - covered)),
       });
-    } catch (e) {
-      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      // Both restorations live here so they also run on the error path (R11).
-      if (controls && controlsWasEnabled !== undefined) controls.enabled = controlsWasEnabled;
-      if (restore !== false) {
-        v.animateCameraTo(start.position, start.target, SWEEP_MOVE_MS / 1000, 'easeInOut');
-        await sleep(SWEEP_MOVE_MS + 100);
+    }
+
+    const labelsPerCell = ORTHO_VIEWS.map((o) => o.label);
+    const mosaics: RvImageChannel[] = [];
+    const savedPaths: Record<string, string> = {};
+    const saveErrors: string[] = [];
+    const base = savePath?.trim() ? savePath.trim().replace(/\.png$/i, '') : '';
+    for (const ch of requestedChannels) {
+      // Pass the rendered cell size: the montage default would rescale every
+      // cell to 533px and make `size` a no-op (the sheet came out 1599×1066
+      // whether 256 or 1024 was asked for, savePath included).
+      const mont = compositeMontage(frames.get(ch) ?? [], labelsPerCell, cellPx);
+      if ('error' in mont) return JSON.stringify({ error: mont.error, channel: ch });
+      mosaics.push({ canvas: mont, mime: mimes.get(ch) ?? 'image/png', channel: ch });
+      if (base) {
+        const outcome = await saveCanvasToProject(mont, `${base}.${ch}.png`);
+        if (typeof outcome.savedPath === 'string') savedPaths[ch] = outcome.savedPath;
+        else if (typeof outcome.saveError === 'string') saveErrors.push(outcome.saveError);
       }
     }
+
+    return canvasesToRvImages(mosaics, {
+      channels: requestedChannels,
+      views,
+      center: vec3(center),
+      sizeM: vec3(extent),
+      clip: doClip,
+      groupBy,
+      ...(unresolved.length ? { unresolved } : {}),
+      ...(Object.keys(savedPaths).length ? { savedPaths } : {}),
+      ...(saveErrors.length ? { saveErrors } : {}),
+    }, 'web_view_ortho');
   }
 
   // ═══ Selection ════════════════════════════════════════════════════════
@@ -792,12 +1177,24 @@ export class McpViewTools {
     });
   }
 
-  @McpTool('Get the current selection: node paths and the primary path.', { readOnly: true })
+  @McpTool('Get the current selection: paths (only what the document addresses), the primary path, and nodes[] — one entry per selected object with uuid, name and either path or runtime:true. Selection identity is the OBJECT since plan-754, so a chunk mesh, a light or an overlay can be selected by a user click and then appears in nodes[] with no path; paths stays the subset a path-taking tool can act on.', { readOnly: true })
   async webSelectionGet(): Promise<string> {
-    const sm = this.viewer?.selectionManager;
+    const v = this.viewer;
+    const sm = v?.selectionManager;
     if (!sm) return JSON.stringify({ error: 'No selection manager' });
     const snap = sm.getSnapshot();
-    return JSON.stringify({ paths: snap.selectedPaths, primary: snap.primaryPath });
+    // Selection identity is the object (plan-754 D10), so a selected chunk
+    // mesh, light or overlay has a uuid and no path. `paths` keeps its old
+    // meaning — what the document can address — and `nodes` is the full truth.
+    const nodes = snap.nodes.map((node) => {
+      const path = v?.registry?.getPathForNode(node) ?? null;
+      return {
+        uuid: node.uuid,
+        name: node.name || node.type,
+        ...(path !== null ? { path } : { runtime: true as const }),
+      };
+    });
+    return JSON.stringify({ paths: snap.selectedPaths, primary: snap.primaryPath, nodes });
   }
 
   @McpTool('Select-similar (the editor\'s "Select ▸" menu, remote): kind = identical (same geometry content — all copies of a part, e.g. all rollers), material (same material/appearance), or invert (everything not selected). Seeds from seedPath or the current selection. Replaces the selection with the match set and returns the count.', { readOnly: false })
@@ -834,8 +1231,4 @@ export class McpViewTools {
     sm.selectPaths(result);
     return JSON.stringify({ kind: k, selected: result.length });
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }

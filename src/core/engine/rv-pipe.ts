@@ -115,10 +115,7 @@ export class RVPipe {
 }
 
 registerTooltipComponent(RVPipe, {
-  hoverable: true,
-  badgeColor: '#26c6da',
-  filterLabel: 'Pipes',
-  hoverEnabledByDefault: true,
-  hoverPriority: 10,
-  pinPriority: 5,
+  pick: 'select',
+  bake: 'keep',    // fluid-color material swap — the original meshes stay
+  ui: { badge: '#26c6da', filter: 'Pipes', category: 'process', priority: 10 },
 });

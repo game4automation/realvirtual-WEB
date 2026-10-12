@@ -35,24 +35,18 @@ import { test, expect } from 'playwright/test';
 import type { Page } from 'playwright/test';
 import { DEV_GLB } from '../tests/fixtures/glb-paths.mjs';
 import { DEV_ASSETS_SKIP_REASON, HAS_DEV_ASSETS } from './dev-assets';
+import { dismissStartupNotices as dismissStartupNoticesShared } from './_viewer-ready';
 
 // The demo is internal (projects/Development, private sibling) — served by the
 // dev server under /private-assets/Development, absent on a public checkout.
 const DEMO = `/?model=${encodeURIComponent(DEV_GLB.ribbonSlitter)}`;
 
-/** Best-effort dismissal of the boot-time overlays (same as collision.spec.ts). */
+/** Best-effort dismissal of the boot-time overlays (shared helper, plan-503). */
 async function dismissStartupNotices(page: Page): Promise<void> {
-  for (const testId of ['auto-quality-ok', 'welcome-start-demo', 'welcome-dismiss']) {
-    const btn = page.getByTestId(testId);
-    try {
-      if (await btn.isVisible({ timeout: 1_000 })) {
-        await btn.click({ timeout: 5_000 });
-        await btn.waitFor({ state: 'detached', timeout: 5_000 });
-      }
-    } catch {
-      /* not shown on this machine — nothing to dismiss */
-    }
-  }
+  await dismissStartupNoticesShared(page, {
+    testIds: ['auto-quality-ok', 'welcome-start-demo', 'welcome-dismiss'],
+    appearTimeoutMs: 1_000,
+  });
 }
 
 interface RibbonProbe {
@@ -74,6 +68,21 @@ interface RibbonProbe {
    */
   passiveMatrix: number[];
   bandVertices: number[];
+  /**
+   * mm — the WORLD position of the first band sample of each path, and the world
+   * centre plus contact radius of the `Unwinder` (plan-468).
+   *
+   * `lengthMm` growing is not evidence that the end wrap is where it belongs: the
+   * point of `WrapDeg` is that the web STARTS on the roll surface, and only the
+   * distance between those two world positions says so. The band vertices are
+   * read in world space (the band is a child of its path node, which the slitter
+   * offsets laterally per strip) so the check is independent of that offset.
+   */
+  firstSampleWorldMm: Array<[number, number, number]>;
+  unwinderWorldMm: [number, number, number] | null;
+  /** Unit world direction of the unwinder's winding axis (the demo winds about X). */
+  unwinderAxisWorld: [number, number, number] | null;
+  unwinderContactRadiusMm: number;
 }
 
 /** Read the live web state out of the running viewer. */
@@ -94,6 +103,48 @@ function probeRibbon(page: Page): Promise<RibbonProbe> {
         return roller ? [...roller.node.matrixWorld.elements] : [];
       })(),
       bandVertices: paths.map((p) => p.band?.mesh?.geometry?.getAttribute('position')?.count ?? 0),
+      // plan-468. Scene units are metres and everything else here is millimetres,
+      // so both readings are scaled by 1000 on the way out.
+      firstSampleWorldMm: paths.map((p) => {
+        const mesh = p.band?.mesh;
+        const pos = mesh?.geometry?.getAttribute('position');
+        if (!mesh || !pos || pos.count < 2) return [0, 0, 0];
+        mesh.updateMatrixWorld(true);
+        // The band is two vertices per sample (the two edges of the strip); the
+        // centre line is their midpoint.
+        const x = (pos.getX(0) + pos.getX(1)) / 2;
+        const y = (pos.getY(0) + pos.getY(1)) / 2;
+        const z = (pos.getZ(0) + pos.getZ(1)) / 2;
+        const e = mesh.matrixWorld.elements;
+        return [
+          (e[0] * x + e[4] * y + e[8] * z + e[12]) * 1000,
+          (e[1] * x + e[5] * y + e[9] * z + e[13]) * 1000,
+          (e[2] * x + e[6] * y + e[10] * z + e[14]) * 1000,
+        ];
+      }),
+      unwinderWorldMm: (() => {
+        const roller = (paths[0]?.rollers ?? []).find((r: any) => r.node?.name === 'Unwinder');
+        if (!roller) return null;
+        roller.node.updateMatrixWorld(true);
+        const e = roller.node.matrixWorld.elements;
+        return [e[12] * 1000, e[13] * 1000, e[14] * 1000];
+      })(),
+      unwinderAxisWorld: (() => {
+        const roller = (paths[0]?.rollers ?? []).find((r: any) => r.node?.name === 'Unwinder');
+        if (!roller) return null;
+        roller.node.updateMatrixWorld(true);
+        const e = roller.node.matrixWorld.elements;
+        // Column 0/1/2 of the world matrix is the node's local X/Y/Z in world space.
+        const col = roller.axis === 'Y' ? 4 : roller.axis === 'Z' ? 8 : 0;
+        const v = [e[col], e[col + 1], e[col + 2]];
+        const n = Math.hypot(v[0], v[1], v[2]) || 1;
+        return [v[0] / n, v[1] / n, v[2] / n];
+      })(),
+      unwinderContactRadiusMm: (() => {
+        const path = paths[0];
+        const roller = (path?.rollers ?? []).find((r: any) => r.node?.name === 'Unwinder');
+        return roller ? roller.radiusMm + (path.RibbonThicknessMm ?? 0) / 2 : 0;
+      })(),
     };
   });
 }
@@ -154,6 +205,37 @@ test.describe('DemoRibbonSlitter (plan-459)', () => {
         && !e.includes('409 (Conflict)'),
     );
     expect(critical).toHaveLength(0);
+  });
+
+  test('the web band starts ON the unwinder roll surface, not at the tangent point (plan-468)', async ({ page }) => {
+    test.setTimeout(180_000);
+    await openDemo(page);
+    const probe = await probeRibbon(page);
+
+    expect(probe.unwinderWorldMm).not.toBeNull();
+    expect(probe.unwinderAxisWorld).not.toBeNull();
+    expect(probe.unwinderContactRadiusMm).toBeGreaterThan(100);
+
+    const centre = probe.unwinderWorldMm!;
+    const axis = probe.unwinderAxisWorld!;
+    /** mm — distance from the winding AXIS, i.e. the radius the sample sits at. */
+    const radialMm = (p: [number, number, number]): number => {
+      const d: [number, number, number] = [p[0] - centre[0], p[1] - centre[1], p[2] - centre[2]];
+      const along = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
+      return Math.hypot(d[0] - along * axis[0], d[1] - along * axis[1], d[2] - along * axis[2]);
+    };
+
+    // The acceptance criterion of the feature: with `WrapDeg: 270` on the demo's
+    // unwinder the FIRST band sample lies on the roll mantle — its distance from
+    // the winding axis is the contact radius (roll + half the caliper) — instead
+    // of at the tangent point, which is where the strip used to appear from.
+    // The tolerance covers the dirty gate (a rebuild is only triggered once the
+    // radius moved 0.05 mm) and the float32 vertex storage; a wrap that was not
+    // built at all would be off by metres, not millimetres.
+    expect(probe.firstSampleWorldMm).toHaveLength(probe.paths);
+    for (const sample of probe.firstSampleWorldMm) {
+      expect(radialMm(sample)).toBeCloseTo(probe.unwinderContactRadiusMm, 0);
+    }
   });
 
   test('stopping the drive stops the web, and reset restores the rolls', async ({ page }) => {

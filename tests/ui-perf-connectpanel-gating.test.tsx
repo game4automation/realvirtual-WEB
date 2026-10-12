@@ -9,7 +9,13 @@
  * null` sits AFTER every hook. That is a deliberate decision (the user's panel
  * state must survive closing it), but it meant two background timers kept running
  * for a panel nobody can see: a 2-second `/status` poll and a 1-second age tick.
- * Both are now gated on `isOpen`.
+ * Both were gated on `isOpen`.
+ *
+ * Since plan-562 the panel has no `/status` poll AT ALL: the write-gate overlay
+ * and the no-data notice need the same counters while the panel is closed, so the
+ * single owner is `ConnectStatusPoll` in connect-plugin.tsx. T1/T2 therefore still
+ * hold, and T3 now pins the opposite of what it used to: opening the panel starts
+ * no second poll. The age tick is still `isOpen`-gated.
  *
  * Closing the panel does unmount `SignalListView` with its scroll container, so
  * the scroll offset is persisted per interface alongside the filter and the
@@ -63,6 +69,10 @@ function makeViewer(lpm: LeftPanelManager, store: SignalStore | null = null): RV
   return {
     leftPanelManager: lpm,
     signalStore: store,
+    // The panel explains a missing live stream via `connectStreamBlock`, which
+    // reads the load's trust — a real viewer always carries one.
+    loadTrust: { trusted: true },
+    lastLoadResult: null,
     registry: null,
     signalBindingManager: undefined,
     getPlugin: () => undefined,
@@ -112,7 +122,7 @@ describe('ConnectPanel — background work is gated on isOpen', () => {
     expect(counts.status).toBe(statusAfterConnect);
   });
 
-  it('T3 opening the panel starts the poll immediately and then on the 2-second grid', async () => {
+  it('T3 an OPEN panel issues no poll of its own either — plan-562 moved the owner', async () => {
     const counts: FetchCounts = { status: 0, total: 0 };
     installFetchStub(counts);
     await act(async () => { await connectToServer(); });
@@ -123,23 +133,22 @@ describe('ConnectPanel — background work is gated on isOpen', () => {
 
     await act(async () => {
       lpm.open('connect', 360);
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, POLL_MS + 400));
     });
-    // First call is immediate (fetchStatus() before the setInterval).
-    await waitFor(() => expect(counts.status).toBeGreaterThan(before));
-    const afterOpen = counts.status;
 
-    await act(async () => { await new Promise((r) => setTimeout(r, POLL_MS + 400)); });
-    expect(counts.status).toBeGreaterThan(afterOpen);
+    // Until plan-562 THIS was the poll, gated on `isOpen`. The write-gate
+    // overlay and the no-data notice need the same counters while the panel is
+    // CLOSED, so the single owner is now `ConnectStatusPoll` in
+    // connect-plugin.tsx and the panel is a pure reader of the store. A poll
+    // here as well would mean two requests per tick whenever the panel is open.
+    expect(counts.status).toBe(before);
+    expect(screen.getByText(/realvirtual CONNECT/i)).toBeTruthy();
 
-    // Closing stops it again.
     await act(async () => {
       lpm.close('connect');
       await new Promise((r) => setTimeout(r, 100));
     });
-    const afterClose = counts.status;
-    await act(async () => { await new Promise((r) => setTimeout(r, POLL_MS * 2 + 300)); });
-    expect(counts.status).toBe(afterClose);
+    expect(counts.status).toBe(before);
   });
 });
 

@@ -33,6 +33,7 @@ import {
   getRequestedSettingsTab,
 } from '../src/core/hmi/settings-tab-store';
 import type { McpBridgeSnapshot } from '../src/plugins/mcp-bridge-plugin';
+import { modeManagerDouble } from './fixtures/mode-manager-double';
 
 const layout = vi.hoisted(() => ({ mobile: false }));
 
@@ -90,6 +91,7 @@ function createViewer(mcp?: Partial<McpBridgeSnapshot>) {
         getSnapshot: () => ({
           connected: false, port: '5100', toolCount: 0, toolNames: [],
           enabled: false, reconnectAttempt: 0, reconnectDelay: 0, serverStatus: null,
+          target: 'ws://localhost:5100/webviewer', failure: 'none',
           ...mcp,
         }),
       }
@@ -97,6 +99,7 @@ function createViewer(mcp?: Partial<McpBridgeSnapshot>) {
   return {
     leftPanelManager: new LeftPanelManager(),
     uiRegistry: new UIPluginRegistry(),
+    modes: modeManagerDouble(),
     applyVisualSettings: vi.fn(),
     clearModel: vi.fn(),
     renderBackend: 'three',

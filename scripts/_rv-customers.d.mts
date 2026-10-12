@@ -21,10 +21,22 @@ export interface RvCustomerContact {
 export interface RvCustomerLicensing {
   connect?: {
     issuer: string;
-    keyRef: string;
+    /**
+     * The licence key as a VALUE (2026-09-13). It used to be a `keyRef` naming
+     * a field in a gitignored sidecar; optional because a customer sits between
+     * onboarding and the portal without one. See `validateCustomer` in
+     * `_rv-customers.mjs`, which is the authority on this shape.
+     */
+    key?: string;
     seats?: number;
     activatedFingerprints?: number;
   };
+}
+
+/** The Requesty pair, carried in the register entry itself. */
+export interface RvCustomerInference {
+  requestyApiKey?: string;
+  requestyBaseUrl?: string;
 }
 
 export interface RvCustomerDelivery {
@@ -48,8 +60,37 @@ export interface RvCustomer {
   licensing?: RvCustomerLicensing;
   delivery: RvCustomerDelivery;
   billing?: { billomatCustomer?: string };
+  inference?: RvCustomerInference;
+  /** plan-759: the hosted-link key halves, in the entry like the licence. */
+  hosted?: RvCustomerHosted;
   secretsRef?: string;
 }
+
+/** The two halves of a hosted deploy's key (plan-759 D6b). */
+export interface RvCustomerHosted {
+  /** base64url of 32 bytes — the `#k=` link factor; stable across re-publishes. */
+  fragment?: string;
+  /** The password the customer types (≥ 8 characters). */
+  password?: string;
+}
+
+export interface RvHostedSecrets {
+  password: string | null;
+  fragment: string | null;
+  source: 'env' | 'register' | null;
+}
+
+/** True for the base64url form of exactly 32 bytes. */
+export function isHostedFragment(value: unknown): boolean;
+/** Password + fragment, environment over register; `customer` may be null. */
+export function resolveHostedSecrets(
+  customer: RvCustomer | null | undefined,
+  env?: Record<string, string | undefined>,
+): RvHostedSecrets;
+/** Writes a minted fragment into `customers/<slug>.json`; refuses to overwrite one. */
+export function recordHostedFragment(privateRoot: string, slug: string, fragment: string): RvCustomer;
+/** The entry with `hosted.password` masked for display. */
+export function redactHostedSecrets<T extends RvCustomer>(customer: T): T;
 
 export interface RvCustomerContext {
   fileName?: string;

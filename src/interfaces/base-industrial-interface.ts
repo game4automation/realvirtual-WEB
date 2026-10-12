@@ -29,6 +29,7 @@ import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import {
   createSignalWriter,
+  IFACE_PATH_PREFIX,
   type SignalStore,
   type SignalWriter,
 } from '../core/engine/rv-signal-store';
@@ -60,6 +61,11 @@ export interface SignalDescriptor {
   initialValue: boolean | number;
   /** Optional protocol sub-source; part of provider identity (for example an MQTT topic). */
   topic?: string;
+  /**
+   * plan-563: the remote has never received a real value for this PLC input — `initialValue` is
+   * only its type default. The interface offers the model value instead (`sendInitValues`).
+   */
+  uninitialized?: boolean;
 }
 
 /** Convert a discovered signal descriptor to the canonical SignalStore PLC type. */
@@ -94,6 +100,8 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
   // ── State ──
 
   protected viewer: RVViewer | null = null;
+  /** plan-539 F15: true while this interface is registered with the viewer's Simulation / PLC mode. */
+  private _holdsConnectionMode = false;
   protected signalStore: SignalStore | null = null;
   protected signalWriter: SignalWriter | null = null;
   private _connectionState: InterfaceConnectionState = 'disconnected';
@@ -102,7 +110,19 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
   private _reconnectAttempt = 0;
   private _settings: InterfaceSettings | null = null;
   private _outgoingSubscriptions: (() => void)[] = [];
+  /** Unsubscribe handle of {@link subscribeToCatalog} (plan-589). */
+  private _catalogUnsub: (() => void) | null = null;
+  /** Unsubscribe handle of the rename-end listener (plan-590). */
+  private _renameEndUnsub: (() => void) | null = null;
+  /**
+   * A discovery answer that arrived while a signal rename was open (plan-590
+   * Rename-/Sync-Vertrag (c)): applied only after `endRename`, so the gateway's
+   * new name never races the viewer store's own rename.
+   */
+  private _deferredDiscovery: SignalDescriptor[] | null = null;
   private _providerProvenanceEnabled = true;
+  /** The target the current connection ACTUALLY reached (plan-498) — see {@link connectedEndpoint}. */
+  private _connectedEndpoint: URL | null = null;
 
   // ── Initial-sync marker (plan-427 F2) ──
   //
@@ -127,6 +147,8 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
    * arrive between two ticks.
    */
   protected readonly pendingIncoming = new Map<string, boolean | number>();
+  /** True while onFixedUpdatePre commits received values — the echo guard of the outgoing subscriptions. */
+  private _applyingIncoming = false;
 
   /**
    * Buffer for outgoing signal values that have changed in the Viewer.
@@ -138,6 +160,17 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
   // ── Public Getters ──
 
   get connectionState(): InterfaceConnectionState { return this._connectionState; }
+
+  /**
+   * The endpoint the CURRENT connection actually uses (plan-498 "Transport-
+   * Erkennung"): set by the subclass from the target it really opened (after
+   * redirects / fallbacks), without credentials or query. `null` whenever the
+   * interface is not `connected` — a configured-but-unreached address is never
+   * reported, so a caller cannot provision against a host it is not talking to.
+   */
+  get connectedEndpoint(): URL | null {
+    return this._connectionState === 'connected' ? this._connectedEndpoint : null;
+  }
   get discoveredSignals(): ReadonlyArray<SignalDescriptor> { return this._discoveredSignals; }
   get isConnected(): boolean { return this._connectionState === 'connected'; }
 
@@ -176,15 +209,26 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
    */
   protected abstract doDiscoverSignals(): Promise<SignalDescriptor[]>;
 
+  /**
+   * Offer start values for PLC inputs the remote listed as never set (plan-563 F8). The remote
+   * takes each value only while the input is still unset — the first real value wins. Protocols
+   * without such a message keep this no-op.
+   */
+  protected sendInitValues(_signals: Record<string, boolean | number>): void {
+    // default: protocol has no init-status support
+  }
+
   // ── RVViewerPlugin Lifecycle ──
 
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     this.unsubscribeFromOutgoingSignals();
+    this.unsubscribeFromCatalog();
     this.viewer = viewer;
     this.signalStore = viewer.signalStore ?? null;
     this.signalWriter = this.signalStore
       ? createSignalWriter(this.signalStore, `interface:${this.id}`, 'interface')
       : null;
+    this.subscribeToCatalog();
 
     // A model reload replaces the SignalStore. Preserve the independent
     // interface connection while rebuilding discovery, metadata and outgoing
@@ -192,6 +236,8 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     if (this._discoveredSignals.length > 0) {
       this.registerDiscoveredSignals(this._discoveredSignals);
       this.subscribeToOutgoingSignals(this._discoveredSignals);
+      // plan-563: a model loaded after the discovery now has the values the remote still lacks.
+      if (this.isConnected) this.offerInitialValues(this._discoveredSignals);
     }
 
     // Auto-connect if settings say so and we're not already connected
@@ -211,12 +257,29 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
   onFixedUpdatePre(_dt: number): void {
     if (this.pendingIncoming.size === 0 || !this.signalStore) return;
 
+    const store = this.signalStore;
+    const renaming = store.hasPendingRename;
     const batch: Record<string, boolean | number> = {};
     for (const [name, value] of this.pendingIncoming) {
+      // plan-590: a value for a name the open rename already moved away would
+      // re-create the old name (the store registers on set) — drop it.
+      if (renaming && store.pendingRenameOf(name) !== undefined && store.get(name) === undefined) continue;
       batch[name] = value;
     }
     this.pendingIncoming.clear();
-    this.signalWriter?.setMany(batch);
+    // plan-539 F15b: the first write to a model PLC output takes the
+    // Simulation / PLC mode over — the virtual PLC is switched off BEFORE this
+    // batch lands, so its deactivation cannot overwrite the PLC's values.
+    if (this._holdsConnectionMode) this.viewer?.connectionMode?.interfaceWrites(this.id, Object.keys(batch));
+    // The store notifies synchronously, and pendingIncoming is already empty here —
+    // without this flag the outgoing subscription saw every received PLC input as a
+    // local change and echoed it straight back to the remote.
+    this._applyingIncoming = true;
+    try {
+      this.signalWriter?.setMany(batch);
+    } finally {
+      this._applyingIncoming = false;
+    }
 
     // plan-427 F2: this was the FIRST commit after a (re)connect — the store now
     // holds the remote's current state, including anything that changed while we
@@ -246,9 +309,69 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
 
   dispose(): void {
     this.disconnect();
+    this.unsubscribeFromCatalog();
     this.viewer = null;
     this.signalStore = null;
     this.signalWriter = null;
+  }
+
+  // ── Editor catalog changes (plan-589) ──
+
+  /**
+   * Follow `SignalStore.onCatalogChanged`: an editor mutation can create,
+   * remove or re-key a model signal at any time, with no model reload in
+   * sight. The interface then REBUILDS its registrations and its outgoing
+   * subscriptions from `_discoveredSignals` — the same work `onModelLoaded`
+   * does — instead of trying to move individual listeners: a listener moved to
+   * a name that no longer exists is a silent dead end, and a name that came
+   * back needs a subscription nobody would re-create.
+   *
+   * Removed names are also purged from both buffers: a queued incoming value
+   * would otherwise re-create the signal on the next flush (the store
+   * registers on `set`), and a queued outgoing value would be sent for a
+   * signal the model no longer has.
+   */
+  private subscribeToCatalog(): void {
+    const store = this.signalStore;
+    if (!store) return;
+    // plan-590: a discovery deferred during a rename runs once the rename ends;
+    // without one, a rename of a name this interface lists asks the remote for
+    // its list again (the gateway renamed it first, so the answer carries the
+    // new name and drops the old one — see applyDiscovery).
+    this._renameEndUnsub = store.onRenameEnded((end) => {
+      if (store.hasPendingRename) return;
+      const deferred = this._deferredDiscovery;
+      if (deferred) {
+        this._deferredDiscovery = null;
+        if (this.isConnected) this.applyDiscovery(deferred);
+        return;
+      }
+      if (this._knownSignalNames.has(end.oldName) || this._knownSignalNames.has(end.newName)) {
+        if (this.isConnected) this.requestRediscovery('catalog');
+      }
+    });
+    this._catalogUnsub = store.onCatalogChanged((change) => {
+      // A rename moved values under another name: whatever is still queued under
+      // the OLD name belongs to a signal that no longer exists (plan-590 F4).
+      for (const name of change.removed) {
+        this.pendingIncoming.delete(name);
+        this.dirtyOutgoing.delete(name);
+      }
+      // Nothing registered or removed → only descriptive metadata moved
+      // (`metaChanged`), which no subscription depends on.
+      if (change.registered.length === 0 && change.removed.length === 0
+        && change.released.length === 0) return;
+      if (this._discoveredSignals.length === 0) return;
+      this.registerDiscoveredSignals(this._discoveredSignals);
+      this.subscribeToOutgoingSignals(this._discoveredSignals);
+    });
+  }
+
+  private unsubscribeFromCatalog(): void {
+    this._catalogUnsub?.();
+    this._catalogUnsub = null;
+    this._renameEndUnsub?.();
+    this._renameEndUnsub = null;
   }
 
   // ── Public API ──
@@ -261,6 +384,7 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     this._settings = settings;
     this._reconnectAttempt = 0;
     this.cancelReconnect();
+    this.resetRediscovery();
 
     this.setConnectionState('connecting');
 
@@ -271,9 +395,7 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
       // Run signal discovery
       try {
         const signals = await this.doDiscoverSignals();
-        this._discoveredSignals = signals;
-        this.registerDiscoveredSignals(signals);
-        this.subscribeToOutgoingSignals(signals);
+        this.applyDiscovery(signals);
         // plan-427 F2: discovery succeeded, so a first incoming snapshot is now
         // expected. Arm the marker; the flush in onFixedUpdatePre resolves it.
         this.beginInitialSync();
@@ -292,12 +414,36 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     }
   }
 
+  /**
+   * Record the target this connection really opened (plan-498). Called by the
+   * subclass once its transport is open; query string and user info are
+   * stripped (an `apikey=` must never travel onwards). `null` clears it.
+   */
+  protected setConnectedEndpoint(target: URL | string | null): void {
+    if (target === null) {
+      this._connectedEndpoint = null;
+      return;
+    }
+    try {
+      const url = new URL(typeof target === 'string' ? target : target.href);
+      url.search = '';
+      url.hash = '';
+      url.username = '';
+      url.password = '';
+      this._connectedEndpoint = url;
+    } catch {
+      this._connectedEndpoint = null;
+    }
+  }
+
   /** Disconnect and stop reconnect attempts. */
   disconnect(): void {
+    this._connectedEndpoint = null;
     // Fix 4: Set state first — prevents onConnectionLost from triggering reconnect
     this._connectionState = 'disconnected'; // direct assignment, skip event for now
 
     this.unsubscribeFromOutgoingSignals();
+    this.resetRediscovery();
     this.pendingIncoming.clear();
     this.dirtyOutgoing.clear();
     // plan-427: a pending sync window dies with the connection — never emit a
@@ -313,6 +459,12 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     }
 
     this.cancelReconnect(); // AFTER doDisconnect — catches any timer set during close
+    // plan-539 F15: an explicit disconnect releases the Simulation / PLC mode
+    // too (the state was set directly above, so setConnectionState is a no-op).
+    if (this._holdsConnectionMode) {
+      this._holdsConnectionMode = false;
+      this.viewer?.connectionMode?.interfaceDisconnected(this.id);
+    }
     this.setConnectionState('disconnected'); // emit events now (no-op if already disconnected)
   }
 
@@ -324,13 +476,237 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     if (!this.isConnected) {
       throw new Error(`Cannot discover signals: ${this.id} is not connected`);
     }
+    // plan-563 F14: single flight — a second caller while a request is pending shares it instead
+    // of sending a second import_request whose answer would race the first.
+    if (this._rediscoverPromise) return this._rediscoverPromise;
+    const pending = this.discoverAndApply();
+    this._rediscoverPromise = pending;
+    const clear = (): void => {
+      if (this._rediscoverPromise === pending) this._rediscoverPromise = null;
+    };
+    pending.then(clear, clear);
+    return pending;
+  }
 
-    this.unsubscribeFromOutgoingSignals();
+  private async discoverAndApply(): Promise<SignalDescriptor[]> {
+    // The old outgoing subscriptions stay active while the answer is pending —
+    // subscribeToOutgoingSignals() swaps them — so a viewer write made meanwhile
+    // is still sent instead of being dropped.
+    const generation = this._connectionGeneration;
     const signals = await this.doDiscoverSignals();
-    this._discoveredSignals = signals;
+    // A disconnect (or a disconnect + reconnect) while the answer was pending:
+    // the list belongs to a connection that no longer exists — apply nothing.
+    if (generation !== this._connectionGeneration || !this.isConnected) return signals;
+    this.applyDiscovery(signals);
+    return signals;
+  }
+
+  /**
+   * Take over one discovery answer: list, store registration, outgoing subscriptions, init offer.
+   *
+   * plan-590: while a signal rename is open the answer is parked and applied
+   * after `endRename` (Rename-/Sync-Vertrag (c)). Names the previous answer
+   * listed and this one no longer does are withdrawn (F4): the provider entry,
+   * the interface placeholder `__iface__/<name>` (the name itself goes only
+   * when nothing else owns it) and anything still queued under it.
+   */
+  private applyDiscovery(signals: SignalDescriptor[]): void {
+    if (this.signalStore?.hasPendingRename) {
+      this._deferredDiscovery = signals;
+      return;
+    }
+    this._deferredDiscovery = null;
+    const previous = this._discoveredSignals;
+    this.setDiscoveredSignals(signals);
+    this.withdrawVanishedSignals(previous, signals);
     this.registerDiscoveredSignals(signals);
     this.subscribeToOutgoingSignals(signals);
-    return signals;
+    this.offerInitialValues(signals);
+  }
+
+  /** Withdraw what `previous` listed and `next` does not (plan-590 F4). */
+  private withdrawVanishedSignals(
+    previous: ReadonlyArray<SignalDescriptor>,
+    next: ReadonlyArray<SignalDescriptor>,
+  ): void {
+    if (previous.length === 0) return;
+    const keep = new Set<string>();
+    for (const sig of next) keep.add(sig.name);
+    const store = this.signalStore;
+    for (const sig of previous) {
+      if (keep.has(sig.name)) continue;
+      this.pendingIncoming.delete(sig.name);
+      this.dirtyOutgoing.delete(sig.name);
+      if (!store) continue;
+      if (this._providerProvenanceEnabled) {
+        store.unregisterSignalProviderSignal({
+          interfaceId: this.id,
+          ...(sig.topic !== undefined ? { topic: sig.topic } : {}),
+          signal: sig.name,
+        });
+      }
+      const placeholder = `${IFACE_PATH_PREFIX}${sig.name}`;
+      if (store.registeredPaths(sig.name).includes(placeholder)) {
+        store.unregisterPath(placeholder, sig.name);
+      }
+    }
+  }
+
+  /**
+   * Opt-in (the CONNECT gateway): an incoming value for a signal the last
+   * discovery did not list means the remote's signal list grew — e.g. an
+   * interface was added or "PLC auto-map → Apply" created signals while this
+   * viewer stayed connected. Such signals were applied incoming but never sent
+   * outgoing, so a PLC input set in the viewer silently never reached the PLC
+   * until the page was reloaded. With this flag the list is re-read.
+   *
+   * Since plan-563 CONNECT also says so explicitly (`catalog_changed` →
+   * {@link requestRediscovery}) — needed for inputs, which it no longer
+   * broadcasts before they have a value. The unknown-name path stays as the
+   * fallback for older gateways; both feed the SAME scheduler.
+   */
+  protected rediscoverOnUnknownSignal = false;
+  /** Bumped on every connect/disconnect — an answer from an older connection is discarded. */
+  private _connectionGeneration = 0;
+  private _knownSignalNames = new Set<string>();
+  private _discoveryComplete = false;
+  /** Incoming names the current list does not contain, waiting for a re-read. */
+  private readonly _unknownSeen = new Set<string>();
+  /** Names a SUCCESSFUL re-read still did not list — never asked for again (no loop). */
+  private readonly _unknownGivenUp = new Set<string>();
+  /** plan-563 F14: the remote announced a catalog change that no run has picked up yet ("pending again"). */
+  private _catalogDirty = false;
+  private _rediscoverTimer: ReturnType<typeof setTimeout> | null = null;
+  private _rediscoverInFlight = false;
+  /** plan-563 F14: the one discovery request currently pending (shared by every caller). */
+  private _rediscoverPromise: Promise<SignalDescriptor[]> | null = null;
+  private _rediscoverFailures = 0;
+  private static readonly REDISCOVER_DEBOUNCE_MS = 250;
+  private static readonly REDISCOVER_MAX_FAILURES = 3;
+
+  private setDiscoveredSignals(signals: SignalDescriptor[]): void {
+    this._discoveredSignals = signals;
+    this._knownSignalNames = new Set(signals.map((s) => s.name));
+    this._discoveryComplete = true;
+    for (const name of this._unknownSeen) if (this._knownSignalNames.has(name)) this._unknownSeen.delete(name);
+    // Names / catalog changes that arrived while this discovery was running are handled now.
+    if (this.hasRediscoveryWork()) this.scheduleRediscovery();
+  }
+
+  private noteIncomingName(name: string): void {
+    if (this._knownSignalNames.has(name) || this._unknownGivenUp.has(name)) return;
+    this._unknownSeen.add(name);
+    this.scheduleRediscovery();
+  }
+
+  /**
+   * Ask the shared discovery scheduler for a re-read (plan-563 F14). `'catalog'` = the remote
+   * announced that its signal list changed; it is remembered until a run STARTED after it has
+   * completed, so a change during a running discovery triggers exactly one follow-up.
+   */
+  protected requestRediscovery(reason: 'catalog'): void {
+    if (reason === 'catalog') this._catalogDirty = true;
+    this.scheduleRediscovery();
+  }
+
+  private hasRediscoveryWork(): boolean {
+    return this._catalogDirty || (this.rediscoverOnUnknownSignal && this._unknownSeen.size > 0);
+  }
+
+  /** Single flight: one re-read at a time; names / catalog changes seen meanwhile trigger the next one. */
+  private scheduleRediscovery(): void {
+    if (!this._discoveryComplete || this._rediscoverInFlight || this._rediscoverTimer !== null) return;
+    this._rediscoverTimer = setTimeout(() => {
+      this._rediscoverTimer = null;
+      void this.runRediscovery();
+    }, BaseIndustrialInterface.REDISCOVER_DEBOUNCE_MS);
+  }
+
+  private async runRediscovery(): Promise<void> {
+    if (!this.isConnected || !this.hasRediscoveryWork()) return;
+    const generation = this._connectionGeneration;
+    const asked = [...this._unknownSeen];
+    const catalog = this._catalogDirty;
+    // Taken by THIS run; a catalog_changed arriving while it is in flight sets it again.
+    this._catalogDirty = false;
+    this._rediscoverInFlight = true;
+    debug('interface', catalog
+      ? `[${this.id}] Remote signal catalog changed — re-reading it`
+      : `[${this.id}] Remote signal list grew (${asked.join(', ')}) — re-reading it`);
+    let ok = false;
+    try {
+      // A request somebody else started BEFORE this run may predate the change it handles — let it
+      // finish, then ask once more (single flight still holds: never two requests at a time).
+      const earlier = this._rediscoverPromise;
+      if (earlier) await earlier.catch(() => {});
+      if (generation !== this._connectionGeneration) return;
+      await this.rediscover();
+      ok = true;
+    } catch (err) {
+      console.warn(`[${this.id}] Rediscovery failed:`, err);
+    } finally {
+      this._rediscoverInFlight = false;
+    }
+    if (generation !== this._connectionGeneration) return; // reset by disconnect/connect meanwhile
+    if (ok) {
+      this._rediscoverFailures = 0;
+      for (const name of asked) {
+        if (!this._knownSignalNames.has(name)) this._unknownGivenUp.add(name);
+        this._unknownSeen.delete(name);
+      }
+    } else if (++this._rediscoverFailures >= BaseIndustrialInterface.REDISCOVER_MAX_FAILURES) {
+      for (const name of asked) { this._unknownGivenUp.add(name); this._unknownSeen.delete(name); }
+      this._rediscoverFailures = 0;
+    } else if (catalog) {
+      this._catalogDirty = true; // failed run: the catalog change is still unhandled — retry
+    }
+    if (this.hasRediscoveryWork()) this.scheduleRediscovery();
+  }
+
+  private resetRediscovery(): void {
+    this._connectionGeneration++;
+    this._discoveryComplete = false;
+    this._knownSignalNames.clear();
+    this._unknownSeen.clear();
+    this._unknownGivenUp.clear();
+    this._catalogDirty = false;
+    this._rediscoverInFlight = false;
+    this._rediscoverPromise = null;
+    this._rediscoverFailures = 0;
+    if (this._rediscoverTimer !== null) {
+      clearTimeout(this._rediscoverTimer);
+      this._rediscoverTimer = null;
+    }
+  }
+
+  /**
+   * plan-563 F8: offer the model's current value for every PLC input the remote listed as never
+   * set. Only signals that exist in the MODEL count (a scene path, not the `__iface__/` placeholder
+   * an interface-only symbol gets) — an interface-only symbol has no model value to offer, only the
+   * remote's own default. Offering again after a later discovery is harmless: the remote keeps the
+   * first value and lists only names that are still unset.
+   */
+  private offerInitialValues(signals: ReadonlyArray<SignalDescriptor>): void {
+    const store = this.signalStore;
+    if (!store) return;
+    const offer: Record<string, boolean | number> = {};
+    let count = 0;
+    for (const sig of signals) {
+      if (!sig.uninitialized || sig.direction !== 'input') continue;
+      const path = store.getPath(sig.name);
+      if (path === undefined || path.startsWith('__iface__/')) continue;
+      const value = store.get(sig.name);
+      if (typeof value !== 'boolean' && typeof value !== 'number') continue;
+      offer[sig.name] = value;
+      count++;
+    }
+    if (count === 0) return;
+    debug('interface', `[${this.id}] Offering ${count} model value(s) for unset PLC inputs: ${Object.keys(offer).join(', ')}`);
+    try {
+      this.sendInitValues(offer);
+    } catch (err) {
+      console.warn(`[${this.id}] sendInitValues error:`, err);
+    }
   }
 
   // ── Helpers for Subclasses ──
@@ -343,6 +719,7 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
   protected bufferIncoming(signals: Record<string, boolean | number>): void {
     for (const name in signals) {
       this.pendingIncoming.set(name, signals[name]);
+      if (this.rediscoverOnUnknownSignal) this.noteIncomingName(name);
     }
     // Also emit interface-data event for plugins that want raw data
     this.viewer?.emit('interface-data', {
@@ -432,15 +809,30 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     this._connectionState = state;
     this.setProviderConnectionState(state === 'connected');
 
-    // Update viewer's global connection state
+    // Update viewer's global connection state. plan-539 F15/F15b: through the
+    // Simulation / PLC controller — a connection alone changes nothing; the
+    // interface takes over only once it writes a model PLC output (see
+    // onFixedUpdatePre); its disconnect returns to the saved StartMode.
+    const mode = this.viewer?.connectionMode;
     if (state === 'connected') {
-      this.viewer?.setConnectionState?.('Connected');
+      if (mode) {
+        // Counted once per interface, also across reconnects via 'error'.
+        if (!this._holdsConnectionMode) mode.interfaceConnected(this.id);
+        this._holdsConnectionMode = true;
+      } else {
+        this.viewer?.setConnectionState?.('Connected');
+      }
       this.viewer?.emit('interface-connected', {
         interfaceId: this.id,
         type: this.protocolName,
       });
-    } else if (state === 'disconnected' && previous === 'connected') {
-      this.viewer?.setConnectionState?.('Disconnected');
+    } else if (state === 'disconnected' && (previous === 'connected' || this._holdsConnectionMode)) {
+      if (mode) {
+        if (this._holdsConnectionMode) mode.interfaceDisconnected(this.id);
+        this._holdsConnectionMode = false;
+      } else {
+        this.viewer?.setConnectionState?.('Disconnected');
+      }
     }
 
     if (state === 'error' && error) {
@@ -453,10 +845,17 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
 
   /** Register discovered signals in the SignalStore. */
   private registerDiscoveredSignals(signals: SignalDescriptor[]): void {
+    // plan-539 F15b: a takeover ends when the interface no longer sources any model output.
+    if (this._holdsConnectionMode) this.viewer?.connectionMode?.interfaceSources(this.id, signals.map((sig) => sig.name));
     if (!this.signalStore) return;
 
+    const store = this.signalStore;
+    const renaming = store.hasPendingRename;
     let registered = 0;
     for (const sig of signals) {
+      // plan-590 Rename-/Sync-Vertrag (b): neither side of an open rename is
+      // (re-)registered here — the store rename moves it, endRename re-applies.
+      if (renaming && store.isRenamePending(sig.name)) continue;
       // If a signal with this name is already registered — most importantly a GLB
       // MODEL signal carrying its real scene path — do NOT re-register it under the
       // synthetic __iface__ placeholder. register() overwrites nameToPath, so doing
@@ -477,6 +876,7 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
     }
     if (!this._providerProvenanceEnabled) return;
     for (const sig of signals) {
+      if (renaming && store.isRenamePending(sig.name)) continue;
       this.signalStore.registerSignalProvider({
         interfaceId: this.id,
         ...(sig.topic !== undefined ? { topic: sig.topic } : {}),
@@ -502,7 +902,7 @@ export abstract class BaseIndustrialInterface implements RVViewerPlugin {
 
       const unsub = this.signalStore.subscribe(sig.name, (value) => {
         // Fix 7: Don't echo back values we just received from the remote
-        if (this.pendingIncoming.has(sig.name)) return;
+        if (this._applyingIncoming || this.pendingIncoming.has(sig.name)) return;
         this.dirtyOutgoing.set(sig.name, value);
       });
       this._outgoingSubscriptions.push(unsub);

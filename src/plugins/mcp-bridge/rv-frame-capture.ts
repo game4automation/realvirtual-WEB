@@ -2,22 +2,51 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-frame-capture — shared one-frame capture for the MCP screenshot tools.
+ * rv-frame-capture — the HUMAN's frame, plus the shared image encoders.
  *
- * Extracted from McpBridgePlugin._captureFrameCanvas so the delegate tool
- * classes (view tools, editor verify tool) reuse the exact same render + crop
- * + downscale path. Renders one frame via the viewer's full frame path
- * (isolate composition, post-processing, overlays — see
- * RVViewer.renderFrameForCapture) and reads the drawing buffer synchronously
- * in the same tick (the renderer has no preserveDrawingBuffer).
+ * {@link captureFrameCanvas} reads the VISIBLE drawing buffer, so what it
+ * returns is the user's canvas at the user's size with the user's UI state.
+ * Since plan-740 Phase 3 that has exactly ONE consumer left: `web_screenshot`,
+ * which is deliberately defined as "what the human sees" (D-U9). Every other
+ * perception tool — eye, render, sweep, burst, annotated, analyze, verify_drive
+ * — renders offscreen through the agent camera (`EyeChannels.renderChannels`).
+ * If you are about to add a second consumer here, you almost certainly want
+ * `renderAgentChannels` in `rv-mcp-observe-tools.ts` instead.
+ *
+ * It renders one frame via the viewer's full frame path (isolate composition,
+ * post-processing, overlays — see RVViewer.renderFrameForCapture) and reads the
+ * drawing buffer synchronously in the same tick (the renderer has no
+ * preserveDrawingBuffer).
  *
  * Crop resolution priority: manual fractional rect → explicit world Box3 →
  * node path (on-screen AABB of the node) → full frame.
+ *
+ * The encoders below (`canvasToRvImage`, `canvasesToRvImages`,
+ * `saveCanvasToProject`, `compositeMontage`) stay shared by both paths — they
+ * are about bytes, not about whose camera produced them.
  */
 
 import { Box3, MathUtils, Vector3 } from 'three';
 import type { RVViewer } from '../../core/rv-viewer';
-import { encodeRvImageWithinBudget } from './rv-image-budget';
+import { encodeRvImageWithinBudget, encodeRvImagesWithinBudget } from './rv-image-budget';
+import { recordAgentEyeEnvelope } from '../../core/hmi/agent-eye-monitor-store';
+
+/**
+ * Hand the FINISHED envelope to the Agent Eye Monitor (plan-481).
+ *
+ * Deliberately the last thing both encoders do, and deliberately swallowing:
+ * the return value is already decided, the monitor is a viewing aid, and a tool
+ * call must never fail because a filmstrip cell could not be built. The store
+ * itself only enqueues here — all real work runs in a macrotask, i.e. after the
+ * MCP answer has been sent (D-A3).
+ */
+function tapAgentEyeMonitor(envelopeJson: string, source?: string): void {
+  try {
+    recordAgentEyeEnvelope(envelopeJson, source);
+  } catch {
+    /* never let the monitor touch a tool result */
+  }
+}
 
 export interface FrameCaptureOptions {
   /** Node path — crop to its on-screen bounding box (+8% padding). */
@@ -126,12 +155,44 @@ export function captureFrameCanvas(
  * the producing side. Normal frames encode exactly once at the historical quality
  * 0.72 and are returned unchanged; only an over-budget frame walks the reduction
  * ladder, and only an unreducible one yields the small error payload.
+ *
+ * `source` is the calling tool's own name (plan-481 D-A8). It is a SEPARATE
+ * third parameter and never part of `extra` — `extra` is spread into
+ * `__rvImage` and would therefore travel to the agent. The returned string is
+ * byte for byte what the budget encoder produced.
  */
 export function canvasToRvImage(
   canvas: HTMLCanvasElement,
   extra?: Record<string, unknown>,
+  source?: string,
 ): string {
-  return encodeRvImageWithinBudget(canvas, extra);
+  const envelope = encodeRvImageWithinBudget(canvas, extra);
+  tapAgentEyeMonitor(envelope, source);
+  return envelope;
+}
+
+/**
+ * JSON-encode SEVERAL aligned canvases as one multi-channel envelope
+ * (plan-740 D-A1) — the `web_eye` counterpart of {@link canvasToRvImage}.
+ *
+ * Channel order is the caller's order and is what the sidecar's `channels[]`
+ * declares, so the agent can match the Nth image block to the Nth name.
+ */
+export function canvasesToRvImages(
+  channels: readonly RvImageChannel[],
+  extra?: Record<string, unknown>,
+  source?: string,
+): string {
+  const envelope = encodeRvImagesWithinBudget(channels, extra);
+  tapAgentEyeMonitor(envelope, source);
+  return envelope;
+}
+
+/** One image on its way into a multi-channel envelope. */
+export interface RvImageChannel {
+  canvas: HTMLCanvasElement;
+  mime: 'image/png' | 'image/jpeg';
+  channel: string;
 }
 
 /** Where an unqualified `savePath` lands inside the project (plan-709 §2.6.2). */
@@ -182,17 +243,29 @@ export async function saveCanvasToProject(
   }
 }
 
-/** Composite frames into a labelled grid montage (burst-style styling). */
+/**
+ * Composite frames into a labelled grid montage (burst-style styling).
+ *
+ * `cellPx` overrides the burst-tuned default cell width. The default keeps the
+ * whole sheet inside 1600px, which is right for a burst of viewport screenshots
+ * but silently discards resolution for a caller that rendered its cells at a
+ * size the USER asked for — `web_view_ortho` rendered 1024px cells and got them
+ * scaled to 533, so its `size` parameter had no observable effect at all.
+ * Callers that own their cell resolution pass it through here instead.
+ */
 export function compositeMontage(
   frames: HTMLCanvasElement[],
   labels: string[],
+  cellPx?: number,
 ): HTMLCanvasElement | { error: string } {
   if (frames.length === 0) return { error: 'No frames' };
   const n = frames.length;
   const cols = Math.ceil(Math.sqrt(n));
   const rows = Math.ceil(n / cols);
   const aspect = frames[0].height / frames[0].width || 0.5625;
-  const cellW = Math.floor(Math.min(640, 1600 / cols));
+  const cellW = Number.isFinite(cellPx) && (cellPx as number) > 0
+    ? Math.round(cellPx as number)
+    : Math.floor(Math.min(640, 1600 / cols));
   const cellH = Math.round(cellW * aspect);
   const mont = document.createElement('canvas');
   mont.width = cols * cellW; mont.height = rows * cellH;
@@ -203,10 +276,16 @@ export function compositeMontage(
     const cx = (i % cols) * cellW, cy = Math.floor(i / cols) * cellH;
     ctx.drawImage(frames[i], cx, cy, cellW, cellH);
     const label = labels[i] ?? `#${i}`;
-    ctx.font = '600 16px system-ui, sans-serif';
+    // Scale with the cell so a larger sheet does not get relatively smaller
+    // labels. 0.03 reproduces the historical 16px exactly at the 533px default.
+    const fontPx = Math.max(12, Math.round(cellW * 0.03));
+    ctx.font = `600 ${fontPx}px system-ui, sans-serif`;
     const tw = ctx.measureText(label).width;
-    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(cx + 4, cy + 4, tw + 10, 22);
-    ctx.fillStyle = '#fff'; ctx.fillText(label, cx + 9, cy + 20);
+    const pad = Math.round(fontPx * 0.25);
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(cx + pad, cy + pad, tw + pad * 2.5, fontPx + pad * 1.5);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, cx + pad * 2.25, cy + fontPx + pad);
   }
   return mont;
 }

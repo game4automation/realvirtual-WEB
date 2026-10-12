@@ -26,7 +26,7 @@
  * that state at all.
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest';
 import {
   BufferAttribute, BufferGeometry, Group, Mesh, Object3D, PerspectiveCamera, Scene,
   Vector3,
@@ -35,11 +35,14 @@ import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { scratchAssetDocument } from './helpers/scratch-asset-document';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
+import { ensureEditorCommandsRegistered } from '../src/core/hmi/editor-command-descriptors';
+import { setActiveAssetContext, type ActiveAssetContext } from '../src/core/editor/active-asset-store';
 import {
   CirclePickGizmo, type CircleGizmoTarget,
 } from '@rv-private/plugins/asset-editor/circle-pick-gizmo';
 import {
-  cancelPivotCirclePick, getPivotCirclePickSnapshot, isPivotCirclePickActive,
+  cancelPivotCirclePick, circleLabel, getPivotCirclePickSnapshot, isPivotCirclePickActive,
   startPivotCirclePick,
 } from '@rv-private/plugins/asset-editor/pivot-circle-pick';
 import {
@@ -76,6 +79,12 @@ const NEAR_RIM = new Vector3(4.4, 0, 3);
 const RIM_Z = 3;
 
 const cleanups: (() => void)[] = [];
+// Loaded up front, so a commit's dispatch runs in the click's tick — as the
+// direct call it replaced did — and `doc.whenIdle()` sees its transaction.
+beforeAll(async () => {
+  ensureEditorCommandsRegistered();
+  await commandRegistry.preload(['editor.pivotToCircle']);
+});
 afterEach(() => {
   cancelPivotCirclePick();
   cancelPivotPick();
@@ -179,6 +188,9 @@ function makeHarness(): Harness {
 
   const viewer = {
     scene, camera,
+    // The commit is a dispatch of `editor.pivotToCircle` — an editor-scoped
+    // command, so the harness is an editor session.
+    modes: { activeMode: 'editor' },
     renderer: { domElement: canvas },
     registry,
     markRenderDirty: vi.fn(),
@@ -216,6 +228,9 @@ function makeHarness(): Harness {
 
   const doc = scratchAssetDocument(viewer);
   cleanups.push(() => doc.dispose());
+  ensureEditorCommandsRegistered();
+  setActiveAssetContext({ viewer, doc } as unknown as ActiveAssetContext);
+  cleanups.push(() => setActiveAssetContext(null));
 
   // Registered AFTER the machine arms, so silence here is the observable form of
   // a claim. Installed per test through `armDownstream()`.
@@ -427,7 +442,8 @@ describe('pivot-to-circle interaction', () => {
 
     const hovered = getPivotCirclePickSnapshot();
     expect(hovered.hasCircle).toBe(true);
-    expect(hovered.hoverLabel).toMatch(/Ø 8\.0/);       // the r = 4 bore
+    // The r = 4 bore — scene units are metres, the panel speaks millimetres.
+    expect(hovered.hoverLabel).toMatch(/Ø 8000\.0 mm/);
     expect(h.overlay()!.visible).toBe(true);
     expect(visibleRing(h)).toBe(true);
 
@@ -514,6 +530,33 @@ describe('pivot-to-circle interaction', () => {
     await pastThrottle();
     pointer('pointermove', CENTRE_X, CENTRE_Y);
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it('a commit is exactly ONE editor.pivotToCircle dispatch, with the circle in world space', async () => {
+    const h = makeHarness();
+    armedOnMesh(h);
+    const at = h.screenOf(NEAR_RIM);
+    pointer('pointermove', at.x, at.y);
+    expect(getPivotCirclePickSnapshot().hasCircle).toBe(true);
+
+    const exec = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: {} });
+    try {
+      click(at.x, at.y);
+      await settle();
+      expect(exec).toHaveBeenCalledTimes(1);
+      const [id, args, opts] = exec.mock.calls[0];
+      expect(id).toBe('editor.pivotToCircle');
+      expect(opts).toMatchObject({ origin: 'ui', buttonKey: 'qe.pivot-to-circle', viewer: h.viewer });
+      const a = args as { path: string; worldCenter: number[]; worldAxis: number[] };
+      expect(a.path).toBe('Asset/Axis');
+      expect(Math.hypot(a.worldCenter[0], a.worldCenter[1])).toBeLessThan(0.05);
+      expect(a.worldCenter[2]).toBeCloseTo(RIM_Z, 2);
+      // The bore's axis is world ±Z.
+      expect(Math.abs(a.worldAxis[2])).toBeCloseTo(1, 3);
+      expect(isPivotCirclePickActive()).toBe(false);
+    } finally {
+      exec.mockRestore();
+    }
   });
 
   it('commit recomputes world data from the CURRENT matrixWorld', async () => {
@@ -665,13 +708,23 @@ describe('pivot-to-circle interaction', () => {
   });
 });
 
+describe('circleLabel', () => {
+  it('reports the diameter in millimetres — scene units are metres', () => {
+    // A 40 mm hub on imported CAD read `Ø 0.0` before (metres, one decimal).
+    expect(circleLabel({ worldCenter: [0, 0, 0], worldAxis: [0, 0, 1], worldRadius: 0.02, kind: 'end', surface: 'shaft' } as never))
+      .toBe('Ø 40.0 mm · cylinder end · shaft');
+    expect(circleLabel({ worldCenter: [0, 0, 0], worldAxis: [0, 0, 1], worldRadius: 0.004, kind: 'rim', surface: 'unknown' } as never))
+      .toBe('Ø 8.0 mm · rim');
+  });
+});
+
 // ─── The overlay in isolation ───────────────────────────────────────────────
 
 function gizmoTarget(overrides: Partial<CircleGizmoTarget> = {}): CircleGizmoTarget {
   return {
     worldVertex: [4, 0, 3],
     circle: { worldCenter: [0, 0, 3], worldAxis: [0, 0, 1], worldRadius: 4 },
-    label: 'Ø 8.0 · rim · bore',
+    label: 'Ø 8.0 mm · rim · bore',
     ...overrides,
   };
 }
@@ -699,7 +752,7 @@ describe('CirclePickGizmo', () => {
     expect(w.gizmo.visible).toBe(true);
     expect(w.gizmo.showsCircle).toBe(true);
     expect(w.hover).toHaveBeenLastCalledWith(
-      expect.objectContaining({ label: 'Ø 8.0 · rim · bore' }));
+      expect.objectContaining({ label: 'Ø 8.0 mm · rim · bore' }));
     // Three fixed objects, never a pool.
     expect(w.gizmo.root.children).toHaveLength(3);
   });

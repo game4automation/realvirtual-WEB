@@ -10,12 +10,11 @@
  * text, and only DURING an interaction (a tool call) — nothing when idle. The
  * label comes from ai-activity-store (fed by the bridge) and auto-clears.
  *
- * Mounted as a direct child of HMIShell (alongside the other overlays).
+ * Mounted in AgentActivityRow beside the Agent Eye control.
  */
 
 import { Box, Typography } from '@mui/material';
 import { alpha, useTheme } from '@mui/material/styles';
-import { ACTIVITY_BAR_WIDTH } from './layout-constants';
 import { useMcpBridge } from '../../hooks/use-mcp-bridge';
 import { useAiActivity } from './ai-activity-store';
 
@@ -36,10 +35,7 @@ export function AiActivityOverlay() {
     <Box
       role="status"
       sx={{
-        position: 'fixed',
-        left: ACTIVITY_BAR_WIDTH + 6,  // just right of the activity bar
-        bottom: 50,                    // aligned with the AI button (above Settings)
-        zIndex: 9400,
+        minWidth: 0,
         pointerEvents: 'none',
         px: 1,
         py: 0.5,

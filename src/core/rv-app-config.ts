@@ -36,17 +36,26 @@ export interface RVAppConfig {
   defaultModel?: string;
   /** Base path for project-specific assets (docs, AASX, logos). Relative to BASE_URL. Ends with '/'. */
   projectAssetsPath?: string;
+  /**
+   * The served project of a hosted deploy (plan-759 D2): the deploy root that
+   * holds `project.json` and every document under its own path, relative to
+   * this runtime's URL (`p/`) or absolute. Read only when the query carries no
+   * `?projectUrl=`, which keeps overriding it. A hosted boot opens the
+   * project's dashboard (D14); a document opens through its own `?doc=`.
+   */
+  projectUrl?: string;
   /** Public corresponding-source URL for the exact embedded AGPL WebViewer build. */
   sourceUrl?: string;
 
   /**
-   * Zero-knowledge encryption for password-protected deploys (plan-267). When
-   * `enabled`, model GLBs on the CDN are AES-256-GCM RVE1 envelopes (self-
-   * describing via magic) under their normal `.glb` names — the runtime shows a
-   * password gate and decrypts before parsing. Salt/iterations live in each
-   * envelope header, so this flag is just a boolean signal set at publish time.
+   * Zero-knowledge encryption for password-protected deploys (plan-267 / 759).
+   * When `enabled`, every GLB on the CDN is an AES-256-GCM RVE1 envelope (self-
+   * describing via magic) under its normal `.glb` name. `probe` is a tiny
+   * envelope over a fixed plaintext with the publish salt: the boot gate
+   * derives the key once from its header and verifies it there, before any
+   * document is fetched (F5). Salt/iterations live in each envelope header.
    */
-  encryption?: { enabled?: boolean };
+  encryption?: { enabled?: boolean; probe?: string };
 
   /** Global plugin IDs — lowest priority, overridden by modelname.json and GLB extras. */
   plugins?: string[];

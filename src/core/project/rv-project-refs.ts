@@ -40,6 +40,7 @@
  */
 
 import type { RvDocumentEntry, RvProject } from './rv-project-types';
+import { PROJECT_ASSET_URL_PREFIX } from './rv-project-asset-source';
 
 // ─── The fields ─────────────────────────────────────────────────────────
 
@@ -82,10 +83,73 @@ export function isConnectConfigPath(path: string | null | undefined): boolean {
  */
 export const KNOWLEDGE_FILE_SUFFIX = '.knowledge.md';
 
-/** Is this path a knowledge file — by ending, wherever it sits? */
+/**
+ * The plain Markdown ending, which counts as knowledge too.
+ *
+ * `.knowledge.md` stays the EXPLICIT spelling — a file named that way says what
+ * it is — but every other `.md` in a project is prose about the machine just as
+ * much, so the dashboard shows one knowledge card for both rather than a
+ * knowledge card next to an inert row holding the same kind of text
+ * (user decision 2026-09-10).
+ */
+export const MARKDOWN_FILE_SUFFIX = '.md';
+
+/** Is this path a knowledge file — any Markdown, wherever it sits? */
 export function isKnowledgeFilePath(path: string | null | undefined): boolean {
   return typeof path === 'string'
-    && path.trim().toLowerCase().endsWith(KNOWLEDGE_FILE_SUFFIX);
+    && path.trim().toLowerCase().endsWith(MARKDOWN_FILE_SUFFIX);
+}
+
+/**
+ * The knowledge ending this path actually carries — the compound one where it
+ * has it, plain `.md` otherwise. Rename restores THIS, so renaming `notes.md`
+ * cannot silently promote it to `notes.knowledge.md`.
+ */
+export function knowledgeSuffixOf(path: string): string {
+  return String(path ?? '').trim().toLowerCase().endsWith(KNOWLEDGE_FILE_SUFFIX)
+    ? KNOWLEDGE_FILE_SUFFIX
+    : MARKDOWN_FILE_SUFFIX;
+}
+
+/**
+ * The folder a project keeps its own code in — the ONE place a `scriptRef` may
+ * point into (user decision, plan-479).
+ *
+ * Unlike {@link CONNECT_CONFIG_SUFFIX} and {@link MARKDOWN_FILE_SUFFIX}, which
+ * classify by ending wherever the file sits, a project script is classified by
+ * PLACE as well as by ending. The reason is not tidiness: `.ts` is an ordinary
+ * text file that a project may legitimately keep as an attachment, an example
+ * or a fragment, and offering every one of them as a bindable plugin would make
+ * the gesture promise something the loader cannot keep. `plugins/` is what the
+ * build glob and `compile-project-scripts.mjs` already look at.
+ */
+export const PROJECT_SCRIPT_FOLDER = 'plugins';
+
+/** The endings a project script may carry. TypeScript only — the loader compiles it. */
+export const PROJECT_SCRIPT_SUFFIXES = ['.ts', '.tsx'] as const;
+
+/**
+ * Is this path a bindable project script — under `plugins/` AND a `.ts`/`.tsx`?
+ *
+ * Any depth below `plugins/` counts: `plugins/index.ts` and
+ * `plugins/hmi/deep/panel.tsx` are both files the glob discovers and
+ * `moduleMatchesScriptRef` resolves, so a depth limit here would be a rule with
+ * no carrier in the code. A `.d.ts` is excluded — it declares types and exports
+ * no runtime module, so binding one could only ever fail.
+ */
+export function isProjectScriptPath(path: string | null | undefined): boolean {
+  if (typeof path !== 'string') return false;
+  // The same spelling every other reference is compared in — a backslash from
+  // Windows must not decide whether a file is bindable.
+  const normalised = normalizeRefPath(path);
+  if (normalised === '') return false;
+  const segments = normalised.split('/');
+  if (segments.length < 2) return false;
+  if (segments[0].toLowerCase() !== PROJECT_SCRIPT_FOLDER) return false;
+  if (segments.some(s => s === '' || s === '.' || s === '..')) return false;
+  const leaf = segments[segments.length - 1].toLowerCase();
+  if (leaf.endsWith('.d.ts')) return false;
+  return PROJECT_SCRIPT_SUFFIXES.some(suffix => leaf.endsWith(suffix));
 }
 
 /**
@@ -107,7 +171,7 @@ export function stripConnectConfigSuffix(path: string): string {
 export function stripKnowledgeFileSuffix(path: string): string {
   const trimmed = String(path ?? '').trim();
   return isKnowledgeFilePath(trimmed)
-    ? trimmed.slice(0, -KNOWLEDGE_FILE_SUFFIX.length)
+    ? trimmed.slice(0, -knowledgeSuffixOf(trimmed).length)
     : trimmed;
 }
 
@@ -259,7 +323,16 @@ export function documentForModelUrl(
   project: RvProject | null | undefined,
   modelUrl: string,
 ): RvDocumentEntry | null {
-  const url = normalizeRefPath(String(modelUrl ?? '').split('?')[0].split('#')[0]);
+  // `rvproject:models/x.glb` is the canonical URL a project document is opened
+  // with, and its scheme is glued straight onto the path with no slash — so the
+  // segment-boundary test below would never fire for it and every project
+  // document would resolve to "not a document of this project" (no scriptRef, no
+  // project code). `resolveModelName` already ignores the scheme; strip it here
+  // too so both halves of the lookup agree.
+  const raw = String(modelUrl ?? '').split('?')[0].split('#')[0];
+  const url = normalizeRefPath(
+    raw.startsWith(PROJECT_ASSET_URL_PREFIX) ? raw.slice(PROJECT_ASSET_URL_PREFIX.length) : raw,
+  );
   if (url === '') return null;
   const candidates = (project?.documents ?? [])
     .filter(d => typeof d.path === 'string' && d.path.trim() !== '')

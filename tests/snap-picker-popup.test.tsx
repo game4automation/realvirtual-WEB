@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
 import { Object3D } from 'three';
 import { SnapPointPickerPopup } from '../src/plugins/snap-point/SnapPointPickerPopup';
 import {
@@ -20,6 +20,8 @@ import {
 } from '../src/plugins/snap-point/snap-hover-store';
 import type { SnapPoint } from '../src/core/engine/rv-snap-point-registry';
 import { useMobileLayout } from '../src/hooks/use-mobile-layout';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
+import { findCompatibleLibraryAssets } from '../src/plugins/snap-point/library-snap-index';
 
 // The popup picks its layout from useMobileLayout(): desktop anchors next to the
 // snap point (left/top from the screen anchor); mobile docks it centre-bottom
@@ -31,6 +33,13 @@ vi.mock('../src/hooks/use-mobile-layout', async (importOriginal) => ({
   useMobileLayout: vi.fn(() => false),
 }));
 const mockUseMobileLayout = vi.mocked(useMobileLayout);
+
+// The compatible-asset lookup loads GLBs; the dispatch tests only need a list.
+vi.mock('../src/plugins/snap-point/library-snap-index', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/plugins/snap-point/library-snap-index')>()),
+  findCompatibleLibraryAssets: vi.fn(async () => []),
+}));
+const mockFindCompatible = vi.mocked(findCompatibleLibraryAssets);
 
 function makeSnap(id: string): SnapPoint {
   const n = new Object3D();
@@ -114,5 +123,82 @@ describe('SnapPointPickerPopup', () => {
     // it must NOT sit at the desktop-anchored 212px / 162px.
     expect(cs.transform).not.toBe('none');
     expect(cs.top).not.toBe('162px');
+  });
+
+  // ── plan-499 follow-up: the picker entry is a view of `layout.snapAttach` ──
+
+  const ENTRY = { id: 'conv-1', name: 'Conveyor 1', category: 'Conveyor', glbUrl: 'x.glb' };
+
+  /** A viewer with a planner whose placement `p1` owns the target snap. */
+  function makeWiredViewer(sp: SnapPoint, placedId: string | null) {
+    const snapshot = { catalogs: new Map([['cat', { entries: [ENTRY] }]]) };
+    const planner = {
+      store: { subscribe: () => () => {}, getSnapshot: () => snapshot },
+      findPlacedIdByRoot: vi.fn(() => placedId),
+      placeAtSnap: vi.fn(async () => 'direct-id'),
+    };
+    const registry = { getByOwnerRoot: () => [sp] };
+    const viewer = {
+      getPlugin: (id: string) => (id === 'layout-planner' ? planner : id === 'snap-point' ? { getRegistry: () => registry } : undefined),
+    };
+    return { viewer, planner };
+  }
+
+  function openWithEntry(): SnapPoint {
+    const sp = makeSnap('a');
+    mockFindCompatible.mockResolvedValue([{ entry: ENTRY as never, ownSnapName: 'Snap-ZP-convroll' }]);
+    snapHoverStore.openPicker(sp, { x: 100, y: 100 });
+    return sp;
+  }
+
+  it('clicking an entry dispatches exactly one layout.snapAttach and closes on success', async () => {
+    const sp = openWithEntry();
+    const { viewer, planner } = makeWiredViewer(sp, 'p1');
+    const exec = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({ ok: true, value: { id: 'new' } });
+    try {
+      render(<SnapPointPickerPopup viewer={viewer as never} />);
+      fireEvent.click(await screen.findByTestId('library-item'));
+      await waitFor(() => expect(exec).toHaveBeenCalledTimes(1));
+      expect(exec).toHaveBeenCalledWith(
+        'layout.snapAttach',
+        { targetId: 'p1', catalogId: 'conv-1', targetSnapName: 'Snap-ZN-convroll' },
+        expect.objectContaining({ origin: 'ui', buttonKey: 'layout.snapAttach', viewer }),
+      );
+      expect(planner.placeAtSnap).not.toHaveBeenCalled();
+      await waitFor(() => expect(snapHoverStore.getState().pickerOpen).toBe(false));
+    } finally {
+      exec.mockRestore();
+    }
+  });
+
+  it('a refused attach shows the command reason and keeps the picker open', async () => {
+    const sp = openWithEntry();
+    const { viewer } = makeWiredViewer(sp, 'p1');
+    const exec = vi.spyOn(commandRegistry, 'execute').mockResolvedValue({
+      ok: false, kind: 'disabled', reason: 'Snap "Snap-ZN-convroll" not free or not found',
+    });
+    try {
+      render(<SnapPointPickerPopup viewer={viewer as never} />);
+      fireEvent.click(await screen.findByTestId('library-item'));
+      expect(await screen.findByText('Snap "Snap-ZN-convroll" not free or not found')).toBeTruthy();
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(snapHoverStore.getState().pickerOpen).toBe(true);
+    } finally {
+      exec.mockRestore();
+    }
+  });
+
+  it('a snap outside any planner placement keeps the direct snap placement', async () => {
+    const sp = openWithEntry();
+    const { viewer, planner } = makeWiredViewer(sp, null);
+    const exec = vi.spyOn(commandRegistry, 'execute');
+    try {
+      render(<SnapPointPickerPopup viewer={viewer as never} />);
+      fireEvent.click(await screen.findByTestId('library-item'));
+      await waitFor(() => expect(planner.placeAtSnap).toHaveBeenCalledTimes(1));
+      expect(exec).not.toHaveBeenCalled();
+    } finally {
+      exec.mockRestore();
+    }
   });
 });

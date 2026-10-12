@@ -51,6 +51,10 @@ import {
  */
 export function remediationFor(message: string): string | null {
   const m = message.toLowerCase();
+  if (/license limit|commercial license/.test(m)) {
+    return 'A commercial license imports CAD files of any size — converted natively on '
+      + 'realvirtual CONNECT, with no browser memory ceiling.';
+  }
   if (/memory access out of bounds|out of memory|allocation fail|wasm memory|heap limit/.test(m)) {
     return 'The in-browser CAD engine ran out of memory — try a lower tessellation quality '
       + 'or convert via realvirtual CONNECT.';
@@ -64,6 +68,18 @@ export function remediationFor(message: string): string | null {
       + 'supported format.';
   }
   return null;
+}
+
+/**
+ * The one failure that has a shop, not a fix: the licensed CAD size. The gateway's
+ * error text is all the dialog sees, so the link is derived from the text — the
+ * same signature `remediationFor` recognises.
+ */
+export const CAD_LICENSE_CTA_URL = 'https://realvirtual.io/en/products/connect/';
+export function licenseCtaFor(message: string): { label: string; href: string } | null {
+  return /license limit|commercial license/i.test(message)
+    ? { label: 'Get a license', href: CAD_LICENSE_CTA_URL }
+    : null;
 }
 
 interface UnifiedImportDialogProps {
@@ -340,6 +356,7 @@ export function UnifiedImportDialog({ viewer, open, onClose }: UnifiedImportDial
 
         {errors.map((e, i) => {
           const hint = remediationFor(e);
+          const cta = licenseCtaFor(e);
           return (
             <Alert key={`e${i}`} severity="error" sx={{ mt: 1.25 }}>
               {e}
@@ -347,6 +364,19 @@ export function UnifiedImportDialog({ viewer, open, onClose }: UnifiedImportDial
                 <Typography variant="caption" component="div" sx={{ mt: 0.25 }}>
                   {hint}
                 </Typography>
+              )}
+              {cta && (
+                <Button
+                  size="small"
+                  variant="contained"
+                  color="error"
+                  href={cta.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  sx={{ mt: 0.75, textTransform: 'none', fontSize: 12, py: 0.25 }}
+                >
+                  {cta.label}
+                </Button>
               )}
             </Alert>
           );

@@ -8,6 +8,8 @@
  * node names/paths must stay stable (rv_extras targeting depends on them).
  */
 import { describe, it, expect } from 'vitest';
+import { RVDrive, DriveDirection } from '../src/core/engine/rv-drive';
+import { RVSource } from '../src/core/engine/rv-source';
 import { Group, Mesh, BoxGeometry, MeshStandardMaterial, Object3D } from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { exportAssetGlb, sanitizeUserDataForExport, pruneRuntimeHelpers } from '../src/core/editor/rv-asset-glb-export';
@@ -199,6 +201,31 @@ describe('pruneRuntimeHelpers', () => {
     expect(findByName(root, '_tankFillViz')).toBeNull();
     expect(findByName(root, 'Gearbox')).not.toBeNull();
   });
+
+  it('removes a Source ghost preview and source marker, so round trips do not pile them up', () => {
+    const root = buildAssetTree();
+    const source = new Object3D();
+    source.name = 'PartSource';
+    root.add(source);
+    const ghost = new Mesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial());
+    ghost.name = 'Part_ghost';
+    ghost.userData._isSourceGhost = true;
+    source.add(ghost);
+    const marker = new Object3D();
+    marker.name = 'PartSource_sourceMarker';
+    marker.userData._isSourceMarker = true;
+    source.add(marker);
+    const preview = new Object3D();
+    preview.name = 'PartSource_preview';
+    preview.userData._isSourcePreview = true;
+    source.add(preview);
+
+    pruneRuntimeHelpers(root);
+    expect(findByName(root, 'Part_ghost')).toBeNull();
+    expect(findByName(root, 'PartSource_sourceMarker')).toBeNull();
+    expect(findByName(root, 'PartSource_preview')).toBeNull();
+    expect(findByName(root, 'PartSource')).not.toBeNull();
+  });
 });
 
 describe('exportAssetGlb — glTF wrapper accumulation', () => {
@@ -296,4 +323,56 @@ describe('exportAssetGlb — glTF wrapper accumulation', () => {
     const parsed = await parseGlb(await exportAssetGlb(buildAssetTree()));
     expect(parsed.name).toBe('Asset');
   });
+});
+
+
+describe('source template material export', () => {
+  it('exports the authored red material instead of the white preview placeholder', async () => {
+    const root = new Group();
+    root.name = 'Asset';
+    const template = new Group();
+    template.name = 'BoxSource';
+    template.userData.realvirtual = { Source: {} };
+    const red = new MeshStandardMaterial({ color: '#cc0605', roughness: 0.45 });
+    const body = new Mesh(new BoxGeometry(1, 1, 1), red);
+    body.name = 'BoxBody';
+    template.add(body);
+    root.add(template);
+    const source = new RVSource(template);
+    source.sourceIsTemplate = true;
+    source.spawnParent = root;
+    source.setTemplate(template);
+    const previewMaterial = body.material;
+    expect(previewMaterial).not.toBe(red);
+    const restored = await parseGlb(await exportAssetGlb(root, 'Asset'));
+    const material = (findByName(restored, 'BoxBody') as Mesh).material as MeshStandardMaterial;
+    expect(material.color.getHexString()).toBe('cc0605');
+    expect(material.roughness).toBeCloseTo(0.45);
+    expect(body.material).toBe(previewMaterial);
+    source.dispose();
+  });
+});
+
+
+it('does not bake StartPosition into the drive home across repeated editor test exports', async () => {
+  let root: Object3D = new Group();
+  root.name = 'Machine';
+  const axis = new Object3D();
+  axis.name = 'Stopper';
+  axis.position.set(0.052, 0.9214, -0.23);
+  axis.userData.realvirtual = { Drive: { Direction: 'LinearY', StartPosition: 50 } };
+  axis.add(new Mesh(new BoxGeometry(0.01, 0.01, 0.01), new MeshStandardMaterial()));
+  root.add(axis);
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const current = root.getObjectByName('Stopper')!;
+    const drive = new RVDrive(current);
+    drive.Direction = DriveDirection.LinearY;
+    drive.StartPosition = 50;
+    drive.initDrive();
+    expect(current.position.y).toBeCloseTo(0.9714, 6);
+    const loaded = await parseGlb(await exportAssetGlb(root));
+    expect(current.position.y).toBeCloseTo(0.9714, 6); // live view is untouched
+    expect(loaded.getObjectByName('Stopper')!.position.y).toBeCloseTo(0.9214, 6);
+    root = loaded;
+  }
 });

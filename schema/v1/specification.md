@@ -287,16 +287,54 @@ default. The Description column mirrors the `description` texts maintained in
 consumed by the reference implementation outside the schema mapper (custom
 `rawFields` keyword, Section 8).
 
+Signal slots of the drive behaviors declare their component-side unit and the
+field that scales them (`signalUnit` / `scaleField`, Section 8; plan-512). The
+tables do not repeat these keywords; `rv-odt.json` carries them on
+`Drive_FollowPosition` (`Position`, `CurrentPosition` → `Scale`), `Drive_Simple`
+(`Speed`, `Accelaration`, `IsAtSpeed` → `ScaleSpeed`; `IsAtPosition` →
+`CurrentPositionScale`), `Drive_Speed` (`SignalCurrentPosition`),
+`Drive_DestinationMotor` (`Destination`, `IsAtPosition`) and
+`Drive_ContinousDestination` (`SignalDestination`, `SignalIsAtPosition`) → each
+`CurrentPositionScale`, `Drive_UniDriveMotor` (`SetPosition`, `ActualPosition` →
+`PositionScale`; `SetSpeed`, `ActualSpeed` → `SpeedScale`; `SetAcceleration`,
+`SetDeceleration` → `AccelerationScale`), `Drive_ProfidrivePos`
+(`MdiTargetPosition`, `PositionActual` → `PositionScale`; `MdiVelocity` →
+`VelocityScale`) and `Drive_FestoFHPP` (`TargetPosition`, `PositionActual` →
+`PositionScale`).
+
 Common serialization metadata emitted by some writers on any component —
 `Name`, `Active` (where not explicitly listed), `_fullTypeName`, `_version`,
 `_enabled` — is NOT part of the format; readers MUST ignore it (exception:
 `_enabled: false` on a `Group` entry disables that group entry).
+
+Some subsections carry usage annotations between their introduction and the
+field table, in two clearly separated blocks:
+
+- **Authoring rules:** — normative constraints a writer MUST respect for the
+  component to be meaningful (e.g. a drive behavior needs a `Drive` on the same
+  node). They add no fields and never contradict `rv-odt.json`.
+- **Reference implementation notes (informative):** — how realvirtual WEB, the
+  reference implementation, applies the data (coordinate mapping, fallbacks,
+  load-time behavior). Informative only; other readers MAY behave differently.
+
+Both blocks are bullet lists; tools (e.g. the realvirtual WEB MCP tool
+`web_component_schema`) serve them verbatim to authoring agents.
 
 ### 7a. Components
 
 #### 7a.1 Drive
 
 Linear or rotational motion control along a local axis. The base motion component.
+
+**Authoring rules:**
+- `Direction` MUST be set: it names the motion axis in the node's local frame in Unity (left-handed) coordinates; `Virtual` moves no transform.
+- Position values (`Offset`, `StartPosition`, `LowerLimit`, `UpperLimit`, `TargetPosition`) are millimeters for the `LinearX`/`LinearY`/`LinearZ` directions and degrees for the rotational directions.
+- A node carries at most one `Drive`; drive behaviors (`Drive_Cylinder`, `Drive_Simple`, `Drive_Gear`, …) are added to the SAME node and control this drive.
+- The drive moves its node together with the whole subtree; parts that must move with the axis belong below the drive node (or are collected there by a `Kinematic`).
+
+**Reference implementation notes (informative):**
+- realvirtual WEB works in glTF (right-handed) space: `LinearX` moves along three.js −X, `LinearY` and `LinearZ` along +Y and +Z; `RotationX` turns about +X, `RotationY` and `RotationZ` about −Y and −Z (Unity convention, mirrored).
+- The drive's rest pose is the authored node transform; positions are applied relative to it along the axis above.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -326,6 +364,15 @@ Linear or rotational motion control along a local axis. The base motion componen
 
 Drive behavior: jog control with speed and directional bits plus feedback signals.
 
+**Authoring rules:**
+- A `Drive` component MUST exist on the same node; `Drive_Simple` controls that drive.
+- `Forward`, `Backward`, `Speed` and the feedback slots are signal references: a `ComponentReference` whose `path` names a PLC signal node and whose `componentType` is its signal type (e.g. `PLCOutputBool`).
+- `Speed` and `Accelaration` values are multiplied by `ScaleSpeed` before they reach the drive.
+- `Enable` is optional. While it is false the drive stops immediately and ignores `Forward` / `Backward`; when it turns true again the drive follows the current `Forward` / `Backward` levels. Without `Enable` the drive is always enabled.
+
+**Reference implementation notes (informative):**
+- Without a `Drive` on the same node the behavior stays inert (logged, no error).
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `Speed` | ComponentReference | - | PLC output for the speed of the drive in millimeters per second; can be scaled by ScaleSpeed. |
@@ -335,6 +382,7 @@ Drive behavior: jog control with speed and directional bits plus feedback signal
 | `IsAtPosition` | ComponentReference | - | Signal for the current position of the drive in millimeters. |
 | `IsAtSpeed` | ComponentReference | - | Signal for the current speed of the drive in millimeters per second. |
 | `IsDriving` | ComponentReference | - | Signal is true while the drive is driving. |
+| `Enable` | ComponentReference | - | Optional motion enable. False stops the drive immediately and ignores Forward/Backward; true follows the current Forward/Backward levels again. Unset means always enabled. |
 | `ScaleSpeed` | number | 1 | Scale factor for the input and output speed and acceleration. |
 | `CurrentPositionScale` | number | 1 | Scale factor for the current position feedback. |
 | `CurrentPositionOffset` | number | 0 | Offset applied to the position feedback in millimeters. |
@@ -348,6 +396,18 @@ Drive behavior: jog control with speed and directional bits plus feedback signal
 
 Drive behavior: two-position cylinder with in/out command and end-position feedback.
 
+**Authoring rules:**
+- A `Drive` component MUST exist on the same node; the cylinder moves that drive between `MinPos` and `MaxPos`.
+- `MinPos` and `MaxPos` are drive positions in millimeters along `Drive.Direction`; `TimeOut` and `TimeIn` are the stroke times in seconds.
+- With `OneBitCylinder` only `Out` is evaluated: true moves to `MaxPos`, false moves to `MinPos`; `In` is ignored. `InvertOutputLogic` inverts the command.
+- `Out`, `In` and the feedback slots (`IsOut`, `IsIn`, `IsMax`, `IsMin`, …) are signal references (`ComponentReference` to a PLC signal node).
+- `Enable` is optional. While it is false the cylinder stops and holds its position; `Out` / `In` commands are latched and executed when `Enable` turns true again (one-bit: the current `Out` level). Without `Enable` the cylinder is always enabled.
+- `Mode` selects the valve behaviour (plan-570). `Legacy` (default) is the behaviour described above. `DoubleActing` (5/3 valve, closed centre) moves only while exactly one of `Out` / `In` is true and holds where it stands when both are false or both are true. `SingleActingPositive`: `Out` true moves to `MaxPos`, false returns to `MinPos`. `SingleActingNegative`: `Out` true moves to `MinPos`, false returns to `MaxPos`. The three new modes evaluate the current signal levels (nothing is latched; `Enable` true re-evaluates them) and ignore `OneBitCylinder` and `InvertOutputLogic`.
+
+**Reference implementation notes (informative):**
+- At start the drive is placed at `MinPos` — or at `MaxPos` when `Drive.StartPosition` equals `MaxPos`; without a `Drive` on the same node the behavior stays inert.
+- The feedback slots (`IsIn`, `IsOut`, `IsMin`, `IsMax`) are written from the actual position right at load, before any logic starts, and again after a simulation reset — not only when the position changes.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `MinPos` | number | 0 | Minimum position of the cylinder in millimeters. |
@@ -356,6 +416,7 @@ Drive behavior: two-position cylinder with in/out command and end-position feedb
 | `TimeIn` | number | 1 | Time for moving in from maximum to minimum position in seconds. |
 | `OneBitCylinder` | boolean | false | If set to true only one bit controls the cylinder; when Out is false the cylinder moves in. |
 | `InvertOutputLogic` | boolean | false | When true, inverts the Out/In signal logic (Out=false extends, Out=true retracts). |
+| `Mode` | enum(Legacy, DoubleActing, SingleActingPositive, SingleActingNegative) | "Legacy" | Valve mode; see the authoring rules above. |
 | `Out` | ComponentReference | - | Signal for moving the cylinder out. |
 | `In` | ComponentReference | - | Signal for moving the cylinder in. |
 | `IsOut` | ComponentReference | - | Signal is true when the cylinder is out or stopped by the Max sensor. |
@@ -364,6 +425,7 @@ Drive behavior: two-position cylinder with in/out command and end-position feedb
 | `IsMin` | ComponentReference | - | Signal is true when the cylinder is at the minimum position. |
 | `IsMovingOut` | ComponentReference | - | Signal is true while the cylinder is moving out. |
 | `IsMovingIn` | ComponentReference | - | Signal is true while the cylinder is moving in. |
+| `Enable` | ComponentReference | - | Optional motion enable. False stops and holds the cylinder; Out/In commands are latched and executed when it turns true again. Unset means always enabled. |
 
 ```json
 { "Drive_Cylinder": { "MinPos": 0, "MaxPos": 250, "TimeOut": 0.8, "TimeIn": 0.8 } }
@@ -411,9 +473,191 @@ Drive behavior: SEW-EURODRIVE MOVILINK unit profile. The PLC writes control word
 { "Drive_SEWMovilink": { "MaxSpeed": 500, "Encoding": "Rpm", "MaxSpeedRpm": 3000 } }
 ```
 
+#### 7a.59 Drive_ProfidriveSpeed
+
+Drive behavior: PROFIdrive speed-controlled drive (SINAMICS) on standard telegram 1. The PLC writes control word STW1 and the normalized speed setpoint NSOLL_A; the drive runs the PROFIdrive state machine (switching-on inhibited → ready for switching on → ready to operate → operation, driven by STW1.0 ON/OFF1, STW1.1 OFF2, STW1.2 OFF3 and STW1.3 enable operation) and moves only in operation with STW1.4/5/6 set. A fault (`SimulateFault`) is sticky until a rising edge of STW1.7. Status word ZSW1 and the actual speed NIST_A go back.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `ReferenceSpeed` | number | 100 | Drive speed in mm/s (or °/s) at the full-scale setpoint (100 %), the reference speed p2000. |
+| `SetpointScale` | number | 16384 | Raw setpoint value that equals 100 %. PROFIdrive NSOLL_A = 16384 (0x4000); ABB Drives profile REF1 = 20000. |
+| `Acceleration` | number | 1000 | Drive acceleration in mm/s² (or °/s²). |
+| `SimulateFault` | boolean | false | Reports a fault (ZSW1.3) until the PLC acknowledges with a rising edge of STW1.7. |
+| `SimulateWarning` | boolean | false | Reports a warning (ZSW1.7). |
+| `ControlWord` | ComponentReference | - | STW1 (PLCOutputInt). |
+| `SpeedSetpoint` | ComponentReference | - | NSOLL_A (PLCOutputInt); negative reverses, STW1.11 inverts. |
+| `StatusWord` | ComponentReference | - | ZSW1 (PLCInputInt), written every tick. |
+| `SpeedActual` | ComponentReference | - | NIST_A (PLCInputInt), same scale as the setpoint. |
+
+```json
+{ "Drive_ProfidriveSpeed": { "ReferenceSpeed": 1500, "SetpointScale": 16384 } }
+```
+
+#### 7a.60 Drive_ProfidrivePos
+
+Drive behavior: PROFIdrive positioning drive (SINAMICS EPOS) on telegram 111. Same state machine as `Drive_ProfidriveSpeed`; in operation the EPOS cascade applies in this order: reject task (STW1.4 = 0), intermediate stop (STW1.5 = 0), set reference point (POS_STW2.1 rising), homing (STW1.11), jog 1 / jog 2 (STW1.8 / STW1.9 at `JogSpeed`), MDI mode (POS_STW1.15) with setup travel (POS_STW1.14) or positioning on a rising edge of STW1.6 (or continuously with POS_STW1.12), absolute (POS_STW1.8) or relative. Speeds are MDI_VELOCITY · `VelocityScale` · OVERRIDE / 0x4000.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `PositionScale` | number | 1 | Drive mm (or degrees) per length unit (LU) for MDI_TARPOS and XIST_A. |
+| `PositionOffset` | number | 0 | Offset in mm (or degrees) applied to the position command and feedback. |
+| `VelocityScale` | number | 1 | Drive speed in mm/s per MDI_VELOCITY unit (1000 LU/min). |
+| `ReferenceSpeed` | number | 100 | Drive speed in mm/s at NIST_B = 0x40000000 (100 %). |
+| `JogSpeed` | number | 50 | Jog speed in mm/s for jog 1 / jog 2. |
+| `Acceleration` | number | 1000 | Drive acceleration in mm/s² at 100 % override. |
+| `SimulateFault` | boolean | false | Reports a fault (ZSW1.3) until a rising edge of STW1.7. |
+| `SimulateWarning` | boolean | false | Reports a warning (ZSW1.7). |
+| `ControlWord` | ComponentReference | - | STW1 (PZD1, PLCOutputInt). |
+| `PosControlWord1` | ComponentReference | - | POS_STW1 (PZD2, PLCOutputInt). |
+| `PosControlWord2` | ComponentReference | - | POS_STW2 (PZD3, PLCOutputInt). |
+| `Override` | ComponentReference | - | OVERRIDE (PZD5, PLCOutputInt), 0x4000 = 100 %. |
+| `MdiTargetPosition` | ComponentReference | - | MDI_TARPOS in LU (PZD6+7, PLCOutputInt). |
+| `MdiVelocity` | ComponentReference | - | MDI_VELOCITY in 1000 LU/min (PZD8+9, PLCOutputInt). |
+| `StatusWord` | ComponentReference | - | ZSW1 (PZD1, PLCInputInt) incl. standstill / accelerates / decelerates bits. |
+| `PosStatusWord1` | ComponentReference | - | POS_ZSW1 (PZD2, PLCInputInt); mirrors ZSW1. |
+| `PosStatusWord2` | ComponentReference | - | POS_ZSW2 (PZD3, PLCInputInt): traverses forwards / backwards, command active. |
+| `PositionActual` | ComponentReference | - | XIST_A in LU (PZD6+7, PLCInputInt). |
+| `SpeedActual` | ComponentReference | - | NIST_B (PZD8+9, PLCInputInt), 0x40000000 = 100 %. |
+
+```json
+{ "Drive_ProfidrivePos": { "PositionScale": 0.001, "VelocityScale": 16.667, "JogSpeed": 20 } }
+```
+
+#### 7a.61 Drive_FestoFHPP
+
+Drive behavior: Festo Handling and Positioning Profile (CMMT / CMMO / CMMP). The PLC writes the 8-byte FHPP output image — CCON (byte 0: ENABLE, STOP active low, RESET, OPM), CPOS (byte 1: HALT active low, START, HOM, JOGP, JOGN), byte 2 (record number in Record Select, CDIR in Direct mode), byte 3 (velocity 0..100 % of `BaseVelocity`) and bytes 4–7 (target position in increments). SCON, SPOS, the byte 2 echo and the actual position go back. Homing sets the position to `PositionOffset`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `PositionScale` | number | 1 | Drive mm (or degrees) per position increment. |
+| `PositionOffset` | number | 0 | Offset in mm (or degrees) applied to the position command and feedback. |
+| `BaseVelocity` | number | 100 | Drive speed in mm/s at 100 % velocity (Direct mode). |
+| `JogSpeed` | number | 50 | Jog speed in mm/s for JOGP / JOGN. |
+| `Acceleration` | number | 1000 | Drive acceleration in mm/s². |
+| `Records` | object[] | [] | Record Select table: `[{ "Position": 0, "Velocity": 100, "Relative": false }, …]`, indexed by byte 2. |
+| `SimulateFault` | boolean | false | Reports SCON.FAULT until a rising edge of CCON.RESET. |
+| `SimulateWarning` | boolean | false | Reports SCON.WARN. |
+| `Ccon` | ComponentReference | - | FHPP control byte CCON (byte 0): ENABLE, STOP, RESET, OPM. (PLCOutputInt) |
+| `Cpos` | ComponentReference | - | FHPP control byte CPOS (byte 1): HALT, START, HOM, JOGP, JOGN. (PLCOutputInt) |
+| `RecordOrCdir` | ComponentReference | - | Byte 2 - record number (Record Select) or CDIR (Direct mode). (PLCOutputInt) |
+| `VelocityPercent` | ComponentReference | - | Byte 3 - velocity 0..100 percent of BaseVelocity (Direct mode). (PLCOutputInt) |
+| `TargetPosition` | ComponentReference | - | Bytes 4-7 - target position in increments (Direct mode, 32-bit signed). (PLCOutputInt) |
+| `Scon` | ComponentReference | - | FHPP status byte SCON (byte 0) written back to the PLC every tick. (PLCInputInt) |
+| `Spos` | ComponentReference | - | FHPP status byte SPOS (byte 1) written back to the PLC every tick. (PLCInputInt) |
+| `RecordOrSdir` | ComponentReference | - | Byte 2 - active record number echo (Record Select) or SDIR (Direct mode). (PLCInputInt) |
+| `PositionActual` | ComponentReference | - | Bytes 4-7 - actual position in increments (32-bit signed). (PLCInputInt) |
+
+```json
+{ "Drive_FestoFHPP": { "BaseVelocity": 250, "Records": [ { "Position": 0, "Velocity": 100, "Relative": false }, { "Position": 400, "Velocity": 200, "Relative": false } ] } }
+```
+
+#### 7a.62 Drive_UniDriveMotor
+
+Drive behavior: UniDrive-style positioning controller. `Run` gates all motion (low = held stopped); `JogPlus` / `JogMinus` jog at `SetupSpeed` or, with `SpeedSelection`, at `SetSpeed · SpeedScale`; a rising edge of `StartPositioning` moves to `SetPosition · PositionScale + PositionOffset` at `SetSpeed · SpeedScale` with the ramp `SetAcceleration · AccelerationScale` (the drive brakes symmetrically, `SetDeceleration` is informational). Feedback: `IsReady`, `IsReferenced` (from the two settings), `IsAtPosition1` (at target and not jogging), integer `ActualPosition` and `ActualSpeed`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `PositionScale` | number | 1 | Scale between integer position units and drive mm (or degrees). |
+| `PositionOffset` | number | 0 | Offset applied to the position command and feedback. |
+| `SpeedScale` | number | 1 | Scale between integer speed units and mm/s. |
+| `AccelerationScale` | number | 1 | Scale between integer ramp units and mm/s². |
+| `SetupSpeed` | number | 50 | Jog speed in mm/s while `SpeedSelection` is false. |
+| `Ready` | boolean | true | Drive reports ready; false simulates a not-ready drive. |
+| `Referenced` | boolean | true | Drive reports the encoder as referenced. |
+| `Run` | ComponentReference | - | General release of the drive - while false the drive is held stopped. (PLCOutputBool) |
+| `JogPlus` | ComponentReference | - | Manual jog forward. (PLCOutputBool) |
+| `JogMinus` | ComponentReference | - | Manual jog backward. (PLCOutputBool) |
+| `StartCalibration` | ComponentReference | - | Start encoder calibration - interface completeness only, no effect in simulation. (PLCOutputBool) |
+| `SpeedSelection` | ComponentReference | - | Jog speed selection: false uses SetupSpeed, true uses the commanded SetSpeed. (PLCOutputBool) |
+| `StartPositioning` | ComponentReference | - | Start positioning to SetPosition - a rising edge triggers the move. (PLCOutputBool) |
+| `ResetFault` | ComponentReference | - | Fault acknowledge - interface completeness only, no effect in simulation. (PLCOutputBool) |
+| `SetPosition` | ComponentReference | - | Target position setpoint in integer units, scaled by PositionScale and PositionOffset. (PLCOutputInt) |
+| `SetSpeed` | ComponentReference | - | Target speed setpoint in integer units, scaled by SpeedScale. (PLCOutputInt) |
+| `SetAcceleration` | ComponentReference | - | Acceleration ramp setpoint in integer units, scaled by AccelerationScale. (PLCOutputInt) |
+| `SetDeceleration` | ComponentReference | - | Deceleration ramp setpoint - read for transparency, the drive brakes with the symmetric acceleration ramp. (PLCOutputInt) |
+| `IsReady` | ComponentReference | - | Feedback that the drive is ready, driven by the Ready setting. (PLCInputBool) |
+| `IsReferenced` | ComponentReference | - | Feedback that the encoder is referenced, driven by the Referenced setting. (PLCInputBool) |
+| `IsAtPosition1` | ComponentReference | - | Feedback that the commanded position has been reached (not while jogging). (PLCInputBool) |
+| `ActualPosition` | ComponentReference | - | Actual drive position in integer units, scaled from the current position. (PLCInputInt) |
+| `ActualSpeed` | ComponentReference | - | Actual drive speed in integer units, scaled from the current speed. (PLCInputInt) |
+
+```json
+{ "Drive_UniDriveMotor": { "PositionScale": 0.01, "SpeedScale": 0.1, "SetupSpeed": 20 } }
+```
+
+#### 7a.63 Drive_ProportionalValve
+
+Drive behavior: hydraulic (or electric) proportional directional valve. The analog setpoint is scaled to a −1..1 command (`SetpointZero` → 0, `SetpointFull` → 1), passed through the dead band (`Deadband`, rescaled so flow starts smoothly above it), optional hysteresis, the spool response time (full stroke in `ResponseTime` seconds) and the flow characteristic `|spool| ^ FlowExponent`, and applied as a signed drive speed `Flow · MaxSpeed`. `FlowExponent` replaces the Unity `FlowCurve` (an AnimationCurve, which the GLB does not carry): 1 = linear, > 1 = progressive.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Setpoint` | number | 0 | Raw analog setpoint when no signal is wired. |
+| `SetpointZero` | number | 0 | Raw value for zero flow (e.g. 0 for ±10 V, 12 for 4–20 mA). |
+| `SetpointFull` | number | 10 | Raw value for 100 % forward flow (10 for ±10 V, 20 for 4–20 mA, 100 for percent). |
+| `Deadband` | number | 0.05 | Dead band as a fraction (0..0.9) of the command. |
+| `EnableHysteresis` | boolean | false | Ignore command changes smaller than `Hysteresis`. |
+| `Hysteresis` | number | 0.02 | Hysteresis band as a fraction (0..0.5). |
+| `FlowExponent` | number | 1 | Flow characteristic exponent (1 linear, > 1 progressive, < 1 degressive). |
+| `ResponseTime` | number | 0.1 | Spool travel time in seconds from neutral to full deflection; 0 = instant. |
+| `MaxSpeed` | number | 100 | Drive speed in mm/s (or °/s) at 100 % flow. |
+| `Acceleration` | number | 1000 | Drive acceleration in mm/s². |
+| `SignalSetpoint` | ComponentReference | - | Analog setpoint from the PLC (PLCOutputFloat). |
+| `SignalSpoolPosition` | ComponentReference | - | Spool position −1..1 (PLCInputFloat). |
+| `SignalCurrentSpeed` | ComponentReference | - | Current drive speed (PLCInputFloat). |
+| `SignalCurrentPosition` | ComponentReference | - | Current drive position (PLCInputFloat). |
+
+```json
+{ "Drive_ProportionalValve": { "SetpointZero": 12, "SetpointFull": 20, "Deadband": 0.1, "MaxSpeed": 300 } }
+```
+
+#### 7a.64 Drive_ContinousDestination
+
+Drive behavior: intelligent positioning drive without a start bit — every change of the destination value starts a move to it; speed and acceleration are forwarded every tick. The spelling "Continous" is the Unity class name.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Destination` | number | 0 | Destination in mm when no signal is wired. |
+| `Acceleration` | number | 100 | Acceleration in mm/s² when no signal is wired. |
+| `TargetSpeed` | number | 100 | Maximum speed in mm/s when no signal is wired. |
+| `CurrentPositionScale` | number | 1 | Scale applied to the destination command and the position feedback. |
+| `CurrentPositionOffset` | number | 0 | Offset applied to the destination command and the position feedback. |
+| `ScaleFeedbackPosition` | boolean | true | Apply scale and offset to the position feedback. |
+| `SignalDestination` | ComponentReference | - | Destination position of the drive in millimeters; a value change starts the move. (PLCOutputFloat) |
+| `SignalAcceleration` | ComponentReference | - | Acceleration of the drive in millimeters per second squared. (PLCOutputFloat) |
+| `SignalTargetSpeed` | ComponentReference | - | Target (maximum) speed of the drive in millimeters per second. (PLCOutputFloat) |
+| `SignalIsAtPosition` | ComponentReference | - | Signal for the current position of the drive in millimeters. (PLCInputFloat) |
+| `SignalIsAtSpeed` | ComponentReference | - | Signal for the current drive speed in millimeters per second. (PLCInputFloat) |
+| `SignalIsAtDestination` | ComponentReference | - | Signal is true when the drive is at the destination. (PLCInputBool) |
+| `SignalIsDriving` | ComponentReference | - | Signal is true while the drive is currently driving. (PLCInputBool) |
+
+```json
+{ "Drive_ContinousDestination": { "TargetSpeed": 400, "Acceleration": 800 } }
+```
+
+#### 7a.65 DrivePulseEncoder
+
+Drive add-on (NOT a `Drive_*` behavior — it sits on the drive node next to the one active behavior): an incremental pulse encoder that toggles a bool signal every time the drive position passes another `PulseIntervall`, starting at `Offset`. A `PulseIntervall` of 0 disables the encoder.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `PulseIntervall` | number | 0 | Distance in mm (or degrees) between two pulses; 0 disables. |
+| `Offset` | number | 0 | Position of the first pulse. |
+| `PulseEncoderSignal` | ComponentReference | - | Toggled signal (PLCInputBool). |
+
+```json
+{ "DrivePulseEncoder": { "PulseIntervall": 10, "Offset": 5 } }
+```
+
 #### 7a.5 Drive_Gear
 
 Drive behavior: slaves this node's Drive to a master Drive with gear ratio and offset.
+
+**Authoring rules:**
+- A `Drive` component MUST exist on the same node (the slave); `MasterDrive` references ANOTHER node's `Drive` (`componentType` `Drive`).
+- The slave position is master position × `GearFactor` + `Offset`; `Offset` is in the slave drive's unit (millimeters or degrees).
+
+**Reference implementation notes (informative):**
+- The slave's own speed and limits are not used while the gear is active; an unresolvable `MasterDrive` leaves the behavior inert.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -498,6 +742,15 @@ Drive behavior: moves the drive to random (or alternating min/max) positions.
 
 Presence sensor: AABB overlap (collision mode) or raycast mode.
 
+**Authoring rules:**
+- In collision mode (`UseRaycast` false) the detection volume is the node's geometry; a node without geometry needs a `BoxCollider` entry.
+- In raycast mode `RayCastDirection` is given in Unity local coordinates and `RayCastLength` in millimeters.
+- `SensorOccupied` / `SensorNotOccupied` are signal references (`ComponentReference` to a `PLCInputBool` node) that the sensor writes.
+
+**Reference implementation notes (informative):**
+- realvirtual WEB takes the mesh bounds of the node and its subtree as the collision volume and falls back to `BoxCollider` only when the node draws nothing.
+- Only MUs (spawned by a `Source`) are detected; `LimitSensorToTag` narrows that to one tag or name.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `UseRaycast` | boolean | false | If true the sensor uses raycast mode instead of collider (AABB overlap) mode. |
@@ -507,6 +760,8 @@ Presence sensor: AABB overlap (collision mode) or raycast mode.
 | `SensorNotOccupied` | ComponentReference | - | Boolean PLC input for the sensor; true when the sensor is NOT occupied. |
 | `AutoRay` | boolean | false | Derives the ray beam from the node bounding box (naming-convention sensors). |
 | `PhysicsMode` | boolean | false | If true and the sensor overlaps a physics zone, the sensor is physics-managed: collision mode uses a physics sensor collider (enter/leave events), raycast mode a physics raycast. Physics-managed sensors detect only physics-owned MUs; sensors that must detect kinematic MUs keep the default false. |
+| `LimitSensorToTag` | string | "" | Detects only MUs with this tag or name. Empty detects all MUs. |
+| `ShowGizmo` | boolean | true | Displays the sensor detection volume in the web viewer. Detection stays active when hidden. |
 
 Raw fields (`rawFields`):
 
@@ -521,6 +776,16 @@ Raw fields (`rawFields`):
 #### 7a.11 TransportSurface
 
 Conveyor surface that moves MUs along a direction at the referenced Drive's speed.
+
+**Authoring rules:**
+- The surface's extent is the geometry of its node (including the subtree); MUs are carried on top of it.
+- `TransportDirection` is a vector in Unity local coordinates of the surface node (X negated relative to glTF).
+- The belt speed comes from a `Drive`: either the one named by `DriveReference` (`componentType` `Drive`) or, when that is empty, the nearest `Drive` on the surface node or one of its ancestors.
+- Set `DriveReference` whenever the surface sits below a positioning axis (lift, turntable): otherwise the axis drive is taken as the belt drive.
+
+**Reference implementation notes (informative):**
+- realvirtual WEB uses the mesh AABB of the surface subtree as the transport footprint, tracks it with the node's current rotation, and resolves the drive as `DriveReference` first, then a `findInParent` walk up the hierarchy.
+- The drive that feeds a surface is marked as a belt drive and no longer moves its own node — a lift axis wrongly picked up by the parent walk stops lifting.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -542,6 +807,15 @@ Conveyor surface that moves MUs along a direction at the referenced Drive's spee
 
 Spawns new MU (Movable Unit) instances at intervals or by distance.
 
+**Authoring rules:**
+- `ThisObjectAsMU` is a node NAME or scene path string (not a `ComponentReference`) of the MU prototype; empty, or the source node's own name, makes the source node itself the prototype.
+- A separate prototype node should carry an `MU` marker; it is a template, not a part of the running scene.
+- `SourceGenerate` and `SourceGenerateOnDistance` are signal references (`ComponentReference` to a `PLCOutputBool` node).
+
+**Reference implementation notes (informative):**
+- A separate prototype is looked up in the source's own asset subtree first, then globally, and is hidden at load; the source shows a ghost preview of it.
+- With `PlaceOnTransportSurface` new MUs are dropped onto the `TransportSurface` below the source.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `AutomaticGeneration` | boolean | true | Automatic generation of MUs when the last MU is farther than GenerateIfDistance from the source. |
@@ -550,6 +824,17 @@ Spawns new MU (Movable Unit) instances at intervals or by distance.
 | `PlaceOnTransportSurface` | boolean | true | If true newly spawned MUs are placed onto the transport surface below the source. |
 | `ThisObjectAsMU` | string | "" | Name of the GameObject used as the MU prototype; defaults to this node when empty. |
 | `CollisionRoleForMUs` | enum(None, Tool, Workpiece, Machine, Robot, Environment, Cutter) | "None" | Collision role assigned to every MU spawned by this source; `None` keeps spawned MUs out of every collision check. |
+| `Enabled` | boolean | true | Enables MU generation. |
+| `GenerateMU` | boolean | true | Generates one MU on a false-to-true transition, including an initial true value. |
+| `DeleteAllMU` | boolean | false | Deletes this source's MUs on a false-to-true transition. |
+| `StartInterval` | number | 0 | Delay before the first interval generation. |
+| `RandomDistance` | boolean | false | Randomizes the distance threshold after automatic generation. |
+| `RangeDistance` | number | 300 | Plus/minus random distance range. |
+| `LimitNumber` | boolean | false | Limits the total number generated by this source. |
+| `MaxNumberMUs` | number | 1 | Maximum lifetime generated count when LimitNumber is enabled. |
+| `Mass` | number | 1 | Mass of each generated MU. |
+| `SourceGenerate` | ComponentReference | - | PLCOutputBool: generates one MU on a rising edge and disables automatic distance generation at startup. |
+| `SourceGenerateOnDistance` | ComponentReference | - | PLCOutputBool: controls AutomaticGeneration by signal level. |
 
 Raw fields (`rawFields`):
 
@@ -563,8 +848,13 @@ Raw fields (`rawFields`):
 
 #### 7a.13 Sink
 
-Destroys MUs that touch it. Carries no configuration fields in v1 — the presence of
-the (empty) `Sink` object on a node marks the node as a sink.
+Destroys MUs that touch it. The presence of a `Sink` object on a node marks the node
+as a sink; an empty object deletes every MU.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `DeleteMus` | boolean | true | Enables MU deletion. |
+| `DeleteOnlyTag` | string | "" | Only deletes MUs with this tag; empty accepts all tags. |
 
 ```json
 { "Sink": {} }
@@ -573,6 +863,14 @@ the (empty) `Sink` object on a node marks the node as a sink.
 #### 7a.14 Grip
 
 Gripper for pick-and-place operations.
+
+**Authoring rules:**
+- The `Grip` node is the gripping point: picked MUs are attached to it and move with it (put it below the drive or kinematic that carries the gripper).
+- `PartToGrip` references a `Sensor` (`componentType` `Sensor`) whose occupying MU is picked; when empty, the nearest MU within `GripRange` millimeters is picked.
+- `SignalPick` / `SignalPlace` are signal references (`ComponentReference` to a PLC signal node); with `OneBitControl` only `SignalPick` is used (rising edge picks, falling edge places).
+
+**Reference implementation notes (informative):**
+- The realvirtual WEB asset editor refuses to add a `Grip` below a `TransportSurface`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -592,10 +890,15 @@ Gripper for pick-and-place operations.
 
 Placement marker for precise MU positioning during Grip auto-place.
 
+**Authoring rules:**
+- With `LoadOnCarrier` a `Grip` in `PlaceMode` `Auto` aligns the part (with everything it carries) at the target pose and then decides: exactly one `MU` the part rests on (see `LoadSeatDepth`) and no other `MU` in the way → the part becomes that MU's load and the target stays free; an overlap with any other `MU`, or with two MUs it could rest on → the place is refused and the part stays in the `Grip`; nothing below and nothing in the way → the part is placed on the target as without `LoadOnCarrier`.
+- A `Zone` releasing onto a target ignores `LoadOnCarrier`.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `AlignPosition` | boolean | true | If true the MU position is snapped to the GripTarget position when placed. |
 | `AlignRotation` | boolean | true | If true the MU rotation is aligned to the GripTarget rotation when placed. |
+| `LoadOnCarrier` | boolean | false | If true a Grip places the part at this pose as a load of the MU below it instead of on the target; the target stays free. |
 
 ```json
 { "GripTarget": { "AlignPosition": true, "AlignRotation": true } }
@@ -1279,6 +1582,7 @@ applied automatically.
 | `DensityKgM3` | number | 7850 | Effective density in kilograms per cubic metre, applied to the computed volume. Follows `DensityPreset` unless that is `custom`. |
 | `MassOverrideKg` | number | - | Optional: replaces the computed mass, in kilograms. The inertia tensor is scaled with it, so the part keeps its shape and only its density is corrected. |
 | `ComOverrideLocalMm` | Vector3 | - | Optional: replaces the computed centre of mass, in the link's local space, in millimeters. |
+| `InertiaOverrideLocalKgMm2` | number[] | - | Optional (plan-501): `[Ixx, Iyy, Izz, Ixy, Ixz, Iyz]` about the centre of mass, link-local axes, kg·mm². Replaces the computed tensor after the mass override scaled it. An invalid value (not 6 finite numbers, not positive definite) is a hard finding — the link is withheld from the force analysis, never silently replaced by the computed tensor. |
 | `MassSource` | string | "mesh" | Read-only diagnosis: `mesh`, `convex-hull`, `bounds`, `override` or `none`. |
 
 ```json
@@ -1366,6 +1670,11 @@ substitute for a hard-wired safety function.
 |---|---|---|---|
 | `stateSignal` | ComponentReference | - | Boolean PLC input signal written by the operator click. |
 | `activeOnStart` | boolean | false | Button clicks itself once when the scene is ready. |
+| `NormallyClosed` | boolean | false | If true the signal is true while the button is released (OK) and false while it is pressed, like a normally-closed emergency-stop contact. |
+
+With `NormallyClosed` the released (OK) value is written when the scene starts,
+so a PLC sees "no emergency stop" without a first click; the pressed / released
+visuals are unchanged.
 
 ```json
 { "EmergencyButton3D": { "stateSignal": { "type": "ComponentReference", "path": "PLC/Emergency", "componentType": "PLCInputBool" }, "activeOnStart": false } }
@@ -1471,18 +1780,21 @@ is precisely how an S-wrap is authored.
 | `RadiusMm` | number | 0 | Contact radius in millimeters; 0 measures it from the mesh bounds perpendicular to `Axis` in the node's own local frame. |
 | `Axis` | enum(X, Y, Z) | "X" | Local rotation axis of the roller and the common axis of the web path. |
 | `RibbonSide` | enum(Auto, Left, Right) | "Auto" | Which side of the roller the web runs on. Leave it on `Auto`: for every normal machine `Auto` picks the short wrap, the only one a real web can take (on an end roller it means `Left`). Set `Left` or `Right` by hand only for an S-wrap or a wrap of more than 180 degrees. `Left` and `Right` are the turning sense seen along `+Axis` — `Left` counter-clockwise, `Right` clockwise. |
-| `RotationDirection` | number | 1 | Which way the roller is drawn turning: `1` or `-1`. Set `-1` when the roller visibly turns against the web (the imported CAD axis points the other way). Picture only — it never enters the web speed. |
+| `RotationDirection` | number | 1 | Deprecated and ignored. The resolved wrap and roller axis determine rotation automatically. |
 | `SpinMode` | enum(Transform, Texture) | "Transform" | How the roller shows that it is turning. `Transform` turns the roller object. `Texture` leaves it standing still and scrolls the pattern on its barrel instead — the same at a glance, and free of per-frame work, which is worth having on a machine with many idlers. Only effective on a roller WITHOUT a drive. |
 | `MantleMesh` | ComponentReference | - | Which part scrolls in `SpinMode: Texture` — normally the barrel. Leave it empty: the roller's own mesh is used, or the largest textured part under it outside a `Faces` node, so the end discs stay still. Wire `componentType` `UnityEngine.Transform` (the schema convention for a node reference). |
+| `MantleMaterialName` | string | "" | Name of a material of the ribbon material library (Unity: `Resources/realvirtual/RibbonMaterialLibrary`). In the browser the name is resolved against the materials of the LOADED document — exactly, then ignoring case, first match wins. Unity writes the library material into the exported GLB under exactly this name, so a document exported from Unity always resolves. Empty = not used. Applied to the barrel only while `OverrideMaterials` is true. |
+| `FaceMaterialName` | string | "" | Name of a material of the ribbon material library (Unity: `Resources/realvirtual/RibbonMaterialLibrary`). In the browser the name is resolved against the materials of the LOADED document — exactly, then ignoring case, first match wins. Unity writes the library material into the exported GLB under exactly this name, so a document exported from Unity always resolves. Empty = not used. Applied to every renderer under a child named `Faces`, only while `OverrideMaterials` is true. |
+| `OverrideMaterials` | boolean | false | Overrides the CAD materials of `MantleMesh` (`MantleMaterialName`) and of every renderer under a `Faces` child (`FaceMaterialName`) at simulation start; restored at stop. An empty name leaves that part unchanged. |
 
 **Driven or follower.** A roller is **driven** when a ROTATIONAL `Drive` sits on
 the SAME node with an axis parallel or antiparallel to `Axis`. Its surface speed
-`v = omega * pi / 180 * r * dot(driveAxis, rollerAxis)` — with `omega` taken from
+`v = omega * pi / 180 * r * dot(driveAxis, rollerAxis) * contactSign` — with `omega` taken from
 the drive POSITION difference of the tick, so it is signed for jog, `DriveTo`,
 playback and `positionOverwrite` alike — is the web speed of its section. Every
-other roller is a **follower** the path turns at `v / r`. A linear drive, or one
+other roller is a **follower** the path turns at `v / r * contactSign`. A linear drive, or one
 whose axis is not parallel to the roller axis, warns once and leaves the roller a
-follower. `RotationDirection` is presentation only and never enters the web speed.
+follower. `contactSign` combines the resolved wrap side (including Auto) with the orientation of the roller axis relative to the path axis. The driven shaft remains controlled by its Drive; the winder controller uses the inverse of the same conversion. `RotationDirection` is ignored. Existing development models must have their shaft commands aligned with their contact direction; there is no version switch.
 
 ```json
 { "RibbonRoller": { "RadiusMm": 60, "Axis": "X", "RibbonSide": "Left", "SpinMode": "Transform" } }
@@ -1516,16 +1828,27 @@ plan-459 shape) and a separately modelled CAD roll. A winder with no geometry at
 all gets a procedural cylinder, so it is never invisible.
 
 `CoreRadiusMm` and `RibbonThicknessMm` must both be `> 0`; otherwise the winder is
-inert with a warning and nothing in the scene ever sees a NaN. An empty roll
-(`Empty`) or one that reached `MaxDiameterMm` (`Full`) clamps the web speed of its
-whole path group to zero in the SAME tick — a slitter's strips all stop together.
+inert with a warning and nothing in the scene ever sees a NaN. An empty unwinder
+or a full rewinder stops every section and drive of the connected line and reports
+an error. Brake faults and torn fabric use the same latched stop. Repair alone
+never restarts the drives; simulation Reset clears the stop and restores the authored
+roll supply. An initially empty rewinder can still collect fabric normally.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `SpeedControl` | enum(None, LineSpeed, Dancer) | "None" | Hold web speed at the changing roll radius; Dancer adds position feedback. |
+| `DancerGainPerMm` | number | 2 | Surface-speed trim in mm/s per millimeter of dancer error. |
+| `MaxTrimPercent` | number | 20 | Maximum dancer trim as a percentage of line speed. |
 | `RadiusMm` | number | 0 | Measured outer radius of the authored roll in millimeters; 0 measures it from the mesh bounds. |
 | `Axis` | enum(X, Y, Z) | "X" | Local winding axis; must be parallel to every other roller axis of the path. |
 | `RibbonSide` | enum(Auto, Left, Right) | "Left" | Side the web leaves or enters the roll on, as the wrap orientation seen along `+Axis`. |
-| `RotationDirection` | number | 1 | Sign correction for the visible roll rotation; `-1` flips it. |
+| `WrapDeg` | number | 0 | How far the web is shown wrapping the roll in degrees, BEFORE it reaches the running tangent on an unwinder and AFTER it leaves it on a rewinder, so the band starts and ends visibly on the roll surface instead of at the tangent point in mid-air. 0 = the plan-459/460 geometry, unchanged. The sweep is used as given and is NOT folded into `[0, 2pi)`, so a value above 360 really is more than one lap. Read only on a winder that is the first or last entry of a path. |
+| `RotationDirection` | number | 1 | Deprecated and ignored. The resolved wrap and roller axis determine rotation automatically. |
+| `SpinMode` | enum(Transform, Texture) | "Transform" | How the winder shows that it is turning; see `RibbonRoller.SpinMode`. A winder that carries a drive is always turned by it, so `Texture` only applies to a dragged reel. |
+| `MantleMesh` | ComponentReference | - | Which part scrolls in `SpinMode: Texture`; see `RibbonRoller.MantleMesh`. Leave it empty to use the winder's own mesh. Wire `componentType` `UnityEngine.Transform` (the schema convention for a node reference). |
+| `MantleMaterialName` | string | "" | Name of a material of the ribbon material library (Unity: `Resources/realvirtual/RibbonMaterialLibrary`). In the browser the name is resolved against the materials of the LOADED document — exactly, then ignoring case, first match wins. Unity writes the library material into the exported GLB under exactly this name, so a document exported from Unity always resolves. Empty = not used. Applied to the barrel only while `OverrideMaterials` is true. |
+| `FaceMaterialName` | string | "" | Name of a material of the ribbon material library (Unity: `Resources/realvirtual/RibbonMaterialLibrary`). In the browser the name is resolved against the materials of the LOADED document — exactly, then ignoring case, first match wins. Unity writes the library material into the exported GLB under exactly this name, so a document exported from Unity always resolves. Empty = not used. Applied to every renderer under a child named `Faces`, only while `OverrideMaterials` is true. |
+| `OverrideMaterials` | boolean | false | Overrides the CAD materials of `MantleMesh` (`MantleMaterialName`) and of every renderer under a `Faces` child (`FaceMaterialName`) at simulation start; restored at stop. An empty name leaves that part unchanged. |
 | `CoreRadiusMm` | number | 76.2 | Radius of the bare core in millimeters; must be `> 0`. The default is the 3 inch core of the converting industry. |
 | `RibbonThicknessMm` | number | 0.1 | Thickness of one wound layer in millimeters (the caliper). With the core radius it decides how fast the roll grows and shrinks. Must be the SAME value as `RibbonPath.RibbonThicknessMm` — it is the same material — and `> 0`. |
 | `InitialWoundLengthMm` | number | -1 | How much material is on the roll at load and after a reset. `-1` = a full roll exactly as modelled (derived from the modelled outer radius), `0` = an empty core, any other value = that many millimeters on the roll. |
@@ -1549,10 +1872,40 @@ roller poses and radii itself, and rebuilds them only when a winder radius or a
 roller transform actually changed. Plain motion costs a texture offset and one
 rotation per roller.
 
-The web is **taut**: there is no sag and no tension control, so the path is
-exactly the tangents plus the wrap arcs. Lengths, radii and thicknesses are
-**millimeters**, speeds **millimeters per second**; the only conversion to glTF
-metres happens where the band mesh is written.
+By default the web is **taut**: the path is exactly the tangents plus the wrap
+arcs. Lengths, radii and thicknesses are **millimeters**, speeds **millimeters
+per second**; the only conversion to glTF metres happens where the band mesh is
+written.
+
+**Tension.** Setting `TensileStiffnessNPerMmWidth > 0` turns the taut web into a
+strained one. The path is then partitioned into **zones** between consecutive
+BOUNDARY rollers — the first roller, the last roller, every driven roller and the
+dancer — and each zone carries one signed strain `eps`, integrated from the
+standard span model of web handling,
+
+```
+L * d(eps)/dt = (v_B - v_A) + eps_in * v_A - eps * v_B
+```
+
+with `L` the mechanical length of the zone (its line segments plus the wrap arcs
+of the idlers inside it, never the arcs at its own boundaries). A driven boundary
+contributes its OWN surface speed, even where its section is led by a roller
+further downstream — that difference is the only thing that ever builds tension.
+An end roller WITHOUT a drive is dragged by the nearest driven roller in the
+direction the web reaches it from (the first one downstream for the unwinder, the
+first one upstream for the rewinder), and falls back to its section speed when
+that side has none. Tension follows
+from the strain as `T = K * w * eps`, and a slack zone (`eps < 0`) carries none —
+its excess length `|eps| * L` visibly sags instead. `eps = 0` reproduces the taut
+geometry exactly, and a stiffness of `0` never builds the partition at all, so a
+document without tension is bit-identical to a pre-tension reader.
+
+A dancer with `LoadN > 0` is a tension SETTER: it imposes `T = LoadN / Strands`
+on both of its neighbouring zones algebraically and immediately, while its
+carriage keeps following the speed difference alone. Tension is not supported on
+slit paths (`SlitAtRoller` / `FullWidthMm`) in this revision — the strips share a
+web before the cut and would have to share a strain; such a path reports it once
+and runs untensioned.
 
 A slitter is modelled as N `RibbonPath`s that share one unwinder (and the rollers up to the cutter, which is their `SlitAtRoller`). Paths sharing a
 roller form ONE group, so an empty or full roll anywhere in the group stops every
@@ -1603,9 +1956,28 @@ make the path inert with a named warning; the rollers then simply stand still.
 | `RibbonThicknessMm` | number | 0.1 | Thickness of the material in millimeters; half of it lifts the web off the roller surface so the two do not intersect. Must be the SAME value as `RibbonWinder.RibbonThicknessMm` on the winders of this path. |
 | `TextureLengthMm` | number | 1000 | How much web one repetition of the surface pattern covers, in millimeters. It is what makes a running web look like it is running; a larger value gives a coarser pattern that appears to move more slowly. |
 | `SamplesPerMeter` | number | 64 | How finely the web strip is subdivided, in points per meter of path. Raise it when a tight wrap looks angular, lower it on a very long run. Samples sit on an ABSOLUTE grid of one point every `1000 / SamplesPerMeter` mm, so strips slit at one roller must share the value to be cut at the same place. A path that outgrows its sample buffer has its density reduced automatically (with a console message); it is then on a coarser grid than its siblings and its cut moves by a fraction of a sample, which the reader reports naming both webs. |
-| `Material` | ComponentReference | - | Optional. A NODE whose material the web copies — a printed pattern, a coloured film. It points at an object in the scene, not at a material asset; the web takes the first textured material found on it, copies ALL of its maps (colour, normal, roughness, …) and owns the copies, so scaling and scrolling the web never touches the donor part. Empty = a plain paper-white surface with a pattern. Wire `componentType` `UnityEngine.Transform`. |
+| `Material` | ComponentReference | - | Optional LEGACY node reference. A NODE whose material the web copies — a printed pattern, a coloured film. It points at an object in the scene, not at a material asset; the web takes the first textured material found on it, copies ALL of its maps (colour, normal, roughness, …) and owns the copies, so scaling and scrolling the web never touches the donor part. `MaterialName` takes PRECEDENCE over it. Both empty = a plain paper-white surface with a pattern. Wire `componentType` `UnityEngine.Transform`. |
+| `MaterialName` | string | "" | Name of a material of the ribbon material library (Unity: `Resources/realvirtual/RibbonMaterialLibrary`). In the browser the name is resolved against the materials of the LOADED document — exactly, then ignoring case, first match wins. Unity writes the library material into the exported GLB under exactly this name, so a document exported from Unity always resolves. Empty = not used. It takes precedence over `Material`. |
 | `SlitAtRoller` | ComponentReference | - | Optional inner roller (the cutter) at which the full web is slit into this strip. The cut sits where the web MEETS that roller (its **arrival** tangent point), which is where the blade is: full web (`FullWidthMm`, centred on the first roller) before it, this strip (`RibbonWidthMm`) in its own lane at the last roller's axial offset from it on. Every strip cut at the same roller therefore reports the same slit point. Only the first strip (by node path) of those slit at one roller draws the shared part. |
 | `FullWidthMm` | number | 0 | Width of the full web before `SlitAtRoller`; 0 = not a slit strip. |
+| `BasisWeightGsm` | number | 20 | Basis weight in grams per square metre. It normalises the tension into a specific tenacity (N*m/kg) so two webs of different grammage become comparable. Display only — it changes no force. |
+| `TensileStiffnessNPerMmWidth` | number | 0 | Secant tensile stiffness in MD, newtons per millimetre of width at 100 % strain, read off the strip tensile curve (EDANA/INDA NWSP 110.4) as a secant at the working point. **This is the switch for the whole tension model**: `0` (the default) means no tension, no strain, no sag, no colouring, and the web behaves exactly as it did before. `E*A` is deliberately not the input — the caliper of a nonwoven is compressible and not uniquely defined. |
+| `MinStrainPercent` | number | 0 | Strain below which the web counts as SLACK, in percent. Raises an alarm and colours the web cyan; clamps nothing. |
+| `MaxStrainPercent` | number | 2 | Strain above which the web counts as OVERSTRETCHED, in percent. Raises an alarm and colours the web magenta; clamps nothing. A working limit, not the breaking point. |
+| `BreakForceNPer50mm` | number | 35 | MD strip tensile force at break, newtons per 50 mm of width — the number on the data sheet. Reaching the strain it implies sets `IsBroken` and FREEZES that zone's strain until a reset; it is the only threshold that clamps anything. `0` disables breaking. |
+| `TargetTensionNPerM` | number | 100 | Set-point tension per unit width in newtons per metre: the entry strain the unwinder pays out at, the start and reset value of every zone, and the centre of the tolerance band. 0.3 to 3.0 PLI covers 80 % of all webs (1 PLI = 175.1 N/m). |
+| `ToleranceBandPercent` | number | 10 | Half-width of the good band around `TargetTensionNPerM`, in percent of it. Inside the band the web is not tinted at all, with a hard edge at the limit. |
+| `EnableSag` | boolean | true | Whether a slack web visibly hangs through. Off leaves the geometry taut while strain, signals and colouring keep reporting the slackness. |
+| `TensionColoring` | boolean | true | Whether the band is tinted by its tension state. Off leaves the material untouched and reports through signals and readout only. |
+| `TintStrength` | number | 0.7 | How strongly the tint is mixed into the band material, 0 to 1. The good band is never tinted whatever this is. |
+| `DeformationScale` | number | 1 | Visual exaggeration of the sag DEPTH only. At realistic strains the sag is a fraction of a millimetre; raising this makes it visible for a demonstration without touching tension, strain, signals or the band. |
+| `ShowTensionLabels` | boolean | false | Whether the tension overlay is drawn: a readout per zone (N/m, PLI, strain, trend arrow) and, on a loaded dancer, a force arrow with the carriage travel bar. |
+| `TensionN` | ComponentReference | - | Signal carrying the web tension of the LAST zone in newtons; written only on a real change. |
+| `SpecificTensionNPerM` | ComponentReference | - | Signal carrying the tension of the LAST zone per unit width in newtons per metre — the regulated variable; written only on a change of more than 0.5 N/m. |
+| `StrainPercent` | ComponentReference | - | Signal carrying the strain of the LAST zone in percent; written only on a change of more than 0.01 %. |
+| `IsSlack` | ComponentReference | - | Signal is true while ANY zone is below `MinStrainPercent`. |
+| `IsOverstretched` | ComponentReference | - | Signal is true while ANY zone is above `MaxStrainPercent`. |
+| `IsBroken` | ComponentReference | - | Signal is true once ANY zone reached the break strain. That zone's strain is frozen from then on; only a simulation reset clears it. |
 
 ```json
 { "RibbonPath": { "Rollers": [ { "type": "ComponentReference", "path": "Slitter/Unwinder", "componentType": "UnityEngine.Transform" }, { "type": "ComponentReference", "path": "Slitter/Idler_01", "componentType": "UnityEngine.Transform" }, { "type": "ComponentReference", "path": "Slitter/Rewinder_A", "componentType": "UnityEngine.Transform" } ], "RibbonWidthMm": 500, "TextureLengthMm": 1000 } }
@@ -1636,6 +2008,11 @@ emptying (`v_down` is held at `v_up`). The web keeps running at the slower side 
 the opposite delta always frees the carriage again — a symmetric stop would deadlock
 at zero. Winder `Empty` / `Full`, by contrast, still stop every section of the group.
 
+A jammed carriage stores no fabric and no longer imposes load-balanced tension.
+Its roller can still rotate, but both contacts use one transport speed; a speed
+mismatch therefore changes the span strain. A jam at matching speeds need not
+tear the fabric. If the fabric does tear, the connected-line stop latches.
+
 Exactly **one** dancer per path is supported; a second is ignored with a warning, and
 so is a dancer at the first or last position of `Rollers` (it would have no section on
 one side). A dancer shared by several strips is only legal when both of its
@@ -1645,12 +2022,17 @@ one warning.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `ShowTravel` | boolean | false | Show carriage track, stops and position marker. |
+| `ShowValues` | boolean | false | Show dancer force, tension and position readouts. |
 | `RadiusMm` | number | 0 | Contact radius in millimeters; 0 measures it from the mesh bounds perpendicular to `Axis`. |
 | `Axis` | enum(X, Y, Z) | "X" | Local rotation axis; must be parallel to every other roller axis of the path. |
 | `RibbonSide` | enum(Auto, Left, Right) | "Auto" | Which side of the dancer roller the web runs on. Leave it on `Auto`: the carriage moves, and `Auto` follows it by always picking the short wrap. `Left` / `Right` (the turning sense along `+Axis`) only for an S-wrap or a wrap over 180 degrees. |
-| `RotationDirection` | number | 1 | Which way the dancer roller is drawn turning: `1` or `-1`. Set `-1` when it visibly turns against the web. Picture only. |
+| `RotationDirection` | number | 1 | Deprecated and ignored. The resolved wrap and roller axis determine rotation automatically. |
 | `SpinMode` | enum(Transform, Texture) | "Transform" | How the dancer roller shows its rotation; see `RibbonRoller.SpinMode`. |
 | `MantleMesh` | ComponentReference | - | Mesh scrolled in `SpinMode: Texture`; see `RibbonRoller.MantleMesh`. |
+| `MantleMaterialName` | string | "" | Name of a material of the ribbon material library (Unity: `Resources/realvirtual/RibbonMaterialLibrary`). In the browser the name is resolved against the materials of the LOADED document — exactly, then ignoring case, first match wins. Unity writes the library material into the exported GLB under exactly this name, so a document exported from Unity always resolves. Empty = not used. Applied to the barrel only while `OverrideMaterials` is true. |
+| `FaceMaterialName` | string | "" | Name of a material of the ribbon material library (Unity: `Resources/realvirtual/RibbonMaterialLibrary`). In the browser the name is resolved against the materials of the LOADED document — exactly, then ignoring case, first match wins. Unity writes the library material into the exported GLB under exactly this name, so a document exported from Unity always resolves. Empty = not used. Applied to every renderer under a child named `Faces`, only while `OverrideMaterials` is true. |
+| `OverrideMaterials` | boolean | false | Overrides the CAD materials of `MantleMesh` (`MantleMaterialName`) and of every renderer under a `Faces` child (`FaceMaterialName`) at simulation start; restored at stop. An empty name leaves that part unchanged. |
 | `TravelAxis` | enum(X, Y, Z) | "Y" | The direction the carriage runs in, in the frame of the object the dancer hangs under — the same axis letters as `RibbonRoller.Axis`. Place the dancer so that moving along the POSITIVE axis lengthens the web path. |
 | `TravelMinMm` | number | -200 | Lower stop in millimeters relative to `HomeMm`; must be `<= 0`. Reaching it sets `AtMin`. |
 | `TravelMaxMm` | number | 200 | Upper stop in millimeters relative to `HomeMm`; must be `>= 0`. Reaching it sets `AtMax`. |
@@ -1659,9 +2041,162 @@ one warning.
 | `PositionMm` | ComponentReference | - | Signal carrying the carriage position in millimeters; written only on a change of more than 0.1 mm. This is the variable a tension controller regulates. |
 | `AtMin` | ComponentReference | - | Signal is true while the carriage sits at `TravelMinMm` (the store is empty). |
 | `AtMax` | ComponentReference | - | Signal is true while the carriage sits at `TravelMaxMm` (the store is full). |
+| `LoadN` | number | 0 | Force the loaded carriage presses into the web, in newtons. The dancer as a tension SETTER: the force balance at the carriage gives `T = LoadN / Strands`, which becomes the tension of both neighbouring zones immediately and algebraically. The carriage POSITION keeps following the speed difference alone, so changing the load at equal speeds moves nothing. `0` is the purely kinematic dancer. Needs `RibbonPath.TensileStiffnessNPerMmWidth > 0` to have any effect. |
+| `TensionN` | ComponentReference | - | Signal carrying the tension this dancer imposes, in newtons (`LoadN / Strands`); written only on a real change. |
 
 ```json
 { "RibbonDancer": { "Axis": "Z", "TravelAxis": "Y", "TravelMinMm": -150, "TravelMaxMm": 150, "Strands": 2, "PositionMm": { "type": "ComponentReference", "path": "Slitter/Signals/DancerPos", "componentType": "realvirtual.PLCInputFloat" } } }
+```
+
+#### 7a.57 TransportStopper
+
+Box collider for contact stopping on accumulating linear transport surfaces. The collider follows its node and axis; lifting it clear releases the MU while the belt may continue running. Applies to kinematic transport, not physics-owned MUs or radial surfaces. Rotated colliders use conservative world-axis bounds.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Enabled` | boolean | true | Enables contact blocking. |
+| `Center` | Vector3 | {"x":0,"y":0,"z":0} | Local glTF collider center in mm. |
+| `Size` | Vector3 | {"x":100,"y":100,"z":100} | Positive local collider dimensions in mm. |
+
+#### 7a.66 Zone
+
+Web-authored effect box on a node (plan-521). The box (`Center`/`Size`, local glTF millimetres) moves with its node and carries any combination of three effects on MUs: **Detect** (occupied/free), **Block** (stop kinematically transported MUs at contact, same contact rule as `TransportStopper`) and **Hold** (take MUs off the transport and carry them with the node). An activation switches the effects on and off: `Always`, a bool signal (`Signal`) or a drive standing inside a position window (`Axis`). A Unity counterpart is not defined yet; a Unity round trip keeps the extras unchanged.
+
+**Authoring rules:**
+- Set at least one of `Detect`, `Block`, `Hold`; a zone without an effect does nothing and is reported by the reader.
+- `Activation` `Signal` needs `ActivationSignal` (a bool signal reference); `InvertSignal` makes the zone active while that signal is false.
+- `Activation` `Axis` needs `ActivationDrive` (`componentType` `Drive`). The zone is active only while the drive position lies inside `AxisFrom`..`AxisTo` (inclusive, in the drive's millimetres or degrees) AND the drive stands still — any motion (running, jogging, behaviour-driven) deactivates it.
+- Put the zone on the node that carries the effect: a stopper plate, a lift, a clamp. The box follows that node's axis; with `Always` a moving box blocks as soon as it crosses the path.
+- `Hold` attaches contained MUs to the zone node. `HoldAcquire` `OnActivate` takes the MUs inside the box at the moment the zone becomes active, `WhileActive` also takes MUs that enter later; `HoldCount` `One` holds at most one MU in total (the one nearest the box center).
+- `SingleRelease` (plan-530) needs `Block` and is meant for zones on stoppers: each lowering releases exactly one MU — the one waiting at the stopper face, or, if none waits, the first one that arrives — and every following MU is caught at the face of the raised (home) box, even when it touches the released one (belt MinGap 0 on the `TransportSurface`). The stopper must START raised: the home box is the box at load time. Lowered means the box left the home box by more than 1 mm (a geometric departure only); a zone on a carrier that moves for other reasons (a lift) would release on every move. A zone made inactive by its activation (`Signal` / `Axis` false) is completely off: it blocks nothing — also not at the home face —, detects nothing, drops its release token and is armed again for the next activation (plan-539). It is ignored while `Hold` is on; the reader reports `SingleRelease` without `Block` and with `Hold`.
+
+**Reference implementation notes (informative):**
+- Detect with `Block` tests against the box grown by 1 mm on each side, so a part stopped in front of the box stays reported as occupied.
+- On deactivation a held MU is put back onto a transport surface below it (lowered onto its top), otherwise onto the nearest free `GripTarget` within `GripTargetSearchRadius`, otherwise it stays where it is.
+- An MU held by a `Grip` or a connection hold is never taken by a zone, and a zone never releases an MU it does not hold.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Center` | Vector3 | {"x":0,"y":0,"z":0} | Box center in local glTF coordinates, in millimetres. |
+| `Size` | Vector3 | {"x":100,"y":100,"z":100} | Positive box dimensions along the local axes, in millimetres. |
+| `Detect` | boolean | true | Reports whether an MU occupies the box (or is held by it) while the zone is active. |
+| `Block` | boolean | false | Stops kinematically transported MUs at contact with the box while the zone is active. |
+| `Hold` | boolean | false | Takes MUs inside the box off the transport and carries them with the node while the zone is active. |
+| `Activation` | enum(Always, Signal, Axis) | "Always" | When the effects act. |
+| `ActivationSignal` | ComponentReference | - | Bool signal that activates the zone when `Activation` is `Signal`. |
+| `InvertSignal` | boolean | false | If true the zone is active while `ActivationSignal` is false. |
+| `ActivationDrive` | ComponentReference | - | Drive whose position activates the zone when `Activation` is `Axis`. |
+| `AxisFrom` | number | 0 | Lower end of the activation window (drive millimetres or degrees, inclusive). |
+| `AxisTo` | number | 0 | Upper end of the activation window (drive millimetres or degrees, inclusive). |
+| `SignalOccupied` | ComponentReference | - | Optional bool signal written with the Detect result on every change. |
+| `HoldAcquire` | enum(OnActivate, WhileActive) | "OnActivate" | When contained MUs are taken. |
+| `HoldCount` | enum(All, One) | "All" | All contained MUs, or at most one in total. |
+| `GripTargetSearchRadius` | number | 500 | Search radius in millimetres for a free GripTarget on release. |
+| `ShowGizmo` | boolean | true | Shows the box in the editor and during a test run. |
+| `SingleRelease` | boolean | false | With `Block` on a stopper: one MU per lowering, the follower is caught at the raised face. |
+
+```json
+{ "Zone": { "Center": { "x": 0, "y": -97.5, "z": 0 }, "Size": { "x": 10, "y": 295, "z": 150 }, "Detect": true, "Block": true, "Activation": "Axis", "ActivationDrive": { "type": "ComponentReference", "path": "Station/Stopper05", "componentType": "realvirtual.Drive" }, "AxisFrom": -15, "AxisTo": -15 } }
+```
+
+#### 7a.58 Fmu
+
+FMI 2.0 Co-Simulation unit attached to a node in the web asset editor. The `.fmu` package is embedded in the same GLB as a standard glTF `bufferView` (one per SHA-256); the file-level list of those views is `asset.extras.realvirtual.fmuBufferViews`. A reader creates one signal child per supported variable (`<node>/Signals/<variable>`, signal name `<node>.<variable>`) — these children are never stored. v1 maps Real → Float, Integer/Enumeration → Int, Boolean → Bool; String variables have no signal. The FMU runs only in realvirtual CONNECT.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `StepSize` | number | 0.01 | Communication step size in seconds. |
+| `Tolerance` | number | 0.000001 | Relative tolerance handed to the FMU solver. |
+| `AllowViewerToFmu` | boolean | true | If true the viewer may write the FMU inputs (CONNECT AllowWebToPlc). |
+| `FmuEmbed` | object | {} | Package metadata (fileName, sha256, guid, modelName, fmiVersion, generationTool, generationDateAndTime, byteLength) and the `bufferView` holding the bytes; -1 = saved without bytes. |
+| `FmuVariables` | object[] | [] | Model variables from modelDescription.xml: name, valueReference, causality, variability, type, start, unit, description; since plan-502 optionally initial, min, max, declaredType and enumItems (`[{name, value}]`). |
+| `FmuStartOverrides` | object | {} | Start-value overrides by variable name, value as string (`{"e": "0.95"}`). Allowed for inputs and non-constant parameters; applied by CONNECT when the instance starts. A name that matches no allowed variable is kept but not applied. |
+| `RestartOnReset` | boolean | true | If true a simulation reset (Play/Reset) restarts the running FMU instance. |
+| `FmuUnits` | object | {} | `UnitDefinitions` of modelDescription.xml: unit name → FMI `BaseUnit` (`{"m": 1, "s": -1, "factor": 1, "offset": 0}`; exponents m, s, rad, kg, K, A, mol, cd). A reader resolves the unit of each FMU signal through it before its own table (plan-512); absent in packages attached before that. |
+
+```json
+{ "Fmu": { "StepSize": 0.01, "AllowViewerToFmu": true, "FmuEmbed": { "fileName": "Feedthrough.fmu", "sha256": "9c1e…", "guid": "{37B954F1-…}", "modelName": "Feedthrough", "fmiVersion": "2.0", "byteLength": 194352, "bufferView": 12 }, "FmuVariables": [ { "name": "Float64_continuous_input", "valueReference": 7, "causality": "input", "variability": "continuous", "type": "Real", "start": "0" } ] } }
+```
+
+#### 7a.59 MechanismTarget
+
+Waypoint of a `MechanismPath`: the node's own world position is the position the
+path's `TargetLink` origin moves to (the `IKTarget` / `KinematicTarget`
+convention — authored by moving the node, there is no position field).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Mechanism` | ComponentReference | - | Optional `KinematicMechanism` this waypoint belongs to; absent = inherited from the path. |
+| `InterpolationToTarget` | enum(Linear, PointToPoint) | "Linear" | Linear = straight Cartesian line with a trapezoid profile; PointToPoint = joint space with synchronised arrival of all driving Drives. |
+| `SpeedToTarget` | number | - | Optional override. Linear: path speed in mm/s. PointToPoint: factor on the Drives' own speeds. Absent = path default. |
+| `WaitForSeconds` | number | 0 | Dwell time in seconds after the waypoint is reached. |
+| `SetSignal` | ComponentReference | - | Bool signal set when the waypoint is reached and reset when the path leaves it. |
+| `WaitForSignal` | ComponentReference | - | Bool signal the path waits for (true) after the waypoint is reached. |
+
+```json
+{ "MechanismTarget": { "InterpolationToTarget": "PointToPoint", "WaitForSeconds": 0.2 } }
+```
+
+#### 7a.60 MechanismPath
+
+Cartesian path for a `KinematicMechanism` (Delta and any other inversely
+solvable mechanism): moves the `TargetLink` origin through an ordered list of
+`MechanismTarget` waypoints using the mechanism's inverse solve. A waypoint that
+cannot be reached stops the path — `SignalEnded` stays low; the path is never
+silently clamped onto the closest reachable pose.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Mechanism` | ComponentReference | - | The `KinematicMechanism` whose driving Drives the path moves. |
+| `TargetLink` | ComponentReference | - | The mechanism's own link (e.g. a Delta platform) whose origin follows the path. |
+| `Path` | ComponentReference[] | - | Ordered list of MechanismTarget references forming the path. |
+| `SignalStart` | ComponentReference | - | Bool signal whose rising edge starts the path. |
+| `SignalIsStarted` | ComponentReference | - | Bool signal that is true while the path runs. |
+| `SignalEnded` | ComponentReference | - | Bool signal set when the path ended regularly. |
+| `LoopPath` | boolean | false | Restarts the path after it has ended. |
+| `SpeedOverride` | number | 1 | Speed factor for the whole path. |
+| `LinearSpeedToTarget` | number | 500 | Linear path speed in millimeters per second. |
+| `LinearAcceleration` | number | 1000 | Linear path acceleration and deceleration in millimeters per second squared. |
+| `Trajectory` | ComponentReference | - | Optional `MechanismTrajectory` (plan-501). Set = the path plays the trajectory's samples back on the simulation clock instead of its waypoint list. |
+| `ShowPath` | boolean | false | Always draws the path in the viewer, not only while the mechanism is selected (plan-511): the waypoints, or the trajectory the path plays. |
+
+Raw fields (`rawFields`):
+
+| Raw field | Type | Notes |
+|---|---|---|
+| `StartNextPath` | object | ComponentReference to the MechanismPath started when this path ends |
+
+```json
+{ "MechanismPath": { "LoopPath": true, "TargetLink": { "type": "ComponentReference", "path": "Delta/Platform", "componentType": "UnityEngine.Transform" }, "Path": [ { "type": "ComponentReference", "path": "Delta/Paths/WP_Pick", "componentType": "MechanismTarget" } ] } }
+```
+
+#### 7a.61 MechanismTrajectory
+
+A sampled Cartesian TCP path of a `KinematicMechanism` plus a payload — one
+drive-sizing case (plan-501). A sizing run pushes every sample through the
+inverse solve, the forward solve and the inverse dynamics in the trajectory's
+own raster (not the 60 Hz simulation tick) and exports velocity, acceleration
+and drive torque per driven axis. `Samples` is validated on every input path
+(CSV import, GLB load, field edit, run, playback): 2 to 20000 finite triples,
+positive raster, output raster a whole multiple of it — a violation marks the
+component invalid and refuses run and playback.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Mechanism` | ComponentReference | - | The `KinematicMechanism` the trajectory is sized for. Required. |
+| `TargetLink` | ComponentReference | - | The mechanism link carrying the TCP (a Delta: the platform). Required. |
+| `Name` | string | "trajectory" | Name of the sizing case; prefix of the exported axis files. |
+| `Samples` | number[] | - | Flat `[x0, y0, z0, x1, …]` TCP positions in millimeters in the mechanism root frame, uniform raster. |
+| `SampleIntervalMs` | number | 2 | Raster of the samples in milliseconds. |
+| `Frame` | enum(z-up, y-up) | "z-up" | Axis convention of the samples. `z-up` is converted to the viewer's y-up as `(x, z, −y)`. |
+| `TcpOffsetMm` | Vector3 | - | TCP relative to the `TargetLink` origin, link-local millimeters — the point the samples describe. |
+| `PayloadMassKg` | number | 0 | Payload carried by the `TargetLink`, modelled as a point mass, in kilograms. |
+| `PayloadOffsetMm` | Vector3 | - | Payload centre of mass in the `TargetLink`'s local frame, millimeters. |
+| `OutputIntervalMs` | number | 4 | Row raster of the exported axis files in milliseconds; a whole multiple of `SampleIntervalMs`. |
+| `ShowPath` | boolean | false | Always draws the path in the viewer, not only while the mechanism is selected (plan-511). |
+
+```json
+{ "MechanismTrajectory": { "Name": "cycle_404_260", "Samples": [-190, 0, -280, -190, 0, -280], "SampleIntervalMs": 2, "Frame": "z-up", "TcpOffsetMm": { "x": 0, "y": 0, "z": -19 }, "PayloadMassKg": 0.26, "OutputIntervalMs": 4 } }
 ```
 
 ### 7b. Logic Steps
@@ -1671,6 +2206,21 @@ component is one step; **hierarchy order defines execution order** inside a
 container. The top-level `LogicStep_SerialContainer` loops automatically. The
 `Active` field on every step is an `ActiveOnly` gate (Section 7c table footnote):
 `enum(Always, Connected, Disconnected, Never, DontChange)`, default `"Always"`.
+
+`Active` is evaluated on every **top-level** logic root (a step node whose parent
+is no step node — also inside a placed asset), each root on its own; `DontChange`
+counts as `Always`. A root runs only while it is active for the current
+connection state: it does not start (and writes nothing) while inactive — also
+when the connection already exists before the model loads. On a change of the
+connection state all deactivations complete before any activation starts. A
+deactivated root cancels its running steps, stops the motion its steps started
+and still command, and writes the output signals its set-signal steps write back
+to their start value — except signals another active root writes and signals
+that are bound, forced or remote-owned. A reactivated root starts again at its
+first step. A simulation reset resets the outputs of the active roots the same
+way, re-initialises component feedback from the plant state and then starts the
+roots that are active for the current state. A runtime warns at load when an
+output or a drive is shared between roots with different `Active`.
 
 Steps marked "MAY be a no-op" have Unity-only semantics; a web runtime is
 conforming when it treats them as zero-duration steps.
@@ -1705,7 +2255,11 @@ Parallel container — children execute concurrently; ends when all children end
 |---|---|---|---|
 | `Signal` | ComponentReference | - | Bool signal to wait for. |
 | `WaitForTrue` | boolean | true | Expected signal value. |
+| `Edge` | enum(Level, Rising, Falling) | "Level" | Level waits for the expected value; Rising/Falling wait for the first false-to-true/true-to-false change after the step started (WaitForTrue is then ignored). |
 | `Active` | ActiveOnly | - | Connection-state gate: whether this step participates depending on the live-connection state. |
+
+With `Edge` = `Rising` / `Falling` the signal value is sampled when the step
+starts; a level that is already high (low) does not finish the step.
 
 #### 7b.5 LogicStep_WaitForSensor
 
@@ -1713,6 +2267,18 @@ Parallel container — children execute concurrently; ends when all children end
 |---|---|---|---|
 | `Sensor` | ComponentReference | - | Sensor to wait for. |
 | `WaitForOccupied` | boolean | true | If true waits for occupied, otherwise for not occupied. |
+| `Active` | ActiveOnly | - | Connection-state gate: whether this step participates depending on the live-connection state. |
+| `WaitForStopped` | boolean | false | Also requires the detected MU to be blocked by accumulation or a transport stopper. Ignored when waiting for the sensor to clear. |
+
+
+#### 7b.29 LogicStep_WaitForZone
+
+Waits until a `Zone` reports occupied (or free). The zone's Detect result is read; a zone without the Detect effect never reports occupied.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Zone` | ComponentReference | - | Zone to wait for. |
+| `WaitForOccupied` | boolean | true | If true waits for occupied, otherwise for free. |
 | `Active` | ActiveOnly | - | Connection-state gate: whether this step participates depending on the live-connection state. |
 
 #### 7b.6 LogicStep_Delay
@@ -1901,6 +2467,25 @@ Statistics output increment. MAY be a no-op.
 |---|---|---|---|
 | `Active` | ActiveOnly | - | Connection-state gate: whether this step participates depending on the live-connection state. |
 
+#### 7b.27 LogicStep_MechanismPath
+
+Starts a MechanismPath and waits until it ended. A path stopped on an
+unreachable waypoint does not end, so the step keeps waiting.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `MechanismPath` | ComponentReference | - | MechanismPath to start; the step waits until the path ended. |
+| `Active` | ActiveOnly | - | Connection-state gate: whether this step participates depending on the live-connection state. |
+
+#### 7b.28 LogicStep_JavaScript
+
+Web-only sequence step. A `WebComponent` script on the node completes it with
+`self.logicStep(self.path).complete()`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Active` | boolean | true | If false the step is skipped. |
+
 ### 7c. PLC Signals
 
 Signal nodes carry exactly one of the six PLC signal types. The signal's identity
@@ -1990,7 +2575,15 @@ the twin and read by the PLC.
 #### 7d.1 Group
 
 Named group membership. A node MAY belong to several groups; writers serialize
-additional memberships under the keys `Group1`, `Group2`, ... with the same shape.
+additional memberships under the keys `Group_1`, `Group_2`, ... with the same shape.
+
+**Authoring rules:**
+- The first membership is the key `Group`; every further membership of the same node uses `Group_N` (`Group_1`, `Group_2`, …) with the same fields. Keys without the underscore (`Group1`) are not group memberships.
+- A `Kinematic` with `IntegrateGroupEnable` collects every node whose `GroupName` matches its own `GroupName`; to put a node on an axis, give it a `Group` with that axis' group name.
+- A group entry whose `_enabled` is false is ignored; the node's other entries stay valid.
+
+**Reference implementation notes (informative):**
+- Group-only nodes carry no geometry of their own after the realvirtual WEB bake: their meshes become a partition of the enclosing chunk, which the Groups panel hides and isolates by group name.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -2000,6 +2593,16 @@ additional memberships under the keys `Group1`, `Group2`, ... with the same shap
 #### 7d.2 Kinematic
 
 Post-load re-structuring directive from the Unity Kinematic tool.
+
+**Authoring rules:**
+- With `IntegrateGroupEnable` the top-level nodes of the group `GroupName` (nodes carrying a `Group` or `Group_N` entry with that name) are re-parented under this node, keeping their world pose; a member below another member moves with its parent.
+- `Parent` is a plain scene-path STRING (not a `ComponentReference`); it is used only with `KinematicParentEnable`, which re-parents THIS node under `Parent`.
+- Axes nest in one of two ways: give the child axis node a `Group` whose `GroupName` is the parent axis' `GroupName` (it becomes a member of the parent), or set `KinematicParentEnable` and `Parent` on the child axis.
+- The motion itself comes from a `Drive` on the same node; `Kinematic` only builds the hierarchy.
+
+**Reference implementation notes (informative):**
+- realvirtual WEB applies the re-parenting once, before the bake (group integration first, then `KinematicParentEnable`); cycles are skipped.
+- `Kinematic` is not added with `web_editor_add_component`: create it with `web_editor_kinematize` or `web_editor_create_kinematic` and assign parts with `web_editor_assign_to_kinematic`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -2012,8 +2615,23 @@ Post-load re-structuring directive from the Unity Kinematic tool.
 
 #### 7d.3 MU
 
-Movable Unit template marker: the marked node is the template that `Source`
-components clone. Carries no consumed configuration fields in v1.
+Movable Unit marker: the marked node is the template that `Source`
+components clone, or a pre-placed part that is live from simulation start.
+
+**Authoring rules:**
+- An `MU` node that a `Source` refers to (by name through `ThisObjectAsMU`, or the `Source` node itself) is a prototype: the `Source` spawns copies of it.
+- An `MU` node no `Source` refers to is a pre-placed part: it is live in the running scene from simulation start.
+- An `MU` whose collider rests on top of another `MU` is that MU's load and moves with it; one carrier can hold several loads.
+- `LoadSeatDepth` is set on the carrier: a load whose collider bottom lies up to this depth below the carrier's collider top still rests on it (a part in a jig, a cap over a valve end). The load's bottom must not lie below the carrier's bottom, and its collider centre must lie inside the carrier's footprint. 0 keeps the plain contact rule.
+
+**Reference implementation notes (informative):**
+- realvirtual WEB hides `MU` template nodes at load; only the spawned copies (and the source's ghost preview) are visible.
+- Pre-placed MUs stay visible, are registered at simulation start and restored to their authored pose on reset. Loads are passive (no per-tick cost) until a `Grip` takes them off.
+- realvirtual WEB limits `LoadSeatDepth` to 80 % of the carrier's collider height and reads it at load and at every simulation reset (Web only so far; the Unity component has no such field).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `LoadSeatDepth` | number | 0 | How deep a load may sit below this MU's collider top and still be its load, in millimetres. |
 
 #### 7d.4 BoxCollider
 
@@ -2147,6 +2765,66 @@ preference.
 |---|---|---|---|
 | `catalogUrls` | string[] | - | Library catalogue URLs the scene draws its placements from. |
 | `gridSizeMm` | number | 500 | Layout grid and translation snap step, in millimetres. |
+| `physicsEnabled` | boolean | - | Opts this scene into zone physics in an internal viewer; absent keeps the viewer preference. |
+
+#### 7d.13 ConnectionMode
+
+Simulation / PLC start mode of a model, on a dedicated node (one per model). It
+decides the connection state the viewer starts in, which gates every logic root
+with `Active: Connected` / `Disconnected`: `Simulation` starts **disconnected**,
+so a virtual PLC (roots with `Active: Disconnected`) runs; `PLC` starts
+**connected**, so a real PLC owns the outputs.
+
+**Authoring rules:**
+- At most one `ConnectionMode` per model; a reader uses the first one it finds.
+- Without the component the viewer keeps its default (connected) — existing models are unchanged.
+
+**Reference implementation notes (informative):**
+- The viewer applies `StartMode` at load, before the logic starts. A Simulation / PLC toggle next to the simulation controls switches the state and writes `StartMode` back into the document, so the next save keeps it.
+- A live industrial interface connection overrides the mode (shown as "PLC (interface)", toggle locked); on disconnect the viewer returns to `StartMode`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `StartMode` | enum(Simulation, PLC) | "Simulation" | Mode at load: Simulation = connection state Disconnected (virtual PLC runs), PLC = Connected (a real PLC owns the outputs). |
+
+#### 7d.14 WebOperatorPanel
+
+3D-HMI marker: an operator panel window described as JSON. Every
+`WebOperatorPanel` of a model (main model and placements) opens one window with
+IEC control-box devices: illuminated push buttons, two-position selector
+switches, emergency stops, a stack light, title-bar chips and a status line.
+Buttons, selectors and E-stops write PLC inputs; lamps show PLC outputs. The
+whole panel is the `Config` string — no code. Pure UI metadata, no Unity
+runtime function.
+
+The `Config` JSON (format version 1) carries `version`, `id`, `title`, optional
+`width` / `position` / `columns`, the device lists `buttons`, `selectors`,
+`estops`, `stackLight`, optional `chips`, the ordered `status` rules and an
+optional `restart` sequence. Devices sit on a grid (1-based `row` / `col`);
+devices sharing a cell stack. Conditions are data:
+`{ "signal": "S", "is": true }`, `{ "all": [ ... ] }`, `{ "any": [ ... ] }`,
+`{ "not": { ... } }`. The full field list, the IEC colour rules and examples
+are served by the MCP guide `web_help("operator-panel")`.
+
+**Authoring rules:**
+- `Config` must parse as JSON and validate; a reader reports each problem with its JSON path (for example buttons[3].signal 'BT9' not found in model) and renders the window disabled with the messages instead of working controls.
+- Every signal `Config` names must exist in the model; a button writes true while held and false on release, a selector writes the value of its position, an E-stop is normally closed (pressed writes false).
+- Several `WebOperatorPanel` components per model are allowed, one window each; `Dock` places a window only when `Config` has no position, windows in one corner stack.
+
+**Reference implementation notes (informative):**
+- Authoring by MCP: `web_editor_add_component` adds the component, `web_editor_set_field` sets `Config` (valueJson = the JSON as a JSON string), `web_editor_save` stores it in the GLB; a field edit re-renders the window without a reload.
+- The inspector edits `Config` as a monospace JSON field, validated on blur; text that is not JSON is never applied. An unusable panel is also listed in the Problems panel.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Title` | string | "" | Window title; empty uses the title in Config. |
+| `Config` | string | "" | The operator panel as a JSON string (version, id, title, buttons, selectors, estops, stackLight, chips, status, restart). Must parse and validate; every signal it names must exist in the model. |
+| `Dock` | enum(top-left, top-right, bottom-left, bottom-right) | "top-left" | Screen corner the window first appears in when Config has no position; several panels in one corner stack. |
+| `StartCollapsed` | boolean | false | If true the window starts collapsed to its title bar (chips, stack light and the E-stop stay reachable). |
+
+```json
+{ "WebOperatorPanel": { "Title": "Operator panel", "Dock": "top-left", "StartCollapsed": false, "Config": "{\"version\":1,\"id\":\"cell-panel\",\"title\":\"Cell\",\"buttons\":[{\"label\":\"Start\",\"signal\":\"S_Start\",\"capColor\":\"green\",\"row\":1,\"col\":1}],\"selectors\":[],\"estops\":[],\"stackLight\":[],\"status\":[{\"kind\":\"idle\",\"tone\":\"neutral\",\"text\":\"READY\"}]}" } }
+```
 
 ### 7e. Recording
 
@@ -2257,8 +2935,21 @@ Property `description` texts are **informative**: they are maintained in
 tools) and mirrored into the Section-7 tables of this document.
 
 - **`unit`** *(string, OPTIONAL, on number properties)* — [UCUM](https://ucum.org/)-conformant
-  unit code (e.g. `mm`, `mm/s`, `s`, `Hz`, `bar`, `Cel`). Documentation-only;
-  validators MUST ignore it. Readers MUST NOT perform unit conversion based on it.
+  unit code (e.g. `mm`, `mm/s`, `s`, `Hz`, `bar`, `Cel`). Validators MUST ignore it.
+  Readers MUST NOT convert the stored VALUE based on it; interactive tools MAY show it
+  as the field's unit (the reference implementation's inspector suffix reads it first).
+- **`signalUnit`** *(string, OPTIONAL, on ComponentReference properties with `signal`)* —
+  Unit of the slot's value on the COMPONENT side: a unit code (`mm`) or a quantity token
+  resolved through `Drive.Direction` of the carrying node — `@drive-position` (`mm` | `deg`),
+  `@drive-speed` (`mm/s` | `deg/s`), `@drive-acceleration` (`mm/s2` | `deg/s2`); a token
+  without a drive (or on a `Virtual` drive) resolves to nothing. Always paired with `scaleField`.
+- **`scaleField`** *(string, OPTIONAL, on ComponentReference properties with `signal`)* — Name
+  of the sibling number field that scales this slot (`Drive_FollowPosition.Position` →
+  `Scale`). When a signal whose source declares a unit is bound, an interactive tool MAY write
+  `factor(signal unit → signalUnit)` into that field as an ordinary, undoable field value —
+  one rule for command and feedback slots (command `target = signal × S`, feedback
+  `signal = target / S`). Several slots may share one `scaleField`; the stored value is never
+  converted at read time (plan-512).
 - **`unityCoords`** *(boolean, OPTIONAL, on properties with `$ref: "#/$defs/Vector3"`)* —
   When `true`, the vector is serialized in Unity left-handed coordinates and a
   conforming reader operating in glTF right-handed space MUST negate the X
@@ -2275,6 +2966,13 @@ tools) and mirrored into the Section-7 tables of this document.
   slot as a standard PLC signal of the given type (`PLCOutputBool`, `PLCInputFloat`,
   ...). A conforming runtime SHOULD auto-provision an unwired slot as a signal named
   `<node>/Signals/<slot>`.
+- **`refType`** *(string, OPTIONAL, on ComponentReference properties without `signal`)* —
+  Names the component type the reference targets (the name of another `$def`,
+  e.g. `TransportSurface.DriveReference` → `Drive`, `Drive_Gear.MasterDrive` → `Drive`,
+  `Grip.PartToGrip` → `Sensor`). A writer SHOULD emit that type as the reference's
+  `componentType`. Documentation metadata for authoring tools; validators MUST ignore
+  it and readers MUST NOT reject a reference because of it. Plain string node paths
+  (e.g. `Kinematic.Parent`, `Source.ThisObjectAsMU`) never carry it.
 - **`readonly`** *(boolean, OPTIONAL)* — The field is informational; interactive
   tools SHOULD display it but MUST NOT offer editing.
 - **`rawFields`** *(object, OPTIONAL, top-level on a component `$def`)* — Documents

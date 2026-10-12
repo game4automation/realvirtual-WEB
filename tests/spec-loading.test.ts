@@ -55,6 +55,9 @@ import rvOdt from '../schema/v1/rv-odt.json';
 const OUT_OF_SCOPE_EXACT = new Set([
   'Conveyor', 'Turntable', 'ChainTransfer',
   'NodeKnowledge',
+  // plan-529 — WEB-only, no rv-ODT interchange: a 3D text label authored in the
+  // browser, no Unity counterpart. Inline schema in src/core/engine/rv-web-label.ts.
+  'WebLabel',
 ]);
 function isInScope(name: string): boolean {
   if (name.startsWith('DES')) return false;
@@ -145,7 +148,11 @@ describe('rv-ODT spec loading', () => {
   it('Drive_Simple signal slots map to componentRef with PLC signal types', () => {
     const s = loadSchemaFromSpec('Drive_Simple');
     expect(s.Forward).toEqual({ type: 'componentRef', signal: 'PLCOutputBool' });
-    expect(s.IsAtPosition).toEqual({ type: 'componentRef', signal: 'PLCInputFloat' });
+    // plan-512: a feedback slot also carries its unit metadata.
+    expect(s.IsAtPosition).toEqual({
+      type: 'componentRef', signal: 'PLCInputFloat',
+      signalUnit: '@drive-position', scaleField: 'CurrentPositionScale',
+    });
   });
 
   it('Lamp keeps OnColor raw and exposes signal fields as component references', () => {
@@ -173,9 +180,9 @@ describe('rv-ODT spec loading', () => {
   });
 
   // ----- Empty schema (Sink edge case) -----
-  it('Sink returns empty schema without throwing', () => {
+  it('Sink exposes its deletion controls', () => {
     expect(() => loadSchemaFromSpec('Sink')).not.toThrow();
-    expect(loadSchemaFromSpec('Sink')).toEqual({});
+    expect(loadSchemaFromSpec('Sink')).toEqual(INLINE_SCHEMA_BASELINE.Sink);
   });
 
   // ----- Unknown component -----

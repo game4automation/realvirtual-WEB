@@ -18,3 +18,14 @@ export const CONNECT_CONFIG_DRAG_TYPE = 'application/x-rv-connect-config';
  * assigns `documents[].knowledgeRef`.
  */
 export const KNOWLEDGE_FILE_DRAG_TYPE = 'application/x-rv-knowledge-file';
+
+/**
+ * The script twin (plan-479 F1): dragging a `plugins/**​/*.ts|tsx` card carries
+ * its project-relative path under this type; dropping it on the document hero
+ * assigns `documents[].scriptRef` — the binding that used to require opening
+ * `project.json` in a text editor.
+ *
+ * The MIME type string itself is the hit-test, as for the two above: during
+ * `dragover` only `dataTransfer.types` is readable, never `getData()`.
+ */
+export const SCRIPT_FILE_DRAG_TYPE = 'application/x-rv-project-script';

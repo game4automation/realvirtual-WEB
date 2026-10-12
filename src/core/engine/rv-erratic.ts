@@ -110,6 +110,26 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
     );
   }
 
+  /**
+   * Forget the target this behavior was driving towards (plan-492 R1).
+   *
+   * A host that parks an axis by taking the behavior out of
+   * `drive.driveBehaviors` and calling `drive.stop()` leaves `driving === true`
+   * and `destPos` at a position the drive will now never reach: re-attaching
+   * the behavior would enter `update()` on the "still driving" branch and wait
+   * forever for an arrival that cannot happen. `resume()` puts the behavior
+   * back into its "pick a new target on the next tick" state WITHOUT moving the
+   * drive, so the axis carries on from wherever it was stopped.
+   *
+   * Additive and unused by the production path — nothing in the viewer detaches
+   * a drive behavior; the cell-matrix benchmark does, to switch motion modes
+   * without a rebuild.
+   */
+  resume(): void {
+    this.driving = false;
+    this.movingToZero = false;
+  }
+
   /** Whether the enable signal is currently true (or no signal = always enabled) */
   private get isEnabled(): boolean {
     if (!this.SignalEnable || !this.signalStore) return true;
@@ -208,5 +228,7 @@ export class RVErraticDriver implements IDriveBehavior, RVComponent {
 
 // Register schema so rv-extras-validator auto-derives CONSUMED fields
 registerComponentSchema('Drive_ErraticPosition', RVErraticDriver.schema, {
-  badgeColor: '#29b6f6',
+  bake: 'chunk', // sits on the Drive node it extends — moves with it (plan-753 §2.3)
+  authorable: true, // addable in the asset editor on a node that carries a Drive
+  ui: { badge: '#29b6f6' },
 });

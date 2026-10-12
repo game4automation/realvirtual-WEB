@@ -22,6 +22,7 @@ import {
   createRuntimeNode,
   type RuntimeNodeDeps,
 } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import type {
   CollisionRoleName,
   CollisionRoleRegistrar,
@@ -117,10 +118,9 @@ export const runProcessExtrasPath: PathRunner = (extras) => {
   const signalStore = new SignalStore();
   const registrar = new FakeCollisionRegistrar();
 
-  processExtras(
-    root, registry, signalStore, new RVTransportManager(), scene,
-    undefined, undefined, undefined, undefined, { collisionManager: registrar },
-  );
+  processExtras(root, buildInitContext({
+    registry, signalStore, transportManager: new RVTransportManager(), scene, collisionManager: registrar,
+  }));
   return commonResult(node, registry, registrar);
 };
 

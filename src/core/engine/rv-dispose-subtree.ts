@@ -20,13 +20,15 @@
  * outlive individual loads and are reused by the next one.
  *
  * What is NOT common stays with its owner and is deliberately not absorbed
- * here: `abortLoad` owns the `batchTable` and the compose `composition`,
+ * here: `abortLoad` owns the bake instance and the compose `composition`,
  * `clearModel` owns the viewer's texture slots. Hence `onMaterial`, called for
  * each material this pass is actually about to dispose, rather than a boolean
  * flag that would encode one owner's policy into the shared primitive.
  */
 
-import type { Material, Object3D } from 'three';
+import type { BufferGeometry, Material, Object3D } from 'three';
+import { chunkMetaOf } from './rv-bake-chunk';
+import { sharedVizGeometries } from './rv-shared-viz-geometry';
 
 export interface DisposeModelSubtreeOptions {
   /**
@@ -54,6 +56,13 @@ export function disposeModelSubtree(
       geometry?: { dispose(): void; disposeBoundsTree?: () => void };
       material?: Material | Material[];
     };
+    // Runtime dispose guard (plan-753 F11): a baked chunk geometry belongs to
+    // its `BakedAsset` (shared by every placement) — skip geometry, BVH AND
+    // material; the asset's own `dispose()` frees them at refcount 0.
+    if (mesh.geometry && chunkMetaOf.has(mesh.geometry as unknown as BufferGeometry)) return;
+    // Shared sensor viz geometries (rv-shared-viz-geometry) follow the same
+    // contract: refcounted, released only by `RVSensor.dispose()`.
+    if (mesh.geometry && sharedVizGeometries.has(mesh.geometry as unknown as BufferGeometry)) return;
     if (mesh.geometry) {
       // Free the three-mesh-bvh tree explicitly — geometry.dispose() only
       // releases GPU buffers, the CPU-side BVH would otherwise linger as long

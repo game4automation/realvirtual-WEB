@@ -100,6 +100,33 @@
       "source": "https://www.fanuc.eu",
       "notes": ["Document public/pdf/fanuc-crx-educational-cell-manual.pdf used by the robot-alarm demo. Included for demonstration purposes under the owner's terms."],
       "match": ["public/pdf/fanuc-crx-educational-cell-manual.pdf"]
+    },
+    {
+      "name": "Intel Open Image Denoise weights (oidn-weights)",
+      "version": "rt_hdr_alb_nrm, rt_hdr (redistributed in npm denoiser 0.0.11)",
+      "license": "Apache-2.0",
+      "copyright": ["Copyright 2018 Intel Corporation"],
+      "source": "https://github.com/RenderKit/oidn-weights",
+      "notes": ["Trained network weights of Intel Open Image Denoise, used unmodified by the denoiser (oidn-web) of the cinematic render (plan-550). Shipped as two loose files: oidn/rt_hdr_alb_nrm.tza (SHA-256 e586ef2ff48d7fbb7611986405220ed8fc5c13ca79bfc40be4dc742fbf959e1a) and oidn/rt_hdr.tza (SHA-256 a097e8fe9b1ba71ec43cde3e6df3fcf54fa4f8f2f4dd41eac01d0a76a16261e3).", "Copied from the tzas/ folder of the npm package denoiser 0.0.11 (https://www.npmjs.com/package/denoiser/v/0.0.11), which redistributes the oidn-weights files under their Apache-2.0 licence; that package itself is not a dependency."],
+      "match": ["oidn/*.tza"]
+    },
+    {
+      "name": "Studio Small 08 HDRI (Poly Haven)",
+      "version": "1k",
+      "license": "CC0-1.0",
+      "copyright": ["Sergej Majboroda / Poly Haven"],
+      "source": "https://polyhaven.com/a/studio_small_08",
+      "notes": ["Environment map of the cinematic render's studio look (plan-553), shipped as envmaps/studio.hdr (1 508 872 bytes, SHA-256 f6a989f89432eb4eee3191364a9c1ceed195c4ec3544173a3c04fd96cb91d0ba). Downloaded unmodified from https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/studio_small_08_1k.hdr on 2026-10-04."],
+      "match": ["envmaps/studio.hdr"]
+    },
+    {
+      "name": "Kloofendal 48d Partly Cloudy (Pure Sky) HDRI (Poly Haven)",
+      "version": "1k",
+      "license": "CC0-1.0",
+      "copyright": ["Greg Zaal (original), Jarod Guest (sky edits) / Poly Haven"],
+      "source": "https://polyhaven.com/a/kloofendal_48d_partly_cloudy_puresky",
+      "notes": ["Environment map of the cinematic render's outdoor look (plan-553), shipped as envmaps/outdoor.hdr (1 435 119 bytes, SHA-256 fd94c84997b8a3c353b62c2125a9b44e19509956986a126e472684432a02d798). Downloaded unmodified from https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/kloofendal_48d_partly_cloudy_puresky_1k.hdr on 2026-10-04."],
+      "match": ["envmaps/outdoor.hdr"]
     }
   ]
 }

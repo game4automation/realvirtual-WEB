@@ -23,9 +23,28 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = dirname(__filename);
 const WEBVIEWER_ROOT = resolve(__dirname, '..');
 
+/**
+ * The linter, pinned to the tree it is actually linting.
+ *
+ * `boundaries/elements` patterns are relative to the plugin's ROOT PATH, and
+ * that root is `process.cwd()` unless `boundaries/root-path` says otherwise -
+ * ESLint's own `cwd` option does NOT reach the plugin. Where the two disagree,
+ * no element type matches, every file is unclassified and the boundary rule
+ * silently reports nothing: the exact silent-pass the config comments warn
+ * about. It disagrees for real on a checkout reached through a `subst` drive,
+ * where `__dirname` resolves to the underlying path while the process cwd keeps
+ * the substituted one. Stating the root removes the dependency entirely.
+ */
+function boundaryLinter(): ESLint {
+  return new ESLint({
+    cwd: WEBVIEWER_ROOT,
+    overrideConfig: { settings: { 'boundaries/root-path': WEBVIEWER_ROOT } },
+  });
+}
+
 describe('ESLint boundary enforcement (plan-182 Phase 6)', () => {
   it('flags an engine/ file that imports from rv-viewer', async () => {
-    const eslint = new ESLint({ cwd: WEBVIEWER_ROOT });
+    const eslint = boundaryLinter();
     const results = await eslint.lintText(
       `import type { RVViewer } from '../rv-viewer';\nexport const _ = 1;`,
       { filePath: resolve(WEBVIEWER_ROOT, 'src/core/engine/_synthetic.ts') }
@@ -40,7 +59,7 @@ describe('ESLint boundary enforcement (plan-182 Phase 6)', () => {
   // community precheck stages (scripts/precheck-community.mjs).
 
   it('allows an engine/ file that does NOT import from rv-viewer', async () => {
-    const eslint = new ESLint({ cwd: WEBVIEWER_ROOT });
+    const eslint = boundaryLinter();
     const results = await eslint.lintText(
       `import { Vector3 } from 'three';\nexport const _ = 1;`,
       { filePath: resolve(WEBVIEWER_ROOT, 'src/core/engine/_synthetic_ok.ts') }

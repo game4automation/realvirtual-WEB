@@ -22,6 +22,8 @@ import { fieldRendererRegistry, type FieldRendererProps } from './rv-field-rende
 import { useViewer } from '../../hooks/use-viewer';
 import { parseSteps } from '../engine/rv-custom-runtime-instruction';
 import { openPdfViewer } from './pdf-viewer-store';
+import { INSPECTOR_ROW_PX } from './rv-inspector-row';
+import { DIVIDER, ERROR, FS, ICON_SIZE, LINK } from './shared-sx';
 
 function InstructionStepsRenderer({ value }: FieldRendererProps) {
   const viewer = useViewer();
@@ -29,7 +31,7 @@ function InstructionStepsRenderer({ value }: FieldRendererProps) {
 
   if (steps.length === 0) {
     return (
-      <Typography sx={{ fontSize: 11, color: 'text.disabled', px: 1, py: 0.5 }}>
+      <Typography sx={{ fontSize: FS.label, color: 'text.disabled', px: INSPECTOR_ROW_PX, py: 0.5 }}>
         (no steps)
       </Typography>
     );
@@ -50,7 +52,7 @@ function InstructionStepsRenderer({ value }: FieldRendererProps) {
   };
 
   return (
-    <Box sx={{ px: 1, py: 0.5, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+    <Box sx={{ px: INSPECTOR_ROW_PX, py: 0.5, display: 'flex', flexDirection: 'column', gap: 0.75 }}>
       {steps.map((step, i) => (
         <Box
           key={i}
@@ -59,14 +61,14 @@ function InstructionStepsRenderer({ value }: FieldRendererProps) {
             flexDirection: 'column',
             gap: 0.35,
             pb: 0.5,
-            borderBottom: i < steps.length - 1 ? '1px solid rgba(255,255,255,0.06)' : 'none',
+            borderBottom: i < steps.length - 1 ? `1px solid ${DIVIDER}` : 'none',
           }}
         >
           <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5 }}>
-            <Typography sx={{ fontSize: 11, fontWeight: 700, color: 'text.secondary', flexShrink: 0 }}>
+            <Typography sx={{ fontSize: FS.label, fontWeight: 700, color: 'text.secondary', flexShrink: 0 }}>
               {i + 1}.
             </Typography>
-            <Typography sx={{ fontSize: 11, color: 'text.primary', lineHeight: 1.4, whiteSpace: 'pre-wrap', flex: 1, minWidth: 0 }}>
+            <Typography sx={{ fontSize: FS.label, color: 'text.primary', lineHeight: 1.4, whiteSpace: 'pre-wrap', flex: 1, minWidth: 0 }}>
               {step.instruction || '(empty)'}
             </Typography>
             {step.url && (
@@ -76,7 +78,7 @@ function InstructionStepsRenderer({ value }: FieldRendererProps) {
                   sx={{ p: 0.25 }}
                   onClick={() => openPdfViewer(step.instruction || 'Document', { type: 'url', url: step.url! })}
                 >
-                  <Description sx={{ fontSize: 14 }} />
+                  <Description sx={{ fontSize: ICON_SIZE.sm }} />
                 </IconButton>
               </Tooltip>
             )}
@@ -91,16 +93,16 @@ function InstructionStepsRenderer({ value }: FieldRendererProps) {
                     <Chip
                       size="small"
                       variant="outlined"
-                      icon={<Visibility sx={{ fontSize: 12 }} />}
+                      icon={<Visibility sx={{ fontSize: ICON_SIZE.xs }} />}
                       label={nodeName(p)}
                       onClick={ok ? () => focus([p]) : undefined}
                       sx={{
                         height: 20,
-                        fontSize: 10,
+                        fontSize: FS.micro,
                         cursor: ok ? 'pointer' : 'default',
                         opacity: ok ? 1 : 0.55,
-                        color: ok ? '#64b5f6' : '#ef5350',
-                        borderColor: ok ? 'rgba(100,181,246,0.4)' : 'rgba(239,83,80,0.4)',
+                        color: ok ? LINK : ERROR,
+                        borderColor: `${ok ? LINK : ERROR}66`,
                         '& .MuiChip-icon': { color: 'inherit' },
                       }}
                     />
@@ -113,7 +115,7 @@ function InstructionStepsRenderer({ value }: FieldRendererProps) {
                   variant="outlined"
                   label="Focus all"
                   onClick={() => focus(step.targetPaths)}
-                  sx={{ height: 20, fontSize: 10, cursor: 'pointer', color: 'text.secondary' }}
+                  sx={{ height: 20, fontSize: FS.micro, cursor: 'pointer', color: 'text.secondary' }}
                 />
               )}
             </Box>

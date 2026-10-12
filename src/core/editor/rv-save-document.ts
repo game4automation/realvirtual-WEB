@@ -364,16 +364,35 @@ function modelFileName(name: string): string {
 }
 
 /**
- * The folder a "Save as…" copy lands in: the open document's own.
+ * The folder a "Save as…" copy lands in: the open document's own, or the
+ * PROJECT ROOT when it has none (plan-744 F7).
  *
  * Only a document that HAS a project path can name a folder. A slot-addressed
  * document (`path === ''`) and a source that was never in the project have no
- * neighbourhood to be saved beside, so both keep the historical destination.
+ * neighbourhood to be saved beside — and the fallback for those used to be
+ * `library/Custom`, which was the last place the product treated a folder as a
+ * type. It filed a first save under "library" whatever the thing was, in a
+ * subfolder the user never asked for and would not find again.
+ *
+ * The root is the honest answer: the document has no place yet, so it lands
+ * where the project starts, and the save dialog's folder picker is where the
+ * user says otherwise.
  */
 function saveAsFolder(base: AssetBase): string {
   const path = (base.kind === 'document' || base.kind === 'referencedAsset' ? base.path : '') ?? '';
   const slash = path ? path.lastIndexOf('/') : -1;
-  return slash > 0 ? path.slice(0, slash) : `library/${CUSTOM_LIBRARY_FOLDER}`;
+  return slash > 0 ? path.slice(0, slash) : '';
+}
+
+/**
+ * `folder` + `file` as one project-relative path — and just `file` at the root.
+ *
+ * A project path never starts with a slash, so the empty folder
+ * {@link saveAsFolder} now returns must not become one through the template
+ * that used to interpolate it.
+ */
+function joinProjectPath(folder: string, file: string): string {
+  return folder === '' ? file : `${folder}/${file}`;
 }
 
 // ─── The one entry point ────────────────────────────────────────────────
@@ -763,8 +782,9 @@ async function saveAssetDocumentLocked(
   // `library/<Custom>/`, which is the pre-716 "the editor writes into the Custom
   // library" rule surviving in the one branch that overrides the routing: a user
   // saving a copy of a project model found it filed somewhere else entirely.
-  // `library/<Custom>/` remains the fallback for a document with no folder of
-  // its own (slot-addressed, or a root-level file).
+  // Since plan-744 F7 the PROJECT ROOT is the fallback for a document with no
+  // folder of its own (slot-addressed, or a root-level file) — `library/Custom`
+  // was the last folder-as-a-type in the save path.
   //
   // It overrides the DESTINATION only, never the refusals: a read-only project
   // stays blocked. And it is a COPY — a new file with an identity of its own, so
@@ -773,7 +793,7 @@ async function saveAssetDocumentLocked(
   const decision: SaveVerbDecision = opts.forceNamePrompt && named.verb !== 'blocked'
     ? {
         verb: 'save',
-        relPath: `${saveAsFolder(baseAtStart)}/${assetFileName(name)}`,
+        relPath: joinProjectPath(saveAsFolder(baseAtStart), assetFileName(name)),
         copies: true,
       }
     : named;
@@ -841,7 +861,6 @@ async function saveAssetDocumentLocked(
       }
 
       seenRevisions.set(ledgerKey(backend, relPath), await revisionOfBytes(bytes));
-      await writeThumbnailBesideAsset(viewer, assetRoot, backend, relPath);
 
       // The identity the document has from here on. A copy MOVES it (§2.4):
       // the session continues on the copy, so the breadcrumb, the draft
@@ -849,6 +868,9 @@ async function saveAssetDocumentLocked(
       // `markSaved(nextBase)` does, and why it takes the base rather than
       // assuming the old one.
       const nextBase = nextIdentity(baseAtStart, relPath, name);
+      // AFTER the identity is known, because the preview is keyed by it since
+      // plan-744 F5 — not by the path it used to mirror.
+      await writeDocumentThumbnail(viewer, assetRoot, backend, nextBase.documentId);
       // plan-703's collision machinery, not a second one: a copy that lands
       // beside an identically named document must be caught here rather than
       // by whoever reads the manifest next.
@@ -965,23 +987,35 @@ async function uniqueProjectPath(backend: ProjectBackend, relPath: string): Prom
 }
 
 /**
- * Best-effort thumbnail beside a saved LIBRARY asset.
+ * Best-effort preview beside a saved document — **any** document
+ * (plan-744 F5).
  *
- * Only for `library/**`, and that is not laziness: `library/.thumbnails/<rel>`
- * is the exact mirror path the library scan looks up. A model under `models/`
- * gets its preview from the thumbnail cache instead, so writing a file there
- * would create a second, unread convention.
+ * Two things changed at once and they are the same change. The file is keyed
+ * by the document's ID (`<project>/.thumbnails/<encodeThumbnailId(id)>.png`)
+ * rather than by a mirror of its path, and it is written for every document
+ * rather than for `library/**` alone.
+ *
+ * The old rule read as an optimisation — "a model gets its preview from the
+ * thumbnail cache instead" — and was a hole: the browser cache is per-browser
+ * and per-machine, so a model, a scene, or anything a customer received on a
+ * fresh machine had no persisted preview to show. And the path mirror lost the
+ * picture on every move or rename, because the key WAS the location.
+ *
+ * Read back by `resolveDocumentThumbnail()`.
  */
-async function writeThumbnailBesideAsset(
+async function writeDocumentThumbnail(
   viewer: RVViewer,
   assetRoot: unknown,
   backend: ProjectBackend,
-  relPath: string,
+  documentId: string,
 ): Promise<void> {
-  if (!relPath.startsWith('library/')) return;
-  const libraryRelative = relPath.slice('library/'.length);
+  const id = typeof documentId === 'string' ? documentId.trim() : '';
+  if (id === '') return;
   try {
-    const { ThumbnailRenderer } = await import('../thumbnails/thumbnail-renderer');
+    const [{ ThumbnailRenderer }, { thumbnailSidecarPath }] = await Promise.all([
+      import('../thumbnails/thumbnail-renderer'),
+      import('../library/library-types'),
+    ]);
     const thumbs = new ThumbnailRenderer(
       viewer.renderer as never, viewer.scene as never);
     const dataUrl = thumbs.render(assetRoot as never, 256);
@@ -989,14 +1023,14 @@ async function writeThumbnailBesideAsset(
     // null = WebGPU renderer; thumbnails need the classic one (plan-271).
     if (!dataUrl) return;
     const blob = await (await fetch(dataUrl)).blob();
-    // Overwrite-by-design: a thumbnail is derived from the asset that was just
-    // saved, so the current one is by definition the one to replace.
+    // Overwrite-by-design: a thumbnail is derived from the document that was
+    // just saved, so the current one is by definition the one to replace.
     await backend.writeDocument(
-      `library/.thumbnails/${libraryRelative.replace(/\.glb$/i, '.png')}`,
+      thumbnailSidecarPath(id),
       new Uint8Array(await blob.arrayBuffer()),
       { expectedRevision: 'any' },
     );
   } catch (e) {
-    console.warn('[save-document] thumbnail write failed (the asset saved fine):', e);
+    console.warn('[save-document] thumbnail write failed (the document saved fine):', e);
   }
 }

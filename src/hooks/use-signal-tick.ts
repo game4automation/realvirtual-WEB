@@ -19,6 +19,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import type { SignalStore } from '../core/engine/rv-signal-store';
+import { subscribePoll } from './shared-ui-ticker';
 
 /**
  * Poll signal store at a fixed interval to trigger re-renders for
@@ -35,14 +36,15 @@ export function useSignalTick(store: SignalStore | null, intervalMs = 200): numb
 
   useEffect(() => {
     if (!store) return;
-    const id = setInterval(() => {
+    // A poll of the shared ticker: a wall-clock interval normally, one recording tick per video
+    // frame while a recording replaces the timers (plan-556 F4).
+    return subscribePoll(() => {
       const v = store.version;
       if (v !== lastVersionRef.current) {
         lastVersionRef.current = v;
         setTick(t => t + 1);
       }
     }, intervalMs);
-    return () => clearInterval(id);
   }, [store, intervalMs]);
 
   return tick;

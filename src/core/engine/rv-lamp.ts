@@ -261,12 +261,9 @@ registerComponent({
   schema: RVLamp.schema,
   capabilities: {
     authorable: true,
-    hoverable: true,
-    hoverEnabledByDefault: true,
-    selectable: true,
-    filterLabel: 'Lamps',
-    badgeColor: '#ffb300',
-    tooltipType: 'lamp',
+    pick: 'select',
+    bake: 'keep',    // swaps its material for the light state — the original mesh stays
+    ui: { filter: 'Lamps', category: 'hmi', badge: '#ffb300', tooltip: 'lamp' },
   },
   create: (node) => new RVLamp(node),
   afterCreate: (inst, node) => {

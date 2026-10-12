@@ -243,7 +243,7 @@ export async function resolveConnectLock(channel, tmpBase, fetchImpl = fetch) {
 
 function printUsage() {
   console.log(`Usage: node scripts/deliver.mjs <slug> [--push] [--fast] [--dry-run] [--no-rag]
-                                   [--projects <name…|all> [--force]]
+                                   [--no-deps-archive] [--projects <name…|all> [--force]]
 
 One-shot customer delivery around generate-customer-workspace.mjs.
 
@@ -279,6 +279,12 @@ Flags:
                  rule says otherwise, and this is the one place that says so out loud.
   --no-rag       deliver without the CONNECT diagnosis package (no rag.zip, no connect/ folder).
                  Neither the RAG seed index nor a <projectKey>.diagnosis.json preset is needed.
+  --no-deps-archive
+                 skip packing and publishing the node_modules archive; the customer restores
+                 dependencies with npm ci instead. The archive is named after the DELIVERING
+                 host's platform-arch, so a delivery from win32-arm64 is discarded by every
+                 x64 customer anyway - and packing plus uploading ~90 MB is the single longest
+                 step of a release whenever package-lock.json changed.
 
 Exit codes:
   0  delivered (or dry-run staged); --projects found nothing of the customer's to replace
@@ -355,6 +361,7 @@ async function main() {
   // not a choice here, it is the only shape this delivery has (plan-434 Phase 4).
   const projectless = projects.length === 0;
   const noRag = argv.includes('--no-rag') || projectless;
+  const noDepsArchive = argv.includes('--no-deps-archive');
   console.log(`[deliver] ${projectless ? `customer=${customerSlug} (projectless)` : `project=${projectKey}`}`
     + ` mode=${push ? 'PUSH' : 'dry-run'}${fast ? ' fast' : ''}${noRag ? ' no-rag' : ''} viewer=${version}`);
   if (projectless) console.log(`[deliver] ${kind} customer: projectless delivery, no RAG`);
@@ -441,6 +448,10 @@ async function main() {
   if (acceptNewPrivateFiles) args.push('--accept-new-private-files');
   if (noRag) args.push('--no-rag');
   else args.push('--seed-index', seedIndex, '--diagnosis-config', diagnosisConfig);
+  // Forwarded explicitly, like every other flag: this list is the generator's whole command
+  // line, so a flag missing here is silently ignored rather than rejected - which is how a
+  // release once paid for a 90 MB archive it had asked not to build.
+  if (noDepsArchive) args.push('--no-deps-archive');
   if (push) args.push('--push');
   if (dryRun) args.push('--dry-run');
   if (fast) args.push('--fast');

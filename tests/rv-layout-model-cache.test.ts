@@ -31,13 +31,18 @@ function createMockLoader() {
 
 /**
  * Stub `globalThis.fetch` so RVAssetBlobCache._fetchWithBucket can hand a
- * Blob back to the loader. The actual blob bytes are irrelevant — the
- * mocked GLTFLoader.loadAsync ignores its argument and returns the
- * pre-built Three.js Group regardless.
+ * Blob back to the loader. The bytes only have to pass the blob cache's
+ * content check (a `glTF` header — since 2026-09-26 the cache refuses to
+ * serve or store anything else); the mocked GLTFLoader.loadAsync ignores
+ * its argument and returns the pre-built Three.js Group regardless.
  */
 function mockFetchOK() {
   const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input) => {
-    return new Response(new Blob([new Uint8Array([0])]), {
+    const header = new Uint8Array(12);
+    header.set([0x67, 0x6c, 0x54, 0x46], 0); // 'glTF'
+    header[4] = 2;
+    header[8] = 12;
+    return new Response(new Blob([header]), {
       status: 200,
       headers: { 'Content-Type': 'model/gltf-binary' },
     });

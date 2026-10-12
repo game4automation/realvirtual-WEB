@@ -17,10 +17,16 @@ import { createSignalWriter } from './rv-signal-store';
  *   Accelaration — acceleration in mm/s² (C# field name kept for GLB parity)
  *   Forward      — jog forward
  *   Backward     — jog backward
+ *   Enable       — optional motion enable (plan-539 F14)
  * PLC Inputs (drive → PLC, written by the viewer every tick):
  *   IsAtPosition — current position in mm (scale/offset applied)
  *   IsAtSpeed    — current speed in mm/s
  *   IsDriving    — true while the drive is running
+ *
+ * plan-539 F14 — motion enable, symmetric to the cylinder's (plan-538 F3):
+ * `Enable` false stops the drive at once and ignores `Forward` / `Backward`
+ * (their levels are still remembered); true again follows the CURRENT levels.
+ * No `Enable` reference = always enabled (behaviour unchanged).
  *
  * Uses init() to wire up subscriptions after all signals are registered,
  * exactly mirroring the Unity two-phase Awake/Start initialisation pattern.
@@ -43,6 +49,8 @@ export class RVDriveSimple implements RVComponent {
   IsAtPosition: string | null = null;
   IsAtSpeed: string | null = null;
   IsDriving: string | null = null;
+  /** plan-539 F14 — optional motion-enable signal (PLCOutputBool). */
+  Enable: string | null = null;
 
   // Settings (PascalCase, parity with C#).
   ScaleSpeed = 1;
@@ -58,6 +66,11 @@ export class RVDriveSimple implements RVComponent {
   /** Bound feedback callback — kept so dispose() can detach it. */
   private feedbackCb: ((d: RVDrive) => void) | null = null;
   private drive: RVDrive | null = null;
+  /** plan-539 F14 — false while `Enable` holds the drive. */
+  private _enabled = true;
+  /** Last commanded Forward / Backward levels (kept while disabled). */
+  private _forward = false;
+  private _backward = false;
   private readonly feedbackListeners: (() => void)[] = [];
   /** Store subscriptions + re-apply slots of the four input signals. Held so
    *  `dispose()` can drop them — before plan-427 the handles were discarded and
@@ -69,12 +82,46 @@ export class RVDriveSimple implements RVComponent {
   }
 
   commandForward(value: boolean | number): void {
-    if (this.drive) this.drive.jogForward = Boolean(value);
+    this._forward = Boolean(value);
+    if (this.drive) this.drive.jogForward = this._enabled && this._forward;
   }
 
   commandBackward(value: boolean | number): void {
-    if (this.drive) this.drive.jogBackward = Boolean(value);
+    this._backward = Boolean(value);
+    if (this.drive) this.drive.jogBackward = this._enabled && this._backward;
   }
+
+  /** True while the motion enable allows the drive to move (plan-539 F14). */
+  get enabled(): boolean { return this._enabled; }
+
+  /**
+   * plan-539 F14 — motion enable. false: stop at once, Forward/Backward are
+   * ignored (their levels are remembered). true: follow the current levels.
+   */
+  setEnable(value: boolean | number): void {
+    const enabled = value === true;
+    const changed = enabled !== this._enabled;
+    this._enabled = enabled;
+    const drive = this.drive;
+    if (!drive) return;
+    if (!enabled) {
+      // Re-asserted also when unchanged: a reset re-applies the authored jog
+      // flags, and a held drive must stay held.
+      drive.jogForward = false;
+      drive.jogBackward = false;
+      if (changed || drive.isRunning) drive.stop();
+      return;
+    }
+    if (!changed) return;
+    drive.jogForward = this._forward;
+    drive.jogBackward = this._backward;
+  }
+
+  /** Direct-binding command contract of the `Enable` slot (plan-539 F14). */
+  commandEnable(value: boolean | number): void { this.setEnable(value); }
+
+  /** Released direct binding of `Enable`: back to the unauthored default (always enabled). */
+  neutralizeEnable(): void { this.setEnable(true); }
 
   commandSpeed(value: boolean | number): void {
     if (this.drive) this.drive.targetSpeed = Number(value) * this.ScaleSpeed;
@@ -131,12 +178,20 @@ export class RVDriveSimple implements RVComponent {
       return;
     }
     this.drive = drive;
+    this._enabled = true;
+    this._forward = drive.jogForward;
+    this._backward = drive.jogBackward;
 
     // ── Inputs (PLC → drive) ──
     // All four via the wiring helpers so the CURRENT level is re-applied after
     // `resetSimulation()` / reconnect — a `Forward` held true across a reset is
     // exactly the case this drive would otherwise sleep through (plan-427).
+    // plan-539 F14: the enable is wired FIRST, so an `Enable` that is already
+    // false at load holds the drive before Forward/Backward are applied.
     this.inputUnsubs.push(
+      wireBoolSignal(ctx.signalStore, this.Enable,
+        (v) => this.setEnable(v),
+        `Drive_Simple "${drive.name}": Enable signal`, ctx.reapply).unsubscribe,
       wireBoolSignal(ctx.signalStore, this.Forward,
         (v) => this.commandForward(v),
         `Drive_Simple "${drive.name}": Forward signal`, ctx.reapply).unsubscribe,
@@ -177,5 +232,7 @@ export class RVDriveSimple implements RVComponent {
 
 // Register schema for auto-derivation of CONSUMED fields
 registerComponentSchema('Drive_Simple', RVDriveSimple.schema, {
-  badgeColor: '#29b6f6',
+  bake: 'chunk', // sits on the Drive node it extends — moves with it (plan-753 §2.3)
+  authorable: true, // addable in the asset editor on a node that carries a Drive
+  ui: { badge: '#29b6f6' },
 });

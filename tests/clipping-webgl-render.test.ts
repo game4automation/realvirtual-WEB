@@ -75,6 +75,10 @@ describe('ClippingPlugin classic WebGL rendering', () => {
 
     const clipping = new ClippingPlugin();
     clipping.onModelLoaded(result, viewer);
+    // The planes bind on first use of the section tool (an enabled axis) and stay
+    // bound; toggling the axis off again leaves nothing cut.
+    clipping.setAxis('y', { enabled: true });
+    clipping.setAxis('y', { enabled: false });
     (viewer as unknown as { currentModel: Group }).currentModel = root;
     viewer.emit('model-loaded', { result });
 
@@ -110,6 +114,10 @@ describe('ClippingPlugin classic WebGL rendering', () => {
 
     const clipping = new ClippingPlugin();
     clipping.onModelLoaded(result, viewer);
+    // The planes bind on first use of the section tool (an enabled axis) and stay
+    // bound; toggling the axis off again leaves nothing cut.
+    clipping.setAxis('y', { enabled: true });
+    clipping.setAxis('y', { enabled: false });
     clipping.resetAll();
 
     // Simulate the production render-mode transition. It swaps the material
@@ -168,6 +176,10 @@ describe('ClippingPlugin classic WebGL rendering', () => {
     } as unknown as LoadResult;
     const clipping = new ClippingPlugin();
     clipping.onModelLoaded(result, viewer);
+    // The planes bind on first use of the section tool (an enabled axis) and stay
+    // bound; toggling the axis off again leaves nothing cut.
+    clipping.setAxis('y', { enabled: true });
+    clipping.setAxis('y', { enabled: false });
     const planes = (clipping as unknown as { planes: Plane[] }).planes;
 
     // Force all three classic-WebGL helper paths to exist after clipping was

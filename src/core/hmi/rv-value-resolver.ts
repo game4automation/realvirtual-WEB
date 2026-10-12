@@ -32,11 +32,15 @@ import type { SignalStore } from '../engine/rv-signal-store';
 import type { RVComponent, ComponentSchema } from '../engine/rv-component-registry';
 import { getFieldDescriptor, isFieldDisplayReadonly } from '../engine/rv-component-registry';
 import type { RVDrive } from '../engine/rv-drive';
+import { FMU_TYPE, fmuStateOf } from '../engine/rv-fmu-constants';
 
 /** Narrow view of RVViewer the resolver depends on (avoids an import cycle). */
 export interface ResolverViewer {
   registry: NodeRegistry | null;
   signalStore: SignalStore | null;
+  emit?(event: 'component-field-changed', data: {
+    nodePath: string; componentType: string; fieldName: string;
+  }): void;
 }
 
 const DASH = '—'; // em dash for "no value"
@@ -175,6 +179,7 @@ export function isEphemeralField(
 /** The single header/badge value for a component:
  *  - signal types → live signal value
  *  - Drive → live current position (+ unit)
+ *  - Fmu → the instance state (`running`, `idle`, `error`, …; plan-510)
  *  - otherwise → null
  *  Returns both formatted `text` and the `raw` value so callers can choose a
  *  different presentation (e.g. glyph vs word) without re-reading. */
@@ -198,6 +203,10 @@ export function getPrimaryDisplayValue(
       const unit = drive.isRotary ? '°' : ' mm';
       return { text: drive.currentPosition.toFixed(1) + unit, raw: drive.currentPosition };
     }
+  }
+  if (baseComponentType(componentType) === FMU_TYPE) {
+    const state = fmuStateOf(viewer.registry?.getNode(nodePath) ?? null);
+    if (state) return { text: state, raw: state };
   }
   return { text: null, raw: undefined };
 }
@@ -257,9 +266,15 @@ export function applyLiveEdit(
   if (coerced === SKIP) return;
 
   // Component-owned mapping first (handles config↔runtime field splits).
-  if (typeof inst.setLiveField === 'function' && inst.setLiveField(fieldName, coerced)) return;
+  if (typeof inst.setLiveField === 'function' && inst.setLiveField(fieldName, coerced)) {
+    viewer.emit?.('component-field-changed', { nodePath, componentType, fieldName });
+    return;
+  }
 
   // Generic: assign onto the same-named instance field if it exists.
   const bag = inst as unknown as Record<string, unknown>;
-  if (fieldName in bag) bag[fieldName] = coerced;
+  if (fieldName in bag) {
+    bag[fieldName] = coerced;
+    viewer.emit?.('component-field-changed', { nodePath, componentType, fieldName });
+  }
 }

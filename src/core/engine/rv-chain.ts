@@ -282,6 +282,8 @@ export class RVChain implements RVComponent {
         delete ud.realvirtual;
         delete ud._layoutObject;
         delete ud._layoutId;
+        delete ud._layoutNestedOf;
+        delete ud._layoutNestedId;
       });
       // The runtime marker: `pruneRuntimeHelpers()` drops anything carrying it
       // before an editor save.
@@ -407,10 +409,11 @@ registerComponent({
   type: 'Chain',
   schema: RVChain.schema,
   capabilities: {
-    hoverable: true,
-    selectable: true,
-    filterLabel: 'Chains',
-    badgeColor: '#78909c',
+    pick: 'select',
+    // Clones its element template N times at load and re-poses every clone per
+    // tick: the originals stay individual meshes, never baked (plan-753 §2.3).
+    bake: 'keep',
+    ui: { filter: 'Chains', category: 'transport', badge: '#78909c' },
   },
   create: (node) => new RVChain(node),
   afterCreate: (inst, node) => {
@@ -422,10 +425,9 @@ registerComponent({
   type: 'ChainElement',
   schema: RVChainElement.schema,
   capabilities: {
-    hoverable: true,
-    selectable: true,
-    filterLabel: 'Chains',
-    badgeColor: '#78909c',
+    pick: 'select',
+    bake: 'chunk',   // one element = one mover along the chain
+    ui: { filter: 'Chains', category: 'transport', badge: '#78909c' },
   },
   create: (node) => new RVChainElement(node),
   afterCreate: (inst, node) => {

@@ -10,6 +10,12 @@
  * node on drag-enter and runs the full `addPlacedToScene` (prep + register) so
  * the dragged object is a real, selectable, gizmo-bearing placement from the
  * start (only the store/undo commit is deferred to drop).
+ *
+ * Since plan-753 Phase 3 only VIRTUAL / DES entries reach this builder: a GLB
+ * entry is drafted by `LayoutPlannerPlugin._startGlbDraft` as an instance of
+ * its baked asset (warm cache) or as a pending placeholder. Cancelling any
+ * draft goes through `removePlacedFromScene` → `BakeRegistry.release()`;
+ * nothing here ever disposes geometry (the clone's belongs to the cache).
  */
 
 import { Group, Object3D, BoxGeometry, EdgesGeometry, LineSegments, LineBasicMaterial } from 'three';
@@ -25,7 +31,7 @@ export class GhostManager {
   private _entryId: string | null = null;
   private _loading = false;
   private _readyPromise: Promise<void> | null = null;
-  private _modelCache: ModelCache;
+  private _modelCache: () => ModelCache;
   private _loadEntry: EntryLoader;
 
   /**
@@ -41,9 +47,9 @@ export class GhostManager {
    * single dependency on the cache; the default preserves the pre-723 behaviour
    * for the standalone construction path.
    */
-  constructor(modelCache: ModelCache, loadEntry?: EntryLoader) {
-    this._modelCache = modelCache;
-    this._loadEntry = loadEntry ?? ((entry) => this._modelCache.getOrLoad(entry.glbUrl ?? ''));
+  constructor(modelCache: ModelCache | (() => ModelCache), loadEntry?: EntryLoader) {
+    this._modelCache = typeof modelCache === 'function' ? modelCache : () => modelCache;
+    this._loadEntry = loadEntry ?? ((entry) => this._modelCache().getOrLoad(entry.glbUrl ?? ''));
   }
 
   /** Whether a preview is currently visible. */

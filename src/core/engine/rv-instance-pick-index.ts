@@ -43,7 +43,7 @@ import { Mesh } from 'three';
 import type { Intersection, Object3D, Raycaster } from 'three';
 import type { NodeRegistry } from './rv-node-registry';
 import type { RaycastBackend } from './rv-raycast-manager';
-import { isAuthoredHidden, isPickableMesh } from './rv-raycast-geometry';
+import { isAuthoredHidden, isPickableMesh } from './rv-pick-utils';
 
 /**
  * Exact-node resolution: the mesh's own registry path, else the nearest

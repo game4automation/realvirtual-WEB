@@ -20,13 +20,15 @@
  * down. `documents[]` is now the only list in the manifest — nothing derives
  * it, nothing derives from it on disk.
  *
- * What the ~80 places that used to read `project.scenes` read instead is
- * {@link sceneDocumentsOf} / {@link assetDocumentsOf} — projections computed at
- * the read site, over the one list. A projection and a mirror look similar and
- * are not the same thing: a projection cannot go stale, cannot disagree with
- * its source, and cannot be edited behind the source's back. That is why the
- * baseline and the three-way merge went with the mirror rather than following
- * it into a new home.
+ * What the ~80 places that used to read `project.scenes` read instead was
+ * `sceneDocumentsOf()` / `assetDocumentsOf()` — projections computed at the
+ * read site, over the one list. Those are gone too (plan-744 F3): a projection
+ * cannot go stale, but a projection over a *heuristic* can be wrong from the
+ * start, and this one was. A browser scene's path is its bare id, so once
+ * nothing stamps `section` the scene projection answers "no scenes" for exactly
+ * the projects that have them. What replaced it is the question each call site
+ * was really asking: `documentsOf(project).find(d => d.id === …)` for an
+ * identity, a path predicate for a place.
  *
  * A client older than this build that opens such a project sees no scenes and,
  * if it saves, writes a manifest this build then refuses (F10). That is the
@@ -45,6 +47,7 @@ import {
   parseClassification,
   type DocumentClassification,
 } from './rv-document-classification';
+import { documentInfoCacheEquals, parseDocumentInfo, type DocumentInfo } from './rv-document-info';
 import {
   assetEntryKey,
   type RvDocumentEntry,
@@ -72,16 +75,24 @@ import {
 //
 //  - **The Legacy-v1 migration** (`scenes[]`/`models[]`/`library[]` →
 //    `documents[]`) must keep knowing the three array names, or an unmigrated
-//    customer manifest loses its documents. That is `LEGACY_DOCUMENT_ARRAYS`,
-//    `documentOfAssetEntry` and `documentsFromLists`.
+//    customer manifest loses its documents. That is `LEGACY_DOCUMENT_ARRAYS`
+//    and `documentsFromLists`.
 //  - **Reading a value somebody else wrote.** Delivered manifests carry
-//    `section` and always will (§F4: it is never actively removed), and the
-//    browser scene path still stamps `'scenes'` for one transition period, so
-//    old clients do not misroute a bare-id scene. `sectionOfDocument` reads
-//    those, so the few remaining scene-shaped projections still find them.
+//    `section` and always will (§F4: it is never actively removed).
+//    `sectionOfDocument` reads those.
 //
-// Nothing outside those two purposes may grow a new caller here. The place a
-// document is, is its path.
+// The transitional `section: 'scenes'` stamp is GONE (plan-744 Phase 2). It
+// existed so a pre-plan-736 client meeting a bare-id browser scene would not
+// route it down the blob branch; the gate on it — the slow delivery channels
+// carrying a client that no longer reads the field — was declared open, and
+// the risk of an old ctrlX snap or CONNECT-embedded appliance mis-routing a
+// browser scene saved from this build on is accepted and documented, not
+// mitigated (plan-744 §5.4).
+//
+// Nothing outside those two purposes may grow a new caller here, and nothing
+// at all may call them from a LIVE path: `documentsInSection` and
+// `sectionOfDocument` are pinned to this module by
+// `tests/listing-removal-guard.test.ts`. The place a document is, is its path.
 
 /** The three legacy kinds. Read, derived — never written to a new row. */
 export type DocumentSection = 'scenes' | 'models' | 'library';
@@ -197,59 +208,35 @@ function assetNameOf(entry: RvProjectAssetEntry): string {
 }
 
 /**
- * Lift a legacy scene entry into a document.
+ * Lift ANY entry — a manifest row, a legacy array member, a bare `{ path }`
+ * off a folder scan — into a document. **The one row shape** (plan-744 F2).
+ *
+ * There used to be two of these, `documentOfSceneEntry` and
+ * `documentOfAssetEntry`, and the only thing that ever distinguished them was
+ * the transitional `section: 'scenes'` stamp the first one wrote. That stamp is
+ * gone (plan-744 Phase 2, the gate of plan-736 Phase 3 declared open), and with
+ * it the reason for a caller to know which legacy array an entry came out of
+ * before it can be lifted. A place is a path; the row says it once.
  *
  * Everything the entry carried survives verbatim — including unknown fields, on
- * which the whole forward-compatibility contract of this manifest rests.
- */
-export function documentOfSceneEntry(
-  entry: RvProjectSceneEntry,
-  mintId: (entry: { path: string }) => string = e => stableDocumentId(e.path),
-): RvDocumentEntry {
-  const id = typeof entry.id === 'string' && entry.id.trim() !== '' ? entry.id : mintId(entry);
-  const name = typeof entry.name === 'string' && entry.name !== ''
-    ? entry.name
-    : assetNameOf(entry as unknown as RvProjectAssetEntry);
-  // ## The transitional stamp (plan-736 Phase 3) — deliberately still here
-  //
-  // Every other write site stopped recording `section`. This one has not, and
-  // the reason is an OLD CLIENT reading a browser project: a scene's path there
-  // is its bare id, so a section-less row hits the pre-plan-736 path heuristic,
-  // comes back `'library'`, and gets routed down the blob branch of that
-  // client's `writeDocumentClassification` and out of its adopt filter. That is
-  // a storage-routing failure, not a badge problem.
-  //
-  // Removing it is an explicit, separate step, gated on the slow delivery
-  // channels (ctrlX snap, CONNECT-embedded appliances) carrying a client that
-  // no longer reads the field. The first section-less row written into a user's
-  // browser storage is the point of no return, and it belongs behind that gate.
-  return { ...entry, id, name, path: entry.path, section: 'scenes' };
-}
-
-/**
- * Lift a legacy `models[]` / `library[]` entry into a document.
+ * which the whole forward-compatibility contract of this manifest rests. A
+ * delivered `section` therefore still round-trips (§F4): it is never written,
+ * and never actively removed either.
  *
- * `name` follows the same precedence the scene branch has always had (own name
- * first, derived second) since plan-717: once every file carries an authored
- * row, the row's name is a user decision and re-deriving it from the filename
- * would silently undo a rename. For an entry that has no name — a bare
- * `{ path }` straight off a folder scan — nothing changes.
+ * `name` precedence is own-name-first, derived second (plan-717): once every
+ * file carries an authored row, the row's name is a user decision and
+ * re-deriving it from the filename would silently undo a rename.
  */
-export function documentOfAssetEntry(
-  entry: RvProjectAssetEntry,
-  _section: Exclude<DocumentSection, 'scenes'>,
+export function documentOfEntry(
+  entry: RvProjectAssetEntry | RvProjectSceneEntry,
   mintId: (entry: { path: string }) => string = e => stableDocumentId(e.path),
 ): RvDocumentEntry {
-  const id = typeof entry.id === 'string' && entry.id.trim() !== '' ? entry.id : mintId(entry);
+  const id = typeof entry.id === 'string' && entry.id.trim() !== ''
+    ? entry.id
+    : mintId(entry as { path: string });
   const own = typeof entry.name === 'string' ? entry.name.trim() : '';
-  // `_section` says which legacy ARRAY the entry was lifted out of. It is not
-  // written to the row any more (plan-736 F3): a `models[]`/`library[]` entry
-  // carries a real `models/`/`library/` path, so the row would only be
-  // restating its own path. The parameter stays because the caller genuinely
-  // has the information and a later migration may need it again — unlike the
-  // scene branch above, this one needs no transitional stamp, because a path
-  // with a folder in it is legible to an old client's heuristic.
-  return { ...entry, id, name: own !== '' ? own : assetNameOf(entry), path: entry.path };
+  const asAsset = entry as unknown as RvProjectAssetEntry;
+  return { ...entry, id, name: own !== '' ? own : assetNameOf(asAsset), path: entry.path };
 }
 
 // ─── Fingerprints ───────────────────────────────────────────────────────
@@ -378,38 +365,27 @@ function fileNameOf(path: unknown): string {
   return text.split(/[\\/]/).filter(Boolean).pop() ?? '';
 }
 
-/** Every document of one section, in manifest order. */
+/**
+ * Every document of one section, in manifest order — **Legacy-v1 only**
+ * (plan-744 F3).
+ *
+ * Module-private on purpose. It is the last reader of {@link sectionOfDocument}
+ * and exists for one caller, {@link withDerivedDocuments}, which has to keep
+ * understanding `scenes[]`/`models[]`/`library[]` or an unmigrated customer
+ * manifest loses its documents. Every LIVE lookup asks the real question
+ * instead — `documentsOf(project).find(d => d.id === …)` for an identity, a
+ * path predicate for a place.
+ *
+ * The three section-shaped projections that used to sit here
+ * (`sceneDocumentsOf`, `assetDocumentsOf`) are gone with their callers: a
+ * browser scene's path is its bare id, so once nothing stamps `section` they
+ * answered "no scenes" for exactly the projects that have them.
+ */
 export function documentsInSection(
   project: RvProject | null | undefined,
   section: DocumentSection,
 ): RvDocumentEntry[] {
   return documentsOf(project).filter(doc => sectionOfDocument(doc) === section);
-}
-
-/**
- * The scene documents of a project, typed as the scene entries every consumer
- * downstream still speaks.
- *
- * A **projection, not a mirror** — computed here, at the read, out of the one
- * list, and never written anywhere. The cast is sound rather than convenient:
- * `RvDocumentEntry` requires `id`, `name` and `path`, which is exactly what
- * `RvProjectSceneEntry` requires, and both carry the same index signature. The
- * extra fields a document has (`classification`, `section`) travel along, which
- * is what lets a consumer that has learnt about them use them without a second
- * lookup.
- */
-export function sceneDocumentsOf(
-  project: RvProject | null | undefined,
-): RvProjectSceneEntry[] {
-  return documentsInSection(project, 'scenes') as unknown as RvProjectSceneEntry[];
-}
-
-/** The `models[]` / `library[]` documents of a project, as asset entries. */
-export function assetDocumentsOf(
-  project: RvProject | null | undefined,
-  section: Exclude<DocumentSection, 'scenes'>,
-): RvProjectAssetEntry[] {
-  return documentsInSection(project, section) as unknown as RvProjectAssetEntry[];
 }
 
 /**
@@ -469,15 +445,26 @@ export function withoutLegacyArrays(project: RvProject): RvProject {
 // ─── Display list (backend listing) ─────────────────────────────────────
 
 /**
- * The list a backend hands out, built from what it actually has.
+ * `scenes[]` + `models[]` + `library[]` → `documents[]` — **Legacy-v1 only**
+ * (plan-744 F1/F2).
  *
- * Not the same thing as the manifest's `documents[]`, and the difference is
- * deliberate. A folder project is **folder-driven** for models and library —
- * dropping `Machine.glb` into `models/` *is* the act of adding it — so the
- * listing has to start from the files and use the manifest as a metadata
- * overlay. The manifest's `documents[]`, by contrast, is derived from and
- * mirrored back into the manifest arrays only, so a folder scan never rewrites
- * a customer's `project.json` with fifty entries it never asked for.
+ * It used to be "the list a backend hands out", and every backend went through
+ * it: the folder one bucketed its scan back into three arrays first, the
+ * bundled one filtered its manifest into two. That was the folder layout acting
+ * as a type system through the back door, and it is gone — a backend builds its
+ * rows directly with {@link documentOfEntry}, because a scan produces rows, not
+ * sections.
+ *
+ * What remains is the reason this function was written in the first place:
+ * {@link withDerivedDocuments} has to keep reading an unmigrated manifest's
+ * three arrays, or a customer who has not opened their project since plan-413
+ * loses every document in it. The array a row came out of no longer changes
+ * what the row looks like (nothing stamps `section`), so the three are merged
+ * in a fixed order and nothing else about them survives.
+ *
+ * Exported for {@link withDerivedDocuments}'s characterization tests only.
+ * `tests/listing-removal-guard.test.ts` pins that no other `src/` module
+ * calls it.
  */
 export function documentsFromLists(
   lists: {
@@ -495,16 +482,10 @@ export function documentsFromLists(
   }
 
   const out: RvDocumentEntry[] = [];
-  for (const entry of lists.scenes ?? []) {
-    if (!entry || typeof entry.path !== 'string') continue;
-    const base = documentOfSceneEntry(entry, mintId);
-    const known = overlay.get(documentKeyOf(entry));
-    out.push(known ? { ...known, ...base, classification: known.classification } : base);
-  }
-  for (const section of ['models', 'library'] as const) {
+  for (const section of LEGACY_DOCUMENT_ARRAYS) {
     for (const entry of lists[section] ?? []) {
       if (!entry || typeof entry.path !== 'string') continue;
-      const base = documentOfAssetEntry(entry, section, mintId);
+      const base = documentOfEntry(entry, mintId);
       const known = overlay.get(documentKeyOf(entry));
       out.push(known ? { ...known, ...base, classification: known.classification } : base);
     }
@@ -607,6 +588,92 @@ export async function reconcileClassificationCache(
   return { documents: out, read, changed };
 }
 
+/** Everything the byte scan reads out of the default scene's extras, in one pass. */
+export interface SceneExtrasOfFile {
+  classification: DocumentClassification | null;
+  /** plan-506 — the document's summary and Markdown description. */
+  documentInfo: DocumentInfo | null;
+}
+
+/** The scan generation {@link reconcileSceneExtrasCache} stamps (plan-506 F13). */
+export const EXTRAS_SCAN_GENERATION = 2 as const;
+
+/**
+ * Bring BOTH scene-extras caches — `classification` and `documentInfo` — back
+ * in line with the files, reading each changed GLB's JSON chunk once
+ * (plan-506 §2.1, the successor of {@link reconcileClassificationCache} on the
+ * open path).
+ *
+ * Three rules on top of the two §2.5 rules of the classification scan:
+ *
+ *  1. **The pre-filter trusts only a row that says what scanned it.** A row's
+ *     stats may have been recorded by the classification-only scan, which never
+ *     looked at `DocumentInfo`. Skipping such a row would hide a description
+ *     forever, so the pre-filter clears only when `extrasScan === 2` (F13).
+ *     Everything else is read once more — header only, never the BIN tail.
+ *  2. **After a read the file's block is taken WHOLE.** Not compared with an
+ *     `equals` that ignores the stamps and then kept: a block re-saved with the
+ *     same words and a newer `updatedAt` must reach the cache, or the stamp in
+ *     the row would be older than the stats beside it (SOL R1-6). Absence in
+ *     the file deletes the cached block.
+ *  3. **`changed` reports text OR stamp changes** of either key, so the caller
+ *     can tell a publish from a no-op.
+ */
+export async function reconcileSceneExtrasCache(
+  documents: readonly RvDocumentEntry[],
+  seams: {
+    stats: readonly DocumentStat[];
+    readExtras: (path: string) => Promise<SceneExtrasOfFile | null>;
+  },
+): Promise<ClassificationScanResult> {
+  const statByPath = new Map<string, DocumentStat>();
+  for (const s of seams.stats) if (s && typeof s.path === 'string') statByPath.set(s.path, s);
+
+  const out: RvDocumentEntry[] = [];
+  const read: string[] = [];
+  const changed: string[] = [];
+
+  for (const doc of documents) {
+    const stat = statByPath.get(doc.path);
+    if (!stat) {
+      // Not scannable (bundled/HTTP, or a file the backend cannot stat): the
+      // manifest is authoritative there by definition.
+      out.push(doc);
+      continue;
+    }
+    const shaKnown = !!stat.sha256 && doc.sha256 === stat.sha256;
+    const sizeKnown = typeof doc.sizeBytes === 'number' && doc.sizeBytes === stat.size;
+    const mtimeKnown = typeof doc.mtimeMs === 'number' && stat.mtime !== undefined
+      && doc.mtimeMs === stat.mtime;
+    if (doc.extrasScan === EXTRAS_SCAN_GENERATION && (shaKnown || (sizeKnown && mtimeKnown))) {
+      out.push(doc);
+      continue;
+    }
+
+    read.push(doc.path);
+    const fromFile = await seams.readExtras(doc.path).catch(() => null);
+    const classification = fromFile?.classification ?? null;
+    const documentInfo = fromFile?.documentInfo ?? null;
+    const next: RvDocumentEntry = { ...doc, sizeBytes: stat.size, extrasScan: EXTRAS_SCAN_GENERATION };
+    if (stat.mtime !== undefined) next.mtimeMs = stat.mtime;
+    if (stat.sha256 !== undefined) next.sha256 = stat.sha256;
+    let differs = false;
+    if (!classificationEquals(doc.classification, classification)) {
+      if (classification) next.classification = classification;
+      else delete next.classification;
+      differs = true;
+    }
+    // Rule 2: taken whole, whatever the comparison says.
+    if (documentInfo) next.documentInfo = documentInfo;
+    else delete next.documentInfo;
+    if (!documentInfoCacheEquals(doc.documentInfo, documentInfo)) differs = true;
+    if (differs) changed.push(doc.path);
+    out.push(next);
+  }
+
+  return { documents: out, read, changed };
+}
+
 /**
  * Read a classification out of a parsed glTF JSON chunk.
  *
@@ -625,6 +692,24 @@ export function classificationOfGltfJson(json: unknown): DocumentClassification 
 }
 
 /**
+ * Read every scene-extras block the scan caches out of a parsed glTF JSON
+ * chunk — the canonical default scene (`json.scene ?? 0`) resolved once for
+ * both keys.
+ */
+export function sceneExtrasOfGltfJson(json: unknown): SceneExtrasOfFile {
+  if (!json || typeof json !== 'object') return { classification: null, documentInfo: null };
+  const doc = json as { scene?: unknown; scenes?: unknown };
+  const scenes = Array.isArray(doc.scenes) ? doc.scenes : [];
+  const index = typeof doc.scene === 'number' ? doc.scene : 0;
+  const scene = scenes[index] as { extras?: unknown } | undefined;
+  const extras = scene?.extras as { realvirtual?: unknown } | undefined;
+  return {
+    classification: parseClassification(extras?.realvirtual),
+    documentInfo: parseDocumentInfo(extras?.realvirtual),
+  };
+}
+
+/**
  * Read a classification out of a GLB **without reading the GLB**.
  *
  * Two slices, twenty bytes and then the JSON chunk — the BIN tail, which is all
@@ -639,6 +724,18 @@ export function classificationOfGltfJson(json: unknown): DocumentClassification 
 export async function classificationOfGlbBlob(
   blob: Blob,
 ): Promise<DocumentClassification | null> {
+  return (await sceneExtrasOfGlbBlob(blob))?.classification ?? null;
+}
+
+/**
+ * Read Classification AND DocumentInfo out of a GLB with ONE header-only slice
+ * pair (plan-506 §2.1, risk 5.2) — the twenty-byte header, then the JSON chunk;
+ * the BIN tail is never touched. {@link classificationOfGlbBlob} is the
+ * one-key view of this for its existing importers.
+ *
+ * `null` for anything that is not a (complete) GLB — never an exception.
+ */
+export async function sceneExtrasOfGlbBlob(blob: Blob): Promise<SceneExtrasOfFile | null> {
   try {
     const head = new DataView(await blob.slice(0, 20).arrayBuffer());
     if (head.byteLength < 20) return null;
@@ -647,7 +744,7 @@ export async function classificationOfGlbBlob(
     if (head.getUint32(16, true) !== 0x4e4f534a) return null;      // 'JSON'
     if (jsonLength <= 0 || jsonLength > 64 * 1024 * 1024) return null;
     const bytes = await blob.slice(20, 20 + jsonLength).arrayBuffer();
-    return classificationOfGltfJson(JSON.parse(new TextDecoder().decode(bytes)));
+    return sceneExtrasOfGltfJson(JSON.parse(new TextDecoder().decode(bytes)));
   } catch {
     return null;
   }

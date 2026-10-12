@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Object3D } from 'three';
+// Production capability registrations (side effects): Drive, Sensor, TransportSurface.
+import '../src/core/engine/rv-drive';
+import '../src/core/engine/rv-sensor';
+import '../src/core/engine/rv-transport-surface';
 import {
-  applyLazyInjection,
-  buildTree,
-  buildStructureTree,
+
+
+
   computeAncestors,
-  countNodes,
-  filterTree,
+
+
   flattenTree,
   flattenVisibleTree,
-  matchesTypeFilter,
+  matchesFilter,
+  migrateLegacyFilter,
+  parseFilterId,
   sortSignalNodes,
-  visibleTreePaths,
+
   splitTypes,
   isSignalType,
   isBoolSignal,
@@ -40,245 +46,6 @@ import type { StepStateInfo } from '../src/core/engine/rv-logic-engine';
 function info(path: string, types: string[] = []): EditableNodeInfo {
   return { path, types } as EditableNodeInfo;
 }
-
-// ── buildTree ──────────────────────────────────────────────────────────────
-
-describe('buildTree', () => {
-  it('returns empty array on empty input', () => {
-    expect(buildTree([], null)).toEqual([]);
-  });
-
-  it('builds nested tree from path strings', () => {
-    const tree = buildTree([
-      info('Robot/Base'),
-      info('Robot/Arm/Joint1'),
-      info('Robot/Arm/Joint2'),
-    ], null);
-    // The wrapper-flatten rule strips a single typeless root child
-    // ('Robot' has children but no types — flattening unwraps it).
-    // So the top-level becomes [Base, Arm] not [Robot].
-    expect(tree.map(n => n.name)).toEqual(['Base', 'Arm']);
-    const arm = tree.find(n => n.name === 'Arm')!;
-    expect(arm.children.map(c => c.name)).toEqual(['Joint1', 'Joint2']);
-  });
-
-  it('keeps a single typed root node (does not flatten if it has types)', () => {
-    const tree = buildTree([
-      info('Top', ['Drive']),
-      info('Top/Child'),
-    ], null);
-    expect(tree.length).toBe(1);
-    expect(tree[0].name).toBe('Top');
-    expect(tree[0].types).toEqual(['Drive']);
-  });
-
-  it('flattens GLB wrapper: single typeless root with children', () => {
-    const tree = buildTree([
-      info('Wrapper/A', ['Drive']),
-      info('Wrapper/B', ['Sensor']),
-    ], null);
-    // 'Wrapper' has no types and a single child — flattened away
-    expect(tree.map(n => n.name)).toEqual(['A', 'B']);
-  });
-
-  it('marks hasOverrides when overlay covers a path', () => {
-    const overlay = { nodes: { 'Foo/Bar': {} } } as unknown as RVExtrasOverlay;
-    const tree = buildTree([
-      info('Foo/Bar', ['Drive']),
-      info('Foo/Baz', ['Sensor']),
-    ], overlay);
-    const bar = tree.find(n => n.name === 'Bar')!;
-    const baz = tree.find(n => n.name === 'Baz')!;
-    expect(bar.hasOverrides).toBe(true);
-    expect(baz.hasOverrides).toBe(false);
-  });
-
-  it('preserves insertion order of siblings', () => {
-    const tree = buildTree([
-      info('Root/Z'),
-      info('Root/A'),
-      info('Root/M'),
-    ], null);
-    expect(tree.map(n => n.name)).toEqual(['Z', 'A', 'M']);
-  });
-
-  // ── Model root row (plan-715) ────────────────────────────────────────────
-  //
-  // Passing `modelRoot` stops the wrapper-collapse at level 1 for the ROOT only.
-  // The legacy 2-arg call must keep flattening exactly as the tests above expect,
-  // which is what lets both behaviours live in one function.
-  describe('with model root', () => {
-    it('keeps the model root as the single top-level row', () => {
-      const tree = buildStructureTree([
-        info('Robot/Base'),
-        info('Robot/Arm/Joint1'),
-        info('Robot/Arm/Joint2'),
-      ], null, { rootPath: 'Robot' });
-      expect(tree.map(n => n.name)).toEqual(['Robot']);
-      expect(tree[0].isModelRoot).toBe(true);
-      expect(tree[0].children.map(n => n.name)).toEqual(['Base', 'Arm']);
-    });
-
-    it('carries the display label without touching the node name', () => {
-      const tree = buildStructureTree([info('Robot/Base')], null, {
-        rootPath: 'Robot', label: 'Welding Cell',
-      });
-      expect(tree[0].name).toBe('Robot');       // path space is untouched
-      expect(tree[0].displayLabel).toBe('Welding Cell');
-    });
-
-    it('stops the collapse AT the root — the chain below it stays intact', () => {
-      // The collapse was always a LEADING-chain rule, applied from the very top
-      // down; it never folded wrappers anywhere else in the tree. Stopping at
-      // the root therefore ends the chain there by construction, and W1/W2
-      // become ordinary rows under it. This is the whole behaviour change of
-      // plan-715, pinned so a future "make it recursive" is a deliberate act.
-      const tree = buildStructureTree([
-        info('Robot/W1/W2/Leaf', ['Drive']),
-      ], null, { rootPath: 'Robot' });
-      expect(tree.map(n => n.name)).toEqual(['Robot']);
-      expect(tree[0].children.map(n => n.name)).toEqual(['W1']);
-      expect(tree[0].children[0].children[0].children[0].types).toEqual(['Drive']);
-    });
-
-    it('still collapses the leading chain when the top row is NOT the model root', () => {
-      // The override scan ("Runtime view") and every legacy caller land here —
-      // the collapse must keep working untouched for them.
-      const tree = buildStructureTree([
-        info('W1/W2/Leaf', ['Drive']),
-      ], null, { rootPath: 'SomeOtherRoot' });
-      expect(tree.map(n => n.name)).toEqual(['Leaf']);
-    });
-
-    it('keeps _layoutRoot content as a separate top-level group, never merged into the root row', () => {
-      const tree = buildStructureTree([
-        info('Robot/Base', ['Drive']),
-        info('_layoutRoot/Conveyor', ['LayoutObject']),
-      ], null, { rootPath: 'Robot' });
-      expect(tree.map(n => n.name)).toEqual(['Robot', '_layoutRoot']);
-      expect(tree[0].isModelRoot).toBe(true);
-      expect(tree[1].isModelRoot).toBeUndefined();
-    });
-
-    it('tags nothing when the root path is not among the top-level rows', () => {
-      const tree = buildStructureTree([info('Other/Base')], null, { rootPath: 'Robot' });
-      expect(tree.every(n => !n.isModelRoot)).toBe(true);
-    });
-
-    it('behaves exactly as the 2-arg call when no root info is passed', () => {
-      const nodes = [info('Robot/Base'), info('Robot/Arm/Joint1')];
-      expect(buildStructureTree(nodes, null, null))
-        .toEqual(buildStructureTree(nodes, null));
-      expect(buildStructureTree(nodes, null, undefined).map(n => n.name))
-        .toEqual(['Base', 'Arm']);
-    });
-  });
-
-  it('handles deeply nested paths (single-child typeless wrappers are flattened)', () => {
-    // Inserting a single leaf "A/B/C/D/E/F" produces a chain of single-child typeless
-    // wrappers — the wrapper-flatten rule unwraps them all and the result is just [F].
-    const tree = buildTree([
-      info('A/B/C/D/E/F', ['Drive']),
-    ], null);
-    expect(tree.length).toBe(1);
-    expect(tree[0].name).toBe('F');
-    expect(tree[0].types).toEqual(['Drive']);
-  });
-
-  it('preserves intermediate typeless nodes when they have multiple children', () => {
-    const tree = buildTree([
-      info('A/B/C/leaf1', ['Drive']),
-      info('A/B/C/leaf2', ['Sensor']),
-    ], null);
-    // A, B, C are typeless single-child wrappers but C has 2 children, so flattening
-    // stops at the multi-child level. Result top-level is [leaf1, leaf2].
-    expect(tree.map(n => n.name)).toEqual(['leaf1', 'leaf2']);
-  });
-
-  it('LayoutObject lazy-inject: a nested Drive node with Three.js descendants shows an expand caret', () => {
-    // Reproduces the turntable bug: Drive-Rot-Y (under a LayoutObject) had
-    // Three.js children (Transport-Z, Snap-*, ...) but no canExpandLazy flag,
-    // so the user couldn't open it to see them.
-    const turntableRoot = new Object3D(); turntableRoot.name = 'Turntable';
-    turntableRoot.userData.realvirtual = { LayoutObject: {}, } as Record<string, unknown>;
-    const driveNode = new Object3D(); driveNode.name = 'Drive-Rot-Y';
-    driveNode.userData.realvirtual = { Drive: {} } as Record<string, unknown>;
-    turntableRoot.add(driveNode);
-    const transport = new Object3D(); transport.name = 'Transport-Z'; driveNode.add(transport);
-    const snap = new Object3D(); snap.name = 'Snap-ZP-x'; driveNode.add(snap);
-
-    const mockViewer = {
-      registry: {
-        getNode: (path: string) => path === 'Turntable' ? turntableRoot : null,
-        registerNode: () => { /* no-op for the test */ },
-      },
-    } as unknown as Parameters<typeof buildTree>[2];
-
-    const tree = buildTree(
-      [info('Turntable', ['LayoutObject'])],
-      null,
-      mockViewer,
-      new Set(['Turntable']),   // LayoutObject expanded, Drive-Rot-Y NOT expanded
-    );
-
-    expect(tree).toHaveLength(1);
-    const tt = tree[0];
-    expect(tt.name).toBe('Turntable');
-    const drive = tt.children.find(c => c.name === 'Drive-Rot-Y');
-    expect(drive).toBeDefined();
-    expect(drive!.children).toEqual([]);                 // not yet injected
-    expect(drive!.canExpandLazy).toBe(true);             // but a caret should show
-  });
-
-  it('LayoutObject lazy-inject: a leaf Three.js child without descendants stays non-expandable', () => {
-    const root = new Object3D(); root.name = 'Asset';
-    root.userData.realvirtual = { LayoutObject: {} } as Record<string, unknown>;
-    const leaf = new Object3D(); leaf.name = 'Plain'; root.add(leaf);    // no own children
-    const mockViewer = {
-      registry: { getNode: (path: string) => path === 'Asset' ? root : null, registerNode: () => {} },
-    } as unknown as Parameters<typeof buildTree>[2];
-    const tree = buildTree([info('Asset', ['LayoutObject'])], null, mockViewer, new Set(['Asset']));
-    const plain = tree[0].children.find(c => c.name === 'Plain')!;
-    expect(plain.canExpandLazy).toBeUndefined();
-  });
-
-  // ── plan-200 §9.4: snap marker skip + readable snap label ──────────────
-  it('does NOT inject the _rvGizmo snap-marker sprite as a hierarchy child (A1)', () => {
-    const root = new Object3D(); root.name = 'Conv';
-    root.userData.realvirtual = { LayoutObject: {} } as Record<string, unknown>;
-    const snap = new Object3D(); snap.name = 'Snap-ZN-convroll'; root.add(snap);
-    // The marker sprite is parented to the snap Empty (attachToNode) and tagged.
-    const marker = new Object3D(); marker.userData._rvGizmo = true; snap.add(marker);
-
-    const mockViewer = {
-      registry: { getNode: (p: string) => (p === 'Conv' ? root : null), registerNode: () => {} },
-    } as unknown as Parameters<typeof buildTree>[2];
-
-    // Expand both the LayoutObject and the snap Empty so injection would reach
-    // the marker if it weren't skipped.
-    const tree = buildTree([info('Conv', ['LayoutObject'])], null, mockViewer, new Set(['Conv', 'Conv/Snap-ZN-convroll']));
-    const snapNode = tree[0].children.find(c => c.path === 'Conv/Snap-ZN-convroll');
-    expect(snapNode).toBeDefined();
-    // The UUID-marker node must NOT appear under the snap.
-    expect(snapNode!.children).toEqual([]);
-    expect(snapNode!.canExpandLazy).toBeUndefined();
-  });
-
-  it('gives a snap Empty a readable label, keeping the real path (A2)', () => {
-    const root = new Object3D(); root.name = 'Conv';
-    root.userData.realvirtual = { LayoutObject: {} } as Record<string, unknown>;
-    const snap = new Object3D(); snap.name = 'Snap-ZN-convroll'; root.add(snap);
-    const mockViewer = {
-      registry: { getNode: (p: string) => (p === 'Conv' ? root : null), registerNode: () => {} },
-    } as unknown as Parameters<typeof buildTree>[2];
-    const tree = buildTree([info('Conv', ['LayoutObject'])], null, mockViewer, new Set(['Conv']));
-    const snapNode = tree[0].children.find(c => c.path === 'Conv/Snap-ZN-convroll')!;
-    expect(snapNode.name).toBe('Snap in (Z) · convroll');     // readable label
-    expect(snapNode.path).toBe('Conv/Snap-ZN-convroll');      // real path unchanged
-  });
-});
-
-// ── snapLabel ────────────────────────────────────────────────────────────
 
 describe('snapLabel (plan-200 A2)', () => {
   it('maps the sign letter to flow and keeps axis + typeId', () => {
@@ -360,13 +127,6 @@ describe('flattenVisibleTree', () => {
       .toEqual([0, 1, 2, 1, 0]);
   });
 
-  it('includes canExpandLazy nodes as single rows when not expanded', () => {
-    const lazy: TreeNode[] = [
-      { name: 'CAD', path: 'CAD', types: ['CADLink'], hasOverrides: false, children: [], canExpandLazy: true },
-    ];
-    expect(flattenVisibleTree(lazy, new Set()).map((row) => row.node.path)).toEqual(['CAD']);
-  });
-
   it('renders path-less group rows and derives unique rowKeys for duplicate names', () => {
     const groups: TreeNode[] = [
       { name: 'Group', path: null, types: [], hasOverrides: false, children: [] },
@@ -388,151 +148,86 @@ describe('flattenVisibleTree', () => {
       ]);
   });
 
-  it('matches visibleTreePaths order for path-bearing rows', () => {
-    const expanded = new Set(['A', 'A/A1']);
-    const rowPaths = flattenVisibleTree(tree, expanded)
-      .filter((row) => row.node.path)
-      .map((row) => row.node.path);
-    expect(rowPaths).toEqual(visibleTreePaths(tree, expanded));
-  });
-});
-
-describe('structure cache', () => {
-  function lazyFixture() {
-    const layout = new Object3D();
-    layout.name = 'Layout';
-    const rawChild = new Object3D();
-    rawChild.name = 'RawChild';
-    layout.add(rawChild);
-    const viewer = {
-      registry: {
-        getNode: (path: string) => path === 'Layout' ? layout : null,
-        registerNode: () => {},
-      },
-    } as unknown as Parameters<typeof applyLazyInjection>[1];
-    const nodes = [info('Layout', ['LayoutObject']), info('Other', ['Drive'])];
-    return { layout, viewer, nodes };
-  }
-
-  it('expand toggle does not rebuild the structural tree and preserves unaffected branch identity', () => {
-    const { viewer, nodes } = lazyFixture();
-    const structure = buildStructureTree(nodes, null);
-    const collapsed = applyLazyInjection(structure, viewer, new Set(), null);
-    const expanded = applyLazyInjection(structure, viewer, new Set(['Layout']), null);
-    expect(collapsed[1]).toBe(structure[1]);
-    expect(expanded[1]).toBe(structure[1]);
-    expect(structure[0].children).toEqual([]);
-  });
-
-  it('lazy injection under expanded LayoutObject matches the buildTree facade', () => {
-    const { viewer, nodes } = lazyFixture();
-    const structure = buildStructureTree(nodes, null);
-    expect(applyLazyInjection(structure, viewer, new Set(['Layout']), null))
-      .toEqual(buildTree(nodes, null, viewer, new Set(['Layout'])));
-  });
-
-  it('search cannot see raw children of collapsed LayoutObject', () => {
-    const { viewer, nodes } = lazyFixture();
-    const structure = buildStructureTree(nodes, null);
-    const collapsed = applyLazyInjection(structure, viewer, new Set(), null);
-    expect(filterTree(collapsed, 'RawChild')).toEqual([]);
-  });
-
-  it('search finds raw children of expanded LayoutObject', () => {
-    const { viewer, nodes } = lazyFixture();
-    const structure = buildStructureTree(nodes, null);
-    const expanded = applyLazyInjection(structure, viewer, new Set(['Layout']), null);
-    expect(flattenTree(filterTree(expanded, 'RawChild')).some((row) => row.node.name === 'RawChild')).toBe(true);
-  });
-});
-
-// ── visibleTreePaths (Shift-range selection order) ─────────────────────────
-
-describe('visibleTreePaths', () => {
-  const t: TreeNode[] = [
-    {
-      name: 'A', path: 'A', types: [], hasOverrides: false,
-      children: [
-        { name: 'A1', path: 'A/A1', types: [], hasOverrides: false, children: [
-          { name: 'A1a', path: 'A/A1/A1a', types: [], hasOverrides: false, children: [] },
-        ] },
-        { name: 'A2', path: 'A/A2', types: [], hasOverrides: false, children: [] },
-      ],
-    },
-    { name: 'B', path: 'B', types: [], hasOverrides: false, children: [] },
-  ];
-
-  it('collapsed parents hide their descendants', () => {
-    expect(visibleTreePaths(t, new Set())).toEqual(['A', 'B']);
-  });
-
-  it('expanded chain is included in DFS render order', () => {
-    expect(visibleTreePaths(t, new Set(['A', 'A/A1']))).toEqual(
-      ['A', 'A/A1', 'A/A1/A1a', 'A/A2', 'B'],
-    );
-    // Expanding only the parent leaves grandchildren hidden.
-    expect(visibleTreePaths(t, new Set(['A']))).toEqual(['A', 'A/A1', 'A/A2', 'B']);
-  });
-
-  it('canExpandLazy node without expansion contributes just itself', () => {
-    const lazy: TreeNode[] = [
-      { name: 'Cad', path: 'Cad', types: ['CADLink'], hasOverrides: false, children: [], canExpandLazy: true },
-    ];
-    expect(visibleTreePaths(lazy, new Set())).toEqual(['Cad']);
-  });
-
-  it('path-less group rows use their name as expand key and are not listed', () => {
-    const grouped: TreeNode[] = [
+  it('honours an explicit expandKey and hasChildren (plan-754 scene rows)', () => {
+    // The scene hierarchy keys expansion on `Object3D.uuid` and reports
+    // `hasChildren` explicitly, because a collapsed row's children array is
+    // empty by design — the walk never entered it.
+    const scene: TreeNode[] = [
       {
-        name: 'Group', path: null, types: [], hasOverrides: false,
-        children: [{ name: 'C', path: 'Group/C', types: [], hasOverrides: false, children: [] }],
+        name: 'Robot', path: 'Robot', types: [], hasOverrides: false,
+        children: [{ name: 'A1', path: 'Robot/A1', types: ['Drive'], hasOverrides: false, children: [] }],
+        expandKey: 'uuid-robot', hasChildren: true,
       },
     ];
-    expect(visibleTreePaths(grouped, new Set())).toEqual([]);
-    expect(visibleTreePaths(grouped, new Set(['Group']))).toEqual(['Group/C']);
+    expect(flattenVisibleTree(scene, new Set(['Robot'])).map((r) => r.node.name)).toEqual(['Robot']);
+    expect(flattenVisibleTree(scene, new Set(['uuid-robot'])).map((r) => r.node.name)).toEqual(['Robot', 'A1']);
   });
 });
 
-// ── matchesTypeFilter ──────────────────────────────────────────────────────
+// ── Category filter id (plan-597 §9.3) ─────────────────────────────────────
 
-describe('matchesTypeFilter', () => {
+describe('migrateLegacyFilter', () => {
+  it('migrates the pre-597 ids to their category', () => {
+    expect(migrateLegacyFilter('drives')).toBe('cat:drives');
+    expect(migrateLegacyFilter('sensors')).toBe('cat:sensors');
+    expect(migrateLegacyFilter('signals')).toBe('cat:signals');
+    expect(migrateLegacyFilter('logic')).toBe('cat:logic');
+  });
+
+  it('turns null, garbage and unknown categories into all', () => {
+    expect(migrateLegacyFilter(null)).toBe('all');
+    expect(migrateLegacyFilter('')).toBe('all');
+    expect(migrateLegacyFilter('garbage')).toBe('all');
+    expect(migrateLegacyFilter('cat:')).toBe('all');
+    expect(migrateLegacyFilter('cat:custom')).toBe('all');
+  });
+
+  it('keeps a valid category and category/label id', () => {
+    expect(migrateLegacyFilter('all')).toBe('all');
+    expect(migrateLegacyFilter('cat:transport')).toBe('cat:transport');
+    expect(migrateLegacyFilter('cat:transport/Conveyors')).toBe('cat:transport/Conveyors');
+  });
+});
+
+describe('parseFilterId', () => {
+  it('splits category and a label with spaces', () => {
+    expect(parseFilterId('cat:transport/Web handling')).toEqual({ category: 'transport', label: 'Web handling' });
+  });
+  it('keeps a slash inside the label', () => {
+    expect(parseFilterId('cat:other/A/B')).toEqual({ category: 'other', label: 'A/B' });
+  });
+  it('answers null/null for all and a category without label', () => {
+    expect(parseFilterId('all')).toEqual({ category: null, label: null });
+    expect(parseFilterId('cat:drives')).toEqual({ category: 'drives', label: null });
+  });
+});
+
+describe('matchesFilter', () => {
   it('"all" matches everything', () => {
-    expect(matchesTypeFilter([], 'all')).toBe(true);
-    expect(matchesTypeFilter(['Drive'], 'all')).toBe(true);
-    expect(matchesTypeFilter(['Anything'], 'all')).toBe(true);
+    expect(matchesFilter([], 'all')).toBe(true);
+    expect(matchesFilter(['Anything'], 'all')).toBe(true);
   });
 
-  it('"drives" matches Drive and Drive_* but not Sensor', () => {
-    expect(matchesTypeFilter(['Drive'], 'drives')).toBe(true);
-    expect(matchesTypeFilter(['Drive_Linear'], 'drives')).toBe(true);
-    expect(matchesTypeFilter(['Sensor'], 'drives')).toBe(false);
+  it('matches by category and by label', () => {
+    expect(matchesFilter(['TransportSurface'], 'cat:transport')).toBe(true);
+    expect(matchesFilter(['TransportSurface'], 'cat:transport/Conveyors')).toBe(true);
+    expect(matchesFilter(['TransportSurface'], 'cat:transport/Chains')).toBe(false);
   });
 
-  it('"sensors" matches Sensor and WebSensor only', () => {
-    expect(matchesTypeFilter(['Sensor'], 'sensors')).toBe(true);
-    expect(matchesTypeFilter(['WebSensor'], 'sensors')).toBe(true);
-    expect(matchesTypeFilter(['Sensor_Special'], 'sensors')).toBe(false);
-    expect(matchesTypeFilter(['Drive'], 'sensors')).toBe(false);
+  it('does not match an unregistered _Special variant', () => {
+    expect(matchesFilter(['Sensor_Special'], 'cat:sensors')).toBe(false);
   });
 
-  it('"signals" matches PLCInput* and PLCOutput*', () => {
-    expect(matchesTypeFilter(['PLCInputBool'], 'signals')).toBe(true);
-    expect(matchesTypeFilter(['PLCOutputFloat'], 'signals')).toBe(true);
-    expect(matchesTypeFilter(['Drive'], 'signals')).toBe(false);
+  it('matches when ANY type of the node is in the category', () => {
+    expect(matchesFilter(['Drive', 'Sensor'], 'cat:sensors')).toBe(true);
+    expect(matchesFilter(['Drive_Linear'], 'cat:drives')).toBe(true);
+    expect(matchesFilter(['PLCInputBool'], 'cat:signals/PLCInputBool')).toBe(true);
+    expect(matchesFilter(['LogicStep_Delay'], 'cat:logic')).toBe(true);
+    expect(matchesFilter(['LogicSteppy'], 'cat:logic')).toBe(false);
   });
 
-  it('"logic" matches LogicStep_*', () => {
-    expect(matchesTypeFilter(['LogicStep_Delay'], 'logic')).toBe(true);
-    expect(matchesTypeFilter(['LogicStep_SerialContainer'], 'logic')).toBe(true);
-    expect(matchesTypeFilter(['LogicSteppy'], 'logic')).toBe(false);
-    expect(matchesTypeFilter(['Drive'], 'logic')).toBe(false);
-  });
-
-  it('empty types array does not match specific filters', () => {
-    expect(matchesTypeFilter([], 'drives')).toBe(false);
-    expect(matchesTypeFilter([], 'sensors')).toBe(false);
-    expect(matchesTypeFilter([], 'signals')).toBe(false);
-    expect(matchesTypeFilter([], 'logic')).toBe(false);
+  it('an empty types array matches no category', () => {
+    expect(matchesFilter([], 'cat:drives')).toBe(false);
   });
 });
 
@@ -574,62 +269,6 @@ describe('sortSignalNodes', () => {
     expect(sortSignalNodes([], 'type')).toEqual([]);
   });
 });
-
-// ── filterTree ─────────────────────────────────────────────────────────────
-
-describe('filterTree', () => {
-  function mkTree(): TreeNode[] {
-    return [
-      {
-        name: 'Robot', path: 'Robot', types: [], hasOverrides: false,
-        children: [
-          { name: 'Arm', path: 'Robot/Arm', types: [], hasOverrides: false, children: [
-            { name: 'Joint1', path: 'Robot/Arm/Joint1', types: ['Drive'], hasOverrides: false, children: [] },
-            { name: 'Joint2', path: 'Robot/Arm/Joint2', types: ['Drive'], hasOverrides: false, children: [] },
-          ] },
-          { name: 'Gripper', path: 'Robot/Gripper', types: ['Sensor'], hasOverrides: false, children: [] },
-        ],
-      },
-    ];
-  }
-
-  it('returns full tree on empty term', () => {
-    const t = mkTree();
-    expect(filterTree(t, '')).toEqual(t);
-  });
-
-  it('keeps only matching leaf and its ancestors', () => {
-    const filtered = filterTree(mkTree(), 'Joint1');
-    expect(filtered[0].name).toBe('Robot');
-    expect(filtered[0].children[0].name).toBe('Arm');
-    expect(filtered[0].children[0].children.length).toBe(1);
-    expect(filtered[0].children[0].children[0].name).toBe('Joint1');
-  });
-
-  it('returns empty when no matches', () => {
-    expect(filterTree(mkTree(), 'totallyMissing')).toEqual([]);
-  });
-
-  it('matches case-insensitively', () => {
-    expect(filterTree(mkTree(), 'gripper').length).toBe(1);
-    expect(filterTree(mkTree(), 'GRIPPER').length).toBe(1);
-  });
-});
-
-// ── countNodes ─────────────────────────────────────────────────────────────
-
-describe('countNodes', () => {
-  it('counts total and overrides', () => {
-    const overlay = { nodes: { 'A': {}, 'B': {} } } as unknown as RVExtrasOverlay;
-    const nodes = [info('A'), info('B'), info('C')];
-    expect(countNodes(nodes, overlay)).toEqual({ total: 3, withOverrides: 2 });
-  });
-
-  it('reports zero overrides on null overlay', () => {
-    expect(countNodes([info('A')], null)).toEqual({ total: 1, withOverrides: 0 });
-  });
-});
-
 // ── computeAncestors ───────────────────────────────────────────────────────
 
 describe('computeAncestors', () => {

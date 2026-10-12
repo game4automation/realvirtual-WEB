@@ -17,7 +17,7 @@ import { isRotation } from '../src/core/engine/rv-coordinate-utils';
 import {
   resolveWorldAxis, perspectiveViewportWorldHeight, computeGizmoScale, minGizmoScale,
   GIZMO_MAX_SCREEN_FRAC, GIZMO_MIN_SCREEN_FRAC, GIZMO_DESIGN_HEIGHT,
-} from '../src/plugins/drive-axis-math';
+} from '../src/core/engine/drive-axis-math';
 
 function makeDrive(direction: DriveDirection, reverse = false): RVDrive {
   const drive = new RVDrive(new Object3D());

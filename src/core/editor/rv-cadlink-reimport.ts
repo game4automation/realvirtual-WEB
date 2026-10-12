@@ -28,6 +28,7 @@ import type { RVViewer } from '../rv-viewer';
 import type { AssetDocument } from './rv-asset-document';
 import { getCadProvider, cadFormatOfName } from './rv-cad-provider';
 import { parseGlbSubtree } from '../engine/rv-glb-parse';
+import { weldImportedGlb } from '../import/rv-glb-weld';
 import { assetOpHeader, type CADLinkExtras } from './rv-asset-ops';
 import { dedupeSiblingNames } from './rv-asset-executors';
 import { deepCloneJSON } from '../ops/rv-op-utils';
@@ -178,7 +179,17 @@ export async function reimportCad(
   let oldMap: Map<string, Object3D>;
   let newMap: Map<string, Object3D>;
   try {
-    ({ glb, cadlink } = await provider.importFile(file, quality));
+    // plan-561: re-convert with the converter the ORIGINAL was made with — browser and
+    // CONNECT build different trees, so switching would break the carry-over matching.
+    // Absent `Converter` = a pre-561 (browser) import. A CONNECT original without a
+    // gateway fails here with the provider's message instead of silently switching.
+    const oldCadlink = (oldRoot.userData?.realvirtual as Record<string, unknown> | undefined)?.['CADLink'] as
+      Partial<CADLinkExtras> | undefined;
+    const converter = oldCadlink?.Converter === 'connect' ? 'connect' : 'browser';
+    ({ glb, cadlink } = await provider.importFile(file, quality, { converter }));
+    // Weld before parsing, so the tree handed to `importCad` below comes from the
+    // very bytes it caches (its own weld of this buffer is then a no-op).
+    glb = weldImportedGlb(glb, cadlink.File);
     // Parse the converted GLB once: this tree is BOTH what we diff the old
     // revision against and what the document inserts (handed over via opts.root),
     // so the matching is done on exactly the nodes that end up in the scene.

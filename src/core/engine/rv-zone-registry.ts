@@ -43,6 +43,23 @@ interface ZoneState {
 export class ZoneRegistry {
   private readonly zones = new Map<string, ZoneState>();
   private readonly byHolder = new Map<string, Set<string>>();
+  /**
+   * Availability listeners (plan-558): notified on EVERY change that can let a
+   * waiting vehicle in — release, releaseAll, a capacity increase via
+   * define/redefine, undefine — so waiters are woken by a trigger instead of a
+   * poll. The movement authorities (DES + continuous) subscribe here.
+   */
+  private readonly availabilityListeners = new Set<(zoneId: string) => void>();
+
+  /** Subscribe to availability changes. Returns the unsubscribe function. */
+  onAvailabilityChanged(cb: (zoneId: string) => void): () => void {
+    this.availabilityListeners.add(cb);
+    return () => { this.availabilityListeners.delete(cb); };
+  }
+
+  private notifyAvailable(zoneId: string): void {
+    for (const cb of this.availabilityListeners) cb(zoneId);
+  }
 
   private zone(zoneId: string): ZoneState {
     let z = this.zones.get(zoneId);
@@ -63,7 +80,9 @@ export class ZoneRegistry {
     const z = this.zone(zoneId);
     if (capacity === undefined || !Number.isFinite(capacity)) return;
     const c = Math.max(0, Math.floor(capacity));
+    const before = z.capacity ?? DEFAULT_ZONE_CAPACITY;
     z.capacity = z.capacity === undefined ? c : Math.max(z.capacity, c);
+    if (z.capacity > before) this.notifyAvailable(zoneId);
   }
 
   /**
@@ -88,6 +107,7 @@ export class ZoneRegistry {
       capacity === undefined || !Number.isFinite(capacity)
         ? undefined
         : Math.max(0, Math.floor(capacity));
+    this.notifyAvailable(zoneId);
   }
 
   /** Drop a zone entirely (definition AND holders) — model-cleared path dispose. */
@@ -96,6 +116,7 @@ export class ZoneRegistry {
     if (!z) return;
     for (const holder of z.holders) this.byHolder.get(holder)?.delete(zoneId);
     this.zones.delete(zoneId);
+    this.notifyAvailable(zoneId);
   }
 
   /** Effective capacity: explicit declaration, else {@link DEFAULT_ZONE_CAPACITY}. */
@@ -124,8 +145,9 @@ export class ZoneRegistry {
 
   /** Release one claim. No-op when `agvId` does not hold `zoneId`. */
   release(zoneId: string, agvId: string): void {
-    this.zones.get(zoneId)?.holders.delete(agvId);
+    const had = this.zones.get(zoneId)?.holders.delete(agvId) ?? false;
     this.byHolder.get(agvId)?.delete(zoneId);
+    if (had) this.notifyAvailable(zoneId);
   }
 
   /**
@@ -136,8 +158,10 @@ export class ZoneRegistry {
   releaseAll(agvId: string): void {
     const held = this.byHolder.get(agvId);
     if (!held) return;
+    const freed = [...held];
     for (const zoneId of held) this.zones.get(zoneId)?.holders.delete(agvId);
     held.clear();
+    for (const zoneId of freed) this.notifyAvailable(zoneId);
   }
 
   /** Drop every zone and claim (model switch / test reset). */

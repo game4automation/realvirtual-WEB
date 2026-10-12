@@ -13,8 +13,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, mkdirSync, cpSync, writeFileSync, readFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import {
   scriptRefsOf,
@@ -23,6 +25,9 @@ import {
   compileProjectDir,
   projectDirsUnder,
 } from '../scripts/compile-project-scripts.mjs';
+import { compileStagedProjectScripts } from '../scripts/generate-customer-workspace.mjs';
+
+const SCRIPTS = resolve(fileURLToPath(import.meta.url), '../../scripts');
 
 let dir: string;
 
@@ -112,6 +117,25 @@ describe('compileProjectDir', () => {
     expect(readFileSync(join(dir, 'scripts/index.js'), 'utf8')).toContain('"three"');
   });
 
+  it('leaves the viewer aliases @rv/* and @rv-private/* external — a plugin that uses the core compiles', async () => {
+    // Regression: the mauser3dhmi delivery stopped with 32 "Could not resolve @rv/…" errors.
+    writeProject([{ id: 'a', scriptRef: 'plugins/index.ts' }]);
+    writeFile(
+      'plugins/index.ts',
+      'import { RVWebError } from "@rv/core/engine/rv-web-error";\n'
+      + 'import { WebXRPlugin } from "@rv/plugins/webxr-plugin";\n'
+      + 'import { Extra } from "@rv-private/plugins/extra";\n'
+      + 'export function registerModelPlugins(): void { void RVWebError; void WebXRPlugin; void Extra; }\n'
+      + 'export function unregisterModelPlugins(): void {}\n',
+    );
+    const result = await compileProjectDir(dir);
+    expect(result.results.map((r) => r.status)).toEqual(['built']);
+    const js = readFileSync(join(dir, 'plugins/index.js'), 'utf8');
+    expect(js).toContain('"@rv/core/engine/rv-web-error"');
+    expect(js).toContain('"@rv/plugins/webxr-plugin"');
+    expect(js).toContain('"@rv-private/plugins/extra"');
+  });
+
   it('reports a dead reference instead of writing an empty artefact', async () => {
     writeProject([{ id: 'a', scriptRef: 'scripts/missing.ts' }]);
     const result = await compileProjectDir(dir);
@@ -170,5 +194,131 @@ describe('projectDirsUnder', () => {
 
   it('answers empty for a root that does not exist', () => {
     expect(projectDirsUnder(join(dir, 'nope'))).toEqual([]);
+  });
+});
+
+// ─── The CLI's own exit code ────────────────────────────────────────────
+
+/**
+ * plan-479 §9 / Finding T5 — the process, not the library return value.
+ *
+ * Everything above calls `compileProjectDir` and reads a `status` string. What
+ * a CI job and a delivery gate actually observe is the EXIT CODE of the child
+ * process, and nothing tested that: the `exitCode = 3` line and the
+ * `process.exit(code)` at the bottom of the script could both have been deleted
+ * without a single test noticing.
+ *
+ * 3 is the specific claim, not merely "non-zero": 1 is a compile failure and 2
+ * a usage error, and a caller that wants to say "artefacts are stale, rebuild
+ * them" from "the source is broken" needs the three apart.
+ */
+describe('the compile CLI as a process', () => {
+  function run(...args: string[]) {
+    return spawnSync(
+      process.execPath,
+      [join(SCRIPTS, 'compile-project-scripts.mjs'), ...args],
+      { encoding: 'utf8' },
+    );
+  }
+
+  it('exits 3 when --check finds a missing artefact', () => {
+    writeProject([{ id: 'a', scriptRef: 'scripts/index.ts' }]);
+    writeFile('scripts/index.ts', 'export const x = 1;\n');
+    const out = run(dir, '--check');
+    expect(out.status).toBe(3);
+    expect(out.stderr).toContain('STALE');
+    expect(existsSync(join(dir, 'scripts/index.js'))).toBe(false);
+  });
+
+  it('exits 0 once the artefact has been built', () => {
+    writeProject([{ id: 'a', scriptRef: 'scripts/index.ts' }]);
+    writeFile('scripts/index.ts', 'export const x = 1;\n');
+    expect(run(dir).status).toBe(0);
+    expect(existsSync(join(dir, 'scripts/index.js'))).toBe(true);
+    expect(run(dir, '--check').status).toBe(0);
+  });
+
+  it('exits 1 — not 3 — when the reference is dead', () => {
+    writeProject([{ id: 'a', scriptRef: 'scripts/missing.ts' }]);
+    const out = run(dir, '--check');
+    expect(out.status).toBe(1);
+    expect(out.stderr).toContain('FAIL');
+  });
+});
+
+// ─── The delivery step (plan-479 Phase 7) ───────────────────────────────
+
+/**
+ * The generator builds the siblings IN THE STAGED COPY, and the source tree
+ * stays clean.
+ *
+ * Both halves are the phase. Building in the source tree would look identical
+ * from the customer's side and would still be wrong: `deliver.mjs` asserts a
+ * clean private tree and never auto-commits, so the dirt would surface as a
+ * failure of the NEXT delivery. `git status --porcelain` on the source repo is
+ * therefore not decoration here — it is the assertion the phase exists for.
+ */
+describe('compileStagedProjectScripts', () => {
+  let source: string;
+  let staged: string;
+
+  function git(cwd: string, ...args: string[]) {
+    return spawnSync('git', args, { cwd, encoding: 'utf8' });
+  }
+
+  /** A one-project "private repo" plus the staged copy a delivery makes of it. */
+  function seed(script: string) {
+    mkdirSync(join(source, 'projects/demo/plugins'), { recursive: true });
+    writeFileSync(
+      join(source, 'projects/demo/project.json'),
+      JSON.stringify({
+        schemaVersion: 'rv-project/1.0',
+        documents: [{ id: 'a', path: 'models/x.glb', scriptRef: 'plugins/panel.tsx' }],
+      }),
+    );
+    writeFileSync(join(source, 'projects/demo/plugins/panel.tsx'), script);
+    git(source, 'init', '-q');
+    git(source, 'config', 'user.email', 'test@example.com');
+    git(source, 'config', 'user.name', 'test');
+    git(source, 'add', '-A');
+    git(source, 'commit', '-qm', 'seed');
+    cpSync(join(source, 'projects'), join(staged, 'projects'), { recursive: true });
+  }
+
+  beforeEach(() => {
+    source = mkdtempSync(join(tmpdir(), 'rv-src-'));
+    staged = mkdtempSync(join(tmpdir(), 'rv-staged-'));
+  });
+  afterEach(() => {
+    rmSync(source, { recursive: true, force: true });
+    rmSync(staged, { recursive: true, force: true });
+  });
+
+  it('writes the .js into the staged copy and leaves the source tree clean', async () => {
+    seed('export function registerModelPlugins(): void {}\n'
+      + 'export function unregisterModelPlugins(): void {}\n');
+
+    await compileStagedProjectScripts(staged, ['demo']);
+
+    expect(existsSync(join(staged, 'projects/demo/plugins/panel.js'))).toBe(true);
+    // The whole point: nothing was written next to the source.
+    expect(existsSync(join(source, 'projects/demo/plugins/panel.js'))).toBe(false);
+    expect(git(source, 'status', '--porcelain').stdout.trim()).toBe('');
+  });
+
+  it('stops the delivery when a script does not compile', async () => {
+    seed('export function registerModelPlugins(): void { this is not typescript }\n');
+
+    await expect(compileStagedProjectScripts(staged, ['demo']))
+      .rejects.toThrow(/did not compile/);
+    // And it stopped BEFORE producing a half-delivery.
+    expect(existsSync(join(staged, 'projects/demo/plugins/panel.js'))).toBe(false);
+    expect(git(source, 'status', '--porcelain').stdout.trim()).toBe('');
+  });
+
+  it('ignores a project key with no manifest instead of failing on it', async () => {
+    seed('export function registerModelPlugins(): void {}\n');
+    await expect(compileStagedProjectScripts(staged, ['demo', 'not-delivered']))
+      .resolves.toBeUndefined();
   });
 });

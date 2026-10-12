@@ -26,20 +26,46 @@
  * Both branches are GLB-only and both carry the same compare-and-swap
  * revision (§2.8): a SHA-256 of the stored bytes. Only the owner of the file
  * differs, so the caller never has to know which one it got.
+ *
+ * ## Drafts are the exception, and always browser-side
+ *
+ * The rule above is about a **committed** body, where the folder has to be
+ * authoritative so a stale browser copy cannot shadow it. A `draft/` slot is
+ * the opposite kind of thing: the autosaved copy of UNSAVED edits, kept only so
+ * a reload or a crash does not lose them, and dropped again the moment the
+ * document is saved. It belongs to this browser and this session, never to the
+ * project.
+ *
+ * It used to inherit the committed rule by accident, which put a private
+ * recovery file into the user's project folder — synced, committed, delivered,
+ * and (because a draft is a full GLB) rescanned as a ghost document. Worse, the
+ * path it landed on came from `sceneGlbRelPathFor()`, which still hard-codes the
+ * `scenes/` prefix that plan-716/736 abolished: the draft was the last thing in
+ * the product still creating that folder.
+ *
+ * So every `draft/` slot goes to the OPFS store unconditionally. Cross-tab
+ * conflict detection survives the move — the store carries the same revision.
+ * What does NOT survive is finding your unsaved edits after opening the same
+ * folder in another browser, which is what "unsaved" means everywhere else.
  */
 
 import { getProjectStore } from '../../project/project-store';
 import {
   deleteSceneGlb,
+  listSceneGlbSlots,
+  moveSceneGlbPointer,
   readSceneGlb,
+  readSceneGlbPointer,
   sceneGlbRevision,
   writeSceneGlb,
+  type SceneGlbMoveResult,
+  type SceneGlbMoveStamp,
 } from '../../storage/rv-scene-glb-store';
 import {
   SceneRevisionConflictError,
   type SceneRevision,
 } from '../../project/rv-scene-record';
-import { sceneDocumentsOf } from '../../project/rv-project-documents';
+import { documentsOf } from '../../project/rv-project-documents';
 import {
   sceneGlbRelPathFor,
   type RvProjectSceneEntry,
@@ -58,6 +84,13 @@ export interface SceneGlbBody {
   glb: Uint8Array;
   revision: SceneRevision;
   target: SceneGlbTarget;
+  /**
+   * OPFS bodies only (plan-546): the document revision the body was baked
+   * from, as the pointer records it. Absent = a legacy or unstamped body.
+   */
+  baseSha?: string;
+  /** OPFS bodies only (plan-546): when the pointer was written (ISO). */
+  updatedAt?: string;
 }
 
 /**
@@ -72,10 +105,42 @@ function writableBackend(): ProjectBackend | null {
   return backend && backend.writable ? backend : null;
 }
 
-/** The manifest entry for a scene in the open project, or null. */
+/**
+ * The prefix every autosave slot carries.
+ *
+ * It lives here beside the branch it steers rather than in the scene store that
+ * mints it: this module is the one place that decides which store a body goes
+ * to, so it has to be the one place that knows what a draft looks like.
+ */
+const DRAFT_SLOT_PREFIX = 'draft/';
+
+/** Is this slot the autosaved copy of unsaved edits, rather than a document? */
+function isDraftSlot(sceneId: string): boolean {
+  return typeof sceneId === 'string' && sceneId.startsWith(DRAFT_SLOT_PREFIX);
+}
+
+/**
+ * The backend that owns this body, or null when the OPFS store does.
+ *
+ * One helper rather than a `writableBackend()` plus a draft test at each of the
+ * three call sites: read, write and revision have to agree about the
+ * destination, and three copies of a condition is how they stop agreeing.
+ */
+function ownerBackendFor(sceneId: string): ProjectBackend | null {
+  return isDraftSlot(sceneId) ? null : writableBackend();
+}
+
+/**
+ * The manifest entry for a scene in the open project, or null.
+ *
+ * By ID over the one list (plan-744 F3) — an id is unique across the manifest,
+ * so the scene-shaped filter this used to run through could only ever lose the
+ * row. It lost every browser one, whose path is its bare id.
+ */
 function projectEntry(sceneId: string): RvProjectSceneEntry | null {
   const project = getProjectStore().getProject();
-  return sceneDocumentsOf(project).find((e) => e?.id === sceneId) ?? null;
+  return (documentsOf(project).find((e) => e?.id === sceneId) ?? null) as
+    RvProjectSceneEntry | null;
 }
 
 // ─── Read ───────────────────────────────────────────────────────────────
@@ -89,8 +154,8 @@ function projectEntry(sceneId: string): RvProjectSceneEntry | null {
  * would otherwise shadow it and quietly serve a stale layout.
  */
 export async function readSceneGlbBody(sceneId: string): Promise<SceneGlbBody | null> {
-  const backend = writableBackend();
-  const entry = projectEntry(sceneId);
+  const backend = ownerBackendFor(sceneId);
+  const entry = backend ? projectEntry(sceneId) : null;
   if (backend && entry?.path) {
     try {
       const record = await backend.readDocument({ path: entry.path, id: sceneId });
@@ -103,14 +168,20 @@ export async function readSceneGlbBody(sceneId: string): Promise<SceneGlbBody | 
 
   const glb = await readSceneGlb(sceneId);
   if (!glb) return null;
-  const revision = sceneGlbRevision(sceneId);
-  return { glb, revision: revision ?? '', target: 'opfs' };
+  const pointer = readSceneGlbPointer(sceneId);
+  return {
+    glb,
+    revision: pointer?.sha ?? '',
+    target: 'opfs',
+    ...(pointer?.baseSha ? { baseSha: pointer.baseSha } : {}),
+    ...(pointer?.updatedAt ? { updatedAt: pointer.updatedAt } : {}),
+  };
 }
 
 /** The stored revision of a scene's body, or null when it has none. */
 export async function sceneGlbBodyRevision(sceneId: string): Promise<SceneRevision | null> {
   const entry = projectEntry(sceneId);
-  if (entry?.revision && writableBackend()) return entry.revision;
+  if (entry?.revision && ownerBackendFor(sceneId)) return entry.revision;
   return sceneGlbRevision(sceneId);
 }
 
@@ -127,6 +198,11 @@ export interface SceneGlbWrite {
    */
   expectedRevision?: SceneRevision | null;
   createdAt?: string;
+  /**
+   * The document revision a DRAFT body was baked from (plan-546). Stamped on
+   * the OPFS pointer; ignored by the project branch. Omitted = no stamp.
+   */
+  baseSha?: string;
 }
 
 /**
@@ -139,7 +215,7 @@ export interface SceneGlbWrite {
  * "conflict" beside the one definition of "destination".
  */
 export async function writeSceneGlbBody(write: SceneGlbWrite): Promise<SceneGlbWriteResult> {
-  const backend = writableBackend();
+  const backend = ownerBackendFor(write.sceneId);
 
   if (backend) {
     const existing = projectEntry(write.sceneId);
@@ -172,11 +248,90 @@ export async function writeSceneGlbBody(write: SceneGlbWrite): Promise<SceneGlbW
     const have = actual === null ? null : actual.toLowerCase();
     if (want !== have) throw new SceneRevisionConflictError(write.sceneId, want, have);
   }
-  const revision = await writeSceneGlb(write.sceneId, write.glb);
+  const revision = await writeSceneGlb(
+    write.sceneId,
+    write.glb,
+    write.baseSha ? { baseSha: write.baseSha } : {},
+  );
   return { revision, target: 'opfs' };
 }
 
 /** Remove a scene's OPFS body. The project branch deletes through the backend. */
 export async function dropSceneGlbBody(sceneId: string): Promise<void> {
   await deleteSceneGlb(sceneId);
+}
+
+// ─── Set-aside drafts (plan-546) ────────────────────────────────────────
+
+/**
+ * The slot prefix under which a document's stale drafts are kept aside.
+ *
+ * Under `draft/` on purpose: every guard that keeps drafts out of the project
+ * folder, out of the migration's orphan adoption and out of the document list
+ * already keys on that prefix.
+ */
+export function setAsideSlotPrefix(documentId: string): string {
+  return `${DRAFT_SLOT_PREFIX}~stale/${documentId}/`;
+}
+
+/** The set-aside slot for one draft body of a document. */
+export function setAsideSlotFor(documentId: string, sha: string): string {
+  return `${setAsideSlotPrefix(documentId)}${sha.slice(0, 12)}`;
+}
+
+/** One set-aside draft, as its pointer describes it. */
+export interface SetAsideBody {
+  slot: string;
+  sha: string;
+  /** The document revision the draft was baked from, when stamped. */
+  baseSha?: string;
+  /** When it was moved aside (ISO); falls back to its write time. */
+  movedAt: string;
+  updatedAt: string;
+}
+
+/** Every set-aside draft of `documentId`, newest move first. */
+export function listSetAsideBodies(documentId: string): SetAsideBody[] {
+  if (!documentId) return [];
+  const out: SetAsideBody[] = [];
+  for (const slot of listSceneGlbSlots(setAsideSlotPrefix(documentId))) {
+    const pointer = readSceneGlbPointer(slot);
+    if (!pointer) continue;
+    out.push({
+      slot,
+      sha: pointer.sha,
+      ...(pointer.baseSha ? { baseSha: pointer.baseSha } : {}),
+      movedAt: pointer.movedAt ?? pointer.updatedAt,
+      updatedAt: pointer.updatedAt,
+    });
+  }
+  const t = (iso: string) => { const v = Date.parse(iso); return Number.isFinite(v) ? v : 0; };
+  return out.sort((a, b) => t(b.movedAt) - t(a.movedAt));
+}
+
+/** The OPFS pointer of a body slot (sha + stamps), or null. */
+export function sceneGlbBodyPointer(sceneId: string): {
+  sha: string; baseSha?: string; updatedAt: string;
+} | null {
+  const pointer = readSceneGlbPointer(sceneId);
+  if (!pointer) return null;
+  return {
+    sha: pointer.sha,
+    updatedAt: pointer.updatedAt,
+    ...(pointer.baseSha ? { baseSha: pointer.baseSha } : {}),
+  };
+}
+
+/**
+ * Move an OPFS body to another slot, compare-and-swap on its sha. Draft slots
+ * only — a committed body belongs to its owner and is never renamed here.
+ */
+export function moveSceneGlbBody(
+  from: string,
+  to: string,
+  expectedSha: string,
+  stamp: SceneGlbMoveStamp = {},
+): SceneGlbMoveResult {
+  if (!isDraftSlot(from) || !isDraftSlot(to)) return 'conflict';
+  return moveSceneGlbPointer(from, to, expectedSha, stamp);
 }

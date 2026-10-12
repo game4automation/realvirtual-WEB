@@ -35,7 +35,7 @@ BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 Mesh.prototype.raycast = acceleratedRaycast;
 
-registerComponentSchema('MaintTestType', {}, { hoverable: true, selectable: true });
+registerComponentSchema('MaintTestType', {}, { pick: 'select' });
 
 const IDENTITY = { position: [0, 0, 0] as [number, number, number], quaternion: [0, 0, 0, 1] as [number, number, number, number], scale: [1, 1, 1] as [number, number, number] };
 

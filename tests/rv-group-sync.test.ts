@@ -10,6 +10,7 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { GroupRegistry } from '../src/core/engine/rv-group-registry';
 import {
   GROUP_KEY_RE,
+  collectKinematicGroupNamesLive,
   getGroupComponentKeys,
   resolveGroupName,
   syncNodeGroups,
@@ -66,6 +67,47 @@ describe('resolveGroupName', () => {
     expect(resolveGroupName({ GroupName: 'Belt', GroupNamePrefix: 'Root/Line1' }, registry)).toBe('Line1Belt');
     // Unresolvable prefix falls back to the plain name
     expect(resolveGroupName({ GroupName: 'Belt', GroupNamePrefix: 'Missing' }, registry)).toBe('Belt');
+  });
+});
+
+// plan-760 F1 / F14 — the LIVE kinematic scan (never GroupRegistry.isKinematic).
+describe('collectKinematicGroupNamesLive', () => {
+  function kinNode(data: Record<string, unknown>, key = 'Kinematic'): Object3D {
+    const node = new Object3D();
+    node.userData['realvirtual'] = { [key]: data };
+    return node;
+  }
+
+  it('collects every Kinematic* GroupName of the live scene; empty root → empty set', () => {
+    const root = new Object3D();
+    root.add(kinNode({ GroupName: 'Axis1' }), kinNode({ GroupName: 'Axis2' }, 'Kinematic_1'));
+    const inner = new Object3D();
+    inner.add(kinNode({ GroupName: 'Axis3' }));
+    root.add(inner);
+    expect([...collectKinematicGroupNamesLive(root, null)].sort()).toEqual(['Axis1', 'Axis2', 'Axis3']);
+    expect(collectKinematicGroupNamesLive(null, null).size).toBe(0);
+  });
+
+  it('resolves a prefixed Kinematic name exactly like the member Group components', () => {
+    const prefixNode = new Object3D();
+    prefixNode.name = 'Line1';
+    const registry = { getNode: (p: string) => (p === 'Root/Line1' ? prefixNode : null) };
+    const root = new Object3D();
+    root.add(kinNode({ GroupName: 'Belt', GroupNamePrefix: 'Root/Line1' }));
+    expect([...collectKinematicGroupNamesLive(root, registry)]).toEqual(['Line1Belt']);
+    // Unresolvable prefix → raw name (resolveGroupName parity)
+    root.add(kinNode({ GroupName: 'Roll', GroupNamePrefix: 'Missing' }));
+    expect([...collectKinematicGroupNamesLive(root, registry)].sort()).toEqual(['Line1Belt', 'Roll']);
+  });
+
+  it('skips empty names, disabled components and non-Kinematic keys', () => {
+    const root = new Object3D();
+    root.add(
+      kinNode({ GroupName: '' }),
+      kinNode({ GroupName: 'Off', _enabled: false }),
+      kinNode({ GroupName: 'NotAKinematic' }, 'KinematicMechanism'),
+    );
+    expect(collectKinematicGroupNamesLive(root, null).size).toBe(0);
   });
 });
 

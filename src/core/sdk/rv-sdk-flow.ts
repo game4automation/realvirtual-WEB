@@ -77,6 +77,35 @@ export interface LocalFlowBackend extends SdkFlowBackend {
    * are released by their own reset path (ConnectionHoldController).
    */
   reset(): void;
+  /**
+   * Drop the MU with `muId` from the ledger and the parked set WITHOUT firing
+   * the seams (plan-567): the MU was deleted or teleported by hand, so its flow
+   * membership ends here — the engine-side hold is released by the caller.
+   * Returns true when the MU was booked in this ledger.
+   */
+  forget(muId: number): boolean;
+}
+
+// ─── Live ledger registry (plan-567) ─────────────────────────────────────
+
+/** Ledgers of the live script components — what a hand-removed MU is struck from. */
+const liveLedgers = new Set<Pick<LocalFlowBackend, 'forget'>>();
+
+/** Track a live ledger; returns the untrack function (call it on teardown). */
+export function trackFlowLedger(ledger: Pick<LocalFlowBackend, 'forget'>): () => void {
+  liveLedgers.add(ledger);
+  return () => { liveLedgers.delete(ledger); };
+}
+
+/**
+ * Strike the MU with `muId` from every live ledger (plan-567 SOL #1): a deleted
+ * MU must not stay parked in a station, a teleported one has left the station
+ * it was booked in. Returns the number of ledgers that held it.
+ */
+export function forgetMuInFlowLedgers(muId: number): number {
+  let n = 0;
+  for (const ledger of liveLedgers) if (ledger.forget(muId)) n++;
+  return n;
 }
 
 export function createLocalFlowBackend(opts: LocalFlowBackendOptions = {}): LocalFlowBackend {
@@ -147,6 +176,12 @@ export function createLocalFlowBackend(opts: LocalFlowBackendOptions = {}): Loca
     reset(): void {
       held.length = 0;
       parked.clear();
+    },
+    forget(muId: number): boolean {
+      const i = held.findIndex((m) => m.id === muId);
+      const wasParked = parked.delete(muId);
+      if (i >= 0) held.splice(i, 1);
+      return i >= 0 || wasParked;
     },
   };
 }

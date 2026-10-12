@@ -131,11 +131,13 @@ describe('?scene=published:<name> resolves through the alias', () => {
   });
 
   it('an HTTP probe could not decide this — which is why the manifest does', async () => {
-    // The reason the boot has no existence probe, unchanged by this plan: the
-    // dev server hosting this test, like any SPA host with a history fallback,
-    // answers 200 with index.html for a file that does not exist. A probe would
+    // The reason the boot has no existence probe, unchanged by this plan: any
+    // SPA host with a history fallback answers 200 with index.html for a file
+    // that does not exist. The dev server hosting this test 404s missing ASSET
+    // paths since plan-508 (`rv-asset-404-guard`), but a deployed host need not,
+    // and every other unknown path still falls back — so a probe would still
     // have opened a deep link to nothing instead of falling through.
-    const resp = await fetch('/NoSuchExample.glb', { cache: 'no-store' });
+    const resp = await fetch('/NoSuchExample', { cache: 'no-store' });
     expect(resp.ok).toBe(true);
     expect((await resp.text()).slice(0, 4)).not.toBe('glTF');
   });

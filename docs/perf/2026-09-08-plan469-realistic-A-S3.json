@@ -1,0 +1,3128 @@
+{
+  "fingerprint": {
+    "timestamp": "2026-09-08T16:38:01.033Z",
+    "host": "desktopmsi",
+    "os": "win32 10.0.26200",
+    "cpu": "Intel(R) Core(TM) i5-9600K CPU @ 3.70GHz",
+    "logicalCpus": 6,
+    "totalMemoryBytes": 34291945472,
+    "freeMemoryBytes": 3539238912,
+    "node": "v24.19.0",
+    "chromium": "145.0.7632.6",
+    "gitCommit": "e892cd2838cc325cd8e5c99611d7b75f08928d00",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "hardwareConcurrency": 6,
+    "deviceMemoryGiB": 8,
+    "devicePixelRatio": 1,
+    "viewport": {
+      "width": 1280,
+      "height": 720
+    },
+    "longTaskObserver": true,
+    "preciseHeap": true,
+    "gpu": {
+      "vendor": "Google Inc. (NVIDIA)",
+      "renderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB (0x00001C03) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    },
+    "headless": false,
+    "mode": "supported",
+    "durationS": 120,
+    "runs": 3,
+    "geom": {
+      "lanes": 24,
+      "plcs": 2,
+      "segments": 9,
+      "seglen": 5,
+      "speed": 1000,
+      "templates": 1,
+      "seed": 465
+    }
+  },
+  "options": {
+    "mode": "supported",
+    "durationS": 120,
+    "runs": 3,
+    "geometry": {
+      "lanes": 24,
+      "plcs": 2,
+      "segments": 9,
+      "seglen": 5,
+      "speed": 1000,
+      "templates": 1,
+      "seed": 465
+    },
+    "headless": false,
+    "proto": "",
+    "hooks": "on",
+    "gcProfile": false,
+    "axes": {
+      "geometryAxis": [
+        "library"
+      ],
+      "muAssetAxis": [
+        "cartonbox"
+      ],
+      "robotAxis": [
+        100
+      ],
+      "robotMotionAxis": [
+        "erratic"
+      ]
+    }
+  },
+  "cells": [
+    {
+      "mu": 2400,
+      "sensors": 1,
+      "load": "none",
+      "renderer": "webgl",
+      "shadows": "off",
+      "effects": "on",
+      "keepmodel": "off",
+      "geometry": "library",
+      "muasset": "cartonbox",
+      "robots": 100,
+      "robotmotion": "erratic",
+      "runs": [
+        {
+          "model": "synthetic-line",
+          "loadTime": "--",
+          "glbSize": "--",
+          "fps": {
+            "min": 0,
+            "avg": 0,
+            "max": 0
+          },
+          "frameTime": {
+            "min": 65,
+            "avg": 65,
+            "max": 334
+          },
+          "benchmark": {
+            "uncappedFps": 0,
+            "avgFrameMs": 0,
+            "headroom": 0
+          },
+          "renderer": {
+            "triangles": 34399992,
+            "drawCalls": 1407,
+            "geometries": 143,
+            "textures": 114
+          },
+          "timestamp": "2026-09-08T16:30:54.125Z",
+          "pass": false,
+          "scenario": "line",
+          "mode": "supported",
+          "reason": "occupancy 2400/2400 ok, spawn 53.99/100.00 per s FAIL, sink 53.79/53.99 per s ok",
+          "plan": {
+            "capacityMUs": 3600,
+            "fillTimeS": 44,
+            "travelLengthM": 44,
+            "sourceIntervalS": 0.24,
+            "partPeriodS": 0.44,
+            "spawnGateS": 0.2,
+            "maxLiveMUs": 2880,
+            "spawnCapMUs": 5280,
+            "valid": true,
+            "pools": 24,
+            "surfaces": 216,
+            "sensors": 216,
+            "sources": 24,
+            "sinks": 24,
+            "signals": [],
+            "config": {
+              "seed": 465,
+              "lanes": 24,
+              "plcs": 2,
+              "segments": 9,
+              "segmentLengthM": 5,
+              "sensorsPerSegment": 1,
+              "targetMUs": 2400,
+              "muTemplates": 1,
+              "muLengthMm": 200,
+              "muGapMm": 100,
+              "speedMmS": 1000,
+              "signalBinding": "none",
+              "originX": 0,
+              "originZ": 0,
+              "geometry": "library",
+              "muAsset": "cartonbox",
+              "robots": 100,
+              "robotMotion": "erratic"
+            },
+            "fixedTimeStep": 0.016666666666666666,
+            "scene": {
+              "geometry": "library",
+              "muAsset": "cartonbox",
+              "conveyorDraws": 45,
+              "conveyorTriangles": 16415136,
+              "conveyorPlacements": 432,
+              "conveyorClonesAvoided": 9720,
+              "muMeshCount": 1,
+              "muTriangles": 324,
+              "muInstanced": true,
+              "robots": 100,
+              "robotDrives": 600,
+              "robotMeshes": 600,
+              "robotTriangles": 7200,
+              "robotMotion": "erratic"
+            }
+          },
+          "probe": {
+            "durationMs": 119987.29999999702,
+            "frameMs": {
+              "p50": 65.25,
+              "p95": 101.25,
+              "p99": 146.75,
+              "max": 333.5,
+              "count": 1778
+            },
+            "stepMs": {
+              "p50": 12,
+              "p95": 17,
+              "p99": 24.25,
+              "max": 53.70000000298023,
+              "count": 7138
+            },
+            "transportMs": {
+              "p50": 11.25,
+              "p95": 16,
+              "p99": 23.25,
+              "max": 53.1000000089407,
+              "count": 7138
+            },
+            "jitterMs": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 0
+            },
+            "flushMs": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 0
+            },
+            "excluded": {
+              "frameMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "stepMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "transportMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              }
+            },
+            "histograms": {
+              "frameMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 1778,
+                "max": 333.5
+              },
+              "stepMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 7138,
+                "max": 53.70000000298023
+              },
+              "transportMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 7138,
+                "max": 53.1000000089407
+              },
+              "jitterMs": {
+                "binWidthMs": 1,
+                "overflow": 0,
+                "count": 0,
+                "max": 0
+              },
+              "flushMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 0,
+                "max": 0
+              }
+            },
+            "latency": {
+              "jitter": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "flush": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "samples": 0,
+              "coalescedGaps": 0,
+              "restarts": 0,
+              "minOffsetMs": 0
+            },
+            "lostSimSeconds": 1.4528999999998762,
+            "clampedSeconds": 1.4528999999998762,
+            "droppedBacklogSeconds": 0,
+            "pausedSeconds": 0,
+            "longTasks": 1436,
+            "longTaskMsMax": 121,
+            "samples": 223,
+            "first": {
+              "t": 541.7999999970198,
+              "visible": true,
+              "gcForced": false,
+              "frames": 10,
+              "frameMsP50": 47,
+              "frameMsP95": 85.25,
+              "frameMsP99": 85.25,
+              "frameMsMax": 85.20000000298023,
+              "steps": 31,
+              "stepMsP95": 20.25,
+              "stepMsMax": 22.099999994039536,
+              "transportMsP95": 19.5,
+              "drawCalls": 1407,
+              "triangles": 34399992,
+              "geometries": 143,
+              "textures": 114,
+              "liveMUs": 2400,
+              "pools": 24,
+              "poolCapacity": 3072,
+              "spawned": 4009,
+              "consumed": 1609,
+              "maxLiveMUs": 2880,
+              "signals": 55,
+              "listeners": 30,
+              "resolveCache": 0,
+              "forced": 0,
+              "clampedSeconds": 0,
+              "droppedBacklogSeconds": 0,
+              "pausedSeconds": 0,
+              "longTasks": 4,
+              "longTaskMsMax": 83
+            },
+            "last": {
+              "t": 119987.29999999702,
+              "visible": true,
+              "gcForced": false,
+              "frames": 6,
+              "frameMsP50": 90,
+              "frameMsP95": 108.75,
+              "frameMsP99": 108.75,
+              "frameMsMax": 108.5,
+              "steps": 33,
+              "stepMsP95": 23.5,
+              "stepMsMax": 23.799999997019768,
+              "transportMsP95": 23,
+              "drawCalls": 1407,
+              "triangles": 34399992,
+              "geometries": 143,
+              "textures": 114,
+              "liveMUs": 2400,
+              "pools": 24,
+              "poolCapacity": 3072,
+              "spawned": 10441,
+              "consumed": 8041,
+              "maxLiveMUs": 2880,
+              "signals": 55,
+              "listeners": 30,
+              "resolveCache": 0,
+              "forced": 0,
+              "clampedSeconds": 1.4528999999998762,
+              "droppedBacklogSeconds": 0,
+              "pausedSeconds": 0,
+              "longTasks": 6,
+              "longTaskMsMax": 100
+            },
+            "heapSlopeMiBPerHour": 0,
+            "regions": {
+              "exclusive": {
+                "sources": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 4.399999991059303,
+                  "count": 7138
+                },
+                "surfaceGrid": {
+                  "p50": 0.45,
+                  "p95": 0.65,
+                  "p99": 1.3,
+                  "max": 21.399999991059303,
+                  "count": 7138
+                },
+                "pick": {
+                  "p50": 2.6,
+                  "p95": 4.05,
+                  "p99": 6.7,
+                  "max": 31.09999991953373,
+                  "count": 7138
+                },
+                "transportExcl": {
+                  "p50": 2.3000000000000003,
+                  "p95": 3.6,
+                  "p99": 5.9,
+                  "max": 26.900000035762787,
+                  "count": 7138
+                },
+                "accumulation": {
+                  "p50": 2.9000000000000004,
+                  "p95": 4.5,
+                  "p99": 7,
+                  "max": 23.899999991059303,
+                  "count": 7138
+                },
+                "muAabbGrid": {
+                  "p50": 0.8,
+                  "p95": 1.4500000000000002,
+                  "p99": 2.3000000000000003,
+                  "max": 10.099999994039536,
+                  "count": 7138
+                },
+                "sensors": {
+                  "p50": 0.65,
+                  "p95": 1.05,
+                  "p99": 1.8,
+                  "max": 9.399999991059303,
+                  "count": 7138
+                },
+                "sinks": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 2.0999999940395355,
+                  "count": 7138
+                },
+                "removal": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 3.7000000029802322,
+                  "count": 7138
+                },
+                "poolMatrices": {
+                  "p50": 0.15000000000000002,
+                  "p95": 0.25,
+                  "p99": 0.35000000000000003,
+                  "max": 4.0999999940395355,
+                  "count": 7138
+                },
+                "adjacency": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7138
+                },
+                "growth": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7138
+                }
+              },
+              "inclusive": {
+                "sources": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 4.399999991059303,
+                  "count": 7138
+                },
+                "surfaceGrid": {
+                  "p50": 0.45,
+                  "p95": 0.65,
+                  "p99": 1.3,
+                  "max": 21.399999991059303,
+                  "count": 7138
+                },
+                "pick": {
+                  "p50": 2.6,
+                  "p95": 4.05,
+                  "p99": 6.7,
+                  "max": 31.09999991953373,
+                  "count": 7138
+                },
+                "transportExcl": {
+                  "p50": 5.25,
+                  "p95": 7.7,
+                  "p99": 11.450000000000001,
+                  "max": 31.599999979138374,
+                  "count": 7138
+                },
+                "accumulation": {
+                  "p50": 2.9000000000000004,
+                  "p95": 4.5,
+                  "p99": 7,
+                  "max": 23.899999991059303,
+                  "count": 7138
+                },
+                "muAabbGrid": {
+                  "p50": 0.8,
+                  "p95": 1.4500000000000002,
+                  "p99": 2.3000000000000003,
+                  "max": 10.099999994039536,
+                  "count": 7138
+                },
+                "sensors": {
+                  "p50": 0.65,
+                  "p95": 1.05,
+                  "p99": 1.8,
+                  "max": 9.399999991059303,
+                  "count": 7138
+                },
+                "sinks": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 2.0999999940395355,
+                  "count": 7138
+                },
+                "removal": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 3.7000000029802322,
+                  "count": 7138
+                },
+                "poolMatrices": {
+                  "p50": 0.15000000000000002,
+                  "p95": 0.25,
+                  "p99": 0.35000000000000003,
+                  "max": 4.0999999940395355,
+                  "count": 7138
+                },
+                "adjacency": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7138
+                },
+                "growth": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7138
+                }
+              },
+              "sumExclusive": {
+                "p50": 10,
+                "p95": 14.350000000000001,
+                "p99": 20.55,
+                "max": 48.1000000089407,
+                "count": 7138
+              },
+              "total": {
+                "p50": 11.25,
+                "p95": 15.9,
+                "p99": 23.150000000000002,
+                "max": 53.1000000089407,
+                "count": 7138
+              },
+              "coverageP50": 0.8918918917104801,
+              "coverageP95": 0.9402985076452581,
+              "ticks": 7138,
+              "hitRates": {
+                "pickFastPath": 0.9965758338843324,
+                "accumSpanStable": 0.7176666713560205,
+                "cloneShare": 0,
+                "pickSamples": 17059920,
+                "accumSamples": 17059920,
+                "aabbSamples": 17059920
+              },
+              "longSteps": [],
+              "longStepsTruncated": 0
+            },
+            "stages": {
+              "perTick": {
+                "drives": {
+                  "p50": 0.55,
+                  "p95": 0.9500000000000001,
+                  "p99": 2.1,
+                  "max": 17.200000002980232,
+                  "count": 7138
+                },
+                "transport": {
+                  "p50": 11.25,
+                  "p95": 15.950000000000001,
+                  "p99": 23.150000000000002,
+                  "max": 53.1000000089407,
+                  "count": 7138
+                },
+                "behaviors": {
+                  "p50": 0.05,
+                  "p95": 0.05,
+                  "p99": 0.1,
+                  "max": 0.5999999940395355,
+                  "count": 7138
+                },
+                "visuals": {
+                  "p50": 0.05,
+                  "p95": 0.15000000000000002,
+                  "p99": 0.15000000000000002,
+                  "max": 1.6000000089406967,
+                  "count": 7138
+                }
+              },
+              "ticks": 7138
+            },
+            "renderPasses": {
+              "mainMs": {
+                "p50": 12.65,
+                "p95": 18.25,
+                "p99": 22.6,
+                "max": 39.099999994039536,
+                "count": 1778
+              },
+              "shadowMs": {
+                "p50": 0.05,
+                "p95": 0.15000000000000002,
+                "p99": 0.2,
+                "max": 0.800000011920929,
+                "count": 1778
+              },
+              "totalMs": {
+                "p50": 12.700000000000001,
+                "p95": 18.25,
+                "p99": 22.6,
+                "max": 39.099999994039536,
+                "count": 1778
+              },
+              "mainDraws": {
+                "p50": 1407,
+                "p95": 1407,
+                "p99": 1407,
+                "max": 1407,
+                "count": 1778
+              },
+              "mainTriangles": {
+                "p50": 34399.992,
+                "p95": 34399.992,
+                "p99": 34399.992,
+                "max": 34399.992,
+                "count": 1778
+              },
+              "shadowDraws": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 1778
+              },
+              "shadowTriangles": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 1778
+              },
+              "frames": 1778,
+              "shadowPassObserved": true
+            },
+            "worldMatrix": {
+              "total": {
+                "updateWorldMatrix": 39377676,
+                "updateMatrixWorld": 11092942,
+                "recomposed": 11021822
+              },
+              "step": {
+                "updateWorldMatrix": 39367008,
+                "updateMatrixWorld": 0,
+                "recomposed": 0
+              },
+              "render": {
+                "updateWorldMatrix": 10668,
+                "updateMatrixWorld": 11092942,
+                "recomposed": 11021822
+              },
+              "perTick": {
+                "updateWorldMatrix": 5515.131409358363,
+                "updateMatrixWorld": 0,
+                "recomposed": 0
+              },
+              "perFrame": {
+                "updateWorldMatrix": 6,
+                "updateMatrixWorld": 6239,
+                "recomposed": 6199
+              },
+              "ticks": 7138,
+              "frames": 1778,
+              "installed": true
+            },
+            "regionsDiag": {
+              "enabled": true,
+              "installed": false,
+              "recorded": true,
+              "hasTransport": false
+            }
+          },
+          "stationarity": {
+            "reached": false,
+            "reason": "occupancy 2400/2400 ok, spawn 53.99/100.00 per s FAIL, sink 53.79/53.99 per s ok",
+            "targetMUs": 2400,
+            "liveMUs": 2400,
+            "spawnRate": 53.98504952779816,
+            "sinkRate": 53.78584270297234,
+            "requiredSpawnRate": 100,
+            "windowS": 120.47779999999702,
+            "sensorEverTriggered": true
+          },
+          "env": {
+            "debugPlugins": "off",
+            "shadows": "off",
+            "effects": "on",
+            "proto": "none",
+            "hooks": "on",
+            "geometry": "library",
+            "muAsset": "cartonbox",
+            "robots": 100,
+            "robotMotion": "erratic",
+            "model": "off",
+            "modelUrl": "rvproject:DemoRealvirtualWeb.glb"
+          },
+          "fillPhaseS": 74.03110000000893,
+          "heapAfterGc": 84231104,
+          "pageErrors": [
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Fetch API cannot load rvproject:DemoRealvirtualWeb.settings.json. URL scheme \"rvproject\" is not supported.",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED"
+          ]
+        },
+        {
+          "model": "synthetic-line",
+          "loadTime": "--",
+          "glbSize": "--",
+          "fps": {
+            "min": 0,
+            "avg": 0,
+            "max": 0
+          },
+          "frameTime": {
+            "min": 60,
+            "avg": 60,
+            "max": 442
+          },
+          "benchmark": {
+            "uncappedFps": 0,
+            "avgFrameMs": 0,
+            "headroom": 0
+          },
+          "renderer": {
+            "triangles": 34399992,
+            "drawCalls": 1407,
+            "geometries": 143,
+            "textures": 114
+          },
+          "timestamp": "2026-09-08T16:34:23.749Z",
+          "pass": false,
+          "scenario": "line",
+          "mode": "supported",
+          "reason": "occupancy 2400/2400 ok, spawn 53.80/100.00 per s FAIL, sink 53.60/53.80 per s ok",
+          "plan": {
+            "capacityMUs": 3600,
+            "fillTimeS": 44,
+            "travelLengthM": 44,
+            "sourceIntervalS": 0.24,
+            "partPeriodS": 0.44,
+            "spawnGateS": 0.2,
+            "maxLiveMUs": 2880,
+            "spawnCapMUs": 5280,
+            "valid": true,
+            "pools": 24,
+            "surfaces": 216,
+            "sensors": 216,
+            "sources": 24,
+            "sinks": 24,
+            "signals": [],
+            "config": {
+              "seed": 465,
+              "lanes": 24,
+              "plcs": 2,
+              "segments": 9,
+              "segmentLengthM": 5,
+              "sensorsPerSegment": 1,
+              "targetMUs": 2400,
+              "muTemplates": 1,
+              "muLengthMm": 200,
+              "muGapMm": 100,
+              "speedMmS": 1000,
+              "signalBinding": "none",
+              "originX": 0,
+              "originZ": 0,
+              "geometry": "library",
+              "muAsset": "cartonbox",
+              "robots": 100,
+              "robotMotion": "erratic"
+            },
+            "fixedTimeStep": 0.016666666666666666,
+            "scene": {
+              "geometry": "library",
+              "muAsset": "cartonbox",
+              "conveyorDraws": 45,
+              "conveyorTriangles": 16415136,
+              "conveyorPlacements": 432,
+              "conveyorClonesAvoided": 9720,
+              "muMeshCount": 1,
+              "muTriangles": 324,
+              "muInstanced": true,
+              "robots": 100,
+              "robotDrives": 600,
+              "robotMeshes": 600,
+              "robotTriangles": 7200,
+              "robotMotion": "erratic"
+            }
+          },
+          "probe": {
+            "durationMs": 119993.59999999404,
+            "frameMs": {
+              "p50": 59.75,
+              "p95": 99.5,
+              "p99": 152.75,
+              "max": 442,
+              "count": 1894
+            },
+            "stepMs": {
+              "p50": 12,
+              "p95": 16.5,
+              "p99": 23.25,
+              "max": 47.20000000298023,
+              "count": 7123
+            },
+            "transportMs": {
+              "p50": 11.25,
+              "p95": 15.75,
+              "p99": 21.5,
+              "max": 46.80000001192093,
+              "count": 7123
+            },
+            "jitterMs": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 0
+            },
+            "flushMs": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 0
+            },
+            "excluded": {
+              "frameMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "stepMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "transportMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              }
+            },
+            "histograms": {
+              "frameMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 1894,
+                "max": 442
+              },
+              "stepMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 7123,
+                "max": 47.20000000298023
+              },
+              "transportMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 7123,
+                "max": 46.80000001192093
+              },
+              "jitterMs": {
+                "binWidthMs": 1,
+                "overflow": 0,
+                "count": 0,
+                "max": 0
+              },
+              "flushMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 0,
+                "max": 0
+              }
+            },
+            "latency": {
+              "jitter": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "flush": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "samples": 0,
+              "coalescedGaps": 0,
+              "restarts": 0,
+              "minOffsetMs": 0
+            },
+            "lostSimSeconds": 1.7010000000000844,
+            "clampedSeconds": 1.7010000000000844,
+            "droppedBacklogSeconds": 0,
+            "pausedSeconds": 0,
+            "longTasks": 1339,
+            "longTaskMsMax": 156,
+            "samples": 224,
+            "first": {
+              "t": 504.59999999403954,
+              "visible": true,
+              "gcForced": false,
+              "frames": 7,
+              "frameMsP50": 54.25,
+              "frameMsP95": 178.5,
+              "frameMsP99": 178.5,
+              "frameMsMax": 178.29999999701977,
+              "steps": 27,
+              "stepMsP95": 13.75,
+              "stepMsMax": 19,
+              "transportMsP95": 13,
+              "drawCalls": 1407,
+              "triangles": 34384440,
+              "geometries": 143,
+              "textures": 114,
+              "liveMUs": 2376,
+              "pools": 24,
+              "poolCapacity": 3072,
+              "spawned": 4009,
+              "consumed": 1633,
+              "maxLiveMUs": 2880,
+              "signals": 55,
+              "listeners": 30,
+              "resolveCache": 0,
+              "forced": 0,
+              "clampedSeconds": 0.04490000000000691,
+              "droppedBacklogSeconds": 0,
+              "pausedSeconds": 0,
+              "longTasks": 5,
+              "longTaskMsMax": 79
+            },
+            "last": {
+              "t": 119993.59999999404,
+              "visible": true,
+              "gcForced": false,
+              "frames": 7,
+              "frameMsP50": 74.5,
+              "frameMsP95": 104.25,
+              "frameMsP99": 104.25,
+              "frameMsMax": 104,
+              "steps": 29,
+              "stepMsP95": 17.75,
+              "stepMsMax": 19.399999991059303,
+              "transportMsP95": 17.25,
+              "drawCalls": 1407,
+              "triangles": 34399992,
+              "geometries": 143,
+              "textures": 114,
+              "liveMUs": 2400,
+              "pools": 24,
+              "poolCapacity": 3072,
+              "spawned": 10441,
+              "consumed": 8041,
+              "maxLiveMUs": 2880,
+              "signals": 55,
+              "listeners": 30,
+              "resolveCache": 0,
+              "forced": 0,
+              "clampedSeconds": 1.7010000000000844,
+              "droppedBacklogSeconds": 0,
+              "pausedSeconds": 0,
+              "longTasks": 5,
+              "longTaskMsMax": 87
+            },
+            "heapSlopeMiBPerHour": 0,
+            "regions": {
+              "exclusive": {
+                "sources": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 3,
+                  "count": 7123
+                },
+                "surfaceGrid": {
+                  "p50": 0.45,
+                  "p95": 0.7000000000000001,
+                  "p99": 1.6500000000000001,
+                  "max": 18.5,
+                  "count": 7123
+                },
+                "pick": {
+                  "p50": 2.6500000000000004,
+                  "p95": 3.95,
+                  "p99": 6.300000000000001,
+                  "max": 30.400000035762787,
+                  "count": 7123
+                },
+                "transportExcl": {
+                  "p50": 2.3000000000000003,
+                  "p95": 3.5,
+                  "p99": 5.7,
+                  "max": 16.10000003874302,
+                  "count": 7123
+                },
+                "accumulation": {
+                  "p50": 2.9000000000000004,
+                  "p95": 4.4,
+                  "p99": 6.8500000000000005,
+                  "max": 28.500000029802322,
+                  "count": 7123
+                },
+                "muAabbGrid": {
+                  "p50": 0.8,
+                  "p95": 1.4500000000000002,
+                  "p99": 2.25,
+                  "max": 16.69999998807907,
+                  "count": 7123
+                },
+                "sensors": {
+                  "p50": 0.65,
+                  "p95": 1.05,
+                  "p99": 1.75,
+                  "max": 8.799999997019768,
+                  "count": 7123
+                },
+                "sinks": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.25,
+                  "max": 3.199999988079071,
+                  "count": 7123
+                },
+                "removal": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.25,
+                  "max": 18.69999998807907,
+                  "count": 7123
+                },
+                "poolMatrices": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 12.600000008940697,
+                  "count": 7123
+                },
+                "adjacency": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7123
+                },
+                "growth": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7123
+                }
+              },
+              "inclusive": {
+                "sources": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 3,
+                  "count": 7123
+                },
+                "surfaceGrid": {
+                  "p50": 0.45,
+                  "p95": 0.7000000000000001,
+                  "p99": 1.6500000000000001,
+                  "max": 18.5,
+                  "count": 7123
+                },
+                "pick": {
+                  "p50": 2.6500000000000004,
+                  "p95": 3.95,
+                  "p99": 6.300000000000001,
+                  "max": 30.400000035762787,
+                  "count": 7123
+                },
+                "transportExcl": {
+                  "p50": 5.2,
+                  "p95": 7.550000000000001,
+                  "p99": 11.100000000000001,
+                  "max": 34.30000005662441,
+                  "count": 7123
+                },
+                "accumulation": {
+                  "p50": 2.9000000000000004,
+                  "p95": 4.4,
+                  "p99": 6.8500000000000005,
+                  "max": 28.500000029802322,
+                  "count": 7123
+                },
+                "muAabbGrid": {
+                  "p50": 0.8,
+                  "p95": 1.4500000000000002,
+                  "p99": 2.25,
+                  "max": 16.69999998807907,
+                  "count": 7123
+                },
+                "sensors": {
+                  "p50": 0.65,
+                  "p95": 1.05,
+                  "p99": 1.75,
+                  "max": 8.799999997019768,
+                  "count": 7123
+                },
+                "sinks": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.25,
+                  "max": 3.199999988079071,
+                  "count": 7123
+                },
+                "removal": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.25,
+                  "max": 18.69999998807907,
+                  "count": 7123
+                },
+                "poolMatrices": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 12.600000008940697,
+                  "count": 7123
+                },
+                "adjacency": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7123
+                },
+                "growth": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7123
+                }
+              },
+              "sumExclusive": {
+                "p50": 10,
+                "p95": 13.950000000000001,
+                "p99": 19.6,
+                "max": 45.6000000089407,
+                "count": 7123
+              },
+              "total": {
+                "p50": 11.25,
+                "p95": 15.65,
+                "p99": 21.450000000000003,
+                "max": 46.80000001192093,
+                "count": 7123
+              },
+              "coverageP50": 0.8901098902178565,
+              "coverageP95": 0.9393939400324954,
+              "ticks": 7123,
+              "hitRates": {
+                "pickFastPath": 0.9965770612350775,
+                "accumSpanStable": 0.7176766309711109,
+                "cloneShare": 0,
+                "pickSamples": 17023968,
+                "accumSamples": 17023968,
+                "aabbSamples": 17023968
+              },
+              "longSteps": [],
+              "longStepsTruncated": 0
+            },
+            "stages": {
+              "perTick": {
+                "drives": {
+                  "p50": 0.45,
+                  "p95": 0.8,
+                  "p99": 1.8,
+                  "max": 16.399999991059303,
+                  "count": 7123
+                },
+                "transport": {
+                  "p50": 11.25,
+                  "p95": 15.65,
+                  "p99": 21.450000000000003,
+                  "max": 46.80000001192093,
+                  "count": 7123
+                },
+                "behaviors": {
+                  "p50": 0.05,
+                  "p95": 0.05,
+                  "p99": 0.1,
+                  "max": 0.20000000298023224,
+                  "count": 7123
+                },
+                "visuals": {
+                  "p50": 0.05,
+                  "p95": 0.15000000000000002,
+                  "p99": 0.15000000000000002,
+                  "max": 1.4000000059604645,
+                  "count": 7123
+                }
+              },
+              "ticks": 7123
+            },
+            "renderPasses": {
+              "mainMs": {
+                "p50": 12.05,
+                "p95": 17.45,
+                "p99": 22.55,
+                "max": 68.69999998807907,
+                "count": 1894
+              },
+              "shadowMs": {
+                "p50": 0.05,
+                "p95": 0.15000000000000002,
+                "p99": 0.15000000000000002,
+                "max": 0.5,
+                "count": 1894
+              },
+              "totalMs": {
+                "p50": 12.100000000000001,
+                "p95": 17.45,
+                "p99": 22.55,
+                "max": 68.69999998807907,
+                "count": 1894
+              },
+              "mainDraws": {
+                "p50": 1407,
+                "p95": 1407,
+                "p99": 1407,
+                "max": 1407,
+                "count": 1894
+              },
+              "mainTriangles": {
+                "p50": 34399.992,
+                "p95": 34399.992,
+                "p99": 34399.992,
+                "max": 34399.992,
+                "count": 1894
+              },
+              "shadowDraws": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 1894
+              },
+              "shadowTriangles": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 1894
+              },
+              "frames": 1894,
+              "shadowPassObserved": true
+            },
+            "worldMatrix": {
+              "total": {
+                "updateWorldMatrix": 39295428,
+                "updateMatrixWorld": 11816666,
+                "recomposed": 11740906
+              },
+              "step": {
+                "updateWorldMatrix": 39284064,
+                "updateMatrixWorld": 0,
+                "recomposed": 0
+              },
+              "render": {
+                "updateWorldMatrix": 11364,
+                "updateMatrixWorld": 11816666,
+                "recomposed": 11740906
+              },
+              "perTick": {
+                "updateWorldMatrix": 5515.10094061491,
+                "updateMatrixWorld": 0,
+                "recomposed": 0
+              },
+              "perFrame": {
+                "updateWorldMatrix": 6,
+                "updateMatrixWorld": 6239,
+                "recomposed": 6199
+              },
+              "ticks": 7123,
+              "frames": 1894,
+              "installed": true
+            },
+            "regionsDiag": {
+              "enabled": true,
+              "installed": false,
+              "recorded": true,
+              "hasTransport": false
+            }
+          },
+          "stationarity": {
+            "reached": false,
+            "reason": "occupancy 2400/2400 ok, spawn 53.80/100.00 per s FAIL, sink 53.60/53.80 per s ok",
+            "targetMUs": 2400,
+            "liveMUs": 2400,
+            "spawnRate": 53.79736326503504,
+            "sinkRate": 53.59811377146083,
+            "requiredSpawnRate": 100,
+            "windowS": 120.452,
+            "sensorEverTriggered": true
+          },
+          "env": {
+            "debugPlugins": "off",
+            "shadows": "off",
+            "effects": "on",
+            "proto": "none",
+            "hooks": "on",
+            "geometry": "library",
+            "muAsset": "cartonbox",
+            "robots": 100,
+            "robotMotion": "erratic",
+            "model": "off",
+            "modelUrl": "rvproject:DemoRealvirtualWeb.glb"
+          },
+          "fillPhaseS": 74.03220000000297,
+          "heapAfterGc": 84424264,
+          "pageErrors": [
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Fetch API cannot load rvproject:DemoRealvirtualWeb.settings.json. URL scheme \"rvproject\" is not supported.",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED"
+          ]
+        },
+        {
+          "model": "synthetic-line",
+          "loadTime": "--",
+          "glbSize": "--",
+          "fps": {
+            "min": 0,
+            "avg": 0,
+            "max": 0
+          },
+          "frameTime": {
+            "min": 66,
+            "avg": 66,
+            "max": 285
+          },
+          "benchmark": {
+            "uncappedFps": 0,
+            "avgFrameMs": 0,
+            "headroom": 0
+          },
+          "renderer": {
+            "triangles": 34399992,
+            "drawCalls": 1407,
+            "geometries": 143,
+            "textures": 114
+          },
+          "timestamp": "2026-09-08T16:37:55.089Z",
+          "pass": false,
+          "scenario": "line",
+          "mode": "supported",
+          "reason": "occupancy 2400/2400 ok, spawn 53.56/100.00 per s FAIL, sink 53.56/53.56 per s ok",
+          "plan": {
+            "capacityMUs": 3600,
+            "fillTimeS": 44,
+            "travelLengthM": 44,
+            "sourceIntervalS": 0.24,
+            "partPeriodS": 0.44,
+            "spawnGateS": 0.2,
+            "maxLiveMUs": 2880,
+            "spawnCapMUs": 5280,
+            "valid": true,
+            "pools": 24,
+            "surfaces": 216,
+            "sensors": 216,
+            "sources": 24,
+            "sinks": 24,
+            "signals": [],
+            "config": {
+              "seed": 465,
+              "lanes": 24,
+              "plcs": 2,
+              "segments": 9,
+              "segmentLengthM": 5,
+              "sensorsPerSegment": 1,
+              "targetMUs": 2400,
+              "muTemplates": 1,
+              "muLengthMm": 200,
+              "muGapMm": 100,
+              "speedMmS": 1000,
+              "signalBinding": "none",
+              "originX": 0,
+              "originZ": 0,
+              "geometry": "library",
+              "muAsset": "cartonbox",
+              "robots": 100,
+              "robotMotion": "erratic"
+            },
+            "fixedTimeStep": 0.016666666666666666,
+            "scene": {
+              "geometry": "library",
+              "muAsset": "cartonbox",
+              "conveyorDraws": 45,
+              "conveyorTriangles": 16415136,
+              "conveyorPlacements": 432,
+              "conveyorClonesAvoided": 9720,
+              "muMeshCount": 1,
+              "muTriangles": 324,
+              "muInstanced": true,
+              "robots": 100,
+              "robotDrives": 600,
+              "robotMeshes": 600,
+              "robotTriangles": 7200,
+              "robotMotion": "erratic"
+            }
+          },
+          "probe": {
+            "durationMs": 120530.89999999106,
+            "frameMs": {
+              "p50": 65.75,
+              "p95": 106.25,
+              "p99": 159.5,
+              "max": 285.29999999701977,
+              "count": 1745
+            },
+            "stepMs": {
+              "p50": 12,
+              "p95": 17.5,
+              "p99": 24.75,
+              "max": 104.79999999701977,
+              "count": 7102
+            },
+            "transportMs": {
+              "p50": 11.25,
+              "p95": 16.25,
+              "p99": 23.25,
+              "max": 104.1000000089407,
+              "count": 7102
+            },
+            "jitterMs": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 0
+            },
+            "flushMs": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 0
+            },
+            "excluded": {
+              "frameMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "stepMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "transportMs": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              }
+            },
+            "histograms": {
+              "frameMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 1745,
+                "max": 285.29999999701977
+              },
+              "stepMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 7102,
+                "max": 104.79999999701977
+              },
+              "transportMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 7102,
+                "max": 104.1000000089407
+              },
+              "jitterMs": {
+                "binWidthMs": 1,
+                "overflow": 0,
+                "count": 0,
+                "max": 0
+              },
+              "flushMs": {
+                "binWidthMs": 0.25,
+                "overflow": 0,
+                "count": 0,
+                "max": 0
+              }
+            },
+            "latency": {
+              "jitter": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "flush": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 0
+              },
+              "samples": 0,
+              "coalescedGaps": 0,
+              "restarts": 0,
+              "minOffsetMs": 0
+            },
+            "lostSimSeconds": 2.165700000000011,
+            "clampedSeconds": 2.165700000000011,
+            "droppedBacklogSeconds": 0,
+            "pausedSeconds": 0,
+            "longTasks": 1419,
+            "longTaskMsMax": 190,
+            "samples": 224,
+            "first": {
+              "t": 527.2999999970198,
+              "visible": true,
+              "gcForced": false,
+              "frames": 8,
+              "frameMsP50": 60.25,
+              "frameMsP95": 93.5,
+              "frameMsP99": 93.5,
+              "frameMsMax": 93.29999999701977,
+              "steps": 31,
+              "stepMsP95": 21.75,
+              "stepMsMax": 24.5,
+              "transportMsP95": 15,
+              "drawCalls": 1407,
+              "triangles": 34399992,
+              "geometries": 143,
+              "textures": 114,
+              "liveMUs": 2400,
+              "pools": 24,
+              "poolCapacity": 3072,
+              "spawned": 4009,
+              "consumed": 1609,
+              "maxLiveMUs": 2880,
+              "signals": 55,
+              "listeners": 30,
+              "resolveCache": 0,
+              "forced": 0,
+              "clampedSeconds": 0,
+              "droppedBacklogSeconds": 0,
+              "pausedSeconds": 0,
+              "longTasks": 6,
+              "longTaskMsMax": 82
+            },
+            "last": {
+              "t": 120530.89999999106,
+              "visible": true,
+              "gcForced": false,
+              "frames": 8,
+              "frameMsP50": 61.75,
+              "frameMsP95": 83.25,
+              "frameMsP99": 83.25,
+              "frameMsMax": 83.09999999403954,
+              "steps": 34,
+              "stepMsP95": 15.25,
+              "stepMsMax": 18,
+              "transportMsP95": 14.5,
+              "drawCalls": 1407,
+              "triangles": 34399992,
+              "geometries": 143,
+              "textures": 114,
+              "liveMUs": 2400,
+              "pools": 24,
+              "poolCapacity": 3072,
+              "spawned": 10441,
+              "consumed": 8041,
+              "maxLiveMUs": 2880,
+              "signals": 55,
+              "listeners": 30,
+              "resolveCache": 0,
+              "forced": 0,
+              "clampedSeconds": 2.165700000000011,
+              "droppedBacklogSeconds": 0,
+              "pausedSeconds": 0,
+              "longTasks": 7,
+              "longTaskMsMax": 88
+            },
+            "heapSlopeMiBPerHour": 0,
+            "regions": {
+              "exclusive": {
+                "sources": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 3.199999988079071,
+                  "count": 7102
+                },
+                "surfaceGrid": {
+                  "p50": 0.45,
+                  "p95": 0.75,
+                  "p99": 1.75,
+                  "max": 10,
+                  "count": 7102
+                },
+                "pick": {
+                  "p50": 2.6500000000000004,
+                  "p95": 4.2,
+                  "p99": 6.800000000000001,
+                  "max": 42.8999999910593,
+                  "count": 7102
+                },
+                "transportExcl": {
+                  "p50": 2.35,
+                  "p95": 3.6,
+                  "p99": 5.6000000000000005,
+                  "max": 20.599999979138374,
+                  "count": 7102
+                },
+                "accumulation": {
+                  "p50": 2.9000000000000004,
+                  "p95": 4.55,
+                  "p99": 7.7,
+                  "max": 41.5,
+                  "count": 7102
+                },
+                "muAabbGrid": {
+                  "p50": 0.75,
+                  "p95": 1.3,
+                  "p99": 2.15,
+                  "max": 19,
+                  "count": 7102
+                },
+                "sensors": {
+                  "p50": 0.7000000000000001,
+                  "p95": 1.05,
+                  "p99": 1.9500000000000002,
+                  "max": 12,
+                  "count": 7102
+                },
+                "sinks": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 10.5,
+                  "count": 7102
+                },
+                "removal": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 5,
+                  "count": 7102
+                },
+                "poolMatrices": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 5.5,
+                  "count": 7102
+                },
+                "adjacency": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7102
+                },
+                "growth": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7102
+                }
+              },
+              "inclusive": {
+                "sources": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 3.199999988079071,
+                  "count": 7102
+                },
+                "surfaceGrid": {
+                  "p50": 0.45,
+                  "p95": 0.75,
+                  "p99": 1.75,
+                  "max": 10,
+                  "count": 7102
+                },
+                "pick": {
+                  "p50": 2.6500000000000004,
+                  "p95": 4.2,
+                  "p99": 6.800000000000001,
+                  "max": 42.8999999910593,
+                  "count": 7102
+                },
+                "transportExcl": {
+                  "p50": 5.15,
+                  "p95": 7.75,
+                  "p99": 12.4,
+                  "max": 46.90000005066395,
+                  "count": 7102
+                },
+                "accumulation": {
+                  "p50": 2.9000000000000004,
+                  "p95": 4.55,
+                  "p99": 7.7,
+                  "max": 41.5,
+                  "count": 7102
+                },
+                "muAabbGrid": {
+                  "p50": 0.75,
+                  "p95": 1.3,
+                  "p99": 2.15,
+                  "max": 19,
+                  "count": 7102
+                },
+                "sensors": {
+                  "p50": 0.7000000000000001,
+                  "p95": 1.05,
+                  "p99": 1.9500000000000002,
+                  "max": 12,
+                  "count": 7102
+                },
+                "sinks": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 10.5,
+                  "count": 7102
+                },
+                "removal": {
+                  "p50": 0.1,
+                  "p95": 0.2,
+                  "p99": 0.25,
+                  "max": 5,
+                  "count": 7102
+                },
+                "poolMatrices": {
+                  "p50": 0.1,
+                  "p95": 0.25,
+                  "p99": 0.30000000000000004,
+                  "max": 5.5,
+                  "count": 7102
+                },
+                "adjacency": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7102
+                },
+                "growth": {
+                  "p50": 0,
+                  "p95": 0,
+                  "p99": 0,
+                  "max": 0,
+                  "count": 7102
+                }
+              },
+              "sumExclusive": {
+                "p50": 10,
+                "p95": 14.5,
+                "p99": 21.6,
+                "max": 99.40000005066395,
+                "count": 7102
+              },
+              "total": {
+                "p50": 11.25,
+                "p95": 16.25,
+                "p99": 23.05,
+                "max": 104.1000000089407,
+                "count": 7102
+              },
+              "coverageP50": 0.8938053082641191,
+              "coverageP95": 0.9416058407339724,
+              "ticks": 7102,
+              "hitRates": {
+                "pickFastPath": 0.9965754247844794,
+                "accumSpanStable": 0.7175630372107952,
+                "cloneShare": 0,
+                "pickSamples": 16973784,
+                "accumSamples": 16973784,
+                "aabbSamples": 16973784
+              },
+              "longSteps": [
+                {
+                  "tick": 3421,
+                  "totalMs": 104.1,
+                  "exclusiveByRegion": {
+                    "sources": 0,
+                    "surfaceGrid": 0.5,
+                    "pick": 42.9,
+                    "transportExcl": 5.4,
+                    "accumulation": 41.5,
+                    "muAabbGrid": 0.7,
+                    "sensors": 8.1,
+                    "sinks": 0.1,
+                    "removal": 0.1,
+                    "poolMatrices": 0.1,
+                    "adjacency": 0,
+                    "growth": 0
+                  },
+                  "sumExclusiveMs": 99.4,
+                  "liveMUs": 2376,
+                  "cloneMUs": 0,
+                  "poolGrew": false,
+                  "adjacencyRebuilt": false,
+                  "surfaceGridRebuilt": false
+                }
+              ],
+              "longStepsTruncated": 0
+            },
+            "stages": {
+              "perTick": {
+                "drives": {
+                  "p50": 0.55,
+                  "p95": 1.05,
+                  "p99": 2.1,
+                  "max": 13,
+                  "count": 7102
+                },
+                "transport": {
+                  "p50": 11.25,
+                  "p95": 16.25,
+                  "p99": 23.1,
+                  "max": 104.20000000298023,
+                  "count": 7102
+                },
+                "behaviors": {
+                  "p50": 0.05,
+                  "p95": 0.05,
+                  "p99": 0.1,
+                  "max": 0.20000000298023224,
+                  "count": 7102
+                },
+                "visuals": {
+                  "p50": 0.05,
+                  "p95": 0.15000000000000002,
+                  "p99": 0.15000000000000002,
+                  "max": 2.0999999940395355,
+                  "count": 7102
+                }
+              },
+              "ticks": 7102
+            },
+            "renderPasses": {
+              "mainMs": {
+                "p50": 12.850000000000001,
+                "p95": 18.05,
+                "p99": 23.900000000000002,
+                "max": 68.8999999910593,
+                "count": 1745
+              },
+              "shadowMs": {
+                "p50": 0.05,
+                "p95": 0.15000000000000002,
+                "p99": 0.25,
+                "max": 6.0999999940395355,
+                "count": 1745
+              },
+              "totalMs": {
+                "p50": 12.850000000000001,
+                "p95": 18.05,
+                "p99": 23.900000000000002,
+                "max": 68.8999999910593,
+                "count": 1745
+              },
+              "mainDraws": {
+                "p50": 1407,
+                "p95": 1407,
+                "p99": 1407,
+                "max": 1407,
+                "count": 1745
+              },
+              "mainTriangles": {
+                "p50": 34399.992,
+                "p95": 34399.992,
+                "p99": 34399.992,
+                "max": 34399.992,
+                "count": 1745
+              },
+              "shadowDraws": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 1745
+              },
+              "shadowTriangles": {
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+                "max": 0,
+                "count": 1745
+              },
+              "frames": 1745,
+              "shadowPassObserved": true
+            },
+            "worldMatrix": {
+              "total": {
+                "updateWorldMatrix": 39178758,
+                "updateMatrixWorld": 10887055,
+                "recomposed": 10817255
+              },
+              "step": {
+                "updateWorldMatrix": 39168288,
+                "updateMatrixWorld": 0,
+                "recomposed": 0
+              },
+              "render": {
+                "updateWorldMatrix": 10470,
+                "updateMatrixWorld": 10887055,
+                "recomposed": 10817255
+              },
+              "perTick": {
+                "updateWorldMatrix": 5515.106730498451,
+                "updateMatrixWorld": 0,
+                "recomposed": 0
+              },
+              "perFrame": {
+                "updateWorldMatrix": 6,
+                "updateMatrixWorld": 6239,
+                "recomposed": 6199
+              },
+              "ticks": 7102,
+              "frames": 1745,
+              "installed": true
+            },
+            "regionsDiag": {
+              "enabled": true,
+              "installed": false,
+              "recorded": true,
+              "hasTransport": false
+            }
+          },
+          "stationarity": {
+            "reached": false,
+            "reason": "occupancy 2400/2400 ok, spawn 53.56/100.00 per s FAIL, sink 53.56/53.56 per s ok",
+            "targetMUs": 2400,
+            "liveMUs": 2400,
+            "spawnRate": 53.55591889961236,
+            "sinkRate": 53.55591889961236,
+            "requiredSpawnRate": 100,
+            "windowS": 120.54690000000596,
+            "sensorEverTriggered": true
+          },
+          "env": {
+            "debugPlugins": "off",
+            "shadows": "off",
+            "effects": "on",
+            "proto": "none",
+            "hooks": "on",
+            "geometry": "library",
+            "muAsset": "cartonbox",
+            "robots": 100,
+            "robotMotion": "erratic",
+            "model": "off",
+            "modelUrl": "rvproject:DemoRealvirtualWeb.glb"
+          },
+          "fillPhaseS": 74.09820000000298,
+          "heapAfterGc": 83802384,
+          "pageErrors": [
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Fetch API cannot load rvproject:DemoRealvirtualWeb.settings.json. URL scheme \"rvproject\" is not supported.",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+            "Failed to load resource: net::ERR_CONNECTION_REFUSED"
+          ]
+        }
+      ],
+      "label": "mu=2400 sensors=1 load=none renderer=webgl shadows=off effects=on keepmodel=off geometry=library muasset=cartonbox robots=100/erratic",
+      "perRun": [
+        {
+          "run": 1,
+          "liveMUs": 2400,
+          "frameP95": 101.25,
+          "stepP50": 12,
+          "stepP95": 17,
+          "stepMax": 53.70000000298023,
+          "transportP95": 16,
+          "longSteps": 0,
+          "coverageP50": 0.8918918917104801,
+          "hitRates": {
+            "pickFastPath": 0.9965758338843324,
+            "accumSpanStable": 0.7176666713560205,
+            "cloneShare": 0,
+            "pickSamples": 17059920,
+            "accumSamples": 17059920,
+            "aabbSamples": 17059920
+          },
+          "regions": {
+            "sources": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.30000000000000004,
+              "max": 4.399999991059303,
+              "count": 7138
+            },
+            "surfaceGrid": {
+              "p50": 0.45,
+              "p95": 0.65,
+              "p99": 1.3,
+              "max": 21.399999991059303,
+              "count": 7138
+            },
+            "pick": {
+              "p50": 2.6,
+              "p95": 4.05,
+              "p99": 6.7,
+              "max": 31.09999991953373,
+              "count": 7138
+            },
+            "transportExcl": {
+              "p50": 2.3000000000000003,
+              "p95": 3.6,
+              "p99": 5.9,
+              "max": 26.900000035762787,
+              "count": 7138
+            },
+            "accumulation": {
+              "p50": 2.9000000000000004,
+              "p95": 4.5,
+              "p99": 7,
+              "max": 23.899999991059303,
+              "count": 7138
+            },
+            "muAabbGrid": {
+              "p50": 0.8,
+              "p95": 1.4500000000000002,
+              "p99": 2.3000000000000003,
+              "max": 10.099999994039536,
+              "count": 7138
+            },
+            "sensors": {
+              "p50": 0.65,
+              "p95": 1.05,
+              "p99": 1.8,
+              "max": 9.399999991059303,
+              "count": 7138
+            },
+            "sinks": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 2.0999999940395355,
+              "count": 7138
+            },
+            "removal": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 3.7000000029802322,
+              "count": 7138
+            },
+            "poolMatrices": {
+              "p50": 0.15000000000000002,
+              "p95": 0.25,
+              "p99": 0.35000000000000003,
+              "max": 4.0999999940395355,
+              "count": 7138
+            },
+            "adjacency": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7138
+            },
+            "growth": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7138
+            }
+          },
+          "stationary": false,
+          "lostSimSeconds": 1.4528999999998762,
+          "runtimeSeconds": 119.98729999999702,
+          "env": {
+            "debugPlugins": "off",
+            "shadows": "off",
+            "effects": "on",
+            "proto": "none",
+            "hooks": "on",
+            "geometry": "library",
+            "muAsset": "cartonbox",
+            "robots": 100,
+            "robotMotion": "erratic",
+            "model": "off",
+            "modelUrl": "rvproject:DemoRealvirtualWeb.glb"
+          },
+          "stages": {
+            "perTick": {
+              "drives": {
+                "p50": 0.55,
+                "p95": 0.9500000000000001,
+                "p99": 2.1,
+                "max": 17.200000002980232,
+                "count": 7138
+              },
+              "transport": {
+                "p50": 11.25,
+                "p95": 15.950000000000001,
+                "p99": 23.150000000000002,
+                "max": 53.1000000089407,
+                "count": 7138
+              },
+              "behaviors": {
+                "p50": 0.05,
+                "p95": 0.05,
+                "p99": 0.1,
+                "max": 0.5999999940395355,
+                "count": 7138
+              },
+              "visuals": {
+                "p50": 0.05,
+                "p95": 0.15000000000000002,
+                "p99": 0.15000000000000002,
+                "max": 1.6000000089406967,
+                "count": 7138
+              }
+            },
+            "ticks": 7138
+          },
+          "renderPasses": {
+            "mainMs": {
+              "p50": 12.65,
+              "p95": 18.25,
+              "p99": 22.6,
+              "max": 39.099999994039536,
+              "count": 1778
+            },
+            "shadowMs": {
+              "p50": 0.05,
+              "p95": 0.15000000000000002,
+              "p99": 0.2,
+              "max": 0.800000011920929,
+              "count": 1778
+            },
+            "totalMs": {
+              "p50": 12.700000000000001,
+              "p95": 18.25,
+              "p99": 22.6,
+              "max": 39.099999994039536,
+              "count": 1778
+            },
+            "mainDraws": {
+              "p50": 1407,
+              "p95": 1407,
+              "p99": 1407,
+              "max": 1407,
+              "count": 1778
+            },
+            "mainTriangles": {
+              "p50": 34399.992,
+              "p95": 34399.992,
+              "p99": 34399.992,
+              "max": 34399.992,
+              "count": 1778
+            },
+            "shadowDraws": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 1778
+            },
+            "shadowTriangles": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 1778
+            },
+            "frames": 1778,
+            "shadowPassObserved": true
+          },
+          "worldMatrix": {
+            "total": {
+              "updateWorldMatrix": 39377676,
+              "updateMatrixWorld": 11092942,
+              "recomposed": 11021822
+            },
+            "step": {
+              "updateWorldMatrix": 39367008,
+              "updateMatrixWorld": 0,
+              "recomposed": 0
+            },
+            "render": {
+              "updateWorldMatrix": 10668,
+              "updateMatrixWorld": 11092942,
+              "recomposed": 11021822
+            },
+            "perTick": {
+              "updateWorldMatrix": 5515.131409358363,
+              "updateMatrixWorld": 0,
+              "recomposed": 0
+            },
+            "perFrame": {
+              "updateWorldMatrix": 6,
+              "updateMatrixWorld": 6239,
+              "recomposed": 6199
+            },
+            "ticks": 7138,
+            "frames": 1778,
+            "installed": true
+          },
+          "frameP50": 65.25,
+          "frameP99": 146.75
+        },
+        {
+          "run": 2,
+          "liveMUs": 2400,
+          "frameP95": 99.5,
+          "stepP50": 12,
+          "stepP95": 16.5,
+          "stepMax": 47.20000000298023,
+          "transportP95": 15.75,
+          "longSteps": 0,
+          "coverageP50": 0.8901098902178565,
+          "hitRates": {
+            "pickFastPath": 0.9965770612350775,
+            "accumSpanStable": 0.7176766309711109,
+            "cloneShare": 0,
+            "pickSamples": 17023968,
+            "accumSamples": 17023968,
+            "aabbSamples": 17023968
+          },
+          "regions": {
+            "sources": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.30000000000000004,
+              "max": 3,
+              "count": 7123
+            },
+            "surfaceGrid": {
+              "p50": 0.45,
+              "p95": 0.7000000000000001,
+              "p99": 1.6500000000000001,
+              "max": 18.5,
+              "count": 7123
+            },
+            "pick": {
+              "p50": 2.6500000000000004,
+              "p95": 3.95,
+              "p99": 6.300000000000001,
+              "max": 30.400000035762787,
+              "count": 7123
+            },
+            "transportExcl": {
+              "p50": 2.3000000000000003,
+              "p95": 3.5,
+              "p99": 5.7,
+              "max": 16.10000003874302,
+              "count": 7123
+            },
+            "accumulation": {
+              "p50": 2.9000000000000004,
+              "p95": 4.4,
+              "p99": 6.8500000000000005,
+              "max": 28.500000029802322,
+              "count": 7123
+            },
+            "muAabbGrid": {
+              "p50": 0.8,
+              "p95": 1.4500000000000002,
+              "p99": 2.25,
+              "max": 16.69999998807907,
+              "count": 7123
+            },
+            "sensors": {
+              "p50": 0.65,
+              "p95": 1.05,
+              "p99": 1.75,
+              "max": 8.799999997019768,
+              "count": 7123
+            },
+            "sinks": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.25,
+              "max": 3.199999988079071,
+              "count": 7123
+            },
+            "removal": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.25,
+              "max": 18.69999998807907,
+              "count": 7123
+            },
+            "poolMatrices": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.30000000000000004,
+              "max": 12.600000008940697,
+              "count": 7123
+            },
+            "adjacency": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7123
+            },
+            "growth": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7123
+            }
+          },
+          "stationary": false,
+          "lostSimSeconds": 1.7010000000000844,
+          "runtimeSeconds": 119.99359999999405,
+          "env": {
+            "debugPlugins": "off",
+            "shadows": "off",
+            "effects": "on",
+            "proto": "none",
+            "hooks": "on",
+            "geometry": "library",
+            "muAsset": "cartonbox",
+            "robots": 100,
+            "robotMotion": "erratic",
+            "model": "off",
+            "modelUrl": "rvproject:DemoRealvirtualWeb.glb"
+          },
+          "stages": {
+            "perTick": {
+              "drives": {
+                "p50": 0.45,
+                "p95": 0.8,
+                "p99": 1.8,
+                "max": 16.399999991059303,
+                "count": 7123
+              },
+              "transport": {
+                "p50": 11.25,
+                "p95": 15.65,
+                "p99": 21.450000000000003,
+                "max": 46.80000001192093,
+                "count": 7123
+              },
+              "behaviors": {
+                "p50": 0.05,
+                "p95": 0.05,
+                "p99": 0.1,
+                "max": 0.20000000298023224,
+                "count": 7123
+              },
+              "visuals": {
+                "p50": 0.05,
+                "p95": 0.15000000000000002,
+                "p99": 0.15000000000000002,
+                "max": 1.4000000059604645,
+                "count": 7123
+              }
+            },
+            "ticks": 7123
+          },
+          "renderPasses": {
+            "mainMs": {
+              "p50": 12.05,
+              "p95": 17.45,
+              "p99": 22.55,
+              "max": 68.69999998807907,
+              "count": 1894
+            },
+            "shadowMs": {
+              "p50": 0.05,
+              "p95": 0.15000000000000002,
+              "p99": 0.15000000000000002,
+              "max": 0.5,
+              "count": 1894
+            },
+            "totalMs": {
+              "p50": 12.100000000000001,
+              "p95": 17.45,
+              "p99": 22.55,
+              "max": 68.69999998807907,
+              "count": 1894
+            },
+            "mainDraws": {
+              "p50": 1407,
+              "p95": 1407,
+              "p99": 1407,
+              "max": 1407,
+              "count": 1894
+            },
+            "mainTriangles": {
+              "p50": 34399.992,
+              "p95": 34399.992,
+              "p99": 34399.992,
+              "max": 34399.992,
+              "count": 1894
+            },
+            "shadowDraws": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 1894
+            },
+            "shadowTriangles": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 1894
+            },
+            "frames": 1894,
+            "shadowPassObserved": true
+          },
+          "worldMatrix": {
+            "total": {
+              "updateWorldMatrix": 39295428,
+              "updateMatrixWorld": 11816666,
+              "recomposed": 11740906
+            },
+            "step": {
+              "updateWorldMatrix": 39284064,
+              "updateMatrixWorld": 0,
+              "recomposed": 0
+            },
+            "render": {
+              "updateWorldMatrix": 11364,
+              "updateMatrixWorld": 11816666,
+              "recomposed": 11740906
+            },
+            "perTick": {
+              "updateWorldMatrix": 5515.10094061491,
+              "updateMatrixWorld": 0,
+              "recomposed": 0
+            },
+            "perFrame": {
+              "updateWorldMatrix": 6,
+              "updateMatrixWorld": 6239,
+              "recomposed": 6199
+            },
+            "ticks": 7123,
+            "frames": 1894,
+            "installed": true
+          },
+          "frameP50": 59.75,
+          "frameP99": 152.75
+        },
+        {
+          "run": 3,
+          "liveMUs": 2400,
+          "frameP95": 106.25,
+          "stepP50": 12,
+          "stepP95": 17.5,
+          "stepMax": 104.79999999701977,
+          "transportP95": 16.25,
+          "longSteps": 1,
+          "coverageP50": 0.8938053082641191,
+          "hitRates": {
+            "pickFastPath": 0.9965754247844794,
+            "accumSpanStable": 0.7175630372107952,
+            "cloneShare": 0,
+            "pickSamples": 16973784,
+            "accumSamples": 16973784,
+            "aabbSamples": 16973784
+          },
+          "regions": {
+            "sources": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.30000000000000004,
+              "max": 3.199999988079071,
+              "count": 7102
+            },
+            "surfaceGrid": {
+              "p50": 0.45,
+              "p95": 0.75,
+              "p99": 1.75,
+              "max": 10,
+              "count": 7102
+            },
+            "pick": {
+              "p50": 2.6500000000000004,
+              "p95": 4.2,
+              "p99": 6.800000000000001,
+              "max": 42.8999999910593,
+              "count": 7102
+            },
+            "transportExcl": {
+              "p50": 2.35,
+              "p95": 3.6,
+              "p99": 5.6000000000000005,
+              "max": 20.599999979138374,
+              "count": 7102
+            },
+            "accumulation": {
+              "p50": 2.9000000000000004,
+              "p95": 4.55,
+              "p99": 7.7,
+              "max": 41.5,
+              "count": 7102
+            },
+            "muAabbGrid": {
+              "p50": 0.75,
+              "p95": 1.3,
+              "p99": 2.15,
+              "max": 19,
+              "count": 7102
+            },
+            "sensors": {
+              "p50": 0.7000000000000001,
+              "p95": 1.05,
+              "p99": 1.9500000000000002,
+              "max": 12,
+              "count": 7102
+            },
+            "sinks": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 10.5,
+              "count": 7102
+            },
+            "removal": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 5,
+              "count": 7102
+            },
+            "poolMatrices": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.30000000000000004,
+              "max": 5.5,
+              "count": 7102
+            },
+            "adjacency": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7102
+            },
+            "growth": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7102
+            }
+          },
+          "stationary": false,
+          "lostSimSeconds": 2.165700000000011,
+          "runtimeSeconds": 120.53089999999106,
+          "env": {
+            "debugPlugins": "off",
+            "shadows": "off",
+            "effects": "on",
+            "proto": "none",
+            "hooks": "on",
+            "geometry": "library",
+            "muAsset": "cartonbox",
+            "robots": 100,
+            "robotMotion": "erratic",
+            "model": "off",
+            "modelUrl": "rvproject:DemoRealvirtualWeb.glb"
+          },
+          "stages": {
+            "perTick": {
+              "drives": {
+                "p50": 0.55,
+                "p95": 1.05,
+                "p99": 2.1,
+                "max": 13,
+                "count": 7102
+              },
+              "transport": {
+                "p50": 11.25,
+                "p95": 16.25,
+                "p99": 23.1,
+                "max": 104.20000000298023,
+                "count": 7102
+              },
+              "behaviors": {
+                "p50": 0.05,
+                "p95": 0.05,
+                "p99": 0.1,
+                "max": 0.20000000298023224,
+                "count": 7102
+              },
+              "visuals": {
+                "p50": 0.05,
+                "p95": 0.15000000000000002,
+                "p99": 0.15000000000000002,
+                "max": 2.0999999940395355,
+                "count": 7102
+              }
+            },
+            "ticks": 7102
+          },
+          "renderPasses": {
+            "mainMs": {
+              "p50": 12.850000000000001,
+              "p95": 18.05,
+              "p99": 23.900000000000002,
+              "max": 68.8999999910593,
+              "count": 1745
+            },
+            "shadowMs": {
+              "p50": 0.05,
+              "p95": 0.15000000000000002,
+              "p99": 0.25,
+              "max": 6.0999999940395355,
+              "count": 1745
+            },
+            "totalMs": {
+              "p50": 12.850000000000001,
+              "p95": 18.05,
+              "p99": 23.900000000000002,
+              "max": 68.8999999910593,
+              "count": 1745
+            },
+            "mainDraws": {
+              "p50": 1407,
+              "p95": 1407,
+              "p99": 1407,
+              "max": 1407,
+              "count": 1745
+            },
+            "mainTriangles": {
+              "p50": 34399.992,
+              "p95": 34399.992,
+              "p99": 34399.992,
+              "max": 34399.992,
+              "count": 1745
+            },
+            "shadowDraws": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 1745
+            },
+            "shadowTriangles": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 1745
+            },
+            "frames": 1745,
+            "shadowPassObserved": true
+          },
+          "worldMatrix": {
+            "total": {
+              "updateWorldMatrix": 39178758,
+              "updateMatrixWorld": 10887055,
+              "recomposed": 10817255
+            },
+            "step": {
+              "updateWorldMatrix": 39168288,
+              "updateMatrixWorld": 0,
+              "recomposed": 0
+            },
+            "render": {
+              "updateWorldMatrix": 10470,
+              "updateMatrixWorld": 10887055,
+              "recomposed": 10817255
+            },
+            "perTick": {
+              "updateWorldMatrix": 5515.106730498451,
+              "updateMatrixWorld": 0,
+              "recomposed": 0
+            },
+            "perFrame": {
+              "updateWorldMatrix": 6,
+              "updateMatrixWorld": 6239,
+              "recomposed": 6199
+            },
+            "ticks": 7102,
+            "frames": 1745,
+            "installed": true
+          },
+          "frameP50": 65.75,
+          "frameP99": 159.5
+        }
+      ],
+      "occupancySpread": 0,
+      "occupancyComparable": true,
+      "median": {
+        "frameP50": 65.25,
+        "frameP95": 101.25,
+        "frameP99": 146.75,
+        "frameMax": 333.5,
+        "stepP95": 17,
+        "transportP95": 16,
+        "drawCalls": 1407,
+        "triangles": 34399992,
+        "liveMUs": 2400,
+        "pools": 24,
+        "poolCapacity": 3072,
+        "signals": 55,
+        "lostSimSeconds": 1.4528999999998762,
+        "runtimeSeconds": 119.98729999999702,
+        "longTasks": 1436,
+        "heapAfterGc": 84231104,
+        "jitterP95": 0,
+        "flushP95": 0,
+        "coalescedGaps": 0,
+        "fillPhaseS": 74.03110000000893,
+        "env": {
+          "debugPlugins": "off",
+          "shadows": "off",
+          "effects": "on",
+          "proto": "none",
+          "hooks": "on",
+          "geometry": "library",
+          "muAsset": "cartonbox",
+          "robots": 100,
+          "robotMotion": "erratic",
+          "model": "off",
+          "modelUrl": "rvproject:DemoRealvirtualWeb.glb"
+        },
+        "regions": {
+          "exclusive": {
+            "sources": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.30000000000000004,
+              "max": 4.399999991059303,
+              "count": 7138
+            },
+            "surfaceGrid": {
+              "p50": 0.45,
+              "p95": 0.65,
+              "p99": 1.3,
+              "max": 21.399999991059303,
+              "count": 7138
+            },
+            "pick": {
+              "p50": 2.6,
+              "p95": 4.05,
+              "p99": 6.7,
+              "max": 31.09999991953373,
+              "count": 7138
+            },
+            "transportExcl": {
+              "p50": 2.3000000000000003,
+              "p95": 3.6,
+              "p99": 5.9,
+              "max": 26.900000035762787,
+              "count": 7138
+            },
+            "accumulation": {
+              "p50": 2.9000000000000004,
+              "p95": 4.5,
+              "p99": 7,
+              "max": 23.899999991059303,
+              "count": 7138
+            },
+            "muAabbGrid": {
+              "p50": 0.8,
+              "p95": 1.4500000000000002,
+              "p99": 2.3000000000000003,
+              "max": 10.099999994039536,
+              "count": 7138
+            },
+            "sensors": {
+              "p50": 0.65,
+              "p95": 1.05,
+              "p99": 1.8,
+              "max": 9.399999991059303,
+              "count": 7138
+            },
+            "sinks": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 2.0999999940395355,
+              "count": 7138
+            },
+            "removal": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 3.7000000029802322,
+              "count": 7138
+            },
+            "poolMatrices": {
+              "p50": 0.15000000000000002,
+              "p95": 0.25,
+              "p99": 0.35000000000000003,
+              "max": 4.0999999940395355,
+              "count": 7138
+            },
+            "adjacency": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7138
+            },
+            "growth": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7138
+            }
+          },
+          "inclusive": {
+            "sources": {
+              "p50": 0.1,
+              "p95": 0.25,
+              "p99": 0.30000000000000004,
+              "max": 4.399999991059303,
+              "count": 7138
+            },
+            "surfaceGrid": {
+              "p50": 0.45,
+              "p95": 0.65,
+              "p99": 1.3,
+              "max": 21.399999991059303,
+              "count": 7138
+            },
+            "pick": {
+              "p50": 2.6,
+              "p95": 4.05,
+              "p99": 6.7,
+              "max": 31.09999991953373,
+              "count": 7138
+            },
+            "transportExcl": {
+              "p50": 5.25,
+              "p95": 7.7,
+              "p99": 11.450000000000001,
+              "max": 31.599999979138374,
+              "count": 7138
+            },
+            "accumulation": {
+              "p50": 2.9000000000000004,
+              "p95": 4.5,
+              "p99": 7,
+              "max": 23.899999991059303,
+              "count": 7138
+            },
+            "muAabbGrid": {
+              "p50": 0.8,
+              "p95": 1.4500000000000002,
+              "p99": 2.3000000000000003,
+              "max": 10.099999994039536,
+              "count": 7138
+            },
+            "sensors": {
+              "p50": 0.65,
+              "p95": 1.05,
+              "p99": 1.8,
+              "max": 9.399999991059303,
+              "count": 7138
+            },
+            "sinks": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 2.0999999940395355,
+              "count": 7138
+            },
+            "removal": {
+              "p50": 0.1,
+              "p95": 0.2,
+              "p99": 0.25,
+              "max": 3.7000000029802322,
+              "count": 7138
+            },
+            "poolMatrices": {
+              "p50": 0.15000000000000002,
+              "p95": 0.25,
+              "p99": 0.35000000000000003,
+              "max": 4.0999999940395355,
+              "count": 7138
+            },
+            "adjacency": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7138
+            },
+            "growth": {
+              "p50": 0,
+              "p95": 0,
+              "p99": 0,
+              "max": 0,
+              "count": 7138
+            }
+          },
+          "sumExclusive": {
+            "p50": 10,
+            "p95": 14.350000000000001,
+            "p99": 20.55,
+            "max": 48.1000000089407,
+            "count": 7138
+          },
+          "total": {
+            "p50": 11.25,
+            "p95": 15.9,
+            "p99": 23.150000000000002,
+            "max": 53.1000000089407,
+            "count": 7138
+          },
+          "coverageP50": 0.8918918917104801,
+          "coverageP95": 0.9402985076452581,
+          "ticks": 7138,
+          "hitRates": {
+            "pickFastPath": 0.9965758338843324,
+            "accumSpanStable": 0.7176666713560205,
+            "cloneShare": 0,
+            "pickSamples": 17059920,
+            "accumSamples": 17059920,
+            "aabbSamples": 17059920
+          },
+          "longSteps": [],
+          "longStepsTruncated": 0
+        },
+        "stages": {
+          "perTick": {
+            "drives": {
+              "p50": 0.55,
+              "p95": 0.9500000000000001,
+              "p99": 2.1,
+              "max": 17.200000002980232,
+              "count": 7138
+            },
+            "transport": {
+              "p50": 11.25,
+              "p95": 15.950000000000001,
+              "p99": 23.150000000000002,
+              "max": 53.1000000089407,
+              "count": 7138
+            },
+            "behaviors": {
+              "p50": 0.05,
+              "p95": 0.05,
+              "p99": 0.1,
+              "max": 0.5999999940395355,
+              "count": 7138
+            },
+            "visuals": {
+              "p50": 0.05,
+              "p95": 0.15000000000000002,
+              "p99": 0.15000000000000002,
+              "max": 1.6000000089406967,
+              "count": 7138
+            }
+          },
+          "ticks": 7138
+        },
+        "renderPasses": {
+          "mainMs": {
+            "p50": 12.65,
+            "p95": 18.25,
+            "p99": 22.6,
+            "max": 39.099999994039536,
+            "count": 1778
+          },
+          "shadowMs": {
+            "p50": 0.05,
+            "p95": 0.15000000000000002,
+            "p99": 0.2,
+            "max": 0.800000011920929,
+            "count": 1778
+          },
+          "totalMs": {
+            "p50": 12.700000000000001,
+            "p95": 18.25,
+            "p99": 22.6,
+            "max": 39.099999994039536,
+            "count": 1778
+          },
+          "mainDraws": {
+            "p50": 1407,
+            "p95": 1407,
+            "p99": 1407,
+            "max": 1407,
+            "count": 1778
+          },
+          "mainTriangles": {
+            "p50": 34399.992,
+            "p95": 34399.992,
+            "p99": 34399.992,
+            "max": 34399.992,
+            "count": 1778
+          },
+          "shadowDraws": {
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+            "count": 1778
+          },
+          "shadowTriangles": {
+            "p50": 0,
+            "p95": 0,
+            "p99": 0,
+            "max": 0,
+            "count": 1778
+          },
+          "frames": 1778,
+          "shadowPassObserved": true
+        },
+        "worldMatrix": {
+          "total": {
+            "updateWorldMatrix": 39377676,
+            "updateMatrixWorld": 11092942,
+            "recomposed": 11021822
+          },
+          "step": {
+            "updateWorldMatrix": 39367008,
+            "updateMatrixWorld": 0,
+            "recomposed": 0
+          },
+          "render": {
+            "updateWorldMatrix": 10668,
+            "updateMatrixWorld": 11092942,
+            "recomposed": 11021822
+          },
+          "perTick": {
+            "updateWorldMatrix": 5515.131409358363,
+            "updateMatrixWorld": 0,
+            "recomposed": 0
+          },
+          "perFrame": {
+            "updateWorldMatrix": 6,
+            "updateMatrixWorld": 6239,
+            "recomposed": 6199
+          },
+          "ticks": 7138,
+          "frames": 1778,
+          "installed": true
+        },
+        "scene": {
+          "geometry": "library",
+          "muAsset": "cartonbox",
+          "conveyorDraws": 45,
+          "conveyorTriangles": 16415136,
+          "conveyorPlacements": 432,
+          "conveyorClonesAvoided": 9720,
+          "muMeshCount": 1,
+          "muTriangles": 324,
+          "muInstanced": true,
+          "robots": 100,
+          "robotDrives": 600,
+          "robotMeshes": 600,
+          "robotTriangles": 7200,
+          "robotMotion": "erratic"
+        }
+      },
+      "summary": {
+        "supported": false,
+        "checks": [
+          {
+            "name": "frame p95 <= 33.3 ms",
+            "ok": false,
+            "value": 101.25
+          },
+          {
+            "name": "frame p99 <= 66 ms",
+            "ok": false,
+            "value": 146.75
+          },
+          {
+            "name": "lost sim time <= 0.1 %",
+            "ok": false,
+            "value": 0.012108781512709364
+          },
+          {
+            "name": "stationarity reached",
+            "ok": false,
+            "value": false
+          }
+        ],
+        "graded": true,
+        "reason": "occupancy 2400/2400 ok, spawn 53.99/100.00 per s FAIL, sink 53.79/53.99 per s ok"
+      }
+    }
+  ]
+}

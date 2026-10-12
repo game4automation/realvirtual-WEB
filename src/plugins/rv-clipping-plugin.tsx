@@ -15,8 +15,14 @@
  *   axis toggle; a disabled axis pushes `plane.constant` to LARGE so nothing
  *   is clipped. Slider drag mutates only `plane.constant` / `plane.normal`
  *   (GC-free, no recompile).
- * - Per-material assignment collected once at model load via `traverseMeshes`,
- *   overlay meshes (`_tankFillViz` marker or HIGHLIGHT_OVERLAY_LAYER) excluded.
+ * - Per-material assignment via `traverseMeshes`, overlay meshes (`_tankFillViz`
+ *   marker or HIGHLIGHT_OVERLAY_LAYER) excluded. The planes are bound on FIRST USE
+ *   (the first enabled axis), not at model load, and stay bound from then on, so
+ *   axis toggles still never recompile. Binding at load turned every model shader
+ *   into a clipping variant that three's `compile()`/`compileAsync()` cannot
+ *   pre-build (it never applies per-material clipping state), i.e. ~1–2 s of
+ *   synchronous program links on the first frame of every cold load — for a tool
+ *   most sessions never open.
  * - `localClippingEnabled` is only reset on destroy when no TankFillManager is
  *   active (both set it to true; idempotent).
  */
@@ -195,6 +201,11 @@ export class ClippingPlugin extends RVBehavior {
   private readonly planes: Plane[] = [new Plane(), new Plane(), new Plane()];
   private bbox: Box3 | null = null;
   private clippedMaterials = new Set<Material>();
+  /** True once an axis was enabled for this model — from then on the planes are bound. */
+  private _planesBound = false;
+  /** Model / placed subtrees seen before the first use; bound when the planes are. */
+  private _pendingRoots: Object3D[] = [];
+  private _pendingChunks: Mesh[] = [];
   private state: ClippingState = structuredClone(DEFAULT_CLIPPING_STATE);
   private _active = false;
   private _modelHash = '';
@@ -215,11 +226,8 @@ export class ClippingPlugin extends RVBehavior {
       : null;
 
     (viewer.renderer as unknown as { localClippingEnabled: boolean }).localClippingEnabled = true;
-    // Optional for lightweight embedders/test hosts that implement only the
-    // original RVBehavior viewer surface. The production RVViewer provides it.
-    (viewer as { setSectionClippingPlanes?: (planes: Plane[] | null) => void })
-      .setSectionClippingPlanes?.(this.planes);
 
+    // Remembered, not bound — see the file header (bound on first use in applyState).
     this._attachClippingPlanes(result.root);
 
     this._buildPlaneViz();
@@ -246,8 +254,9 @@ export class ClippingPlugin extends RVBehavior {
       }));
 
       const off = viewer.on('layout-content-added', (data: unknown) => {
-        const root = (data as { root?: Object3D } | undefined)?.root;
-        if (root) this._attachSubtree(root);
+        const payload = data as { root?: Object3D; chunks?: Mesh[]; keep?: Mesh[] } | undefined;
+        const root = payload?.root;
+        if (root) this._attachSubtree(root, payload?.chunks);
       });
       this.addCleanup(off);
     }
@@ -259,6 +268,9 @@ export class ClippingPlugin extends RVBehavior {
       ?.setSectionClippingPlanes?.(null);
     for (const mat of this.clippedMaterials) mat.clippingPlanes = null;
     this.clippedMaterials.clear(); // avoid leak across model switches
+    this._planesBound = false;
+    this._pendingRoots = [];
+    this._pendingChunks = [];
     this._disposePlaneViz();
     // Only disable local clipping when no TankFillManager is relying on it.
     if (viewer && !viewer.tankFillManager) {
@@ -312,6 +324,7 @@ export class ClippingPlugin extends RVBehavior {
 
   /** Slider drag calls only this → mutates plane.constant / .normal in place. */
   private applyState(): void {
+    if (!this._planesBound && AXES.some((a) => this.state[a].enabled)) this._bindPlanesOnFirstUse();
     for (let i = 0; i < 3; i++) {
       const axis = AXES[i];
       const s = this.state[axis];
@@ -334,16 +347,39 @@ export class ClippingPlugin extends RVBehavior {
 
   // ── Late-added geometry (Planner / DES / CAD import) ──
 
-  /** Bind the stable clipping-plane array to every current model material. */
+  /** First enabled axis: bind the planes to every subtree seen so far and to the
+   *  post-processing override materials. One shader-variant wave, once per model. */
+  private _bindPlanesOnFirstUse(): void {
+    this._planesBound = true;
+    // Optional for lightweight embedders/test hosts that implement only the
+    // original RVBehavior viewer surface. The production RVViewer provides it.
+    (this.viewer as { setSectionClippingPlanes?: (planes: Plane[] | null) => void } | null)
+      ?.setSectionClippingPlanes?.(this.planes);
+    for (const chunk of this._pendingChunks) this._bindMesh(chunk);
+    for (const root of this._pendingRoots) this._attachClippingPlanes(root);
+    this._pendingRoots = [];
+    this._pendingChunks = [];
+  }
+
+  private _bindMesh(mesh: Mesh): void {
+    for (const mat of materialsOf(mesh)) {
+      if (this.clippedMaterials.has(mat)) continue;
+      mat.clippingPlanes = this.planes; // stable reference, length 3
+      mat.clipShadows = true;
+      this.clippedMaterials.add(mat);
+    }
+  }
+
+  /** Bind the stable clipping-plane array to every current model material
+   *  (before the first use: only remember the subtree). */
   private _attachClippingPlanes(root: Object3D): void {
+    if (!this._planesBound) {
+      if (!this._pendingRoots.includes(root)) this._pendingRoots.push(root);
+      return;
+    }
     traverseMeshes(root, (mesh) => {
       if (isOverlayMesh(mesh)) return; // tank-fill / gizmos etc.
-      for (const mat of materialsOf(mesh)) {
-        if (this.clippedMaterials.has(mat)) continue;
-        mat.clippingPlanes = this.planes;
-        mat.clipShadows = true;
-        this.clippedMaterials.add(mat);
-      }
+      this._bindMesh(mesh);
     });
     this.viewer?.markRenderDirty();
   }
@@ -356,7 +392,24 @@ export class ClippingPlugin extends RVBehavior {
    * clip range once the first content is placed. Runs only on discrete
    * placement events, never per frame.
    */
-  private _attachSubtree(root: Object3D): void {
+  private _attachSubtree(root: Object3D, chunks?: Mesh[]): void {
+    const viewer = this.viewer;
+    if (!viewer) return;
+    const __t0 = performance.now();
+    try { this._attachSubtreeImpl(root, chunks); } finally { performance.measure('rv:clip.attachSubtree', { start: __t0 }); }
+  }
+
+  /**
+   * `chunks` (plan-753 Phase 3, F9): a baked placement announces its chunk
+   * meshes with the event. Their materials are the session's uber singleton
+   * (bound once — the Set dedups) plus the asset's textured ones, and the
+   * bounds come from ONE `expandByObject(root)`: a placement is ≤ ~10 meshes
+   * with precomputed geometry bounds, so no per-CAD-mesh walk happens any more.
+   * Keep meshes (Lamp, Ray …) still hang in the subtree and are bound by the
+   * same traversal — the traversal is what binds every mesh that is not a
+   * chunk, whatever the caller announced.
+   */
+  private _attachSubtreeImpl(root: Object3D, chunks?: Mesh[]): void {
     const viewer = this.viewer;
     if (!viewer) return;
 
@@ -364,17 +417,31 @@ export class ClippingPlugin extends RVBehavior {
     const box = this.bbox ? this.bbox.clone() : new Box3();
     let added = false;
 
-    traverseMeshes(root, (mesh) => {
-      if (isOverlayMesh(mesh)) return; // tank-fill / gizmos etc.
-      for (const mat of materialsOf(mesh)) {
-        if (this.clippedMaterials.has(mat)) continue;
-        mat.clippingPlanes = this.planes; // stable reference, length 3
-        mat.clipShadows = true;
-        this.clippedMaterials.add(mat);
-      }
-      box.expandByObject(mesh);
+    const bind = (mesh: Mesh): void => {
+      if (this._planesBound) this._bindMesh(mesh);
+    };
+    if (!this._planesBound) {
+      // Bounds still grow now (plane viz / slider range); the binding waits for first use.
+      if (!this._pendingRoots.includes(root)) this._pendingRoots.push(root);
+      if (chunks) this._pendingChunks.push(...chunks);
+    }
+
+    if (chunks && chunks.length > 0) {
+      for (const chunk of chunks) bind(chunk);
+      traverseMeshes(root, (mesh) => {
+        if (isOverlayMesh(mesh)) return;
+        bind(mesh);
+      });
+      box.expandByObject(root);
       added = true;
-    });
+    } else {
+      traverseMeshes(root, (mesh) => {
+        if (isOverlayMesh(mesh)) return; // tank-fill / gizmos etc.
+        bind(mesh);
+        box.expandByObject(mesh);
+        added = true;
+      });
+    }
 
     if (!added) return;
 
@@ -383,10 +450,14 @@ export class ClippingPlugin extends RVBehavior {
     // Rebuild the plane-viz + re-apply only when the extents actually grew (or
     // there was no bbox before) — the viz geometry is sized from the bbox.
     if (!this.bbox || !box.equals(this.bbox)) {
+      const __t1 = performance.now();
       this.bbox = box;
       this._disposePlaneViz();
       this._buildPlaneViz();
+      performance.measure('rv:clip.planeViz', { start: __t1 });
+      const __t2 = performance.now();
       this.applyState();
+      performance.measure('rv:clip.applyState', { start: __t2 });
     } else {
       viewer.markRenderDirty();
     }

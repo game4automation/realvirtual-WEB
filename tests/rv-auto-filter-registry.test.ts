@@ -62,9 +62,9 @@ describe('AutoFilterRegistry', () => {
     _resetCapabilitiesForTesting();
   });
 
-  it('should build filters from capabilities with filterLabel', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives', badgeColor: '#ff9800' });
-    registerCapabilities('Sensor', { filterLabel: 'Sensors', badgeColor: '#4caf50' });
+  it('should build filters from capabilities with ui.filter', () => {
+    registerCapabilities('Drive', { ui: { filter: 'Drives', badge: '#ff9800' } });
+    registerCapabilities('Sensor', { ui: { filter: 'Sensors', badge: '#4caf50' } });
 
     const { nodeRegistry } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -86,10 +86,10 @@ describe('AutoFilterRegistry', () => {
     expect(sensors!.nodes).toHaveLength(1);
   });
 
-  it('should exclude types without filterLabel', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives' });
-    registerCapabilities('Sensor', { filterLabel: null }); // no filterLabel
-    registerCapabilities('TransportSurface', {}); // no filterLabel
+  it('should exclude types without ui.filter', () => {
+    registerCapabilities('Drive', { ui: { filter: 'Drives' } });
+    registerCapabilities('Sensor', { ui: { filter: null } }); // no filter
+    registerCapabilities('TransportSurface', {}); // no filter
 
     const { nodeRegistry } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -101,8 +101,8 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should exclude types with zero instances in scene', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives' });
-    registerCapabilities('Conveyor', { filterLabel: 'Conveyors' }); // no instances
+    registerCapabilities('Drive', { ui: { filter: 'Drives' } });
+    registerCapabilities('Conveyor', { ui: { filter: 'Conveyors' } }); // no instances
 
     const { nodeRegistry } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -114,8 +114,8 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should sort by label alphabetically', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives' });
-    registerCapabilities('Sensor', { filterLabel: 'Sensors' });
+    registerCapabilities('Drive', { ui: { filter: 'Drives' } });
+    registerCapabilities('Sensor', { ui: { filter: 'Sensors' } });
 
     const { nodeRegistry } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -126,7 +126,7 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should toggle visibility on all nodes of a type', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives' });
+    registerCapabilities('Drive', { ui: { filter: 'Drives' } });
 
     const { nodeRegistry, driveNodes } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -148,7 +148,7 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should isolate a filter type with ISOLATE_FOCUS_LAYER', () => {
-    registerCapabilities('Sensor', { filterLabel: 'Sensors' });
+    registerCapabilities('Sensor', { ui: { filter: 'Sensors' } });
 
     const { nodeRegistry, sensorNodes } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -167,7 +167,7 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should clear isolate state with showAll', () => {
-    registerCapabilities('Sensor', { filterLabel: 'Sensors' });
+    registerCapabilities('Sensor', { ui: { filter: 'Sensors' } });
 
     const { nodeRegistry, sensorNodes } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -185,7 +185,7 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should restore prior visibility on showAll after isolate', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives' });
+    registerCapabilities('Drive', { ui: { filter: 'Drives' } });
 
     const { nodeRegistry, driveNodes } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -204,7 +204,7 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should clear all state on clear()', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives' });
+    registerCapabilities('Drive', { ui: { filter: 'Drives' } });
 
     const { nodeRegistry } = setupRegistry();
     const afr = new AutoFilterRegistry();
@@ -221,8 +221,8 @@ describe('AutoFilterRegistry', () => {
   });
 
   it('should switch isolate between types', () => {
-    registerCapabilities('Drive', { filterLabel: 'Drives' });
-    registerCapabilities('Sensor', { filterLabel: 'Sensors' });
+    registerCapabilities('Drive', { ui: { filter: 'Drives' } });
+    registerCapabilities('Sensor', { ui: { filter: 'Sensors' } });
 
     const { nodeRegistry, driveNodes, sensorNodes } = setupRegistry();
     const afr = new AutoFilterRegistry();

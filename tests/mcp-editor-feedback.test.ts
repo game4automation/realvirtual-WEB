@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PerspectiveCamera, Mesh, BoxGeometry, MeshBasicMaterial, Object3D } from 'three';
+import { UserActivity } from '../src/core/rv-user-activity';
+import { _resetFollowForTest } from '../src/plugins/mcp-bridge/rv-mcp-follow-policy';
+import { setFollowAgent, _resetFollowAgentForTest } from '../src/core/hmi/follow-agent-store';
+import { MCP_FOLLOW_AGENT_KEY } from '../src/core/hmi/rv-storage-keys';
 import type { RVViewer } from '../src/core/rv-viewer';
 import {
   applyEditorFeedback,
@@ -13,6 +17,12 @@ import {
   getButtonSimSnapshot,
   _setSimTimingsForTest,
 } from '@rv-private/plugins/asset-editor/button-sim-store';
+import { getAiTouches, _resetButtonSimStateForTest } from '../src/core/hmi/button-sim-state';
+import {
+  getInspectorFieldReveal,
+  inspectorFieldKey,
+  _resetInspectorFieldRevealForTest,
+} from '../src/core/hmi/inspector-field-touch';
 
 interface FakeViewer {
   viewer: RVViewer;
@@ -166,7 +176,8 @@ describe('prepareEditorChoreography', () => {
         const s = getButtonSimSnapshot();
         if (s && phases[phases.length - 1] !== s.phase) phases.push(s.phase);
       }, 2);
-      await prepareEditorChoreography(f.viewer, 'web_editor_to_ground', { path: 'A' });
+      // plan-499: the button comes from the call context (the bound command's key).
+      await prepareEditorChoreography(f.viewer, 'web_editor_to_ground', { path: 'A' }, 'qe.to-ground');
       clearInterval(probe);
       expect(f.selectPaths).toHaveBeenCalledWith(['A']);
       expect(f.open.mock.calls[0][0]).toBe('kinematics');
@@ -177,11 +188,339 @@ describe('prepareEditorChoreography', () => {
     }
   });
 
+  it('without a button key (unbound tool / no branch) it selects and opens the panel but presses nothing', async () => {
+    _setSimTimingsForTest(10, 10);
+    const el = document.createElement('button');
+    el.setAttribute('data-rv-button-id', 'qe.to-ground');
+    document.body.appendChild(el);
+    try {
+      const f = makeViewer({ A: meshAt(0, 0, 0) });
+      const phases: string[] = [];
+      const probe = setInterval(() => { const s = getButtonSimSnapshot(); if (s) phases.push(s.phase); }, 2);
+      await prepareEditorChoreography(f.viewer, 'web_editor_to_ground', { path: 'A' });
+      clearInterval(probe);
+      expect(f.selectPaths).toHaveBeenCalledWith(['A']);
+      expect(f.open.mock.calls[0][0]).toBe('kinematics');
+      expect(phases).toEqual([]); // no buttonId table any more — nothing to press
+    } finally {
+      el.remove();
+    }
+  });
+
   it('resolves without dwell when the button is not in the DOM and never throws', async () => {
     const f = makeViewer({ A: meshAt(0, 0, 0) });
+    // plan-520: a viewer without an activity clock never counts as idle → 'fallback'.
     await expect(
-      prepareEditorChoreography(f.viewer, 'web_editor_to_ground', { path: 'A' }),
-    ).resolves.toBeUndefined();
+      prepareEditorChoreography(f.viewer, 'web_editor_to_ground', { path: 'A' }, 'qe.to-ground'),
+    ).resolves.toBe('fallback');
     expect(getButtonSimSnapshot()).toBeNull();
+  });
+});
+
+// ─── Inspector field writes (web_editor_set_field / web_component_set) ──
+
+/** A fake extras editor on top of the fake viewer: records how the inspector was opened. */
+function withEditor(f: FakeViewer, snap: { panelOpen: boolean; showInspector: boolean; selectedNodePath: string | null }) {
+  const selectNode = vi.fn((p: string, show: boolean) => { snap.selectedNodePath = p; snap.showInspector = show; });
+  const selectAndReveal = vi.fn((p: string, show: boolean) => { snap.selectedNodePath = p; snap.showInspector = show; snap.panelOpen = true; });
+  (f.viewer as unknown as { getPlugin: (id: string) => unknown }).getPlugin = (id: string) =>
+    id === 'rv-extras-editor' ? { getSnapshot: () => ({ ...snap }), selectNode, selectAndReveal } : undefined;
+  return { selectNode, selectAndReveal };
+}
+
+describe('inspector field choreography', () => {
+  let widthSpy: { mockRestore: () => void } | null = null;
+  beforeEach(() => {
+    _resetButtonSimStateForTest();
+    _resetInspectorFieldRevealForTest();
+    // Desktop layout: the compact (<900 px) layout has no docked inspector.
+    widthSpy = vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+  });
+  afterEach(() => { widthSpy?.mockRestore(); });
+
+  it('web_editor_set_field opens the inspector (hierarchy closed → reveal), requests the field and presses its row', async () => {
+    _setSimTimingsForTest(10, 10);
+    const key = inspectorFieldKey('A', 'Drive', 'TargetSpeed');
+    const row = document.createElement('div');
+    row.setAttribute('data-rv-button-id', key);
+    document.body.appendChild(row);
+    try {
+      const f = makeViewer({ A: meshAt(0, 0, 0) });
+      const ed = withEditor(f, { panelOpen: false, showInspector: false, selectedNodePath: null });
+      const phases: string[] = [];
+      const probe = setInterval(() => {
+        const s = getButtonSimSnapshot();
+        if (s && s.id === key && phases[phases.length - 1] !== s.phase) phases.push(s.phase);
+      }, 2);
+      await prepareEditorChoreography(
+        f.viewer, 'web_editor_set_field',
+        { path: 'A', componentType: 'Drive', fieldName: 'TargetSpeed', valueJson: '500' }, key,
+      );
+      clearInterval(probe);
+      expect(ed.selectAndReveal).toHaveBeenCalledWith('A', true);
+      expect(f.open).not.toHaveBeenCalled(); // no Quick Edit panel for a field write
+      expect(getInspectorFieldReveal()).toMatchObject({ path: 'A', componentType: 'Drive', fieldName: 'TargetSpeed' });
+      expect(phases).toEqual(['hover', 'pressed']);
+    } finally {
+      row.remove();
+    }
+  });
+
+  it('web_component_set (unbound) presses the first field row itself and keeps an open hierarchy', async () => {
+    _setSimTimingsForTest(10, 10);
+    const key = inspectorFieldKey('A', 'Source', 'Interval');
+    const row = document.createElement('div');
+    row.setAttribute('data-rv-button-id', key);
+    document.body.appendChild(row);
+    try {
+      const f = makeViewer({ A: meshAt(0, 0, 0) });
+      const ed = withEditor(f, { panelOpen: true, showInspector: false, selectedNodePath: null });
+      const phases: string[] = [];
+      const probe = setInterval(() => { const s = getButtonSimSnapshot(); if (s && phases[phases.length - 1] !== s.phase) phases.push(s.phase); }, 2);
+      await prepareEditorChoreography(f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2,"Enabled":true}' });
+      clearInterval(probe);
+      expect(ed.selectNode).toHaveBeenCalledWith('A', true);
+      expect(ed.selectAndReveal).not.toHaveBeenCalled();
+      expect(phases).toEqual(['hover', 'pressed']);
+    } finally {
+      row.remove();
+    }
+  });
+
+  it('presses nothing when the field row never renders (custom renderer / filtered) and never throws', async () => {
+    const f = makeViewer({ A: meshAt(0, 0, 0) });
+    withEditor(f, { panelOpen: true, showInspector: true, selectedNodePath: 'A' });
+    await expect(prepareEditorChoreography(
+      f.viewer, 'web_editor_set_field', { path: 'A', componentType: 'Drive', fieldName: 'Nope', valueJson: '1' },
+      inspectorFieldKey('A', 'Drive', 'Nope'),
+    )).resolves.toBe('fallback');
+    expect(getButtonSimSnapshot()).toBeNull();
+  });
+
+  it('web_component_set leaves the afterglow on every APPLIED field, not on rejected ones', () => {
+    const f = makeViewer({ A: meshAt(0, 0, 0) });
+    applyEditorFeedback(
+      f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2,"Bogus":1}' },
+      JSON.stringify({ path: 'A', type: 'Source', applied: { Interval: 2 }, rejected: { Bogus: 1 } }),
+    );
+    expect(getAiTouches().map((t) => t.buttonKey)).toEqual([inspectorFieldKey('A', 'Source', 'Interval')]);
+    expect(f.selectPaths).toHaveBeenCalledWith(['A']);
+  });
+});
+
+// ─── plan-520: Follow agent ─────────────────────────────────────────────
+
+function smallMeshAt(x: number, y: number, z: number): Mesh {
+  const m = new Mesh(new BoxGeometry(0.4, 0.4, 0.4), new MeshBasicMaterial());
+  m.position.set(x, y, z);
+  m.updateMatrixWorld(true);
+  return m;
+}
+
+/** Give the fake viewer what the follow policy reads: activity clock, follow mode, renderer. */
+function withFollow(f: FakeViewer, clock: () => number, extra: Record<string, unknown> = {}): UserActivity {
+  const activity = new UserActivity();
+  activity._setClockForTest(clock);
+  Object.assign(f.viewer as unknown as Record<string, unknown>, {
+    userActivity: activity,
+    cameraFollowMode: 'off',
+    renderer: { xr: { isPresenting: false } },
+    ...extra,
+  });
+  return activity;
+}
+
+function followCalls(f: FakeViewer): unknown[][] {
+  return f.fitToNodes.mock.calls.filter((c) => (c[2] as { tag?: string } | undefined)?.tag === 'follow-agent');
+}
+
+describe('follow agent (plan-520)', () => {
+  let t = 100_000;
+  let widthSpy: { mockRestore: () => void } | null = null;
+  beforeEach(() => {
+    t = 100_000;
+    localStorage.removeItem(MCP_FOLLOW_AGENT_KEY);
+    _resetFollowAgentForTest();
+    _resetFollowForTest(() => t);
+    _resetFrameThrottleForTest(() => t);
+    _resetInspectorFieldRevealForTest();
+    widthSpy = vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+  });
+  afterEach(() => {
+    widthSpy?.mockRestore();
+    localStorage.removeItem(MCP_FOLLOW_AGENT_KEY);
+    _resetFollowAgentForTest();
+  });
+
+  it('idle + web_component_set on a small node flies once, tagged, BEFORE the tool runs', async () => {
+    const f = makeViewer({ A: smallMeshAt(0, 0, 0) });
+    withFollow(f, () => t);
+    const decision = await prepareEditorChoreography(
+      f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2}' },
+    );
+    // The pre phase already flew — the tool body has not run yet.
+    expect(decision).toBe('fly');
+    expect(f.fitToNodes).toHaveBeenCalledTimes(1);
+    expect(f.fitToNodes.mock.calls[0][2]).toMatchObject({ tag: 'follow-agent', easing: 'easeInOut' });
+    expect(f.selectPaths).toHaveBeenCalledWith(['A']);
+    applyEditorFeedback(f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2}' },
+      JSON.stringify({ path: 'A', applied: { Interval: 2 } }), decision);
+    expect(f.fitToNodes).toHaveBeenCalledTimes(1);
+  });
+
+  it('a series of writes to the same node flies exactly once', async () => {
+    const f = makeViewer({ A: smallMeshAt(0, 0, 0) });
+    withFollow(f, () => t);
+    for (let i = 0; i < 3; i++) {
+      await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'A' });
+      t += 2000; // past the cooldown — only the same-target rule holds the camera
+    }
+    expect(followCalls(f)).toHaveLength(1);
+  });
+
+  it('A → (user uses the view, idle again) → A flies again; A → A without input does not', async () => {
+    const f = makeViewer({ A: smallMeshAt(0, 0, 0) });
+    const activity = withFollow(f, () => t);
+    await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'A' });
+    expect(followCalls(f)).toHaveLength(1);
+    t += 2000; // past the cooldown, no user input → same-target rule holds
+    await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'A' });
+    expect(followCalls(f)).toHaveLength(1);
+    activity.markUserInput(t); // user orbits away …
+    t += 3500; // … and is idle again (> 3 s, > cooldown)
+    await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'A' });
+    expect(followCalls(f)).toHaveLength(2);
+  });
+
+  it('A → B → A flies again to A, A → A never', async () => {
+    const f = makeViewer({ A: smallMeshAt(0, 0, 0), B: smallMeshAt(1, 0, 0) });
+    withFollow(f, () => t);
+    for (const p of ['A', 'A', 'B', 'A']) {
+      await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: p });
+      t += 2000;
+    }
+    expect(followCalls(f)).toHaveLength(3);
+  });
+
+  it('user active → no flight for web_component_set; offscreen transform falls back to frameIfHelpful', async () => {
+    const f = makeViewer({ A: smallMeshAt(0, 0, 0), Off: meshAt(500, 0, 0) });
+    const activity = withFollow(f, () => t);
+    activity.markUserInput(t - 1000);
+    const d1 = await prepareEditorChoreography(f.viewer, 'web_component_set', { path: 'A', type: 'Source', props: '{"Interval":2}' });
+    expect(d1).toBe('fallback');
+    expect(f.fitToNodes).not.toHaveBeenCalled();
+    const d2 = await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'Off' });
+    expect(d2).toBe('fallback');
+    applyEditorFeedback(f.viewer, 'web_editor_transform', { path: 'Off' }, '{"ok":true}', d2);
+    expect(f.fitToNodes).toHaveBeenCalledTimes(1);
+    expect(followCalls(f)).toHaveLength(0); // the old, untagged offscreen framing
+  });
+
+  it('a pre-flight suppresses the post frameIfHelpful of the same call', async () => {
+    const f = makeViewer({ Off: meshAt(500, 0, 0) });
+    withFollow(f, () => t);
+    const d = await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'Off' });
+    expect(d).toBe('fly');
+    applyEditorFeedback(f.viewer, 'web_editor_transform', { path: 'Off' }, '{"ok":true}', d);
+    expect(f.fitToNodes).toHaveBeenCalledTimes(1);
+  });
+
+  it('toggle off → exactly the pre-plan-520 fitToNodes calls', async () => {
+    setFollowAgent(false);
+    const run = async (withActivity: boolean) => {
+      _resetFrameThrottleForTest(() => t);
+      _resetFollowForTest(() => t);
+      const f = makeViewer({ On: smallMeshAt(0, 0, 0), Off: meshAt(500, 0, 0) });
+      if (withActivity) withFollow(f, () => t);
+      for (const p of ['On', 'Off', 'Off']) {
+        const d = await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: p });
+        applyEditorFeedback(f.viewer, 'web_editor_transform', { path: p }, '{"ok":true}', d);
+      }
+      return f.fitToNodes.mock.calls.map((c) => [(c[0] as Object3D[]).length, c[2]]);
+    };
+    const legacy = await run(false); // a viewer the follow policy cannot see = today's behaviour
+    const off = await run(true);
+    expect(off).toEqual(legacy);
+    expect(off).toHaveLength(1);
+    expect(off[0][1]).toEqual({ duration: 0.7, easing: 'easeInOut' });
+  });
+
+  it('web_drive_jog {name} selects the drive node and flies to it', async () => {
+    const node = smallMeshAt(2, 0, 0);
+    const f = makeViewer({ 'Line/Conveyor': node });
+    withFollow(f, () => t, {
+      drives: [{ name: 'Other', node: new Object3D() }, { name: 'Conveyor', node }],
+    });
+    (f.viewer.registry as unknown as { getPathForNode: (n: Object3D) => string | null }).getPathForNode =
+      (n: Object3D) => (n === node ? 'Line/Conveyor' : null);
+    const d = await prepareEditorChoreography(f.viewer, 'web_drive_jog', { name: 'Conveyor', forward: true });
+    expect(d).toBe('fly');
+    expect(f.selectPaths).toHaveBeenCalledWith(['Line/Conveyor']);
+    expect(followCalls(f)).toHaveLength(1);
+    expect(f.open).not.toHaveBeenCalled(); // no right-dock panel for a runtime drive
+  });
+
+  it('web_drive_stop with an unknown drive name does nothing and never throws', async () => {
+    const f = makeViewer({});
+    withFollow(f, () => t, { drives: [] });
+    await expect(prepareEditorChoreography(f.viewer, 'web_drive_stop', { name: 'Nope' })).resolves.toBeUndefined();
+    expect(f.fitToNodes).not.toHaveBeenCalled();
+    expect(f.selectPaths).not.toHaveBeenCalled();
+  });
+
+  it('a result-addressed tool follows post; an {error} result does not', () => {
+    const f = makeViewer({ 'Root/New': meshAt(500, 0, 0) });
+    withFollow(f, () => t);
+    applyEditorFeedback(f.viewer, 'web_editor_create_empty', { name: 'New' }, '{"error":"no document"}');
+    expect(f.fitToNodes).not.toHaveBeenCalled();
+    applyEditorFeedback(f.viewer, 'web_editor_create_empty', { name: 'New' }, '{"ok":true,"path":"Root/New"}');
+    expect(followCalls(f)).toHaveLength(1);
+  });
+
+  it('property inspector not available (compact width) → flight + selection, no reveal', async () => {
+    widthSpy?.mockRestore();
+    widthSpy = vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(500);
+    const f = makeViewer({ A: smallMeshAt(0, 0, 0) });
+    withFollow(f, () => t);
+    const ed = withEditor(f, { panelOpen: false, showInspector: false, selectedNodePath: null });
+    const d = await prepareEditorChoreography(
+      f.viewer, 'web_editor_set_field',
+      { path: 'A', componentType: 'Drive', fieldName: 'TargetSpeed', valueJson: '500' },
+      inspectorFieldKey('A', 'Drive', 'TargetSpeed'),
+    );
+    expect(d).toBe('fly');
+    expect(f.selectPaths).toHaveBeenCalledWith(['A']);
+    expect(followCalls(f)).toHaveLength(1);
+    expect(ed.selectAndReveal).not.toHaveBeenCalled();
+    expect(ed.selectNode).not.toHaveBeenCalled();
+    expect(getInspectorFieldReveal()).toBeNull();
+  });
+
+  it('a simulated button click dispatches no pointerdown (it can never count as viewport use)', async () => {
+    _setSimTimingsForTest(10, 10);
+    const el = document.createElement('button');
+    el.setAttribute('data-rv-button-id', 'qe.to-ground');
+    document.body.appendChild(el);
+    const seen: string[] = [];
+    const onPointer = (e: Event) => { seen.push(e.type); };
+    document.addEventListener('pointerdown', onPointer, true);
+    document.addEventListener('mousedown', onPointer, true);
+    try {
+      const f = makeViewer({ A: meshAt(0, 0, 0) });
+      await prepareEditorChoreography(f.viewer, 'web_editor_to_ground', { path: 'A' }, 'qe.to-ground');
+      expect(seen).toEqual([]);
+    } finally {
+      document.removeEventListener('pointerdown', onPointer, true);
+      document.removeEventListener('mousedown', onPointer, true);
+      el.remove();
+    }
+  });
+
+  it('never flies while the camera rides a follow / sit-on source', async () => {
+    const f = makeViewer({ A: smallMeshAt(0, 0, 0) });
+    withFollow(f, () => t, { cameraFollowMode: 'follow' });
+    const d = await prepareEditorChoreography(f.viewer, 'web_editor_transform', { path: 'A' });
+    expect(d).toBe('none');
+    expect(f.fitToNodes).not.toHaveBeenCalled();
   });
 });

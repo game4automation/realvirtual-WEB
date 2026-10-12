@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect } from 'vitest';
-import { compactToggleGroupSx, filterChipSx } from '../src/core/hmi/shared-sx';
+import { compactToggleGroupSx, filterChipSx, INK_HIGH } from '../src/core/hmi/shared-sx';
 
 describe('compactToggleGroupSx', () => {
   it('returns an array', () => {
@@ -44,14 +44,18 @@ describe('compactToggleGroupSx', () => {
 describe('filterChipSx', () => {
   it('returns active styling when isActive=true', () => {
     const sx = filterChipSx(true) as Record<string, unknown>;
-    expect(sx.fontWeight).toBe(700);
+    // plan-597 Phase 6b: one weight in both states (no reflow), Ink High text
+    // (accent text on its own tint misses 4.5:1), state carried by tint + border.
+    expect(sx.fontWeight).toBe(500);
+    expect(sx.color).toBe(INK_HIGH);
+    expect(sx.border).toContain('79, 195, 247');
     expect(sx.bgcolor).toContain('79, 195, 247');
     expect(sx.cursor).toBe('pointer');
   });
 
   it('returns inactive styling when isActive=false', () => {
     const sx = filterChipSx(false) as Record<string, unknown>;
-    expect(sx.fontWeight).toBe(400);
+    expect(sx.fontWeight).toBe(500);
     expect(sx.bgcolor).toBe('transparent');
   });
 

@@ -208,28 +208,22 @@ export class DropTargetOverlayController {
   }
 
   /**
-   * The scene's pickable meshes, read-only.
+   * The scene's pickable meshes, read-only: the chunk + keep meshes of every
+   * live bake instance (`BakeRegistry.pickMeshes`, plan-753) — the loaded
+   * model in place and every planner placement. A scene without a baked
+   * model (editor, merging off) has none, and the occlusion check is skipped.
    *
-   * `raycastManager.raycastGeometry` is a `RaycastGeometrySet`, not an
-   * `Object3D` — it cannot be handed to a raycaster directly (SOL-R2 F2). The
-   * raycastable things inside it are the merged static mesh and one merged mesh
-   * per kinematic group; both parts are optional, and a scene may have neither.
-   *
-   * Reused across the whole drag: the array is rebuilt only when the set
-   * identity changes, so a candidate switch does not allocate.
+   * Reused across the whole drag: the array is rebuilt only when the
+   * registry's list changes identity or length, so a candidate switch does
+   * not allocate.
    */
   private _pickMeshes(): readonly Mesh[] {
-    const set = this._viewer.raycastManager?.raycastGeometry ?? null;
-    if (!set) { this._pickMeshCache = []; this._pickMeshSource = null; return this._pickMeshCache; }
-    if (set === this._pickMeshSource) return this._pickMeshCache;
-    const meshes: Mesh[] = [];
-    if (set.staticGroup?.mesh) meshes.push(set.staticGroup.mesh);
-    for (const group of set.kinematicGroups.values()) {
-      if (group?.mesh) meshes.push(group.mesh);
-    }
-    this._pickMeshSource = set;
-    this._pickMeshCache = meshes;
-    return meshes;
+    const list = this._viewer.bakeRegistry?.pickMeshes ?? null;
+    if (!list) { this._pickMeshCache = []; this._pickMeshSource = null; return this._pickMeshCache; }
+    if (list === this._pickMeshSource && list.length === this._pickMeshCache.length) return this._pickMeshCache;
+    this._pickMeshSource = list;
+    this._pickMeshCache = [...list];
+    return this._pickMeshCache;
   }
 
   /** Is pickable geometry sitting between the camera and this candidate? */
@@ -246,8 +240,12 @@ export class DropTargetOverlayController {
     raycaster.near = 0;
     raycaster.far = distance - OCCLUSION_EPSILON_M;
     if (raycaster.far <= 0) return false;
-    // firstHitOnly: the three-mesh-bvh fast path — we only need "is there
-    // anything", never the full sorted hit list.
+    // firstHitOnly: we only need "is there anything", never the full sorted hit
+    // list. plan-756 verified: a chunk / keep mesh answers through the instance
+    // `.raycast` override, which returns AT MOST the nearest hit and applies
+    // `near` / `far` in world distance — so the any-hit test below is exact and
+    // the flag is simply redundant there (it still steers three-mesh-bvh on any
+    // non-baked mesh that ends up in the list).
     (raycaster as unknown as { firstHitOnly?: boolean }).firstHitOnly = true;
 
     for (const mesh of meshes) {

@@ -45,7 +45,7 @@ import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import { clearAllBlobs, sha256OfBlob } from '../src/core/storage/rv-opfs-blobs';
 import { listSceneGlbIds, readSceneGlbPointer } from '../src/core/storage/rv-scene-glb-store';
 import { glbWrite } from './helpers/scene-write';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
@@ -369,8 +369,12 @@ describe('BrowserBackend — manifest', () => {
     const manifest = await backend.readManifest();
     expect(manifest?.hidden).toEqual(['published:demo']);
     expect(manifest?.activeSceneId).toBe('scn_real');
-    expect(await backend.listModels()).toMatchObject([{ path: 'models/a.glb', label: 'A' }]);
-    expect(await backend.listLibrary()).toMatchObject([{ path: 'library/b.glb' }]);
+    // plan-744 F1: ONE listing, filtered by PLACE at the read site.
+    const listed = await backend.listDocuments();
+    expect(listed.filter(d => d.path.startsWith('models/')))
+      .toMatchObject([{ path: 'models/a.glb', label: 'A' }]);
+    expect(listed.filter(d => d.path.startsWith('library/')))
+      .toMatchObject([{ path: 'library/b.glb' }]);
   });
 
   it('a corrupt manifest reads as absent, not as a throw', async () => {
@@ -449,5 +453,34 @@ describe('BrowserBackend — blobs go to OPFS', () => {
     const resolved = await backend.readDocumentUrl('models/r.glb');
     resolved!.release();
     expect(() => resolved!.release()).not.toThrow();
+  });
+});
+
+// ─── listAllFiles ───────────────────────────────────────────────────────
+
+describe('BrowserBackend — listAllFiles', () => {
+  it('unions blob-index paths and manifest documents, drops internal paths, sorts', async () => {
+    const backend = await open(P1);
+    await backend.writeManifest({
+      schemaVersion: 1,
+      id: P1,
+      name: 'One',
+      documents: [{ id: 'doc_real', name: 'Real', path: 'scenes/Real.glb', section: 'scenes' }],
+    });
+    const text = (s: string) => new TextEncoder().encode(s);
+    await backend.writeDocument('docs/readme.md', text('# hi'), { expectedRevision: 'create' });
+    await backend.writeDocument('connect/plc.connect.json', text('{}'), { expectedRevision: 'create' });
+    await backend.writeDocument('thumbnails/x.png', text('png'), { expectedRevision: 'create' });
+
+    expect(await backend.listAllFiles()).toEqual([
+      'connect/plc.connect.json',
+      'docs/readme.md',
+      'scenes/Real.glb',
+    ]);
+  });
+
+  it('is empty for a project that owns nothing', async () => {
+    const backend = await open(P2);
+    expect(await backend.listAllFiles()).toEqual([]);
   });
 });

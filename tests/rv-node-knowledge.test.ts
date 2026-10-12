@@ -94,9 +94,8 @@ describe('NodeKnowledge registration', () => {
     const caps = getCapabilities(NODE_KNOWLEDGE_TYPE);
     expect(caps.authorable).toBe(true);
     // Unlike RuntimeMetadata: an agent note must not become a hover tooltip.
-    expect(caps.hoverable).toBe(false);
-    expect(caps.selectable).toBe(false);
-    expect(caps.tooltipType).toBeNull();
+    expect(caps.pick).toBe('none');
+    expect(caps.ui.tooltip).toBeNull();
   });
 });
 

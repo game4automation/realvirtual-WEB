@@ -17,6 +17,10 @@
  *    Four of the six original tools happily authored components into a build
  *    with no solver behind them; that is document rubbish which only surfaces
  *    once the asset reaches a Professional build.
+ *  * **plan-504** — eleven write tools are views of the `mechanism.*`
+ *    commands now. Nothing here registers them: loading the tool module does
+ *    (cold start), and in the community build a bound tool answers
+ *    `ERR_EDITOR_UNAVAILABLE` — never "Unknown command".
  *
  * Real `McpEditorTools` over a real `AssetDocument`, `NodeRegistry` and `Scene`
  * (the `mcp-editor-doc-mutations` fixture), with a RECORDING bridge double in
@@ -34,6 +38,7 @@ import { setActiveAssetContext } from '../src/core/editor/active-asset-store';
 import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
 import {
   setMechanismUiBridge,
+  type MechanismCogView,
   type MechanismFindingView,
   type MechanismJointView,
   type MechanismLinkView,
@@ -41,6 +46,17 @@ import {
   type MechanismView,
 } from '../src/core/engine/rv-kinematic-registry';
 import { allSchemas } from './helpers/mcp-schemas';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
+import { ERR_EDITOR_UNAVAILABLE } from '../src/core/editor/rv-editor-guard-core';
+import { MECHANISM_COMMAND_IDS } from '../src/core/hmi/mechanism-command-descriptors';
+
+/** The mechanism write tools that are command views since plan-504 (community: ERR_EDITOR_UNAVAILABLE). */
+const BOUND = new Set([
+  'web_editor_mechanism_create', 'web_editor_mechanism_add_joint', 'web_editor_mechanism_assign_drive',
+  'web_editor_mechanism_jog', 'web_editor_mechanism_set_anchor_snap', 'web_editor_mechanism_set_axis',
+  'web_editor_mechanism_add_body', 'web_editor_mechanism_set_mass', 'web_editor_mechanism_set_limits',
+  'web_editor_mechanism_statics', 'web_editor_mechanism_fix',
+]);
 
 // ─── Bridge double ──────────────────────────────────────────────────────────
 
@@ -70,6 +86,27 @@ const FINDING: MechanismFindingView = {
   message: 'Anchors are 4.2 mm apart', jointPath: 'Mech/Arm/Joint1', fixable: true,
 };
 
+/** The plan-472 centre-of-gravity block, as the private bridge produces it. */
+function cogView(nodePath: string, over: Partial<MechanismCogView> = {}): MechanismCogView {
+  return {
+    totalMassKg: 12.75,
+    cogWorldMm: [12.4, 630.1, -3.8],
+    contributingLinks: 3,
+    totalLinks: 3,
+    skippedLinks: [],
+    estimated: false,
+    ambiguousOwnership: false,
+    warnings: [],
+    contributions: [
+      { nodePath: `${nodePath}/Base`, comWorldMm: [0, 0, 0], massKg: 4.25, comSource: 'mesh', ambiguous: false },
+      { nodePath: `${nodePath}/Arm`, comWorldMm: [0, 900, 0], massKg: 4.25, comSource: 'mesh', ambiguous: false },
+      { nodePath: `${nodePath}/Tool`, comWorldMm: [37, 990, -11], massKg: 4.25, comSource: 'mesh', ambiguous: false },
+    ],
+    unityToMm: 1000,
+    ...over,
+  };
+}
+
 function mechanismView(nodePath: string, over: Partial<MechanismView> = {}): MechanismView {
   return {
     nodePath, name: nodePath.split('/').pop() ?? nodePath,
@@ -77,6 +114,7 @@ function mechanismView(nodePath: string, over: Partial<MechanismView> = {}): Mec
     disabledReason: '', jointCount: 2, linkCount: 3, loopCount: 1, dof: 1,
     joints: [joint(`${nodePath}/Arm/Joint1`, 'Joint1'), joint(`${nodePath}/Arm/Joint2`, 'Joint2')],
     links: [link(`${nodePath}/Base`, 'Base'), link(`${nodePath}/Arm`, 'Arm'), link(`${nodePath}/Tool`, 'Tool')],
+    cog: cogView(nodePath),
     findings: [FINDING],
     ...over,
   };
@@ -89,7 +127,10 @@ class FakeBridge implements MechanismUiBridge {
   opCountAtRebuild: number[] = [];
   opCounter: () => number = () => 0;
 
-  constructor(private readonly _views: MechanismView[]) {}
+  constructor(private _views: MechanismView[]) {}
+
+  /** Stand in for a state change on the private side (a mass edit, a jog, …). */
+  setViews(views: MechanismView[]): void { this._views = views; }
 
   list(): MechanismView[] { return this._views; }
   validate(): MechanismFindingView[] { return [FINDING]; }
@@ -148,7 +189,9 @@ function makeEnv(): Env {
   }
 
   let activeMode = 'editor';
-  const viewer = {
+  // plan-504: statics runs through the force recorder plugin (ensureForceRecorder).
+  const plugins = new Map<string, unknown>();
+  const viewer: RVViewer = {
     scene, registry, signalStore: null, transportManager: null,
     get currentModelRoot() { return root; },
     modes: {
@@ -161,6 +204,11 @@ function makeEnv(): Env {
     selectionManager: {
       select() {}, selectPaths() {}, clear() {},
       getSnapshot: () => ({ selectedPaths: [] as string[] }),
+    },
+    getPlugin<T>(id: string): T | undefined { return plugins.get(id) as T | undefined; },
+    use(plugin: { id: string; init?: (v: RVViewer) => void }): void {
+      plugins.set(plugin.id, plugin);
+      plugin.init?.(viewer);
     },
     markRenderDirty() {}, markShadowsDirty() {}, emit() {},
     on() { return () => {}; },
@@ -217,6 +265,10 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
     expect(m.links[0].massWarning).toBe('');
     expect(m.links[0].massKg).toBeCloseTo(4.25, 6);
 
+    // plan-472 — `comLocalMm` was always serialised but never DOCUMENTED; the tool description
+    // now names it, and this pins that it keeps travelling.
+    expect(m.links[0].comLocalMm).toEqual([0, 10, 0]);
+
     expect(m.findings).toHaveLength(1);
     expect(m.findings[0].fixable).toBe(true);
   });
@@ -230,6 +282,68 @@ describe('T1 — web_editor_mechanism_inspect passes the bridge views through', 
     // The counters stay regardless — they are what makes the filter usable.
     expect(m.jointCount).toBe(2);
     expect(m.linkCount).toBe(3);
+  });
+
+  // ── plan-472 — the centre of gravity ──────────────────────────────────────
+
+  it('carries the cog block verbatim, including the counting half', async () => {
+    const r = parse(await env.tools.webEditorMechanismInspect('', ''));
+    const cog = r.mechanisms[0].cog;
+    expect(cog).toBeDefined();
+    expect(cog.cogWorldMm).toEqual([12.4, 630.1, -3.8]);
+    expect(cog.totalMassKg).toBeCloseTo(12.75, 6);
+    expect(cog.contributingLinks).toBe(3);
+    expect(cog.totalLinks).toBe(3);
+    expect(cog.estimated).toBe(false);
+    expect(cog.ambiguousOwnership).toBe(false);
+    expect(cog.unityToMm).toBe(1000);
+    expect(cog.contributions).toHaveLength(3);
+    expect(cog.contributions[1].comWorldMm).toEqual([0, 900, 0]);
+  });
+
+  it('survives include= narrowing — an agent saving context must not lose it silently', async () => {
+    const r = parse(await env.tools.webEditorMechanismInspect('', 'findings'));
+    const m = r.mechanisms[0];
+    expect(m.links).toBeUndefined();
+    expect(m.cog.cogWorldMm).toEqual([12.4, 630.1, -3.8]);
+  });
+
+  it('a null cog serialises as null, never as an invented origin', async () => {
+    setMechanismUiBridge(new FakeBridge([mechanismView('Mech', { cog: null })]));
+    const raw = await env.tools.webEditorMechanismInspect('', '');
+    expect(raw).toContain('"cog":null');
+    expect(parse(raw).mechanisms[0].cog).toBeNull();
+  });
+
+  it('a cog with no contribution reports null coordinates and says how many links it had', async () => {
+    setMechanismUiBridge(new FakeBridge([mechanismView('Mech', {
+      cog: cogView('Mech', {
+        cogWorldMm: null, totalMassKg: 0, contributingLinks: 0, contributions: [],
+        skippedLinks: [{ nodePath: 'Mech/Base', reason: 'no body' }],
+      }),
+    })]));
+    const cog = parse(await env.tools.webEditorMechanismInspect('', '')).mechanisms[0].cog;
+    expect(cog.cogWorldMm).toBeNull();
+    expect(cog.contributingLinks).toBe(0);
+    expect(cog.totalLinks).toBe(3);
+    expect(cog.skippedLinks).toEqual([{ nodePath: 'Mech/Base', reason: 'no body' }]);
+  });
+
+  it('is answered with the 3D marker OFF, and follows a mass change', async () => {
+    // The tool never asks whether the marker is on — the snapshot is computed per request. Here
+    // that is the bridge's second answer differing from its first, which is what a mass edit
+    // produces on the private side.
+    const bridge = new FakeBridge([mechanismView('Mech')]);
+    setMechanismUiBridge(bridge);
+    const before = parse(await env.tools.webEditorMechanismInspect('', '')).mechanisms[0].cog;
+    expect(before.totalMassKg).toBeCloseTo(12.75, 6);
+
+    bridge.setViews([mechanismView('Mech', {
+      cog: cogView('Mech', { totalMassKg: 52.75, cogWorldMm: [12.4, 320.5, -3.8] }),
+    })]);
+    const after = parse(await env.tools.webEditorMechanismInspect('', '')).mechanisms[0].cog;
+    expect(after.totalMassKg).toBeCloseTo(52.75, 6);
+    expect(after.cogWorldMm[1]).toBeCloseTo(320.5, 6);
   });
 
   it('an unknown path refuses and names the ones that exist', async () => {
@@ -248,11 +362,18 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
     const r = parse(await env.tools.webEditorMechanismSetLimits(
       'Mech/Arm/Joint1', 'KinematicJoint', true, -45, 45,
     ));
+    if (!__RV_HAS_PRIVATE__) {
+      // A command view without its private implementation: refused up front.
+      expect(r).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
+      expect(bridge.rebuilt).toEqual([]);
+      return;
+    }
     expect(r.error).toBeUndefined();
     expect(bridge.rebuilt).toEqual(['Mech']);
   });
 
   it('(a) the rebuild happens AFTER the transaction, never before', async () => {
+    if (!__RV_HAS_PRIVATE__) return; // community: the command refuses before any write
     const bridge = new FakeBridge([mechanismView('Mech')]);
     bridge.opCounter = () => env.doc.getSnapshot().opCount;
     setMechanismUiBridge(bridge);
@@ -268,6 +389,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
     // The `add_body` reality: `planAddBody` only puts a MechanismBody on a node,
     // so until a joint references it the node appears in no links[]. Stage 2
     // alone would miss it and stage 3 would rebuild the world.
+    if (!__RV_HAS_PRIVATE__) return; // community: the command refuses before any write
     const view = mechanismView('Mech', { joints: [], links: [] });
     const bridge = new FakeBridge([view, mechanismView('Other')]);
     setMechanismUiBridge(bridge);
@@ -277,6 +399,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
   });
 
   it('(c) genuine fallback: no mechanism ancestor and no reference rebuilds all, in list order', async () => {
+    if (!__RV_HAS_PRIVATE__) return; // community: the command refuses before any write
     const bridge = new FakeBridge([
       mechanismView('Mech', { joints: [], links: [] }),
       mechanismView('Other', { joints: [], links: [] }),
@@ -288,6 +411,7 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
   });
 
   it('(b2) stage 2 catches a body linked from OUTSIDE the mechanism subtree', async () => {
+    if (!__RV_HAS_PRIVATE__) return; // community: the command refuses before any write
     const bridge = new FakeBridge([
       mechanismView('Mech', { joints: [], links: [link('Outside', 'Outside')] }),
       mechanismView('Other', { joints: [], links: [] }),
@@ -298,6 +422,9 @@ describe('T1b — _mechCommit rebuilds the RIGHT mechanism', () => {
   });
 
   it('every legacy write tool rebuilds too — the plan-706 F2 defect', async () => {
+    // The direct tool commits through the private `commitMechanismPlan` (plan-504);
+    // the community stub commits nothing, and no community build has a bridge.
+    if (!__RV_HAS_PRIVATE__) return;
     const bridge = new FakeBridge([mechanismView('Mech')]);
     setMechanismUiBridge(bridge);
     await env.tools.webEditorMechanismSetAnchor(
@@ -320,8 +447,11 @@ describe('T2 — without the private bundle every mechanism tool refuses', () =>
     .map((s) => s.name)
     .filter((n) => n.includes('mechanism'));
 
-  it('the roster carries all 16 mechanism tools', () => {
-    expect(mechanismTools.length).toBe(16);
+  // 16 -> 22 with plan-729 (Cartesian mechanism paths: add_target, path_create,
+  // path_add_waypoint, path_remove_waypoint, path_move_waypoint, path_inspect).
+  // 22 -> 26 with plan-501 (drive sizing: trajectory_import, _run, _inspect, _export).
+  it('the roster carries all 26 mechanism tools', () => {
+    expect(mechanismTools.length).toBe(26);
   });
 
   it('each returns an error, names the alternative, and appends NO op', async () => {
@@ -335,7 +465,7 @@ describe('T2 — without the private bundle every mechanism tool refuses', () =>
       web_editor_mechanism_jog: () => env.tools.webEditorMechanismJog('Mech/Arm/Joint1', 10, ''),
       web_editor_mechanism_inspect: () => env.tools.webEditorMechanismInspect('', ''),
       web_editor_mechanism_snap_list: () => env.tools.webEditorMechanismSnapList(0.5, 0.5, 12),
-      web_editor_mechanism_set_anchor_snap: () => env.tools.webEditorMechanismSetAnchorSnap('Mech/Arm/Joint1', 'KinematicJoint', 'B', 'snap0', true),
+      web_editor_mechanism_set_anchor_snap: () => env.tools.webEditorMechanismSetAnchorSnap('Mech/Arm/Joint1', 'KinematicJoint', 'B', 'snap0', true, ''),
       web_editor_mechanism_set_axis: () => env.tools.webEditorMechanismSetAxis('Mech/Arm/Joint1', 'KinematicJoint', '', '{"x":0,"y":0,"z":1}', '', false),
       web_editor_mechanism_add_body: () => env.tools.webEditorMechanismAddBody('Mech/Arm/FreshBody', 'steel'),
       web_editor_mechanism_set_mass: () => env.tools.webEditorMechanismSetMass('Mech/Arm/FreshBody', 'steel', 0, '', ''),
@@ -343,6 +473,16 @@ describe('T2 — without the private bundle every mechanism tool refuses', () =>
       web_editor_mechanism_forces: () => env.tools.webEditorMechanismForces('Mech', '', false),
       web_editor_mechanism_statics: () => env.tools.webEditorMechanismStatics('Mech'),
       web_editor_mechanism_fix: () => env.tools.webEditorMechanismFix('Mech/Arm/Joint1', 'AnchorsApart'),
+      web_editor_mechanism_add_target: () => env.tools.webEditorMechanismAddTarget('Mech/Arm', 'Linear', 0, 0, ''),
+      web_editor_mechanism_path_create: () => env.tools.webEditorMechanismPathCreate('Mech/Arm', 'Mech', 'Mech/Arm', '', false, 0, 0),
+      web_editor_mechanism_path_add_waypoint: () => env.tools.webEditorMechanismPathAddWaypoint('Mech/Arm', 'Mech/Arm', 0),
+      web_editor_mechanism_path_remove_waypoint: () => env.tools.webEditorMechanismPathRemoveWaypoint('Mech/Arm', 0),
+      web_editor_mechanism_path_move_waypoint: () => env.tools.webEditorMechanismPathMoveWaypoint('Mech/Arm', 0, 1),
+      web_editor_mechanism_path_inspect: () => env.tools.webEditorMechanismPathInspect(''),
+      web_editor_mechanism_trajectory_import: () => env.tools.webEditorMechanismTrajectoryImport('Mech/Arm', 'time;X;Y;Z\n0;0;0;0\n0.002;0;0;0', '', 'Mech', 'Mech/Arm', ''),
+      web_editor_mechanism_trajectory_run: () => env.tools.webEditorMechanismTrajectoryRun('Mech/Arm'),
+      web_editor_mechanism_trajectory_inspect: () => env.tools.webEditorMechanismTrajectoryInspect('', 0),
+      web_editor_mechanism_trajectory_export: () => env.tools.webEditorMechanismTrajectoryExport('Mech/Arm'),
     };
     // Every roster entry must be exercised — a tool missing from this map would
     // otherwise be "covered" by not being called.
@@ -352,10 +492,133 @@ describe('T2 — without the private bundle every mechanism tool refuses', () =>
     for (const [name, call] of Object.entries(calls)) {
       const r = parse(await call());
       expect(r.error, `${name} must refuse without the bridge`).toBeTruthy();
+      if (!__RV_HAS_PRIVATE__ && BOUND.has(name)) {
+        // plan-504: a command view in the community build refuses at the
+        // descriptor's capability — the edition text, never "Unknown command".
+        expect(r.error, name).toBe(ERR_EDITOR_UNAVAILABLE);
+        continue;
+      }
       expect(String(r.error), `${name} must name the alternative`)
         .toContain('web_editor_create_kinematic');
     }
     expect(env.doc.getSnapshot().opCount, 'no mechanism tool may write without a solver')
       .toBe(opsBefore);
+  });
+});
+
+// ─── plan-729 — Cartesian mechanism path tools ─────────────────────────────
+
+describe('plan-729 9.4 — mechanism path tools write one composite each and rebuild nothing', () => {
+  const rv = (path: string): Record<string, any> =>
+    (env.viewer.registry!.getNode(path)!.userData.realvirtual ?? {}) as Record<string, any>;
+  const list = (path: string): string[] =>
+    ((rv(path).MechanismPath?.Path ?? []) as { path: string }[]).map((e) => e.path);
+
+  it('target → path → add / move / remove waypoint round-trip through the document', async () => {
+    const bridge = new FakeBridge([mechanismView('Mech')]);
+    setMechanismUiBridge(bridge);
+
+    let r = parse(await env.tools.webEditorMechanismAddTarget('Mech/Arm/FreshBody', 'PointToPoint', 0, 0.3, ''));
+    expect(r.ok).toBe(true);
+    expect(rv('Mech/Arm/FreshBody').MechanismTarget).toMatchObject({
+      InterpolationToTarget: 'PointToPoint', WaitForSeconds: 0.3,
+    });
+    expect(rv('Mech/Arm/FreshBody').MechanismTarget.SpeedToTarget).toBeUndefined();
+
+    r = parse(await env.tools.webEditorMechanismPathCreate(
+      'Mech/Arm', 'Mech', 'Mech/Arm/Joint1', 'Mech/Arm/FreshBody', true, 300, 0,
+    ));
+    expect(r.ok).toBe(true);
+    expect(rv('Mech/Arm').MechanismPath).toMatchObject({ LoopPath: true, LinearSpeedToTarget: 300 });
+    expect(list('Mech/Arm')).toEqual(['Mech/Arm/FreshBody']);
+
+    const before = env.doc.getSnapshot().opCount;
+    r = parse(await env.tools.webEditorMechanismPathAddWaypoint('Mech/Arm', 'Mech/Arm/FreshBody', 0));
+    expect(r.waypoints).toEqual(['Mech/Arm/FreshBody', 'Mech/Arm/FreshBody']);
+    // ONE op per list edit — one undo step.
+    expect(env.doc.getSnapshot().opCount).toBe(before + 1);
+
+    r = parse(await env.tools.webEditorMechanismPathMoveWaypoint('Mech/Arm', 0, 1));
+    expect(r.ok).toBe(true);
+    r = parse(await env.tools.webEditorMechanismPathRemoveWaypoint('Mech/Arm', 1));
+    expect(r.removed).toBe('Mech/Arm/FreshBody');
+    expect(list('Mech/Arm')).toEqual(['Mech/Arm/FreshBody']);
+
+    // A path/waypoint edit changes no joint topology — no mechanism rebuild.
+    expect(bridge.rebuilt).toEqual([]);
+  });
+
+  it('refuses a waypoint that is not a MechanismTarget, and an out-of-range index', async () => {
+    setMechanismUiBridge(new FakeBridge([mechanismView('Mech')]));
+    await env.tools.webEditorMechanismPathCreate('Mech/Arm', 'Mech', 'Mech/Arm/Joint1', '', false, 0, 0);
+    const before = env.doc.getSnapshot().opCount;
+    let r = parse(await env.tools.webEditorMechanismPathAddWaypoint('Mech/Arm', 'Mech/Arm/Joint1', 0));
+    expect(String(r.error)).toContain('web_editor_mechanism_add_target');
+    r = parse(await env.tools.webEditorMechanismPathRemoveWaypoint('Mech/Arm', 3));
+    expect(r.error).toBeTruthy();
+    r = parse(await env.tools.webEditorMechanismPathCreate('Mech/Arm/Joint1', 'Outside', 'Mech/Arm', '', false, 0, 0));
+    expect(String(r.error)).toContain('not a KinematicMechanism');
+    expect(env.doc.getSnapshot().opCount).toBe(before);
+  });
+
+  it('path_inspect hands the bridge path views through, and reads [] from a bridge without listPaths', async () => {
+    const view = {
+      nodePath: 'Mech/Arm', name: 'Arm', mechanismPath: 'Mech', targetLinkPath: 'Mech/Arm',
+      loopPath: true, speedOverride: 1, linearSpeedToTarget: 500, linearAcceleration: 1000,
+      waypoints: [{
+        nodePath: 'Mech/Arm/FreshBody', name: 'FreshBody', resolved: true, interpolation: 'Linear' as const,
+        speedToTarget: null, waitForSeconds: 0, worldPositionMm: [1, 2, 3] as [number, number, number],
+      }],
+      showPath: false, // plan-511
+      active: false, finished: false, failed: true, reachable: false, numTarget: 0,
+      lastError: "waypoint 'FreshBody' is not reachable",
+    };
+    const withPaths = new FakeBridge([mechanismView('Mech')]) as FakeBridge & { listPaths(): typeof view[] };
+    withPaths.listPaths = () => [view];
+    setMechanismUiBridge(withPaths);
+    let r = parse(await env.tools.webEditorMechanismPathInspect(''));
+    expect(r.paths).toEqual([view]);
+    r = parse(await env.tools.webEditorMechanismPathInspect('Nope'));
+    expect(r.availablePaths).toEqual(['Mech/Arm']);
+
+    setMechanismUiBridge(new FakeBridge([mechanismView('Mech')]));
+    r = parse(await env.tools.webEditorMechanismPathInspect(''));
+    expect(r.paths).toEqual([]);
+  });
+});
+
+// ─── plan-504 — the command views ────────────────────────────────────────────
+
+describe('plan-504 — mechanism tools are command views', () => {
+  it('cold start: loading the tool module registered all twelve descriptors (no setup registration)', () => {
+    // Nothing in this file registers commands: the import of McpEditorTools did.
+    for (const id of MECHANISM_COMMAND_IDS) expect(commandRegistry.get(id), id).toBeDefined();
+    expect(MECHANISM_COMMAND_IDS).toHaveLength(12);
+  });
+
+  it('statics without a solvable snapshot answers the reason (no force recorder figures invented)', async () => {
+    setMechanismUiBridge(new FakeBridge([mechanismView('Mech')]));
+    const r = parse(await env.tools.webEditorMechanismStatics('Mech'));
+    if (!__RV_HAS_PRIVATE__) {
+      expect(r).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
+      return;
+    }
+    expect(r.error).toContain('web_editor_mechanism_add_body');
+    expect(r.availablePaths).toEqual(['Mech']);
+  });
+
+  it('a refusal answers the rule text with its details (unknown preset → availablePresets)', async () => {
+    const bridge = new FakeBridge([mechanismView('Mech')]);
+    setMechanismUiBridge(bridge);
+    const opsBefore = env.doc.getSnapshot().opCount;
+    const r = parse(await env.tools.webEditorMechanismAddBody('Mech/Arm/FreshBody', 'unobtainium'));
+    if (!__RV_HAS_PRIVATE__) {
+      expect(r).toEqual({ error: ERR_EDITOR_UNAVAILABLE });
+      return;
+    }
+    expect(r.error).toBe('Unknown densityPreset "unobtainium"');
+    expect(r.availablePresets).toContain('steel');
+    expect(env.doc.getSnapshot().opCount).toBe(opsBefore);
+    expect(bridge.rebuilt).toEqual([]);
   });
 });

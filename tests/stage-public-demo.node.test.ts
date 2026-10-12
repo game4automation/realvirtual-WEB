@@ -431,6 +431,13 @@ describe('the repository demo stages, and the fixture does not travel', () => {
     expect(gate.documents.map(d => d.path)).toEqual([
       'DemoRealvirtualWeb.glb',
       'DemoPlanner.glb',
+      'fmu-demo.glb',
+      // Added 2026-09-26 (c659bd52): the Autonox delta kinematics model.
+      'Autonox-DELTA-RL5-1900-6kg.glb',
+      // Added 2026-10-05..07: the Laser Welding Assembly Station (the public VIBN demo
+      // for TIA/PLCSIM users). The AGV maze (plan-470) is devOnly since 2026-10-08
+      // (user decision: development only for now) and must NOT appear here.
+      'LaserWeldingAssemblyStation.glb',
       'demo.knowledge.md',
     ]);
     expect(gate.start.path).toBe('DemoRealvirtualWeb.glb');
@@ -572,7 +579,7 @@ describe('-Public carries no demo folder (plan-739 F11)', () => {
     return { core, privateRoot };
   }
 
-  it('includePublicDemoContent:false leaves no demo folder in the staged core', () => {
+  it('includePublicDemoContent:false stages the demo at the deploy root AND as a project', () => {
     const { core, privateRoot } = coreFixture();
     const staged = stageFilteredSourceTree({
       coreRoot: core,
@@ -582,16 +589,25 @@ describe('-Public carries no demo folder (plan-739 F11)', () => {
     });
     temporary.push(staged.workspaceRoot);
 
-    // The staged core is what Vite builds into `dist/`, so this is the statement
-    // that decides what the `-Public` zip contains.
-    expect(existsSync(join(staged.coreRoot, 'public', PUBLIC_DEMO_FOLDER))).toBe(false);
+    // The demo folder USED to be filtered off the staged core here, and that is
+    // what made `-Public` demo-free at this level. The filter is gone (2026-09-12,
+    // "delivery: neutral shared-repo identity, and a demo that can be opened"):
+    // a delivered workspace serves `realvirtual-web/` and nothing above it, so
+    // the project copy under `projects/` is not reachable over HTTP, while the
+    // dashboard lists the DemoRealvirtual row unconditionally — filtering it off
+    // the deploy root left every standard customer with a row that 404s.
+    //
+    // `-Public` is therefore NO LONGER demo-free by way of this filter. It is
+    // demo-free by way of the artefact: `stagePublic()` removes
+    // `PUBLIC_DEMO_FOLDER` from the built output in its non-demo branch, which is
+    // the statement that actually ships and the one plan-739 F11 is about.
+    expect(existsSync(join(staged.coreRoot, 'public', PUBLIC_DEMO_FOLDER))).toBe(true);
     // …and `public/settings.json`, the file the shell genuinely needs, still
-    // arrives — a filter that took everything would pass the line above too.
+    // arrives — a staging that took nothing would pass the line above too.
     expect(existsSync(join(staged.coreRoot, 'public', 'settings.json'))).toBe(true);
-    // The demo is staged as a customer PROJECT on this branch (plan-737 F4),
-    // beside the core rather than inside it. That folder is not part of the
-    // build, so it never reaches the zip — but saying so here is what keeps a
-    // future reader from "fixing" the assertion above by deleting it.
+    // The demo is ALSO staged as a customer PROJECT on this branch (plan-737 F4),
+    // beside the core rather than inside it — that copy is the one a customer
+    // opens, edits and keeps across updates (seed-once). Both places, one flag.
     expect(existsSync(join(staged.workspaceRoot, 'projects', PUBLIC_DEMO_FOLDER, 'project.json')))
       .toBe(true);
   });

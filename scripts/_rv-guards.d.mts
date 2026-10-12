@@ -56,3 +56,28 @@ export function isCredentialPropertyName(name: unknown): boolean;
 export function isSecretReferenceValue(value: unknown): boolean;
 export function collectSecretRefKeys(value: unknown, keys?: string[]): string[];
 export function plaintextSecretPaths(value: unknown, path?: Array<string | number>, out?: string[]): string[];
+
+// ─── Hosted deploy deny list (plan-759 F1) ───────────────────────────────
+
+export const HOSTED_DEPLOY_DENIED_DIRS: readonly string[];
+export const HOSTED_DEPLOY_DENIED_FILES: readonly RegExp[];
+export const HOSTED_DEPLOY_WARN_FILE_BYTES: number;
+export interface ProjectIgnoreRule {
+  source: string;
+  re: RegExp;
+  dirOnly: boolean;
+  anchored: boolean;
+}
+/** Parses a `.rvprojectignore` (gitignore-lite); throws on negation. */
+export function parseProjectIgnoreRules(text: string | null | undefined): ProjectIgnoreRule[];
+/** `<projectDir>/.rvprojectignore` parsed, `[]` when absent. */
+export function readProjectIgnoreRules(projectDir: string): ProjectIgnoreRule[];
+/** `null` when the path travels, else the short reason it is removed. */
+export function hostedDeployDenyReason(
+  relPath: string,
+  opts?: { isDir?: boolean; ignoreRules?: ProjectIgnoreRule[] },
+): string | null;
+export function isHostedDeployDenied(
+  relPath: string,
+  opts?: { isDir?: boolean; ignoreRules?: ProjectIgnoreRule[] },
+): boolean;

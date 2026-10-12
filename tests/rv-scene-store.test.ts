@@ -115,13 +115,48 @@ function makeViewer(): FakeViewer {
 const builtinDemo: SceneBase = { kind: 'builtin', url: '/models/Demo.glb', label: 'Demo' };
 const empty: SceneBase = { kind: 'empty' };
 
+/**
+ * The fixture models `/models/Demo.glb` / `/models/Tests.glb` do not exist on
+ * the test server. Until plan-508 Vite answered them with its SPA `index.html`
+ * (status 200), and a save embedded that page as the "base bytes". The dev
+ * server now answers a missing asset with 404, so the fixture serves a minimal
+ * real GLB (empty scene) under those two urls and passes everything else on.
+ */
+function minimalGlb(): ArrayBuffer {
+  const json = new TextEncoder().encode(JSON.stringify({ asset: { version: '2.0' }, scene: 0, scenes: [{ nodes: [] }] }));
+  const jsonLength = (json.length + 3) & ~3;
+  const buf = new ArrayBuffer(20 + jsonLength);
+  const view = new DataView(buf);
+  view.setUint32(0, 0x46546c67, true);
+  view.setUint32(4, 2, true);
+  view.setUint32(8, buf.byteLength, true);
+  view.setUint32(12, jsonLength, true);
+  view.setUint32(16, 0x4e4f534a, true);
+  const bytes = new Uint8Array(buf);
+  bytes.fill(0x20, 20);
+  bytes.set(json, 20);
+  return buf;
+}
+function serveFixtureModels(): { mockRestore(): void } {
+  const realFetch = globalThis.fetch.bind(globalThis);
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (/\/models\/(Demo|Tests)\.glb$/.test(new URL(url, location.href).pathname)) {
+      return new Response(minimalGlb(), { status: 200, headers: { 'content-type': 'model/gltf-binary' } });
+    }
+    return realFetch(input as RequestInfo, init);
+  });
+}
+
 describe('SceneStore', () => {
   let viewer: FakeViewer;
   let store: SceneStore;
   /** Installed per test — see the file header for why it is not global. */
   let project: FakeDocumentProject | null = null;
+  let fixtureModels: { mockRestore(): void } | null = null;
 
   beforeEach(() => {
+    fixtureModels = serveFixtureModels();
     localStorage.clear();
     resetProjectStore();
     project = null;
@@ -131,6 +166,8 @@ describe('SceneStore', () => {
   });
 
   afterEach(() => {
+    fixtureModels?.mockRestore();
+    fixtureModels = null;
     project?.restore();
     resetProjectStore();
   });

@@ -258,7 +258,9 @@ export function SensorHistoryPanel() {
   useEffect(() => {
     const offLoaded = viewer.on('model-loaded', () => setSceneVersion(v => v + 1));
     const offCleared = viewer.on('model-cleared', () => setSceneVersion(v => v + 1));
-    return () => { offLoaded(); offCleared(); };
+    // Sensors of placed references register AFTER model-loaded (scene-ready contract).
+    const offReady = viewer.on('placements-materialized', () => setSceneVersion(v => v + 1));
+    return () => { offLoaded(); offCleared(); offReady(); };
   }, [viewer]);
 
   const allSensors = useMemo<SensorHistoryRef[]>(() => {

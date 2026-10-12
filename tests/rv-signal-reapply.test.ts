@@ -29,6 +29,7 @@ import {
   setActiveSignalReapplyRegistry,
 } from '../src/core/engine/rv-signal-reapply-registry';
 import { createRuntimeNode, processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import { RVGrip } from '../src/core/engine/rv-grip';
 import { RVIKPath } from '../src/core/engine/rv-ik-path';
 import { RVSceneButtonBase } from '../src/core/engine/rv-scene-button-base';
@@ -477,9 +478,9 @@ describe('ComponentContext matrix — every construction path carries the regist
     placed.userData.realvirtual = diagnosticsExtras(signalPath);
     world.root.add(placed);
 
-    const result = processExtras(
-      placed, world.registry, world.signalStore, world.transportManager, world.scene,
-    );
+    const result = processExtras(placed, buildInitContext({
+      registry: world.registry, signalStore: world.signalStore, transportManager: world.transportManager, scene: world.scene,
+    }));
 
     expect(result.componentsCreated).toBeGreaterThan(0);
     expect(world.reapply.size).toBe(1);
@@ -495,9 +496,9 @@ describe('ComponentContext matrix — every construction path carries the regist
     placed.userData.realvirtual = diagnosticsExtras(signalPath);
     world.root.add(placed);
 
-    expect(() => processExtras(
-      placed, world.registry, world.signalStore, world.transportManager, world.scene,
-    )).not.toThrow();
+    expect(() => processExtras(placed, buildInitContext({
+      registry: world.registry, signalStore: world.signalStore, transportManager: world.transportManager, scene: world.scene,
+    }))).not.toThrow();
     expect(world.reapply.size).toBe(0);
   });
 });

@@ -41,7 +41,7 @@
  * enforce the load-generation guard before every write.
  */
 
-import { BufferGeometry, Mesh } from 'three';
+import { BufferGeometry, BufferAttribute, Mesh } from 'three';
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -60,6 +60,13 @@ export interface BVHBuildOptions {
 export interface BVHBuildPort {
   generate(geometry: BufferGeometry, options?: BVHBuildOptions): Promise<unknown>;
   dispose(): void;
+  /**
+   * Resolves once no build is queued or running. While a worker build is in
+   * flight the geometry's position/index buffers are DETACHED (transferred);
+   * code that must read those CPU buffers synchronously — the cinematic scene
+   * copy (plan-550) — waits for this instead of touching the transfer path.
+   */
+  whenIdle?(): Promise<void>;
 }
 
 /** Minimal surface of three-mesh-bvh's GenerateMeshBVHWorker. */
@@ -174,6 +181,15 @@ class DefaultBVHPort implements BVHBuildPort {
     return job;
   }
 
+  async whenIdle(): Promise<void> {
+    // Jobs queued while we wait extend the chain — wait until it stops growing.
+    let q: Promise<unknown>;
+    do {
+      q = this.queue;
+      await q;
+    } while (q !== this.queue && !this.disposed);
+  }
+
   dispose(): void {
     this.disposed = true;
     // Note: terminating mid-build leaves the in-flight promise unresolved —
@@ -187,20 +203,40 @@ class DefaultBVHPort implements BVHBuildPort {
   private async generateOne(geometry: BufferGeometry, options?: BVHBuildOptions): Promise<unknown> {
     if (this.disposed) throw new Error('BVHBuildPort is disposed');
 
-    const wantWorker =
-      !this.workerDead &&
-      typeof Worker !== 'undefined' &&
-      options?.transferable !== false &&
-      isTransferSafeGeometry(geometry);
+    const workerPossible = !this.workerDead && typeof Worker !== 'undefined';
+    const wantWorker = workerPossible && options?.transferable !== false && isTransferSafeGeometry(geometry);
+    // `transferable: false` means "do not detach THIS geometry's buffers" —
+    // they are shared with a sibling geometry or a zero-copy highlight proxy.
+    // It never meant "build on the main thread": a placement pick bundle of
+    // 2.9M triangles measured 9.7 s inline (2026-09-16). Hand the worker a
+    // private COPY of the arrays instead; the copy's buffers are what gets
+    // transferred, the original stays untouched, and the finished tree is
+    // re-pointed at the original geometry (identical layout; built INDIRECT so
+    // the index order of the original stays the one the tree addresses).
+    const wantWorkerCopy = workerPossible && options?.transferable === false && hasPlainPositionAndIndex(geometry);
 
-    if (wantWorker) {
+    if (wantWorker || wantWorkerCopy) {
       const worker = await this.getWorker();
       if (worker) {
         try {
           // GenerateMeshBVHWorker passes options through to `new MeshBVH()`
           // in the worker, serializes the (indirect-aware) result and
           // restores the transferred buffers on resolve.
-          const tree = await worker.generate(geometry, { indirect: options?.indirect === true });
+          const input = wantWorker ? geometry : copyForTransfer(geometry);
+          // A non-indirect MeshBVH REORDERS the index of the geometry it is
+          // built on, and the worker writes that reordered index back onto ITS
+          // input. On the copy path that is the throwaway copy — the original
+          // keeps its authored order, so a direct tree re-pointed at it would
+          // address the wrong triangles (2026-09-22: every imported STEP part
+          // above one leaf was unpickable in the editor; native triangle test
+          // hit, BVH missed). An indirect tree never touches the index, so it
+          // is the only kind the copy path may hand back.
+          const indirect = options?.indirect === true || input !== geometry;
+          const tree = await worker.generate(input, { indirect });
+          if (input !== geometry) {
+            (tree as { geometry?: BufferGeometry }).geometry = geometry;
+            input.dispose();
+          }
           return await this.rebrandToMainEntry(tree);
         } catch (e) {
           // Worker failures are treated as systemic (module load / runtime
@@ -211,7 +247,9 @@ class DefaultBVHPort implements BVHBuildPort {
       }
     }
 
-    return this.generateInline(geometry, options);
+    const __t0 = performance.now();
+    try { return await this.generateInline(geometry, options); }
+    finally { performance.measure('rv:bvh.inline', { start: __t0 }); }
   }
 
   private getWorker(): Promise<MeshBVHWorkerLike | null> {
@@ -273,6 +311,29 @@ class DefaultBVHPort implements BVHBuildPort {
     // the `geometry.boundsTree` assignment (load-generation guard).
     return new MeshBVH(geometry, options?.indirect ? { indirect: true } : undefined);
   }
+}
+
+/** A geometry the copy-for-transfer path can reproduce: plain (non-interleaved)
+ *  position attribute and, if indexed, a plain index. */
+function hasPlainPositionAndIndex(geometry: BufferGeometry): boolean {
+  const pos = geometry.getAttribute('position');
+  if (!pos || (pos as unknown as { isInterleavedBufferAttribute?: boolean }).isInterleavedBufferAttribute) return false;
+  const index = geometry.index;
+  if (index && (index as unknown as { isInterleavedBufferAttribute?: boolean }).isInterleavedBufferAttribute) return false;
+  return true;
+}
+
+/** A throwaway geometry whose position/index arrays are PRIVATE copies, so the
+ *  worker can take their buffers without touching the source geometry. Only
+ *  what `MeshBVH` reads is copied (position + index + groups). */
+function copyForTransfer(geometry: BufferGeometry): BufferGeometry {
+  const out = new BufferGeometry();
+  const pos = geometry.getAttribute('position');
+  out.setAttribute('position', new BufferAttribute(pos.array.slice(), pos.itemSize, pos.normalized));
+  const index = geometry.index;
+  if (index) out.setIndex(new BufferAttribute(index.array.slice(), index.itemSize, index.normalized));
+  for (const g of geometry.groups) out.addGroup(g.start, g.count, g.materialIndex);
+  return out;
 }
 
 /** Inline-only port — used by tests and available as an explicit fallback.

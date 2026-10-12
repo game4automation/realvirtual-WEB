@@ -30,9 +30,13 @@ export type UISlot =
   | 'views'            // Bottom right: Expandable panels (charts, tables)
   | 'settings-tab'     // Settings dialog: Tab registration
   | 'toolbar-button-leading' // TopBar: Buttons rendered before Hierarchy (primary sim controls)
+  | 'toolbar-status' // TopBar: own status pills right of the sim controls (each entry renders its own pill)
   | 'toolbar-button'   // TopBar: Additional top-bar action buttons (toggles/modals, not left windows)
   | 'toolbar-button-center'  // TopBar: Center region toolbars (reserved for future tools)
   | 'toolbar-button-trailing' // TopBar: Right region toolbars (before the camera/view group)
+  | 'view-overflow'    // Bottom-right view cluster: a ROW in its "⋯" overflow menu. The
+                       //   component renders an `ActionMenuRow` (action-group.tsx) directly —
+                       //   no wrapper element — and closes the menu via the row itself.
   | 'overlay';         // Full-screen overlay panels (left panels, modals, etc.)
 
 /** Props passed to every UI slot component. */

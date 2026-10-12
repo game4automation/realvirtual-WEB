@@ -33,6 +33,7 @@ import { useViewer } from '../../hooks/use-viewer';
 import { useContextMenu } from './context-menu-store';
 import type { ContextMenuTarget, ResolvedContextMenuItem } from './context-menu-store';
 import { appendKeyBadge } from './key-badge-store';
+import { commandRegistry, type CommandOrigin } from './rv-command-registry';
 
 const PAPER_SX = {
   bgcolor: 'rgba(30, 30, 30, 0.95)',
@@ -255,15 +256,24 @@ export function ContextMenuLayer() {
   }, [viewer]);
 
   const handleItemClick = useCallback(
-    (item: ResolvedContextMenuItem, target: ContextMenuTarget) => {
+    (item: ResolvedContextMenuItem, target: ContextMenuTarget, origin: CommandOrigin = 'ui') => {
       try {
-        item.action?.(target);
+        if (item.command) {
+          // plan-499 F7: a command item is a VIEW — one dispatch through the
+          // registry, with the right-click target as input to its args.
+          const cmd = item.command;
+          void commandRegistry.execute(cmd.id, cmd.args(target), {
+            origin, viewer, ...(cmd.buttonKey ? { buttonKey: cmd.buttonKey } : {}),
+          });
+        } else {
+          item.action?.(target);
+        }
       } catch (e) {
         console.error(`[ContextMenu] Action '${item.id}' error:`, e);
       }
       closeAll();
     },
-    [closeAll],
+    [closeAll, viewer],
   );
 
   const handleInputSubmit = useCallback(
@@ -298,9 +308,10 @@ export function ContextMenuLayer() {
       if (item.children?.length) {
         appendKeyBadge(keyLabel);
         viewer.contextMenu.descendInto(item.id);
-      } else if (item.action) {
+      } else if (item.action || item.command) {
         appendKeyBadge(keyLabel, item.resolvedLabel);
-        handleItemClick(item, target);
+        // The open-menu chord is a keyboard dispatch.
+        handleItemClick(item, target, 'shortcut');
       }
     };
     window.addEventListener('keydown', onKeyDown, true);

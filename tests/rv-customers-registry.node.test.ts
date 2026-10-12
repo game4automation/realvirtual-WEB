@@ -100,11 +100,20 @@ describe.skipIf(!HAS_PRIVATE)('customer register — the real files', () => {
     }
   });
 
-  it('carries no credential value in any entry', () => {
-    // loadCustomer already refuses one; this reads the raw text as well, so a
-    // future field that escapes the string walk still cannot pass unnoticed.
+  it('carries no credential value beyond the two the register is allowed to hold', () => {
+    // Since 2026-09-13 the entry holds the CONNECT licence and the Requesty
+    // pair; both reach the customer through the delivery anyway. Anything ELSE
+    // that looks like a credential must still be absent, so the two known
+    // fields are lifted out and the rest of the raw text is scanned as before.
     for (const slug of listCustomerSlugs(PRIVATE_ROOT)) {
-      const text = readFileSync(customerRegistryPath(PRIVATE_ROOT, slug), 'utf8');
+      const raw = JSON.parse(readFileSync(customerRegistryPath(PRIVATE_ROOT, slug), 'utf8'));
+      const licence = raw?.licensing?.connect?.key;
+      if (licence !== undefined) {
+        expect(licence, `customers/${slug}.json`).toMatch(/^LIC(-[A-Z0-9]{4}){3}$/i);
+      }
+      delete raw?.licensing?.connect?.key;
+      delete raw?.inference;
+      const text = JSON.stringify(raw);
       expect(text, `customers/${slug}.json`).not.toMatch(/LIC(-[A-Z0-9]{4}){3}/i);
       expect(text, `customers/${slug}.json`).not.toMatch(/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
     }
@@ -281,10 +290,10 @@ for (const { slug, projectKey, legacyConfigName, contract } of MIGRATED) {
         .toEqual({ legacyIdentity: legacyConfigName, registryIdentity: slug });
     });
 
-    it('resolves the licence key out of the gitignored secrets file, not the register', () => {
+    it('resolves the licence key out of the register entry itself', () => {
       const customer = loadCustomer(PRIVATE_ROOT, slug);
       const secrets = resolveCustomerSecrets(PRIVATE_ROOT, customer);
-      expect(secrets.path.endsWith(`${slug}.secrets.json`)).toBe(true);
+      expect(secrets.path.endsWith(`${slug}.json`)).toBe(true);
       expect(secrets.connectLicenseKey).toMatch(/^LIC(-[A-Z0-9]{4}){3}$/i);
       // The same value the pipeline puts into settings.json as connectLicensePrefill.
       const config = withHubBaseUrl(() => loadDeliveryConfig(PRIVATE_ROOT, projectKey));

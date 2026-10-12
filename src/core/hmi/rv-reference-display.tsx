@@ -34,27 +34,40 @@ import { SignalBadge, type SignalDirection } from './rv-signal-badge';
 // ── navigateToRef ────────────────────────────────────────────────────────
 
 /** Navigate to a referenced node: open hierarchy, expand tree, select + show inspector. */
-export function navigateToRef(viewer: RVViewer | null, path: string): void {
+export function navigateToRef(viewer: RVViewer | null, path: string, ownerPath?: string): void {
   if (!viewer) return;
   const plugin = viewer.getPlugin<RvExtrasEditorPlugin>('rv-extras-editor');
   if (!plugin) return;
-  plugin.selectAndReveal(path, true);
+  // plan-757 F7: an asset-relative reference (`Mount/Kine`) is resolved
+  // relative to the OWNER's asset first, so navigation lands in the right
+  // placement; the canonical registry path is what the tree reveals.
+  plugin.selectAndReveal(resolveReferenceForDisplay(viewer, path, ownerPath) ?? path, true);
+}
+
+/** Canonical registry path of a reference as seen from its owner, or null when unresolved. */
+function resolveReferenceForDisplay(viewer: RVViewer | null, path: string, ownerPath?: string): string | null {
+  const registry = viewer?.registry;
+  if (!registry) return null;
+  const owner = ownerPath ? registry.getNode(ownerPath) : null;
+  const node = (owner ? registry.resolvePath(path, owner) : null) ?? registry.getNode(path);
+  return node ? registry.getPathForNode(node) : null;
 }
 
 // ── ReferenceDisplay ─────────────────────────────────────────────────────
 
 /** Display a ComponentReference — single badge, clickable to navigate. */
-export function ReferenceDisplay({ value, viewer, signalStore }: {
+export function ReferenceDisplay({ value, viewer, signalStore, ownerPath }: {
   value: { type: string; path: string; componentType: string };
   viewer: RVViewer | null;
   signalStore: SignalStore | null;
+  /** Registry path of the node carrying the reference — scoped resolution (plan-757 F7). */
+  ownerPath?: string;
 }) {
-  const resolvedNode = viewer?.registry?.getNode(value.path);
-  const isLinked = !!resolvedNode;
+  const isLinked = resolveReferenceForDisplay(viewer, value.path, ownerPath) !== null;
   const shortName = value.path.split('/').pop() ?? value.path;
   const shortType = value.componentType?.split('.').pop() ?? '';
 
-  const handleClick = useCallback(() => navigateToRef(viewer, value.path), [viewer, value.path]);
+  const handleClick = useCallback(() => navigateToRef(viewer, value.path, ownerPath), [viewer, value.path, ownerPath]);
 
   // Signal references -> the unified interactive SignalBadge (plan-246): same
   // hover tooltip (with click-to-navigate on the title), click-to-force,

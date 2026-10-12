@@ -2,74 +2,57 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * Agv — an autonomous path-following carrier (FTS/AGV, plan-268 Phase 1+2).
+ * Agv — an autonomous path-following carrier (FTS/AGV, plan-268 / plan-558).
  *
- * The vehicle rides an `RVPath` graph (rv_extras.Path, plan-268 §2.3): its
- * ONE movement scalar lives in a `PathTraveler` (`s += v/1000 · dt`, while-
- * carry hand-off at path ends), the speed ramp is the DRIVE's ramp
- * (`computeRampedSpeed`, rv-drive.ts — not re-invented), and the pose comes
- * from `lookRotation(tangent, align)` (rv-pose-align.ts).
+ * The vehicle rides an `RVPath` graph (rv_extras.Path, plan-268 §2.3); its
+ * route bookkeeping lives in a `PathTraveler` and the pose comes from
+ * `lookRotation(tangent, align)` (rv-pose-align.ts).
  *
- * Phase 2 — traffic WITHOUT raycasts (plan-268 §2.4):
- *   - Headway: the gap to the vehicle ahead is the 1D ARC-LENGTH difference
- *     along the graph (SpacingController — sorted by `s`, across path ends up
- *     to `LookAhead`, wrap on closed paths). The car-following ramp
- *     `v_target = clamp((gap − SafetyDistance)·HeadwayGain, 0, TargetSpeed)`
- *     brakes smoothly to standstill at `SafetyDistance` and restarts smoothly.
- *     A HARD clamp additionally guarantees the gap never drops below `MinGap`
- *     (1D arc-length analogue of the transport-surface accumulation clamp) —
- *     no colliders, no physics, no penetration.
- *   - Zones (control-point model, ZoneRegistry): a path tagged `zone` must be
- *     CLAIMED before entry. The per-tick look-ahead walk claims upcoming zones
- *     within `LookAhead`; on a failed claim the vehicle holds AT the zone
- *     entrance (same stop mechanics as the headway). Claims are released
- *     strictly AFTER the position transfer (one tick later — never before),
- *     and `releaseAll` runs in the reset/teardown hooks so no reset/dispose/
- *     despawn can ever leave a zone permanently held (review finding 2).
+ * Plan-558 — DISTANCE CONTROL by a trajectory-based moving block
+ * (rv-movement-authority.ts), the SAME planner in both kernels:
+ *   - Every vehicle owns one closed-form motion plan (rv-motion-profile.ts:
+ *     trapezoid / triangle phases, braking exactly into the stop, curve limit
+ *     v ≤ √(LateralAcceleration·R), docking crawl over the last
+ *     DockingDistance before a service stop) that always ends in a stop — the
+ *     movement AUTHORITY. A follower plans against the PLANNED TRAJECTORY of
+ *     the vehicle ahead on its own route and keeps ≥ SafetyGap between its
+ *     front and the leader's rear at every instant.
+ *   - DES: one event per PLAN (not per path piece); the leg tween samples the
+ *     profile position over time (accelerating / braking vehicles), routing is
+ *     decided at PLANNING time and stored in the plan. With a project router
+ *     installed every piece end is announced at its exact arrival time.
+ *   - Continuous: the fixed tick evaluates the SAME plan `x(t)`; plan events
+ *     run on the continuous authority's clock at their exact times (several
+ *     path ends inside one tick included) — conflict-free trajectories are
+ *     identical in both kernels. `UseAcceleration = false` keeps the legacy
+ *     car-following step mode (continuous) / an instant ramp (DES).
+ *   - Zones (merge control points, ZoneRegistry) are claimed before the FRONT
+ *     enters and released when the REAR has left; a release wakes the waiters.
+ *   - Scanner fields (optional): protective field
+ *     `v·t_r + v²/2b + ProtectiveMargin`, warning field + WarningMargin,
+ *     evaluated at planning time against the leader's planned trajectory —
+ *     warning caps the speed, protective stops the vehicle.
  *
- * MECHANICS ONLY (plan-268 §2.4): routing/dispatch are project logic — the
- * traveler exposes id-based hooks (`selectNextPath(candidateIds) → id`,
- * `onArrive(nodeId, agvId)`); without a hook the vehicle plainly follows
- * `successors[0]`.
+ * Statistics: Transport (driving with a task), Working (service), Slowed
+ * (below the free profile because of traffic or the warning field), Stopped
+ * (standing at a traffic stop — free time), Empty (no task / Run off),
+ * Failure (DES downtime).
  *
- * Phase 3 — DES coupling (`des` block, dispatched ONLY by the private runner;
- * this file never imports it):
- *   - One event per path leg: `onGenerate` (runner start kick) schedules the
- *     first Arrival after `transit = remainingLength / TargetSpeed`; every
- *     `onArrival` routes at the segment boundary (IDENTICAL callback
- *     signature as the continuous carry — `onArrive(pathId, agvId)` +
- *     `peekNext`, the same selectNextPath dispatch) and schedules the next leg.
- *     Full-path travel times are cached per path id (`length / v`).
- *   - Visibility via the `path` tween (`self.pathTween`): the vehicle root is
- *     sampled along the arc between events; FastForward writes NO transforms —
- *     the final tween write leaves the root exactly at the arc-length end.
- *   - Blocking is an ARRIVAL RESCHEDULE (plan-268 §2.4): an occupied zone at
- *     the next path holds the vehicle AT the boundary and re-checks the claim
- *     after `DES_BLOCKED_RETRY_SEC` — a discrete poll, no sub-tick, no ramp.
- *     PARITY IS CONFLICT-FREE ONLY (§2.4 final decision / §10 finding 3):
- *     under contention the continuous car-following ramp and the DES
- *     reschedule deliberately diverge in their momentary trajectory; only
- *     arrival ORDER and end state / throughput converge.
- *   - `samplesLiveGeometry` is deliberately NOT set: path geometry is parsed
- *     once (rv-path cache) and the hooks never sample live world transforms,
- *     so FastForward keeps its zero-settle fast path.
- *   - Phase-3 scope note: the DES leg plan reads `Run` at the start kick and
- *     at boundaries; mid-leg Run toggling / live re-speeding is continuous-only.
- *     `AtNode` (a one-TICK pulse — tick semantics) is not published in DES;
- *     arrivals surface through the traveler's `onArrive` hook instead.
+ * MECHANICS ONLY: routing/dispatch are project logic — the traveler exposes
+ * id-based hooks (`selectNextPath`, `onArrive`), the fleet handle the task
+ * API (rv-agv-fleet.ts); without them the vehicle follows `successors[0]`.
  *
- * Path resolution (setup): the `PathId` schema field selects a path from the
- * shared `RVPathNetwork`; otherwise the first `rv_extras.Path` node under the
- * component root is used (payload-detected, never name-detected).
+ * Signals: `Agv.Run` (command), `Agv.Moving`, `Agv.Position` (mm on the
+ * current path), `Agv.AtNode` (one-tick pulse, continuous), `Agv.Blocked`
+ * (= Stopped by traffic), `Agv.Speed` (mm/s), `Agv.Slowed`,
+ * `Agv.FieldWarning`, `Agv.FieldProtective`. When the component is PLC-wired
+ * (`self.isWired`) the internal simulation stays silent.
  *
- * Signals (F9): `Agv.Run` (command), `Agv.Moving`, `Agv.Position` (mm, drive
- * parity), `Agv.AtNode` (one-tick pulse at a path-end node), `Agv.Blocked`
- * (v == 0 because of the vehicle ahead or an occupied zone). When the
- * component is PLC-wired (`self.isWired`) the internal simulation stays
- * silent — the live values are authoritative.
+ * DES snapshots of scenes with AGVs are an explicit non-goal (the runner
+ * refuses the restore); `samplesLiveGeometry` is deliberately NOT declared.
  */
 
-import { Matrix4, Quaternion, Vector3 } from 'three';
+import { Box3, Matrix4, Mesh, Quaternion, Vector3, type Object3D } from 'three';
 import { defineLibraryComponent, type RV } from './_shared/behavior-kit';
 import { pathFromNode, type RVPath } from '../core/engine/rv-path';
 import { getDefaultPathNetwork } from '../core/engine/rv-path-network';
@@ -80,17 +63,28 @@ import {
   getDefaultSpacingController,
 } from '../core/engine/rv-spacing-controller';
 import { getDefaultZoneRegistry } from '../core/engine/rv-zone-registry';
-import { getDefaultAgvFleet, type AgvTask, type AgvPhase, type AgvHandle } from '../core/engine/rv-agv-fleet';
+import {
+  getDefaultAgvFleet, AGV_NO_BODY_KEY, type AgvTask, type AgvPhase, type AgvMotionInfo,
+} from '../core/engine/rv-agv-fleet';
 import { getDefaultPathDockRegistry } from '../core/engine/rv-path-dock';
+import {
+  getDefaultMovementAuthority, findUnzonedMerges, isTrafficStop,
+  type MbHost, type MbEventKind, type MbParams, type MovementAuthority,
+} from '../core/engine/rv-movement-authority';
+import { reportProblem, clearProblemsOfCode } from '../core/hmi/problems-store';
 
 // PLC contract — auto-declared as `Agv.<key>` with typed `self.sig.<key>`
 // accessors. Run follows the Conveyor convention (command in, status out).
 const SIGNALS = {
-  Run:      'PLCInputBool',
-  Moving:   'PLCOutputBool',
-  Position: 'PLCOutputFloat', // arc position on the current path, in mm
-  AtNode:   'PLCOutputBool',  // one-tick pulse at a path-end node
-  Blocked:  'PLCOutputBool',  // held at v=0 by the vehicle ahead / an occupied zone (F9)
+  Run:             'PLCInputBool',
+  Moving:          'PLCOutputBool',
+  Position:        'PLCOutputFloat', // arc position on the current path, in mm
+  AtNode:          'PLCOutputBool',  // one-tick pulse at a path-end node
+  Blocked:         'PLCOutputBool',  // standing at a traffic stop (leader / zone / field) — Stopped
+  Speed:           'PLCOutputFloat', // mm/s
+  Slowed:          'PLCOutputBool',  // driving below the free profile because of traffic
+  FieldWarning:    'PLCOutputBool',  // scanner warning field engaged
+  FieldProtective: 'PLCOutputBool',  // scanner protective field engaged (vehicle stops)
 } as const;
 
 // Schema defaults (stamped as AgvBehavior inspector rows by the factory).
@@ -100,11 +94,34 @@ const DEFAULTS = {
   UseAcceleration: true,
   PathId: '',
   StartPosition: 0,      // mm — initial arc position on the resolved path
-  SafetyDistance: 1000,  // mm — car-following standstill separation (Phase 2)
-  MinGap: 200,           // mm — HARD no-penetration floor (< SafetyDistance)
-  LookAhead: 5000,       // mm — leader search / zone claim window across path ends
-  HeadwayGain: 2,        // 1/s — car-following proportional gain
+  SafetyDistance: 1000,  // mm — legacy car-following standstill separation (UseAcceleration=false)
+  MinGap: 200,           // mm — legacy HARD no-penetration floor (UseAcceleration=false)
+  LookAhead: 5000,       // mm — legacy leader search / zone claim window (UseAcceleration=false)
+  HeadwayGain: 2,        // 1/s — legacy car-following proportional gain (UseAcceleration=false)
+  // Plan-558 — distance control
+  Deceleration: 500,        // mm/s²
+  LateralAcceleration: 500, // mm/s² — curve limit v ≤ √(aLat·R)
+  VehicleLength: 0,         // mm along travel; 0 = from the mesh bounds (root may be off-centre)
+  VehicleWidth: 0,          // mm; 0 = from the mesh bounds
+  SafetyGap: 300,           // mm — front-to-rear standstill gap behind the vehicle ahead
+  DockingSpeed: 300,        // mm/s — crawl speed before a service stop (ISO 3691-4: ≤ 0.3 m/s)
+  DockingDistance: 500,     // mm — crawl distance before a service stop
+  ScannerFields: true,
+  ScannerReactionTime: 0.2, // s — scanner + control reaction time t_r
+  ProtectiveMargin: 200,    // mm — protective field supplement
+  WarningMargin: 1000,      // mm — warning field length beyond the protective field
 } as const;
+
+/** Body used when neither VehicleLength/Width nor a mesh defines it (mm). */
+const FALLBACK_LENGTH_MM = 1000;
+const FALLBACK_WIDTH_MM = 600;
+
+/** Scanner exit hysteresis (m) and restart delay after a protective stop (s). */
+const FIELD_HYSTERESIS_M = 0.2;
+const FIELD_RESTART_SEC = 0.5;
+
+/** Ramp used for `UseAcceleration = false` in the planner (DES) — a jump within microseconds. */
+const INSTANT_RAMP = 1e7; // m/s²
 
 /** Bound on the zone claim walk (pathological graphs / zero-length chains). */
 const MAX_ZONE_WALK = 8;
@@ -117,14 +134,10 @@ const HARD_CLAMP_BACKOFF_MM = 1e-6;
  *  asymptotically and the speed would never reach exactly 0. */
 const PARK_EPS_MM = 1e-3;
 
-/** DES blocked-retry interval (s): an occupied zone reschedules the SAME
- *  arrival check after this delay (Ankunfts-Reschedule, plan-268 §2.4 —
- *  a discrete poll, deliberately NOT the continuous ramp). */
-const DES_BLOCKED_RETRY_SEC = 0.5;
-
-/** Minimum DES leg transit (s) — keeps degenerate legs finite (mirrors the
- *  tween registry's own duration guard). */
+/** Minimum DES service duration (s) — keeps zero-time stays ordered after the arrival. */
 const DES_MIN_TRANSIT_SEC = 0.001;
+
+type MbKind = 'des' | 'continuous';
 
 interface AgvLocal {
   traveler: PathTraveler | null;
@@ -138,17 +151,17 @@ interface AgvLocal {
   startTask: AgvTask | null;
   /** Movement phase — drives the stop/dwell state machine. */
   phase: AgvPhase;
-  /** Continuous dwell countdown in seconds (phase 'servicing' only). */
+  /** Legacy continuous dwell countdown in seconds (phase 'servicing' only). */
   serviceRemainingSec: number;
-  /** Scheduled DES ServiceEnd event id (−1 = none) — cancelled on reset. */
+  /** Scheduled ServiceEnd event id (−1 = none) — cancelled on reset. */
   desServiceEvent: number;
   /** Who ends the stay: 'timer' = task serviceSec; 'dock' = the dock's release(). */
   serviceMode: 'timer' | 'dock';
-  /** Set by a dock's release() in continuous mode — ends the stay next tick. */
+  /** Legacy continuous: set by a dock's release() — ends the stay next tick. */
   dockReleaseFlag: boolean;
   /** Segment already served this visit (dock re-trigger guard) — cleared on hand-off. */
   servedPathId: string | null;
-  // Phase 2 — headway / zone parameters (mm, mm/s, 1/s)
+  // Legacy car-following parameters (mm, mm/s, 1/s) — UseAcceleration=false.
   safetyDistanceMm: number;
   minGapMm: number;
   lookAheadMm: number;
@@ -156,18 +169,36 @@ interface AgvLocal {
   /** Deterministic re-seed for reset: the resolved start path + position (m). */
   startPath: RVPath | null;
   startPosM: number;
-  /** Set by onArrive during advance(); published as the AtNode pulse. */
+  /** Set by onArrive; published as the AtNode pulse (continuous). */
   atNodeId: string | null;
-  // Phase 3 — DES leg bookkeeping (unused in continuous mode).
-  /** Scheduled DES Arrival event id (−1 = none) — cancelled on reset. */
-  desLegEvent: number;
-  /** Path id whose END was already announced via onArrive — de-dupes the hook
-   *  across blocked-arrival retries at the same boundary. */
+  /** Path id whose END was already announced via onArrive (de-dupe). */
   desArrivedPathId: string | null;
-  /** Reisezeit-Cache: path id → FULL-path transit seconds at `desCacheSpeed`. */
-  desTravelSec: Map<string, number>;
-  /** TargetSpeed (mm/s) the cache entries assume — speed change clears it. */
-  desCacheSpeed: number;
+  // Plan-558 — distance control parameters (mm, mm/s, mm/s², s).
+  decel: number;
+  aLat: number;
+  frontMm: number;
+  rearMm: number;
+  widthMm: number;
+  gapMm: number;
+  dockSpeed: number;
+  dockDist: number;
+  scanner: boolean;
+  reactionSec: number;
+  protectiveMm: number;
+  warningMm: number;
+  /** Authority the vehicle plans through (null = legacy step mode / not yet registered). */
+  mbKind: MbKind | null;
+  mbHost: MbHost | null;
+  /** Continuous: the vehicle's clock time (s) — joins the authority clock on the first tick. */
+  cTime: number;
+  /** Continuous: last observed canMove (Run edge → re-plan). */
+  lastCanMove: boolean;
+  /** DES freeze (component failure). */
+  frozen: boolean;
+  /** Remaining service time stashed at a freeze (−1 = none). */
+  frozenServiceSec: number;
+  /** Inside a plan event's callbacks: task changes only mark the plan dirty (one re-plan per event). */
+  inHook: boolean;
   // Pre-allocated pose temps + zone scratch buffers — no GC in the tick.
   _pos: Vector3;
   _quat: Quaternion;
@@ -192,6 +223,10 @@ function configBag(self: AgvSelf): Record<string, unknown> {
 function cfgNumber(bag: Record<string, unknown>, key: string, def: number): number {
   const n = Number(bag[key]);
   return Number.isFinite(n) ? n : def;
+}
+
+function cfgBool(bag: Record<string, unknown>, key: string, def: boolean): boolean {
+  return typeof bag[key] === 'boolean' ? (bag[key] as boolean) : def;
 }
 
 // ── Shared helpers (logic layer) ────────────────────────────────────────────
@@ -249,6 +284,41 @@ function isIdentityMatrix(m: Matrix4): boolean {
 
 const IDENTITY_ELEMENTS = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] as const;
 
+/**
+ * Body extents relative to the root in the root's local frame (+Z = travel):
+ * reach ahead (front), behind (rear) and width, in mm, from the mesh bounds.
+ * Null when the vehicle carries no mesh.
+ */
+function meshBodyMm(root: Object3D): { front: number; rear: number; width: number } | null {
+  root.updateWorldMatrix(true, true);
+  const inv = new Matrix4().copy(root.matrixWorld).invert();
+  const box = new Box3();
+  const part = new Box3();
+  const m = new Matrix4();
+  let any = false;
+  root.traverse((o) => {
+    const mesh = o as Mesh;
+    if (!mesh.isMesh || !mesh.geometry) return;
+    // Overlays parented to the vehicle (scanner fields) are not body.
+    for (let p: Object3D | null = mesh; p && p !== root; p = p.parent) {
+      if (p.userData[AGV_NO_BODY_KEY] === true) return;
+    }
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+    const bb = mesh.geometry.boundingBox;
+    if (!bb || bb.isEmpty()) return;
+    m.multiplyMatrices(inv, mesh.matrixWorld);
+    part.copy(bb).applyMatrix4(m);
+    box.union(part);
+    any = true;
+  });
+  if (!any) return null;
+  return {
+    front: Math.max(0, box.max.z) * 1000,
+    rear: Math.max(0, -box.min.z) * 1000,
+    width: Math.max(0, box.max.x - box.min.x) * 1000,
+  };
+}
+
 /** Remaining distance (mm) to a positional stop — the end of a TERMINAL path.
  *  ∞ while the graph continues (successors exist) or the path is closed, so
  *  the drive ramp only decelerates into a real dead end. Allocation-free. */
@@ -277,13 +347,37 @@ function claimCurrentZone(t: PathTraveler): void {
   }
 }
 
+/** Problems-panel code for merges without a shared zone. */
+const UNZONED_MERGE_CODE = 'agv-merge-without-zone';
+
 /**
- * Zone claim-ahead walk (control-point model, plan-268 §2.4): walk the routed
- * successors from the current position up to `LookAhead`, CLAIM every zoned
- * path before entry, and return the distance (mm) to the FIRST entrance whose
- * claim failed — the vehicle then holds there via the stop mechanics.
- * Also rebuilds `l._relevantZones` (current + upcoming zone ids) which the
- * post-advance release pass uses. Infinity = no zone constraint in reach.
+ * Load-time validation (plan-558): two paths that merge into the same
+ * successor without a shared zone let vehicles from both branches enter the
+ * merge together — the moving block only sees vehicles on the OWN route.
+ * Reported as warnings in the Problems panel (re-reported idempotently).
+ */
+function reportUnzonedMerges(): void {
+  const net = getDefaultPathNetwork();
+  net.resolveGraph();
+  clearProblemsOfCode(UNZONED_MERGE_CODE);
+  for (const m of findUnzonedMerges(net.all())) {
+    reportProblem({
+      id: `${UNZONED_MERGE_CODE}:${m.pathId}`,
+      severity: 'warning',
+      code: UNZONED_MERGE_CODE,
+      title: `AGV merge without a zone at path '${m.pathId}'`,
+      detail: `Paths ${m.incoming.map((id) => `'${id}'`).join(', ')} merge into '${m.pathId}' without a shared zone — `
+        + 'vehicles from both branches may enter the merge at the same time. Give the merging paths and '
+        + `'${m.pathId}' one common zone id.`,
+    });
+  }
+}
+
+/**
+ * Legacy zone claim-ahead walk (UseAcceleration = false, continuous): walk
+ * the routed successors up to `LookAhead`, CLAIM every zoned path before
+ * entry, and return the distance (mm) to the FIRST entrance whose claim failed.
+ * Also rebuilds `l._relevantZones` for the post-advance release pass.
  */
 function claimAheadZones(l: AgvLocal, t: PathTraveler): number {
   const zones = getDefaultZoneRegistry();
@@ -292,11 +386,8 @@ function claimAheadZones(l: AgvLocal, t: PathTraveler): number {
   let p = t.path as RVPath; // caller guards non-null
   if (p.zoneId) relevant.push(p.zoneId);
   if (p.closed) return Number.POSITIVE_INFINITY; // a loop has no entrances to gate
-  // Queue-order guard: the arc-length gap to the vehicle ahead. A NEW claim is
-  // only ours when the entrance lies CLOSER than the leader — a leader standing
-  // between this vehicle and the entrance must claim first (headway already
-  // gates us behind it). Claiming across the leader inverts the queue into a
-  // gridlock: the follower holds the zone the leader is waiting for.
+  // Queue-order guard: a leader standing between this vehicle and the entrance
+  // must claim first (claiming across it inverts the queue into a gridlock).
   const gapMm = getDefaultSpacingController().gapOf(t.id) * 1000;
   let accMm = (p.length - t.s) * 1000;
   for (let i = 0; i < MAX_ZONE_WALK; i++) {
@@ -319,14 +410,7 @@ function claimAheadZones(l: AgvLocal, t: PathTraveler): number {
   return Number.POSITIVE_INFINITY;
 }
 
-/**
- * Release pass — runs every tick AFTER `advance()` (position transfer first,
- * plan-268 §2.4): frees every held zone that is neither the zone the vehicle
- * stands in nor an upcoming zone from THIS tick's claim walk. Because the
- * relevant set was built before the advance, a zone that was just left stays
- * held for exactly one more tick — release strictly after transfer, never a
- * one-tick double occupancy the other way round.
- */
+/** Legacy release pass (UseAcceleration = false) — strictly AFTER the position transfer. */
 function releaseStaleZones(l: AgvLocal, t: PathTraveler): void {
   const zones = getDefaultZoneRegistry();
   const relevant = l._relevantZones;
@@ -339,14 +423,41 @@ function releaseStaleZones(l: AgvLocal, t: PathTraveler): void {
   }
 }
 
-// ── Task control (plan-921 — destination + service time + callbacks) ───────────────
+// ── Task control (plan-921 — destination + service time + callbacks) ───────
+
+/** The authority the vehicle plans through (null = legacy step mode). */
+function authorityOf(l: AgvLocal): MovementAuthority | null {
+  return l.mbKind ? getDefaultMovementAuthority(l.mbKind) : null;
+}
+
+/** Schedule the service end `delay` s from now on the vehicle's kernel clock. */
+function scheduleServiceEnd(self: AgvSelf, delay: number): number {
+  const l = self.local;
+  if (l.mbKind === 'continuous') {
+    const clock = getDefaultMovementAuthority('continuous').clock;
+    return clock.schedule(clock.now + delay, 0, () => {
+      l.desServiceEvent = -1;
+      handleServiceEnd(self);
+      bookStat(self);
+    });
+  }
+  return self.in(delay, 'ServiceEnd', null, null);
+}
+
+function cancelServiceEnd(self: AgvSelf): void {
+  const l = self.local;
+  if (l.desServiceEvent < 0) return;
+  if (l.mbKind === 'continuous') getDefaultMovementAuthority('continuous').clock.cancel(l.desServiceEvent);
+  else if (self.mode === 'des') self.cancel(l.desServiceEvent);
+  l.desServiceEvent = -1;
+}
 
 /**
  * Enter the service stay at the segment end. Two triggers, one mechanism:
  * the segment is the TASK DESTINATION (vehicle-side `serviceSec` timer), or a
  * DOCK is bound to it (station-side control — the dock's `release()` ends the
- * stay and OVERRIDES the task timer; "die Station definiert selbst, was sie
- * macht"). The task's `onArrive` fires only at its destination.
+ * stay and OVERRIDES the task timer). The task's `onArrive` fires only at its
+ * destination.
  */
 function beginService(self: AgvSelf): void {
   const l = self.local;
@@ -368,12 +479,12 @@ function beginService(self: AgvSelf): void {
     const release = (): void => {
       if (released) return;
       released = true;
-      if (self.mode === 'des') {
+      if (l.mbHost !== null) {
         if (l.phase === 'servicing' && l.desServiceEvent < 0) {
-          l.desServiceEvent = self.in(DES_MIN_TRANSIT_SEC, 'ServiceEnd', null, null);
+          l.desServiceEvent = scheduleServiceEnd(self, DES_MIN_TRANSIT_SEC);
         }
       } else {
-        l.dockReleaseFlag = true; // fixedUpdate ends the stay next tick
+        l.dockReleaseFlag = true; // legacy fixedUpdate ends the stay next tick
       }
     };
     try { dock.onVehicleArrive(t.id, release); }
@@ -384,10 +495,9 @@ function beginService(self: AgvSelf): void {
 /**
  * Finish the service stay. At the TASK DESTINATION: fires `onServiceEnd` —
  * assigning a NEW task from inside the callback chains directly (work-plan
- * style); otherwise the vehicle parks idle and the fleet's idle channel fires
- * (the dispatch trigger). At a THROUGH dock (not the destination) the vehicle
- * simply resumes its route. Either way the segment is marked served, so the
- * dock does not re-trigger until the vehicle leaves it.
+ * style); otherwise the vehicle parks idle and the fleet's idle channel fires.
+ * At a THROUGH dock the vehicle simply resumes its route. Either way the
+ * segment is marked served, so the dock does not re-trigger this visit.
  */
 function endService(self: AgvSelf): void {
   const l = self.local;
@@ -398,6 +508,7 @@ function endService(self: AgvSelf): void {
     return;
   }
   const finished = l.task;
+  self.statOutput(); // one completed job (station stop) — Output/h, Processed
   try { finished?.onServiceEnd?.(t.id, finished); } catch (e) { console.error('[Agv] task onServiceEnd failed:', e); }
   if (l.task === finished) {
     l.task = null;
@@ -406,8 +517,7 @@ function endService(self: AgvSelf): void {
   }
 }
 
-/** True while the traveler stands ON its destination segment (drive → service
- *  is triggered at that segment's END). */
+/** True while the traveler stands ON its destination segment. */
 function atTaskDestination(l: AgvLocal): boolean {
   return l.task !== null && l.traveler?.path?.id === l.task.destination;
 }
@@ -422,75 +532,404 @@ function serviceStopAhead(l: AgvLocal): boolean {
   return getDefaultPathDockRegistry().dockAt(p.id) !== null;
 }
 
-// ── DES helpers (plan-268 Phase 3 — leg scheduling + Reisezeit-Cache) ───────
+// ── Statistics ──────────────────────────────────────────────────────────────
 
 /**
- * FULL-path transit seconds at the current TargetSpeed, cached per path id
- * (Reisezeit-Cache `length / v`). A TargetSpeed change invalidates the cache.
+ * Book the vehicle's statistics category (DES + continuous StateStatistics).
+ * Priority (plan-558 Phase 6): Run off → Empty; Failure (DES freeze);
+ * servicing → Working; standing at a traffic stop → Stopped; driving below
+ * the free profile because of traffic / the warning field → Slowed; driving
+ * with a task → Transport; without → Empty. AGVs never book `Blocked`.
+ * `statState` de-dupes, so calling it after every event / tick is cheap.
  */
-function desFullTravelSec(l: AgvLocal, path: RVPath): number {
-  const v = Math.max(0.001, l.targetSpeed); // mm/s, division-protected
-  if (l.desCacheSpeed !== v) {
-    l.desTravelSec.clear();
-    l.desCacheSpeed = v;
-  }
-  let sec = l.desTravelSec.get(path.id);
-  if (sec === undefined) {
-    sec = (path.length * 1000) / v; // meters → mm, / (mm/s) = seconds
-    l.desTravelSec.set(path.id, sec);
-  }
-  return sec;
+function bookStat(self: AgvSelf): void {
+  const l = self.local;
+  const t = l.traveler;
+  if (!t || self.sig.Run.get() !== true) { self.statState('Empty'); return; }
+  if (l.frozen) { self.statState('Failure'); return; }
+  if (l.phase === 'servicing') { self.statState('Working'); return; }
+  const mb = l.mbHost ? authorityOf(l) : null; // planned vehicles only (a legacy one books from its step model)
+  const motion = mb ? mb.motionStateOf(t.id) : (t.blocked ? 'stopped' : 'free');
+  if (motion === 'stopped') self.statState('Stopped');
+  else if (motion === 'slowed') self.statState('Slowed');
+  else if (l.phase === 'driving' && l.task) self.statState('Transport');
+  else self.statState('Empty');
 }
 
-/**
- * Schedule the CURRENT leg: one Arrival event after the remaining transit of
- * the traveler's path, with a `path` tween sampling the arc between the events
- * (the vehicle-root default target of `self.pathTween`). The traveler's `s`
- * stays authoritative — the DES hooks set it at boundaries; the tween only
- * renders in between (and its final write lands exactly on the leg end).
- */
-function desScheduleLeg(self: AgvSelf): void {
+// ── Planner registration (both kernels) ─────────────────────────────────────
+
+/** Vehicle parameters for the authority (meters / seconds). */
+function plannerParams(l: AgvLocal): MbParams {
+  const useAcc = l.useAcceleration;
+  return {
+    vmax: Math.max(0.001, l.targetSpeed / 1000),
+    a: useAcc ? Math.max(0, l.acceleration / 1000) : INSTANT_RAMP,
+    b: useAcc ? Math.max(0.001, l.decel / 1000) : INSTANT_RAMP,
+    // UseAcceleration = false keeps the legacy jump semantics: no curve / docking limits.
+    aLat: useAcc ? Math.max(0.001, l.aLat / 1000) : INSTANT_RAMP * 1000,
+    front: l.frontMm / 1000,
+    rear: l.rearMm / 1000,
+    width: l.widthMm / 1000,
+    gap: l.gapMm / 1000,
+    dockSpeed: Math.max(0.001, l.dockSpeed / 1000),
+    dockDist: useAcc ? Math.max(0, l.dockDist / 1000) : 0,
+    scanner: l.scanner ? {
+      reactionTime: Math.max(0, l.reactionSec),
+      protectiveMargin: Math.max(0, l.protectiveMm / 1000),
+      warningMargin: Math.max(0, l.warningMm / 1000),
+      hysteresis: FIELD_HYSTERESIS_M,
+      restartDelay: FIELD_RESTART_SEC,
+    } : null,
+  };
+}
+
+/** Host callbacks over `self` for one kernel. */
+function makeHost(self: AgvSelf, mb: MovementAuthority, kind: MbKind): MbHost {
   const l = self.local;
   const t = l.traveler!;
-  const p = t.path!;
-  const full = desFullTravelSec(l, p);
-  const frac = p.length > 0 ? (p.length - t.s) / p.length : 0;
-  const transit = Math.max(DES_MIN_TRANSIT_SEC, full * frac);
-  l.desLegEvent = self.in(transit, 'Arrival', null, self.pathTween(p, t.s, p.length));
-  t.v = l.targetSpeed;
-  t.blocked = false;
-  self.sig.Moving.set(true);
-  self.sig.Blocked.set(false);
+  const des = kind === 'des';
+  return {
+    now: () => (des ? self.now : mb.clock.now),
+    nextEventTime: () => (des ? self.nextEventTime : mb.clock.nextEventTime),
+    schedule: (delay, k, data, tween, priority) => {
+      if (des) {
+        if (k === 'arrival') return self.in(delay, 'Arrival', null, tween ?? null);
+        const d: Record<string, unknown> = data ?? {};
+        d.kind = k;
+        if (tween) d.tween = (tween as { tween: unknown }).tween;
+        if (priority !== undefined) d.priority = priority;
+        return self.in(delay, 'Replan', null, d);
+      }
+      return mb.clock.schedule(mb.clock.now + delay, priority ?? 0, () => dispatchPlanEvent(self, k, data));
+    },
+    cancel: (id) => { if (des) self.cancel(id); else mb.clock.cancel(id); },
+    legTween: (sampler, fromX, toX, sAt) => (des ? self.pathTween(sampler, fromX, toX, undefined, undefined, sAt) : null),
+    serviceStopAt: (path, current) => {
+      if (current) return serviceStopAhead(l);
+      return l.task?.destination === path.id || getDefaultPathDockRegistry().dockAt(path.id) !== null;
+    },
+    canMove: () => !self.disabled && self.sig.Run.get() === true
+      && (l.phase === 'driving' || l.phase === 'cruising'),
+    onPlanApplied: (moving, stopped) => {
+      t.blocked = stopped;
+      self.sig.Moving.set(moving);
+      self.sig.Blocked.set(stopped);
+      self.sig.Speed.set(mb.speedOf(t.id, des ? self.now : mb.clock.now) * 1000);
+    },
+    onArrivedAt: (prev) => {
+      // The per-piece arrival of the step model — announced once per visit.
+      if (prev.closed || l.desArrivedPathId === prev.id) return;
+      l.desArrivedPathId = prev.id;
+      t.hooks.onArrive?.(prev.id, t.id);
+      t.network?.notifyArrive(prev.id, t.id);
+    },
+    onHandOver: (_prev, next) => {
+      l.desArrivedPathId = null;
+      l.servedPathId = null;
+      t.path = next;
+      t.s = 0;
+      t.atEnd = false;
+    },
+    onMotionState: (state) => {
+      self.sig.Slowed.set(state === 'slowed');
+      bookStat(self);
+    },
+    onFieldState: (state) => {
+      self.sig.FieldWarning.set(state !== 'clear');
+      self.sig.FieldProtective.set(state === 'protective');
+    },
+  };
 }
+
+/** (Re-)register the vehicle with the authority of `kind` from its traveler position. */
+function registerPlanned(self: AgvSelf, kind: MbKind): MovementAuthority {
+  const l = self.local;
+  const t = l.traveler!;
+  const mb = getDefaultMovementAuthority(kind);
+  const host = makeHost(self, mb, kind);
+  l.mbKind = kind;
+  l.mbHost = host;
+  mb.register(t.id, t, host, plannerParams(l));
+  l.lastCanMove = host.canMove();
+  return mb;
+}
+
+/** Re-plan after a state change of this vehicle (task, service, Run). */
+function replanNow(self: AgvSelf, why: string): void {
+  const l = self.local;
+  const t = l.traveler;
+  const mb = authorityOf(l);
+  if (!t || !mb || !l.mbHost || !mb.has(t.id)) return;
+  mb.markDirty(t.id, why);
+  if (!l.inHook) mb.requestFlush(l.mbHost);
+}
+
+// ── Plan events (shared by the DES hooks and the continuous clock) ──────────
+
+/** Plan end at a service stop / dead end. */
+function handleArrival(self: AgvSelf): void {
+  const l = self.local;
+  const t = l.traveler;
+  const mb = authorityOf(l);
+  if (self.disabled || !t || !t.path || !mb || !l.mbHost) return;
+  mb.recordEvent('Arrival', t.id, l.mbHost.now());
+  mb.onLegEnd(t.id);
+  const p = t.path;
+  t.s = p.length;
+  t.v = 0;
+  self.sig.Position.set(t.s * 1000);
+  self.sig.Speed.set(0);
+
+  if (!p.closed && l.desArrivedPathId !== p.id) {
+    l.desArrivedPathId = p.id;
+    t.hooks.onArrive?.(p.id, t.id);
+    t.network?.notifyArrive(p.id, t.id);
+  }
+
+  if (serviceStopAhead(l)) {
+    beginService(self); // dock mode: the dock's release() schedules ServiceEnd
+    self.sig.Blocked.set(false);
+    if (l.serviceMode === 'timer') {
+      l.desServiceEvent = scheduleServiceEnd(self, Math.max(l.serviceRemainingSec, DES_MIN_TRANSIT_SEC));
+    }
+    replanNow(self, 'serviceBegin'); // → hold plan (same trajectory, no version bump)
+    return;
+  }
+
+  const next = t.peekNext(p, 1);
+  if (!next) {
+    // Dead end: park. The dispatch trigger fires exactly once per stop.
+    const wasAtEnd = t.atEnd;
+    t.atEnd = true;
+    t.blocked = false;
+    self.sig.Moving.set(false);
+    self.sig.Blocked.set(false);
+    if (!wasAtEnd) t.network?.requestDispatch(t.id);
+    replanNow(self, 'deadEnd');
+    return;
+  }
+  // The plan ended at a stop that is no longer a service stop (task changed
+  // while driving) — re-plan onward.
+  replanNow(self, 'arrival');
+}
+
+/** Plan end at a traffic / hold stop. */
+function handleStop(self: AgvSelf): void {
+  const l = self.local;
+  const t = l.traveler;
+  const mb = authorityOf(l);
+  if (self.disabled || !t || !mb || !l.mbHost) return;
+  const now = l.mbHost.now();
+  mb.recordEvent('Replan:stop', t.id, now);
+  mb.onLegEnd(t.id);
+  const loc = mb.locate(t.id, now);
+  if (loc) { t.s = loc.s; self.sig.Position.set(loc.s * 1000); }
+  t.v = 0;
+  self.sig.Moving.set(false);
+  self.sig.Speed.set(0);
+  const c = mb.stopCauseOf(t.id);
+  const stopped = c !== null && isTrafficStop(c);
+  t.blocked = stopped;
+  self.sig.Blocked.set(stopped);
+  mb.requestFlush(l.mbHost);
+}
+
+/** Event labels for the planner statistics / trace (no string building per event). */
+const REPLAN_LABEL: Partial<Record<MbEventKind, string>> = {
+  flush: 'Replan:flush', extend: 'Replan:extend', zoneRelease: 'Replan:zoneRelease', watchdog: 'Replan:watchdog',
+  notify: 'Replan:notify', field: 'Replan:field', stat: 'Replan:stat',
+};
+
+/** Authority bookkeeping events (flush / extend / zone release / notify / field / stat / watchdog). */
+function handlePlanEvent(self: AgvSelf, kind: MbEventKind, data: Record<string, unknown> | null): void {
+  const l = self.local;
+  const t = l.traveler;
+  const mb = authorityOf(l);
+  if (self.disabled || !t || !mb || !l.mbHost) return;
+  // The shared flush belongs to the fleet, not to the vehicle whose queue slot carried it.
+  mb.recordEvent(REPLAN_LABEL[kind] ?? `Replan:${kind}`, kind === 'flush' ? '*' : t.id, l.mbHost.now());
+  mb.onEvent(t.id, kind, data);
+  mb.requestFlush(l.mbHost);
+}
+
+/** End of the dwell — the follow-up task (if any) re-plans via assign(). */
+function handleServiceEnd(self: AgvSelf): void {
+  const l = self.local;
+  const t = l.traveler;
+  if (self.disabled || !t) return;
+  const mb = authorityOf(l);
+  if (mb && l.mbHost) mb.recordEvent('ServiceEnd', t.id, l.mbHost.now());
+  // A follow-up task assigned from onServiceEnd re-plans together with the end.
+  l.inHook = true;
+  try { endService(self); } finally { l.inHook = false; }
+  if (l.phase === 'idle') self.sig.Moving.set(false);
+  replanNow(self, 'serviceEnd');
+}
+
+/** Continuous-clock dispatch of one plan event (DES routes through the hooks). */
+function dispatchPlanEvent(self: AgvSelf, kind: MbEventKind, data: Record<string, unknown> | null): void {
+  if (kind === 'arrival') handleArrival(self);
+  else if (kind === 'stop') handleStop(self);
+  else handlePlanEvent(self, kind, data);
+  bookStat(self);
+}
+
+/** Drop every trace of the vehicle from the shared traffic state (re-setup / teardown). */
+function releaseVehicle(self: AgvSelf, wake: boolean): void {
+  const l = self.local;
+  const t = l.traveler;
+  if (!t) return;
+  getDefaultSpacingController().remove(t.id);
+  getDefaultZoneRegistry().releaseAll(t.id);
+  const mb = authorityOf(l);
+  if (mb) mb.unregister(t.id, wake);
+  l.mbKind = null;
+  l.mbHost = null;
+}
+
+// ── Legacy step mode (UseAcceleration = false, continuous) ──────────────────
+
+/**
+ * The pre-558 continuous model: 1D car-following (`computeCarFollowingSpeed`,
+ * SafetyDistance / MinGap / HeadwayGain) + per-tick zone claim walk + hard
+ * no-penetration clamp. Kept as the fallback for `UseAcceleration = false`.
+ */
+function legacyFixedUpdate(self: AgvSelf, dt: number): void {
+  const l = self.local;
+  const t = l.traveler!;
+  const run = self.sig.Run.get() === true;
+
+  if (l.servedPathId !== null && t.path!.id !== l.servedPathId) l.servedPathId = null;
+
+  if (l.phase === 'servicing') {
+    t.v = 0;
+    if (l.serviceMode === 'dock') {
+      if (l.dockReleaseFlag) endService(self);
+    } else {
+      l.serviceRemainingSec -= dt;
+      if (l.serviceRemainingSec <= 0) endService(self);
+    }
+    self.sig.Moving.set(false);
+    self.sig.Blocked.set(false);
+    self.sig.Speed.set(0);
+    return;
+  }
+  if (l.phase === 'idle') {
+    t.v = 0;
+    self.sig.Moving.set(false);
+    self.sig.Blocked.set(false);
+    self.sig.Speed.set(0);
+    return;
+  }
+
+  const gapM = getDefaultSpacingController().gapOf(t.id);
+  let headwayCap = Number.POSITIVE_INFINITY;
+  let headwayFreeMm = Number.POSITIVE_INFINITY;
+  let headwayStopMm = Number.POSITIVE_INFINITY;
+  if (Number.isFinite(gapM)) {
+    const gapMm = gapM * 1000;
+    headwayCap = computeCarFollowingSpeed(gapMm, l.safetyDistanceMm, l.headwayGain, l.targetSpeed);
+    headwayFreeMm = Math.max(0, gapMm - l.minGapMm);
+    headwayStopMm = Math.max(0, gapMm - l.safetyDistanceMm);
+  }
+  const zoneHoldMm = claimAheadZones(l, t);
+  const destStopMm = serviceStopAhead(l)
+    ? Math.max(0, (t.path!.length - t.s) * 1000)
+    : Number.POSITIVE_INFINITY;
+  const stopMm = Math.min(remainingToStopMm(t), zoneHoldMm, headwayStopMm, destStopMm);
+  const target = run ? Math.min(l.targetSpeed, headwayCap) : 0;
+  if (t.atEnd || stopMm <= 0) {
+    t.v = 0;
+  } else {
+    t.v = computeRampedSpeed(t.v, target, l.acceleration, l.useAcceleration, stopMm, dt);
+  }
+  let parkedByConstraint = false;
+  if (t.v > 0) {
+    const hardMm = Math.min(headwayFreeMm, zoneHoldMm, destStopMm);
+    if (Number.isFinite(hardMm)) {
+      const allowedMm = Math.max(0, hardMm - HARD_CLAMP_BACKOFF_MM);
+      if (t.v * dt > allowedMm) {
+        if (allowedMm <= PARK_EPS_MM) {
+          t.v = 0;
+          parkedByConstraint = true;
+        } else {
+          t.v = allowedMm / dt;
+        }
+      }
+    }
+  }
+  t.advance(dt);
+  applyPose(self);
+  releaseStaleZones(l, t);
+  if ((l.phase === 'driving' || l.phase === 'cruising') && serviceStopAhead(l)
+      && (t.path!.length - t.s) * 1000 <= PARK_EPS_MM) {
+    beginService(self);
+    self.sig.Position.set(t.s * 1000);
+    return;
+  }
+  const blocked = run && !t.atEnd && t.v === 0 && (
+    parkedByConstraint ||
+    (Number.isFinite(gapM) && headwayCap === 0) ||
+    zoneHoldMm <= PARK_EPS_MM
+  );
+  t.blocked = blocked;
+  self.sig.Moving.set(Math.abs(t.v) > 1e-3);
+  self.sig.Position.set(t.s * 1000);
+  self.sig.Speed.set(t.v);
+  self.sig.AtNode.set(l.atNodeId !== null);
+  self.sig.Blocked.set(blocked);
+  l.atNodeId = null;
+}
+
+// ── Definition ──────────────────────────────────────────────────────────────
 
 const def = {
   type: 'Agv' as const,
   kind: 'conveyor' as const,
+  bake: 'chunk' as const, // the vehicle moves its own node — its body must be its own chunk
+  pick: 'select' as const, // a vehicle is an object of its own: click → inspector + DES statistics
   description: 'Autonomous vehicle (FTS/AGV) that follows an rv_extras.Path graph.',
   mcpDocs:
-    'Path-following vehicle (plan-268). Rides the rv_extras.Path graph: PathId selects a ' +
-    'registered path (else the first Path node under the root is used). Speed/ramp come from ' +
-    'TargetSpeed/Acceleration (mm/s, mm/s² — drive parity). Traffic is raycast-free: 1D ' +
-    'arc-length headway (SafetyDistance/MinGap/LookAhead/HeadwayGain) plus zone reservation ' +
-    '(rv_extras.Path zone/zoneCapacity — claim before entry, hold at the entrance when ' +
-    'occupied). Routing at junctions is a project-injectable id-based hook (selectNextPath); ' +
-    'default is successors[0]. Signals: Agv.Run (command), Agv.Moving, Agv.Position (mm), ' +
-    'Agv.AtNode (pulse), Agv.Blocked (held by traffic).',
+    'Path-following vehicle (plan-268 / plan-558). Rides the rv_extras.Path graph: PathId selects a ' +
+    'registered path (else the first Path node under the root is used). Motion is a closed-form ' +
+    'speed profile: TargetSpeed / Acceleration / Deceleration (mm/s, mm/s²), curve limit ' +
+    'v <= sqrt(LateralAcceleration * R), docking crawl (DockingSpeed over DockingDistance before a ' +
+    'service stop). Distance control is a trajectory-based moving block: a follower keeps SafetyGap ' +
+    '(mm) between its front and the leader rear (VehicleLength / VehicleWidth, 0 = from the mesh). ' +
+    'Zones (rv_extras.Path zone/zoneCapacity) are claimed before the front enters and released when ' +
+    'the rear has left. Optional scanner fields (ScannerFields, ScannerReactionTime, ProtectiveMargin, ' +
+    'WarningMargin): warning caps the speed, protective stops. Routing at junctions is a ' +
+    'project-injectable id-based hook (selectNextPath); default is successors[0]. Signals: Agv.Run ' +
+    '(command), Agv.Moving, Agv.Position (mm), Agv.AtNode (pulse), Agv.Blocked (stopped by traffic), ' +
+    'Agv.Speed (mm/s), Agv.Slowed, Agv.FieldWarning, Agv.FieldProtective. UseAcceleration=false keeps ' +
+    'the legacy car-following step mode (SafetyDistance/MinGap/LookAhead/HeadwayGain).',
   models: ['*Agv*', '*AGV*'],
   schema: {
-    TargetSpeed:     { type: 'number' as const, default: DEFAULTS.TargetSpeed },
-    Acceleration:    { type: 'number' as const, default: DEFAULTS.Acceleration },
-    UseAcceleration: { type: 'boolean' as const, default: DEFAULTS.UseAcceleration },
-    PathId:          { type: 'string' as const, default: DEFAULTS.PathId },
-    StartPosition:   { type: 'number' as const, default: DEFAULTS.StartPosition },
+    TargetSpeed:         { type: 'number' as const, default: DEFAULTS.TargetSpeed },
+    Acceleration:        { type: 'number' as const, default: DEFAULTS.Acceleration },
+    UseAcceleration:     { type: 'boolean' as const, default: DEFAULTS.UseAcceleration },
+    PathId:              { type: 'string' as const, default: DEFAULTS.PathId },
+    StartPosition:       { type: 'number' as const, default: DEFAULTS.StartPosition },
     // Plan-921 — declarative one-shot task (no callbacks): drive to
     // Destination (any path id), wait ServiceTime seconds, then idle.
-    Destination:     { type: 'string' as const, default: '' },
-    ServiceTime:       { type: 'number' as const, default: 0 },
-    SafetyDistance:  { type: 'number' as const, default: DEFAULTS.SafetyDistance },
-    MinGap:          { type: 'number' as const, default: DEFAULTS.MinGap },
-    LookAhead:       { type: 'number' as const, default: DEFAULTS.LookAhead },
-    HeadwayGain:     { type: 'number' as const, default: DEFAULTS.HeadwayGain },
+    Destination:         { type: 'string' as const, default: '' },
+    ServiceTime:         { type: 'number' as const, default: 0 },
+    SafetyDistance:      { type: 'number' as const, default: DEFAULTS.SafetyDistance },
+    MinGap:              { type: 'number' as const, default: DEFAULTS.MinGap },
+    LookAhead:           { type: 'number' as const, default: DEFAULTS.LookAhead },
+    HeadwayGain:         { type: 'number' as const, default: DEFAULTS.HeadwayGain },
+    // Plan-558 — distance control (web-only fields, no Unity counterpart).
+    Deceleration:        { type: 'number' as const, default: DEFAULTS.Deceleration },
+    LateralAcceleration: { type: 'number' as const, default: DEFAULTS.LateralAcceleration },
+    VehicleLength:       { type: 'number' as const, default: DEFAULTS.VehicleLength },
+    VehicleWidth:        { type: 'number' as const, default: DEFAULTS.VehicleWidth },
+    SafetyGap:           { type: 'number' as const, default: DEFAULTS.SafetyGap },
+    DockingSpeed:        { type: 'number' as const, default: DEFAULTS.DockingSpeed },
+    DockingDistance:     { type: 'number' as const, default: DEFAULTS.DockingDistance },
+    ScannerFields:       { type: 'boolean' as const, default: DEFAULTS.ScannerFields },
+    ScannerReactionTime: { type: 'number' as const, default: DEFAULTS.ScannerReactionTime },
+    ProtectiveMargin:    { type: 'number' as const, default: DEFAULTS.ProtectiveMargin },
+    WarningMargin:       { type: 'number' as const, default: DEFAULTS.WarningMargin },
   },
 
   signals: SIGNALS,
@@ -515,10 +954,26 @@ const def = {
     startPath: null,
     startPosM: 0,
     atNodeId: null,
-    desLegEvent: -1,
     desArrivedPathId: null,
-    desTravelSec: new Map(),
-    desCacheSpeed: 0,
+    decel: DEFAULTS.Deceleration,
+    aLat: DEFAULTS.LateralAcceleration,
+    frontMm: FALLBACK_LENGTH_MM / 2,
+    rearMm: FALLBACK_LENGTH_MM / 2,
+    widthMm: FALLBACK_WIDTH_MM,
+    gapMm: DEFAULTS.SafetyGap,
+    dockSpeed: DEFAULTS.DockingSpeed,
+    dockDist: DEFAULTS.DockingDistance,
+    scanner: DEFAULTS.ScannerFields,
+    reactionSec: DEFAULTS.ScannerReactionTime,
+    protectiveMm: DEFAULTS.ProtectiveMargin,
+    warningMm: DEFAULTS.WarningMargin,
+    mbKind: null,
+    mbHost: null,
+    cTime: Number.NaN,
+    lastCanMove: false,
+    frozen: false,
+    frozenServiceSec: -1,
+    inHook: false,
     _pos: new Vector3(),
     _quat: new Quaternion(),
     _parentQuat: new Quaternion(),
@@ -531,18 +986,40 @@ const def = {
   // Mode-agnostic init: resolve the path, build the traveler, wire hooks.
   setup(self: AgvSelf): void {
     const l = self.local;
+    // A re-setup (DES runner restart) must not leave the previous traveler's
+    // traces behind — claims, headway entry, planner registration.
+    if (l.traveler) releaseVehicle(self, false);
     const bag = configBag(self);
+    // Stay clickable while an authoring mode (planner / DES) filters picks to
+    // layout objects — selecting a vehicle shows its inspector and statistics.
+    self.root.userData._rvSimSelectable = true;
     l.targetSpeed = cfgNumber(bag, 'TargetSpeed', DEFAULTS.TargetSpeed);
     l.acceleration = cfgNumber(bag, 'Acceleration', DEFAULTS.Acceleration);
-    l.useAcceleration = bag['UseAcceleration'] !== undefined
-      ? bag['UseAcceleration'] === true
-      : DEFAULTS.UseAcceleration;
+    l.useAcceleration = cfgBool(bag, 'UseAcceleration', DEFAULTS.UseAcceleration);
     const pathId = typeof bag['PathId'] === 'string' ? (bag['PathId'] as string) : DEFAULTS.PathId;
     l.safetyDistanceMm = Math.max(0, cfgNumber(bag, 'SafetyDistance', DEFAULTS.SafetyDistance));
     l.minGapMm = Math.max(0, cfgNumber(bag, 'MinGap', DEFAULTS.MinGap));
     l.lookAheadMm = Math.max(0, cfgNumber(bag, 'LookAhead', DEFAULTS.LookAhead));
     l.headwayGain = Math.max(0, cfgNumber(bag, 'HeadwayGain', DEFAULTS.HeadwayGain));
     const startPosMm = cfgNumber(bag, 'StartPosition', DEFAULTS.StartPosition);
+    l.decel = Math.max(1, cfgNumber(bag, 'Deceleration', DEFAULTS.Deceleration));
+    l.aLat = Math.max(1, cfgNumber(bag, 'LateralAcceleration', DEFAULTS.LateralAcceleration));
+    l.gapMm = Math.max(0, cfgNumber(bag, 'SafetyGap', DEFAULTS.SafetyGap));
+    l.dockSpeed = Math.max(1, cfgNumber(bag, 'DockingSpeed', DEFAULTS.DockingSpeed));
+    l.dockDist = Math.max(0, cfgNumber(bag, 'DockingDistance', DEFAULTS.DockingDistance));
+    l.scanner = cfgBool(bag, 'ScannerFields', DEFAULTS.ScannerFields);
+    l.reactionSec = Math.max(0, cfgNumber(bag, 'ScannerReactionTime', DEFAULTS.ScannerReactionTime));
+    l.protectiveMm = Math.max(0, cfgNumber(bag, 'ProtectiveMargin', DEFAULTS.ProtectiveMargin));
+    l.warningMm = Math.max(0, cfgNumber(bag, 'WarningMargin', DEFAULTS.WarningMargin));
+    // Body: explicit length → centred on the root; 0 → mesh bounds (the root
+    // may sit anywhere on the body, e.g. at the rear axle); no mesh → fallback.
+    const lengthMm = Math.max(0, cfgNumber(bag, 'VehicleLength', DEFAULTS.VehicleLength));
+    const widthMm = Math.max(0, cfgNumber(bag, 'VehicleWidth', DEFAULTS.VehicleWidth));
+    const mesh = lengthMm > 0 && widthMm > 0 ? null : meshBodyMm(self.root);
+    if (lengthMm > 0) { l.frontMm = lengthMm / 2; l.rearMm = lengthMm / 2; }
+    else if (mesh && mesh.front + mesh.rear > 0) { l.frontMm = mesh.front; l.rearMm = mesh.rear; }
+    else { l.frontMm = FALLBACK_LENGTH_MM / 2; l.rearMm = FALLBACK_LENGTH_MM / 2; }
+    l.widthMm = widthMm > 0 ? widthMm : (mesh && mesh.width > 0 ? mesh.width : FALLBACK_WIDTH_MM);
 
     // Path resolution: PathId → shared network; else the first rv_extras.Path
     // node under the root (payload-detected via NODE_KIND_TESTS.path).
@@ -560,11 +1037,10 @@ const def = {
     const traveler = new PathTraveler(self.root.name || 'Agv', path, net);
     traveler.hooks.onArrive = (nodeId) => { l.atNodeId = nodeId; };
     // Plan-921 junction resolution — layered: central control first (the
-    // registered network router — "ask the superordinate control for the new
-    // target"), then the mechanical shortest-distance hop toward the task
-    // destination, then the successors[0] default. Installed as the
-    // per-traveler hook, so peekNext (headway/zone look-ahead) predicts the
-    // SAME route the carry takes.
+    // registered network router), then the mechanical shortest-distance hop
+    // toward the task destination, then the successors[0] default. Installed
+    // as the per-traveler hook, so the planner's route walk (peekNext)
+    // predicts the SAME route the hand-over takes.
     traveler.hooks.selectNextPath = (candidates, ctx) => {
       const routerPick = net.routerSelect(candidates, ctx);
       if (typeof routerPick === 'string' && candidates.includes(routerPick)) return routerPick;
@@ -585,26 +1061,47 @@ const def = {
       assign: (task: AgvTask) => {
         l.task = task;
         l.phase = 'driving';
+        // A new task to the segment the vehicle stands on is a new visit.
+        if (task.destination === traveler.path?.id) l.servedPathId = null;
         l.serviceRemainingSec = 0;
-        if (l.desServiceEvent >= 0) { self.cancel(l.desServiceEvent); l.desServiceEvent = -1; }
-        // DES: a parked vehicle has no pending leg — re-kick the event chain.
-        if (self.mode === 'des' && l.desLegEvent < 0 && traveler.path) {
-          l.desLegEvent = self.in(DES_MIN_TRANSIT_SEC, 'Arrival', null, null);
-        }
+        cancelServiceEnd(self);
         traveler.atEnd = false;
+        const mb = authorityOf(l);
+        if (mb && mb.has(traveler.id)) {
+          mb.invalidateRoute(traveler.id); // a new destination re-decides the junctions ahead
+          replanNow(self, 'assign');
+        }
+        bookStat(self);
       },
       clear: () => {
         l.task = null;
         l.phase = 'cruising';
         l.serviceRemainingSec = 0;
-        if (l.desServiceEvent >= 0) { self.cancel(l.desServiceEvent); l.desServiceEvent = -1; }
-        if (self.mode === 'des' && l.desLegEvent < 0 && traveler.path) {
-          l.desLegEvent = self.in(DES_MIN_TRANSIT_SEC, 'Arrival', null, null);
-        }
+        cancelServiceEnd(self);
         traveler.atEnd = false;
+        const mb = authorityOf(l);
+        if (mb && mb.has(traveler.id)) {
+          mb.invalidateRoute(traveler.id);
+          replanNow(self, 'assign');
+        }
+        bookStat(self);
       },
       get task() { return l.task; },
       get phase() { return l.phase; },
+      node: self.root,
+      motion: (out: AgvMotionInfo): boolean => {
+        const mb = l.mbHost ? authorityOf(l) : null;
+        if (!mb || !mb.has(traveler.id)) return false;
+        const speed = mb.renderSpeedOf(traveler.id);
+        out.speed = speed;
+        out.field = mb.fieldStateOf(traveler.id);
+        out.protectiveLength = mb.protectiveFieldLength(traveler.id, speed);
+        out.warningLength = out.protectiveLength + l.warningMm / 1000;
+        out.front = l.frontMm / 1000;
+        out.width = l.widthMm / 1000;
+        out.scanner = l.scanner;
+        return true;
+      },
     });
 
     // Declarative one-shot task from the config (no callbacks — MCP/inspector
@@ -620,9 +1117,12 @@ const def = {
     traveler.s = l.startPosM;
     l.atNodeId = null;
 
-    // Phase 2: join the shared headway fleet + claim the starting zone.
+    // Join the shared headway index (legacy model + reprojection on live edits)
+    // and claim the starting zone (a fresh vehicle holds nothing yet).
     getDefaultSpacingController().add(traveler, { lookAhead: l.lookAheadMm / 1000 });
+    getDefaultZoneRegistry().releaseAll(traveler.id);
     claimCurrentZone(traveler);
+    reportUnzonedMerges();
 
     // The vehicle runs unless told to stop (a live CONNECT source owns Run when bound).
     if (!self.isWired) self.sig.Run.set(true);
@@ -640,32 +1140,28 @@ const def = {
     const l = self.local;
     const t = l.traveler;
     l.atNodeId = null;
-    // Plan-921: cancel a pending service stay and re-arm the declarative config task
-    // (deterministic restart — imperative fleet tasks do NOT survive a reset;
-    // fleet logic re-assigns on 'simulation-start').
-    if (l.desServiceEvent >= 0) {
-      self.cancel(l.desServiceEvent);
-      l.desServiceEvent = -1;
-    }
+    // Plan-921: cancel a pending service stay and re-arm the declarative config
+    // task (imperative fleet tasks do NOT survive a reset).
+    cancelServiceEnd(self);
     l.serviceRemainingSec = 0;
     l.serviceMode = 'timer';
     l.dockReleaseFlag = false;
     l.servedPathId = null;
     l.task = l.startTask ? { ...l.startTask } : null;
     l.phase = l.task ? 'driving' : 'cruising';
-    // Phase 3: drop the pending DES leg (stale ids are ignored by the queue)
-    // and the boundary bookkeeping — a restart re-kicks via onGenerate.
-    if (l.desLegEvent >= 0) {
-      self.cancel(l.desLegEvent);
-      l.desLegEvent = -1;
-    }
     l.desArrivedPathId = null;
-    l.desTravelSec.clear();
+    l.frozen = false;
+    l.frozenServiceSec = -1;
+    const kind = l.mbKind;
     if (t) {
-      // Release EVERY held zone FIRST (review finding 2 — a reset that keeps a
-      // claim deadlocks the crossing permanently; no timeout can heal it), then
-      // re-seed the traveler deterministically on its start path.
+      // Release EVERY held zone and the planner entry FIRST (a reset that keeps
+      // a claim or a plan deadlocks / ghosts the traffic), then re-seed the
+      // traveler deterministically on its start path.
       getDefaultZoneRegistry().releaseAll(t.id);
+      const mb = authorityOf(l);
+      if (mb) mb.unregister(t.id);
+      l.mbKind = null;
+      l.mbHost = null;
       if (l.startPath) t.path = l.startPath;
       t.s = l.startPosM;
       t.v = 0;
@@ -673,308 +1169,180 @@ const def = {
       t.blocked = false;
       claimCurrentZone(t);
       applyPose(self);
+      // Continuous: re-join the planner from the start pose (DES re-registers at onGenerate).
+      if (kind === 'continuous' && l.useAcceleration) {
+        const mb2 = registerPlanned(self, 'continuous');
+        l.cTime = Number.NaN;
+        mb2.markDirty(t.id, 'start');
+        mb2.requestFlushDeferred(l.mbHost!);
+      }
     }
     self.sig.Moving.set(false);
     self.sig.Position.set(l.startPosM * 1000);
     self.sig.AtNode.set(false);
     self.sig.Blocked.set(false);
+    self.sig.Speed.set(0);
+    self.sig.Slowed.set(false);
+    self.sig.FieldWarning.set(false);
+    self.sig.FieldProtective.set(false);
   },
   start(self: AgvSelf): void {
     if (!self.isWired) self.sig.Run.set(true);
   },
 
   continuous: {
+    /** Join the continuous planner (UseAcceleration = true) — every vehicle registers before the first tick. */
+    setup(self: AgvSelf): void {
+      const l = self.local;
+      const t = l.traveler;
+      if (self.disabled || !t || !t.path || !l.useAcceleration) return;
+      const mb = registerPlanned(self, 'continuous');
+      l.cTime = Number.NaN;
+      mb.markDirty(t.id, 'start');
+      mb.requestFlushDeferred(l.mbHost!);
+    },
+
     fixedUpdate(self: AgvSelf, dt: number): void {
       const l = self.local;
       const t = l.traveler;
       if (!t || !t.path) return;
       if (self.isWired) return;          // an interface controls the vehicle → stay silent
-
-      const run = self.sig.Run.get() === true;
-
-      // Dock re-trigger guard: leaving the served segment clears the mark.
-      if (l.servedPathId !== null && t.path.id !== l.servedPathId) l.servedPathId = null;
-
-      // ── Task phases (plan-921): service countdown / idle park ──
-      if (l.phase === 'servicing') {
-        t.v = 0;
-        if (l.serviceMode === 'dock') {
-          if (l.dockReleaseFlag) endService(self); // the dock released the vehicle
+      if (!l.useAcceleration || l.mbKind !== 'continuous' || !l.mbHost) {
+        legacyFixedUpdate(self, dt);
+        // A legacy vehicle is an obstacle for the planned ones (mixed fleets).
+        const mb = getDefaultMovementAuthority('continuous');
+        if (!mb.has(t.id)) {
+          l.mbKind = 'continuous';
+          mb.registerExternal(t.id, t, plannerParams(l), () => mb.clock.now);
         } else {
-          l.serviceRemainingSec -= dt;
-          if (l.serviceRemainingSec <= 0) endService(self); // may assign the next task
+          mb.updateExternal(t.id);
         }
-        self.sig.Moving.set(false);
-        self.sig.Blocked.set(false);
+        bookStat(self);
         return;
       }
-      if (l.phase === 'idle') {
-        t.v = 0;
-        self.sig.Moving.set(false);
-        self.sig.Blocked.set(false);
-        return;
+      const mb = getDefaultMovementAuthority('continuous');
+      const host = l.mbHost;
+      if (!mb.has(t.id)) return;
+      if (Number.isNaN(l.cTime)) l.cTime = mb.clock.now;
+      // Run / phase edge → re-plan at the current clock time (the DES kernel
+      // observes Run at its events only — the continuous tick sees it at once).
+      const can = host.canMove();
+      if (can !== l.lastCanMove) {
+        l.lastCanMove = can;
+        mb.markDirty(t.id, 'run');
+        mb.requestFlush(host);
       }
-
-      // ── Headway (1D arc-length, forward only — plan-268 F4) ──
-      // gapOf reads the shared start-of-tick snapshot (auto-refresh per round).
-      const gapM = getDefaultSpacingController().gapOf(t.id);
-      let headwayCap = Number.POSITIVE_INFINITY;    // mm/s ramp target cap
-      let headwayFreeMm = Number.POSITIVE_INFINITY; // hard advance budget (gap − MinGap)
-      let headwayStopMm = Number.POSITIVE_INFINITY; // braking target (gap − SafetyDistance)
-      if (Number.isFinite(gapM)) {
-        const gapMm = gapM * 1000;
-        headwayCap = computeCarFollowingSpeed(gapMm, l.safetyDistanceMm, l.headwayGain, l.targetSpeed);
-        headwayFreeMm = Math.max(0, gapMm - l.minGapMm);
-        headwayStopMm = Math.max(0, gapMm - l.safetyDistanceMm);
-      }
-
-      // ── Zone reservation (claims ahead as a side effect — plan-268 F5) ──
-      const zoneHoldMm = claimAheadZones(l, t);
-
-      // Plan-921: a service stop (task destination OR a bound dock) is a
-      // positioning stop like a dead end — the drive ramp decelerates into it.
-      const destStopMm = serviceStopAhead(l)
-        ? Math.max(0, (t.path.length - t.s) * 1000)
-        : Number.POSITIVE_INFINITY;
-
-      const stopMm = Math.min(remainingToStopMm(t), zoneHoldMm, headwayStopMm, destStopMm);
-      const target = run ? Math.min(l.targetSpeed, headwayCap) : 0;
-
-      if (t.atEnd || stopMm <= 0) {
-        // Parked — at a dead end, at an occupied zone entrance, or inside the
-        // safety envelope of the vehicle ahead (drive parity: a positioning
-        // drive clamps at its target; re-evaluated every tick, so the vehicle
-        // restarts as soon as the constraint clears).
-        t.v = 0;
-      } else {
-        // The DRIVE's ramp (computeRampedSpeed IS RVDrive.update's ramp): the
-        // nearest stop constraint gates the deceleration exactly like a
-        // positioning drive approaching its target; the headway cap shapes the
-        // car-following approach speed.
-        t.v = computeRampedSpeed(t.v, target, l.acceleration, l.useAcceleration, stopMm, dt);
-      }
-
-      // ── Hard no-penetration clamp (1D arc-length analogue of the transport-
-      // surface gap clamp): this tick's advance may never eat into MinGap nor
-      // cross an unclaimed zone entrance — regardless of what the ramp decided.
-      let parkedByConstraint = false;
-      if (t.v > 0) {
-        // destStopMm is HARD too (plan-921): the destination end must never be
-        // crossed by a single-tick overshoot (UseAcceleration=false travels
-        // v·dt per tick) — the carry would hand the vehicle to a successor
-        // before the arrival check runs.
-        const hardMm = Math.min(headwayFreeMm, zoneHoldMm, destStopMm);
-        if (Number.isFinite(hardMm)) {
-          const allowedMm = Math.max(0, hardMm - HARD_CLAMP_BACKOFF_MM);
-          if (t.v * dt > allowedMm) {
-            if (allowedMm <= PARK_EPS_MM) {
-              t.v = 0; // parked at the constraint (see PARK_EPS_MM)
-              parkedByConstraint = true;
-            } else {
-              t.v = allowedMm / dt;
-            }
-          }
-        }
-      }
-
-      t.advance(dt);
+      // Advance the shared clock: every plan event due inside this tick runs
+      // at its exact time (the first vehicle of the tick advances everybody).
+      l.cTime += dt;
+      mb.clock.advanceTo(l.cTime);
+      mb.syncTo(t.id, l.cTime);
       applyPose(self);
-
-      // Zone release strictly AFTER the position transfer (plan-268 §2.4).
-      releaseStaleZones(l, t);
-
-      // Plan-921: arrival at a service stop (destination or dock) → stay starts.
-      if ((l.phase === 'driving' || l.phase === 'cruising') && serviceStopAhead(l)
-          && (t.path.length - t.s) * 1000 <= PARK_EPS_MM) {
-        beginService(self);
-        self.sig.Position.set(t.s * 1000);
-        return;
-      }
-
-      // ── Signals ──
-      const blocked = run && !t.atEnd && t.v === 0 && (
-        parkedByConstraint ||                            // standing at MinGap / a zone entrance
-        (Number.isFinite(gapM) && headwayCap === 0) ||   // held inside the safety envelope
-        zoneHoldMm <= PARK_EPS_MM                        // standing at an occupied zone
-      );
-      t.blocked = blocked;
-      self.sig.Moving.set(Math.abs(t.v) > 1e-3);
-      self.sig.Position.set(t.s * 1000);            // mm — drive parity
-      self.sig.AtNode.set(l.atNodeId !== null);     // one-tick pulse
-      self.sig.Blocked.set(blocked);
+      const speed = mb.speedOf(t.id, l.cTime);
+      t.v = speed * 1000;
+      self.sig.Moving.set(speed > 1e-6);
+      self.sig.Position.set(t.s * 1000);       // mm — drive parity
+      self.sig.Speed.set(speed * 1000);
+      self.sig.AtNode.set(l.atNodeId !== null); // one-tick pulse
       l.atNodeId = null;
+      bookStat(self);
     },
 
     teardown(self: AgvSelf): void {
       // Dispose/despawn must leave NO traces in the shared traffic state:
-      // a surviving claim would block the crossing permanently (finding 2).
+      // a surviving claim or plan would block / ghost the traffic permanently.
       const t = self.local.traveler;
       if (!t) return;
-      getDefaultSpacingController().remove(t.id);
-      getDefaultZoneRegistry().releaseAll(t.id);
+      releaseVehicle(self, true);
       getDefaultAgvFleet().unregister(t.id); // plan-921 — no stale handles
     },
   },
 
-  // ── DES adapter (plan-268 Phase 3) — dispatched ONLY by the private runner;
-  // this definition never imports it (public/private boundary, §5.1). NOTE:
-  // `samplesLiveGeometry` is deliberately NOT declared — the hooks read the
-  // parsed path geometry (static) and traveler state, never live world
-  // transforms, so FastForward keeps its zero-settle fast path.
+  // ── DES adapter — dispatched ONLY by the private runner; this definition
+  // never imports it (public/private boundary). `samplesLiveGeometry` is
+  // deliberately NOT declared — the hooks read the parsed path geometry and the
+  // plan, never live world transforms, so FastForward keeps its fast path.
   des: {
     /**
-     * Start kick (runner.start): schedule the first leg from the seeded
-     * StartPosition. A parked vehicle (Run=false) schedules nothing —
-     * mid-run Run toggling is a continuous-mode feature (Phase-3 scope).
+     * Start kick: register with the DES authority (a parked vehicle too — it
+     * is an obstacle) and defer the first flush to an event at this instant
+     * so every vehicle is registered before anyone plans.
      */
     onGenerate(self: AgvSelf): void {
       const l = self.local;
       const t = l.traveler;
       if (self.disabled || !t || !t.path) return;
-      if (self.sig.Run.get() !== true) return;
-      const p = t.path;
-      if (p.length <= 0) return;                    // degenerate — never schedule a 0-length loop storm
-      if (!p.closed && p.length - t.s <= 0) {       // seeded AT a dead end
-        t.atEnd = true;
-        self.sig.Moving.set(false);
-        return;
-      }
-      desScheduleLeg(self);
+      const mb = registerPlanned(self, 'des');
+      mb.recordEvent('Generate', t.id, self.now);
+      mb.markDirty(t.id, 'start');
+      mb.requestFlushDeferred(l.mbHost!);
+    },
+
+    /** Plan end at a service stop / dead end. */
+    onArrival(self: AgvSelf): void {
+      handleArrival(self);
+    },
+
+    /** End of the dwell — the follow-up task (if any) re-plans via assign(). */
+    onServiceEnd(self: AgvSelf): void {
+      self.local.desServiceEvent = -1;
+      handleServiceEnd(self);
+    },
+
+    /** Planner events: stop / flush / extend / zoneRelease / notify / field / stat / watchdog. */
+    onReplan(self: AgvSelf, data: unknown): void {
+      const d = (data ?? {}) as Record<string, unknown>;
+      const kind = (typeof d.kind === 'string' ? d.kind : '') as MbEventKind;
+      if (kind === 'stop') handleStop(self);
+      else handlePlanEvent(self, kind, d);
     },
 
     /**
-     * End of the current leg. Routing at the segment boundary uses the SAME
-     * callback signature as the continuous carry: `onArrive(pathId, agvId)`
-     * fires once per boundary (de-duped across blocked retries), the next
-     * path comes from `peekNext` (the identical selectNextPath hook dispatch).
-     * An occupied zone → Ankunfts-Reschedule (hold at the boundary, re-check
-     * after DES_BLOCKED_RETRY_SEC); a free/claimed zone → transfer first,
-     * release the left zone AFTER the transfer (§2.4), schedule the next leg.
+     * Component failure (DES downtime): the adapter cancelled every queued
+     * event. The planner's own events are dropped (it re-plans: the vehicle
+     * brakes to a stop with its deceleration, followers re-plan against that);
+     * a running service stay keeps its remaining time for the resume.
      */
-    onArrival(self: AgvSelf): void {
+    onFreeze(self: AgvSelf, frozen: { action: string; remaining: number }[]): void {
       const l = self.local;
       const t = l.traveler;
-      if (self.disabled || !t || !t.path) return;
-      const p = t.path;
-      l.desLegEvent = -1;
-      t.s = p.length; // authoritative end state (the tween's final write is the transform)
-      self.sig.Position.set(t.s * 1000); // mm — drive parity
-
-      if (p.closed) {
-        // Loop wrap — a closed chain has no end node: no arrival announcement
-        // (continuous-carry parity), just the next round.
-        t.s = 0;
-        desScheduleLeg(self);
-        return;
+      if (!t) return;
+      l.frozen = true;
+      l.frozenServiceSec = -1;
+      for (let i = frozen.length - 1; i >= 0; i--) {
+        const a = frozen[i].action;
+        if (a.endsWith('.ServiceEnd')) { l.frozenServiceSec = frozen[i].remaining; frozen.splice(i, 1); }
+        else if (a.endsWith('.Arrival') || a.endsWith('.Replan')) frozen.splice(i, 1);
       }
-
-      if (l.desArrivedPathId !== p.id) {
-        l.desArrivedPathId = p.id;
-        t.hooks.onArrive?.(p.id, t.id);
-        // Phase 6: same router notification as the continuous carry —
-        // de-duped with the hook across blocked-arrival retries.
-        t.network?.notifyArrive(p.id, t.id);
-      }
-
-      // Plan-921: destination reached → dwell instead of the next leg. The
-      // DwellEnd event ends the stay; a follow-up task assigned from inside
-      // onServiceEnd re-kicks the leg chain (fleet handle assign()).
-      if (serviceStopAhead(l)) {
-        beginService(self); // dock mode: the dock's release() schedules ServiceEnd
-        self.sig.Blocked.set(false);
-        if (l.serviceMode === 'timer') {
-          l.desServiceEvent = self.in(
-            Math.max(l.serviceRemainingSec, DES_MIN_TRANSIT_SEC), 'ServiceEnd', null, null);
-        }
-        return;
-      }
-
-      const next = t.peekNext(p, 1);
-      if (!next || next === p) {
-        // Dead end: park (mirror of the continuous clamp+stop). `atEnd` was
-        // false on the way in (cleared at every transfer), so the Phase-6
-        // dispatch trigger fires exactly once per stop — carry parity.
-        t.v = 0;
-        const wasAtEnd = t.atEnd;
-        t.atEnd = true;
-        t.blocked = false;
-        self.sig.Moving.set(false);
-        self.sig.Blocked.set(false);
-        if (!wasAtEnd) t.network?.requestDispatch(t.id);
-        return;
-      }
-
-      if (next.zoneId) {
-        const zones = getDefaultZoneRegistry();
-        if (!zones.isHolder(next.zoneId, t.id)) {
-          zones.define(next.zoneId, next.zoneCapacity ?? undefined);
-          if (!zones.claim(next.zoneId, t.id)) {
-            // Ankunfts-Reschedule (plan-268 §2.4): hold AT the entrance and
-            // re-run this SAME arrival check later — a discrete poll, no
-            // sub-tick, no ramp. The momentary trajectory deliberately
-            // diverges from the continuous car-following here (§10 finding 3).
-            t.v = 0;
-            t.blocked = true;
-            self.sig.Moving.set(false);
-            self.sig.Blocked.set(true);
-            l.desLegEvent = self.in(DES_BLOCKED_RETRY_SEC, 'Arrival', null, null);
-            return;
-          }
-        }
-      }
-
-      // Plan-921 DES parity — SEGMENT OCCUPANCY: one vehicle per segment. The
-      // follower brakes/stops only at PATH ENDS (the agreed simplification of
-      // the continuous car-following chain); a finer queue is modelled by
-      // splitting the path into shorter segments. Same discrete hold-and-poll
-      // as an occupied zone — arrival ORDER and throughput converge with the
-      // continuous mode, the momentary trajectory deliberately does not.
-      if (getDefaultSpacingController().occupantsOf(next.id, t.id) > 0) {
-        t.v = 0;
-        t.blocked = true;
-        self.sig.Moving.set(false);
-        self.sig.Blocked.set(true);
-        l.desLegEvent = self.in(DES_BLOCKED_RETRY_SEC, 'Arrival', null, null);
-        return;
-      }
-
-      // Position transfer FIRST, then release the zone that was left (§2.4 —
-      // never a gap where the crossing is unheld while the vehicle is inside).
-      const leftZone = p.zoneId;
-      t.path = next;
-      t.s = 0;
-      t.atEnd = false;
-      l.desArrivedPathId = null;
-      l.servedPathId = null; // left the served segment
-      if (leftZone && leftZone !== next.zoneId) {
-        getDefaultZoneRegistry().release(leftZone, t.id);
-      }
-      desScheduleLeg(self);
+      l.desServiceEvent = -1;
+      authorityOf(l)?.freeze(t.id);
     },
 
-    /**
-     * Plan-921: end of the dwell at a task destination. `endService` fires the
-     * task's `onServiceEnd`; a follow-up task assigned inside the callback has
-     * already re-kicked the leg chain via the fleet handle — without one the
-     * vehicle parks idle (and the fleet idle channel fired).
-     */
-    onServiceEnd(self: AgvSelf): void {
+    /** Repaired: the stay continues with its remaining time; the vehicle re-plans. */
+    onResume(self: AgvSelf): void {
       const l = self.local;
-      l.desServiceEvent = -1;
-      if (self.disabled || !l.traveler) return;
-      endService(self);
-      if (l.phase === 'idle') {
-        self.sig.Moving.set(false);
-        return;
+      const t = l.traveler;
+      if (!t) return;
+      l.frozen = false;
+      if (l.frozenServiceSec >= 0 && l.phase === 'servicing') {
+        l.desServiceEvent = scheduleServiceEnd(self, Math.max(l.frozenServiceSec, DES_MIN_TRANSIT_SEC));
       }
-      // Through dock (or a chained follow-up task): resume the leg chain —
-      // the re-run arrival is de-duped (announce + served marks) and routes on.
-      if (l.desLegEvent < 0) {
-        l.desLegEvent = self.in(DES_MIN_TRANSIT_SEC, 'Arrival', null, null);
-      }
+      l.frozenServiceSec = -1;
+      authorityOf(l)?.resume(t.id);
     },
   },
 };
+
+// Statistics: book the category after every state-changing entry point instead
+// of before each of their many early returns (see bookStat).
+const withStat = <A extends unknown[]>(fn: (self: AgvSelf, ...args: A) => void) =>
+  (self: AgvSelf, ...args: A): void => { fn(self, ...args); bookStat(self); };
+def.des.onGenerate = withStat(def.des.onGenerate);
+def.des.onArrival = withStat(def.des.onArrival);
+def.des.onServiceEnd = withStat(def.des.onServiceEnd);
+def.des.onReplan = withStat(def.des.onReplan);
+def.des.onFreeze = withStat(def.des.onFreeze);
+def.des.onResume = withStat(def.des.onResume);
 
 /** Agv — path-following vehicle (factory-built; behaviour identical to the def). */
 const AgvBehavior = defineLibraryComponent(def);

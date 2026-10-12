@@ -10,7 +10,7 @@
  */
 
 import { useState, useEffect, lazy } from 'react';
-import { Box, Tabs, Tab, Typography } from '@mui/material';
+import { Box, Tabs, Tab, Typography, Link } from '@mui/material';
 import { useViewer } from '../../hooks/use-viewer';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { LeftPanel, clampWidth } from './LeftPanel';
@@ -164,6 +164,10 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
           px: 1.5,
           py: 0.5,
           borderTop: '1px solid rgba(255,255,255,0.08)',
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 0.75,
+          flexWrap: 'wrap',
         }}
       >
         <Typography
@@ -173,7 +177,30 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         >
           realvirtual WEB {formatVersionFull()}
         </Typography>
+        <OpenSourceLicensesLink />
       </Box>
     </LeftPanel>
+  );
+}
+
+/**
+ * "Open-source licenses" — opens the THIRD-PARTY-NOTICES.txt every build ships next to
+ * index.html (plan-544 F7). Relative to the deploy base, so it works on every channel
+ * (hosted sub-paths, CONNECT's /webviewer, a customer workspace). The dev server answers the
+ * same URL with a development preview.
+ */
+export function OpenSourceLicensesLink() {
+  return (
+    <Link
+      href={`${import.meta.env.BASE_URL}THIRD-PARTY-NOTICES.txt`}
+      target="_blank"
+      rel="noopener noreferrer"
+      underline="hover"
+      title="Third-party software notices"
+      data-testid="settings-open-source-licenses"
+      sx={{ color: 'rgba(255,255,255,0.3)', fontSize: 10, '&:hover': { color: 'rgba(255,255,255,0.6)' } }}
+    >
+      · Open-source licenses ↗
+    </Link>
   );
 }

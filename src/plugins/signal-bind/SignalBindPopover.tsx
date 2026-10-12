@@ -46,12 +46,16 @@ import {
   upsertMappingForRow,
 } from './slot-row-models';
 import { emitSignalBindingApplied } from './binding-applied-pulse';
+import { mergeAppliedMappings } from './binding-inventory';
+import { bindWithUnitScale } from './unit-scale';
 import { slotRejectReason, type DropRejectReason } from './drop-accept';
 import { signalProviderKey } from '../../core/engine/rv-signal-provider';
 import { popoverContentRegistry } from '../../core/hmi/popover-store';
 import { getConnectSnapshot, subscribeConnectStore, type ConnectInterface } from '../../core/hmi/connect-store';
 import { BINDING_STATE_LABEL } from '../../core/hmi/signal-vocabulary';
 import { omitUndefined } from '../../core/hmi/rv-omit-undefined';
+import { InspectorSubheader } from '../../core/hmi/rv-inspector-blocks';
+import { ACCENT, ERROR, FS, INK_LOW, NEUTRAL, SUCCESS, WARN } from '../../core/hmi/shared-sx';
 
 // Re-exports: the row/picker shapes moved to the shared core row (plan-325);
 // existing imports from this module keep working.
@@ -65,25 +69,21 @@ const STATE_LABEL: Record<ElementBindingState, string> = BINDING_STATE_LABEL;
  * Panel palette for the header dot. Deliberately NOT shared with the 3D
  * `SIGNAL_BADGE_STATE_COLOR`: the marker palette is tuned against the scene,
  * this one against the panel background, so the values differ on purpose while
- * the LABELS above are identical.
+ * the LABELS above are identical. The values are the shared-sx design tokens
+ * (plan-514) — it is still its OWN state map, never the signal-value colours.
  */
 const STATE_COLOR: Record<ElementBindingState, string> = {
-  unbound: '#808080',
-  live: '#66bb6a',
-  pending: '#4fc3f7',
-  disconnected: '#ffa726',
-  conflict: '#ef5350',
+  unbound: NEUTRAL,
+  live: SUCCESS,
+  pending: ACCENT,
+  disconnected: WARN,
+  conflict: ERROR,
 };
 
-/** Compact uppercase group header; the label already carries PLC direction. */
+/** Group header (PLC Outputs / PLC Inputs / Unavailable) — the inspector subheader
+ *  block, so the popover and the inline inspector rows share one heading style. */
 function SectionHeader({ label }: { label: string }) {
-  return (
-    <Box sx={{ display: 'flex', alignItems: 'center', mt: 0.5, mb: 0.25, px: 1 }}>
-      <Typography sx={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: 'rgba(255,255,255,0.5)' }}>
-        {label}
-      </Typography>
-    </Box>
-  );
+  return <InspectorSubheader>{label}</InspectorSubheader>;
 }
 
 export interface SignalBindPopoverProps {
@@ -223,12 +223,12 @@ export function SignalBindPopover({
     >
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.5 }}>
         <Box sx={{ width: 7, height: 7, borderRadius: '50%', bgcolor: STATE_COLOR[state] }} />
-        <Typography data-testid="signal-bind-state" sx={{ fontSize: 11, color: STATE_COLOR[state] }}>
+        <Typography data-testid="signal-bind-state" sx={{ fontSize: FS.label, color: STATE_COLOR[state] }}>
           {STATE_LABEL[state]}
         </Typography>
       </Box>
       {slots.length === 0 && (
-        <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', py: 1 }}>
+        <Typography sx={{ fontSize: FS.label, color: INK_LOW, py: 1 }}>
           No bindable signals on this element.
         </Typography>
       )}
@@ -333,7 +333,8 @@ function SignalBindPopoverConnected({ viewer }: { viewer: RVViewer }) {
 
   const persist = (next: SignalMapping[]) => {
     const applied = mgr.applyMappings(targetId, target.node, next);
-    persistence.write(applied);
+    // Broken links of the same target survive an unrelated change (plan-425).
+    persistence.write(mergeAppliedMappings(next, applied));
   };
 
   const setMapping = (
@@ -345,17 +346,26 @@ function SignalBindPopoverConnected({ viewer }: { viewer: RVViewer }) {
     kind?: BindableRowKind,
   ) => {
     if (!source) return;
-    const next = upsertMappingForRow(mappings, { slot, componentPath, kind, direction }, source);
-    if (!next) return;
-    persist(next);
-    // Same boundary as the inline drop (plan-425 F8) — the picker is the other
-    // way a person makes a link, and it must acknowledge the same way.
-    emitSignalBindingApplied(viewer, targetId, {
-      componentPath,
-      slot,
-      signal: source.name,
-      sourceKind: source.origin === 'internal' ? 'internal' : 'connect',
-    });
+    const row = { slot, componentPath, kind, direction };
+    if (!upsertMappingForRow(mappings, row, source)) return;
+    // The resolved row carries the component type the unit logic needs (plan-512).
+    const resolved = rows.find((r) => r.kind !== 'unavailable'
+      && r.slot === slot && r.componentPath === componentPath && (kind === undefined || r.kind === kind));
+    void bindWithUnitScale(viewer, target, persistence, { ...row, componentType: resolved?.componentType }, source)
+      .then((result) => {
+        if (!result?.persisted) {
+          if (result?.error) console.warn(`[signal-bind] binding ${slot} did not stick: ${result.error}`);
+          return;
+        }
+        // Same boundary as the inline drop (plan-425 F8) — the picker is the other
+        // way a person makes a link, and it must acknowledge the same way.
+        emitSignalBindingApplied(viewer, targetId, {
+          componentPath,
+          slot,
+          signal: source.name,
+          sourceKind: source.origin === 'internal' ? 'internal' : 'connect',
+        });
+      });
   };
 
   return (

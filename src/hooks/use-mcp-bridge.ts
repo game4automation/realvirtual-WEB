@@ -28,6 +28,8 @@ const INITIAL: McpBridgeSnapshot = {
   reconnectAttempt: 0,
   reconnectDelay: 0,
   serverStatus: null,
+  target: '',
+  failure: 'none',
 };
 
 /**

@@ -15,7 +15,10 @@
  * The trap being guarded is real and was measured in the plan-395 spike: the
  * Vite dev server answers EVERY unknown path with the SPA fallback,
  * `200 text/html`. A probe written the obvious way (`res.ok`) is therefore true
- * for an asset that does not exist.
+ * for an asset that does not exist. Since plan-508 the dev server answers a
+ * missing ASSET path (`*.glb`, `library/**`, `models/**`, …) with a real 404
+ * (`rv-asset-404-guard`); every other unknown path still gets the fallback, and
+ * that — plus any host without such a guard — is what the probe must survive.
  *
  * This file itself must NOT skip — it is the test of the skip.
  */
@@ -26,7 +29,8 @@ import { DEV_GLB } from './fixtures/glb-paths.mjs';
 
 /**
  * A path the dev server certainly does not have, and that the SPA fallback
- * therefore answers with `200 text/html`.
+ * therefore answers with `200 text/html`. Not an asset extension: those are
+ * 404 since plan-508 (asserted separately below).
  *
  * Deliberately NOT under `/private-assets/`: since plan-395 that prefix is
  * owned by the hardened route, which ends in a real 404 (asserted below). The
@@ -34,7 +38,9 @@ import { DEV_GLB } from './fixtures/glb-paths.mjs';
  * the state a public checkout is in for the whole prefix, because with no
  * private sibling the plugin is not installed and nothing claims it.
  */
-const ABSENT = '/definitely-not-here-395.glb';
+const ABSENT = '/definitely-not-here-395.bin';
+/** A missing ASSET path — a real 404 since plan-508. */
+const ABSENT_GLB = '/definitely-not-here-395.glb';
 
 /**
  * Whether the `/private-assets/` route is mounted at all.
@@ -60,6 +66,13 @@ describe('devAssetProbe_IgnoresSpaFallback', () => {
     expect(raw.headers.get('content-type') ?? '').toMatch(/text\/html/);
 
     expect(await devAssetAvailable(ABSENT)).toBe(false);
+  });
+
+  it('answers a missing asset path with a real 404, not the fallback (plan-508)', async () => {
+    const raw = await fetch(ABSENT_GLB, { method: 'HEAD' });
+    expect(raw.status).toBe(404);
+    expect(raw.headers.get('content-type') ?? '').not.toMatch(/text\/html/);
+    expect(await devAssetAvailable(ABSENT_GLB)).toBe(false);
   });
 
   it.runIf(ROUTE_MOUNTED)('answers a missing private file with a real 404', async () => {

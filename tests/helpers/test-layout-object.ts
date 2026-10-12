@@ -99,6 +99,9 @@ export interface LayoutTestViewer {
   drives: unknown[];
   raycastManager: null;
   rebuildGroupedBvh: () => void;
+  /** Viewer events the editor emits (e.g. `layout-lock-changed`) — recorded, no listeners. */
+  emit: (event: string, payload?: unknown) => void;
+  _emitted: { event: string; payload?: unknown }[];
   getPlugin<T = unknown>(id: string): T | undefined;
   _objectMap: Map<string, Object3D>;
   _idByObject: WeakMap<Object3D, string>;
@@ -146,6 +149,8 @@ export function makeLayoutTestViewer(): LayoutTestViewer {
     drives: [],
     raycastManager: null,
     rebuildGroupedBvh: () => {},
+    emit: (event: string, payload?: unknown) => { viewer._emitted.push({ event, payload }); },
+    _emitted: [],
     getPlugin<T = unknown>(id: string): T | undefined {
       return plugins.get(id) as T | undefined;
     },

@@ -11,31 +11,22 @@
  */
 
 import { expect, test, type Page } from 'playwright/test';
+import { waitForViewerReady as waitForViewerReadyShared } from './_viewer-ready';
 
+// Two modal overlays can be in front of the toolbar on a fresh profile and
+// BOTH swallow clicks: the first-visit welcome (auto-opens everywhere except
+// the Viewer, which plan-387 gated) and the auto-quality notice, which
+// appears late — only once the renderer has judged the GPU. Neither is what
+// this spec is about, so they are dismissed, in whichever order they arrive.
+// The shared helper (plan-503) reads `window.viewer`, answers a consent gate
+// if one is shown and dismisses the notices afterwards.
 async function waitForViewerReady(page: Page): Promise<void> {
   await page.waitForSelector('canvas', { timeout: 30_000 });
-  await page.waitForFunction(() => {
-    const viewer = (window as unknown as {
-      __rvViewer?: { currentModelUrl?: string; modes?: { activeMode?: string | null } };
-    }).__rvViewer;
-    const overlay = document.getElementById('loading-overlay');
-    return !!viewer?.currentModelUrl && !!overlay?.classList.contains('hidden');
-  }, undefined, { timeout: 90_000 });
-  // Two modal overlays can be in front of the toolbar on a fresh profile and
-  // BOTH swallow clicks: the first-visit welcome (auto-opens everywhere except
-  // the Viewer, which plan-387 gated) and the auto-quality notice, which
-  // appears late — only once the renderer has judged the GPU. Neither is what
-  // this spec is about, so they are dismissed, in whichever order they arrive.
-  for (const testId of ['welcome-dismiss', 'auto-quality-ok', 'welcome-dismiss']) {
-    const overlay = page.locator(`[data-testid="${testId}"]`);
-    try {
-      await overlay.first().waitFor({ state: 'visible', timeout: 5_000 });
-    } catch {
-      continue;   // not shown on this run — fine
-    }
-    await overlay.first().click();
-    await overlay.first().waitFor({ state: 'hidden', timeout: 10_000 });
-  }
+  await waitForViewerReadyShared(page, {
+    timeoutMs: 90_000,
+    notices: ['welcome-dismiss', 'auto-quality-ok', 'welcome-dismiss'],
+    noticeTimeoutMs: 5_000,
+  });
 }
 
 const activeMode = (page: Page) => page.evaluate(() => (window as unknown as {

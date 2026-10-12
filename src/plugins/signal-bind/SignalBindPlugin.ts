@@ -20,6 +20,10 @@ import { BindingsOverviewButton } from './BindingsOverviewButton';
 import { isSignalLinkModeActive } from './signal-link-mode-store';
 import { isDuplicateSignalName } from '../../core/engine/rv-signal-construction';
 import { registerSignalBulkActions } from './component-bulk-actions';
+import type { SignalBindingManager } from '../../core/engine/rv-signal-binding-manager';
+import { clearUnitProblems } from '../../core/hmi/problems-store';
+import { getFmuInstances, subscribeFmuInstances } from '../../core/engine/rv-fmu';
+import { reconcileUnitProblems } from './unit-scale';
 // Side-effect registration of the badge hover card (plan-422 F5): the
 // controller registers itself with the tooltip registry, which App.tsx renders.
 import './BadgeTooltipController';
@@ -74,9 +78,20 @@ export class SignalBindPlugin implements RVViewerPlugin {
   private overlayController: DropTargetOverlayController | null = null;
   private badgeController: SignalBadgeController | null = null;
   private clickUnsub: (() => void) | null = null;
+  /** plan-512: the manager the unit reconcile listens to (a model load builds a new one). */
+  private unitManager: SignalBindingManager | null = null;
+  private unitManagerUnsub: (() => void) | null = null;
+  /** Targets whose binding set changed in this model — re-evaluated when an FMU attaches late. */
+  private readonly unitTargets = new Set<string>();
+  private fmuUnsub: (() => void) | null = null;
+  private fmuSignalKey = '';
 
   init(viewer: RVViewer): void {
     this.viewer = viewer;
+    // plan-512 F7: an FMU registers its signal units in `init()`, which can run
+    // AFTER the mappings that read them were applied (placements, editor
+    // attach). A changed FMU signal set re-derives the unit problems.
+    this.fmuUnsub = subscribeFmuInstances(() => this._onFmuInstancesChanged());
     // Auto-assign / Unbind-all as component-section actions (plan-325 F5) —
     // registered once; component schemas are in place at plugin init.
     registerSignalBulkActions();
@@ -92,6 +107,9 @@ export class SignalBindPlugin implements RVViewerPlugin {
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this.teardownModel();
     this.viewer = viewer;
+    // Before the restore traverse below: its applyMappings calls are what the
+    // unit problems of a loaded model are derived from.
+    this._attachUnitReconcile(viewer);
     const overlay = new DropTargetOverlayController(viewer);
     this.overlayController = overlay;
     this.dragController = new SceneDragOpenController(viewer, () => overlay.nearestBindTarget);
@@ -177,6 +195,13 @@ export class SignalBindPlugin implements RVViewerPlugin {
       ]);
       const ops = getSceneStore()?.getSnapshot().draft?.edits.ops;
       if (!ops || ops.length === 0) return;
+      // The check is "does this path resolve" — and the placed references of a
+      // layout document reach the registry only AFTER `model-loaded` (plan-753).
+      // Judged earlier, every op addressed into a placement reads as orphaned,
+      // and the self-heal below would MIGRATE a carrier that is merely late.
+      // Optional call: narrow test hosts do not carry the scene-ready contract.
+      await viewer.whenSceneReady?.();
+      if ('lastLoadResult' in viewer && viewer.lastLoadResult !== result) return; // document changed meanwhile
       // `materialise` is the SAME projection the bake feeds to `splitOverlay()`,
       // so a mapping that would be written is exactly one that is checked.
       const overlay = materialise(ops).overlay;
@@ -262,6 +287,37 @@ export class SignalBindPlugin implements RVViewerPlugin {
   onRender(): void {
     this.overlayController?.onRender();
     this.badgeController?.onRender();
+    // A manager built after onModelLoaded (logic gated at load) is picked up
+    // here — one reference comparison per frame, no allocation.
+    if (this.viewer && this.viewer.signalBindingManager !== this.unitManager) this._attachUnitReconcile(this.viewer);
+  }
+
+  /**
+   * Hook the unit-problem reconcile onto the binding manager's "binding set
+   * changed" notification (plan-512 F7) — fired after every applyMappings AND
+   * every unbindAll, so load, bind, unbind, bulk actions, undo/redo, repair and
+   * the planner are all covered without a path of their own.
+   */
+  private _attachUnitReconcile(viewer: RVViewer): void {
+    const manager = viewer.signalBindingManager ?? null;
+    if (manager === this.unitManager) return;
+    this.unitManagerUnsub?.();
+    this.unitManagerUnsub = null;
+    this.unitManager = manager;
+    if (!manager) return;
+    this.unitManagerUnsub = manager.addBindingsChangedListener((targetId, mappings) => {
+      this.unitTargets.add(targetId);
+      reconcileUnitProblems(viewer, targetId, mappings);
+    });
+  }
+
+  private _onFmuInstancesChanged(): void {
+    const viewer = this.viewer;
+    if (!viewer) return;
+    const key = getFmuInstances().map((f) => f.signalNames.join('|')).join('\u0001');
+    if (key === this.fmuSignalKey) return;
+    this.fmuSignalKey = key;
+    for (const targetId of this.unitTargets) reconcileUnitProblems(viewer, targetId);
   }
 
   onRenderBackendChanged(backend: 'three' | 'omniverse'): void {
@@ -270,6 +326,11 @@ export class SignalBindPlugin implements RVViewerPlugin {
 
   dispose(): void {
     this.teardownModel();
+    this.unitManagerUnsub?.();
+    this.unitManagerUnsub = null;
+    this.unitManager = null;
+    this.fmuUnsub?.();
+    this.fmuUnsub = null;
     // Symmetric to init() — without this a dispose/re-init cycle leaves a menu
     // item closing over the OLD viewer (plan-418 Entscheidungs-Log).
     this.viewer?.contextMenu.unregister(SIGNAL_BIND_MENU_PLUGIN_ID);
@@ -291,5 +352,8 @@ export class SignalBindPlugin implements RVViewerPlugin {
     this.badgeController?.dispose();
     this.badgeController = null;
     closeSignalBindPopover();
+    // plan-512: unit problems belong to the model they were derived from.
+    this.unitTargets.clear();
+    clearUnitProblems();
   }
 }

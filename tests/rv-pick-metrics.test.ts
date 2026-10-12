@@ -8,8 +8,10 @@ import {
 } from 'three';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 import { PickMetrics } from '../src/core/engine/rv-pick-metrics';
-import { buildRaycastGeometries } from '../src/core/engine/rv-raycast-geometry';
 import { RaycastManager } from '../src/core/engine/rv-raycast-manager';
+import { BakeRegistry } from '../src/core/engine/rv-bake-registry';
+import { PickBackend } from '../src/core/engine/rv-pick-backend';
+import { bakeAndPlace } from './fixtures/bake-fixture';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { registerComponentSchema } from '../src/core/engine/rv-component-registry';
 
@@ -20,7 +22,8 @@ BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 Mesh.prototype.raycast = acceleratedRaycast;
 
 // Synthetic hoverable type (avoids importing heavy component modules).
-registerComponentSchema('PickMetricsTestType', {}, { hoverable: true, selectable: true });
+registerComponentSchema('PickMetricsTestType', {}, { pick: 'select' });
+registerComponentSchema('PickMetricsMover', {}, { pick: 'select', bake: 'chunk' });
 
 // ─── PickMetrics unit ───────────────────────────────────────────────
 
@@ -48,11 +51,11 @@ describe('PickMetrics', () => {
 
   it('records highlight strategy and overlay count', () => {
     const m = new PickMetrics();
-    m.recordHighlight(3.5, 'overlay-legacy', 42);
+    m.recordHighlight(3.5, 'overlay', 42);
     const s = m.snapshot();
     expect(s.highlightMs).toBeCloseTo(3.5, 6);
     expect(s.lastHighlightMs).toBeCloseTo(3.5, 6);
-    expect(s.strategy).toBe('overlay-legacy');
+    expect(s.strategy).toBe('overlay');
     expect(s.overlayObjects).toBe(42);
   });
 
@@ -97,13 +100,13 @@ function makeHighlighterMock() {
 }
 
 /**
- * Scene layout (ray travels -Z from z=10):
- *   DriveBox mesh at z=2  (kinematic group, dist 8 — CLOSER)
- *   StaticBox mesh at z=0 (static group,   dist 10)
- * The static category is intersected FIRST by the timed split — the drive hit
- * must still win, proving distance ordering is preserved across category loops.
+ * Scene layout (ray travels -Z from z=10), baked in place (plan-753):
+ *   DriveBox mesh at z=2  (mover chunk,  dist 8 — CLOSER)
+ *   StaticBox mesh at z=0 (static chunk, dist 10)
+ * Both are hits of the chunk pick backend; the drive hit must win, proving
+ * distance ordering is preserved across the backend's own hit order.
  */
-function buildPickScene() {
+async function buildPickScene() {
   const root = new Group();
   root.name = 'Root';
 
@@ -118,7 +121,8 @@ function buildPickScene() {
 
   const driveNode = new Group();
   driveNode.name = 'DriveBox';
-  driveNode.userData._rvType = 'PickMetricsTestType';
+  driveNode.userData.realvirtual = { PickMetricsMover: {} };
+  driveNode.userData._rvType = 'PickMetricsMover';
   const driveMesh = new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial());
   driveMesh.name = 'DriveMesh';
   driveMesh.position.set(0, 0, 2);
@@ -127,13 +131,21 @@ function buildPickScene() {
 
   root.updateMatrixWorld(true);
 
+  // plan-754: the destructive bake replaces the survivors, so both the
+  // registry and the nodes under test come from the placed TEMPLATE.
+  const bakeRegistry = new BakeRegistry();
+  const placed = await bakeAndPlace(root, bakeRegistry);
+
   const registry = new NodeRegistry();
-  root.traverse((n) => registry.registerNode(NodeRegistry.computeNodePath(n), n));
+  placed.template.traverse((n) => registry.registerNode(NodeRegistry.computeNodePath(n), n));
 
-  const driveNodeSet = new Set<import('three').Object3D>([driveNode]);
-  const geo = buildRaycastGeometries(root, [{ node: driveNode }], registry, driveNodeSet);
-
-  return { root, registry, geo, staticParent, driveNode };
+  return {
+    root: placed.template,
+    registry,
+    bakeRegistry,
+    staticParent: placed.node(staticParent.name),
+    driveNode: placed.node(driveNode.name),
+  };
 }
 
 function makeManager(registry: NodeRegistry, highlighter: ReturnType<typeof makeHighlighterMock>) {
@@ -150,20 +162,25 @@ function makeManager(registry: NodeRegistry, highlighter: ReturnType<typeof make
   );
 }
 
+function install(rm: RaycastManager, bakeRegistry: BakeRegistry): void {
+  rm.addBackend(new PickBackend(bakeRegistry));
+  rm.enableHoverType('PickMetricsTestType', true);
+  rm.enableHoverType('PickMetricsMover', true);
+}
+
 describe('RaycastManager timed intersect (metrics installed)', () => {
-  it('keeps cross-category distance ordering and populates metrics', () => {
-    const { registry, geo, driveNode } = buildPickScene();
+  it('keeps distance ordering across backend hits and populates metrics', async () => {
+    const { registry, bakeRegistry, driveNode } = await buildPickScene();
     const highlighter = makeHighlighterMock();
     const rm = makeManager(registry, highlighter);
     const metrics = new PickMetrics();
     rm.setMetrics(metrics);
-    rm.setRaycastGeometry(geo, []);
-    rm.enableHoverType('PickMetricsTestType', true);
+    install(rm, bakeRegistry);
 
     rm.updateFromXRController(new Vector3(0, 0, 10), new Vector3(0, 0, -1));
 
-    // Drive mesh (z=2) is closer than static mesh (z=0) — must win even though
-    // the static target is intersected first by the category split.
+    // Drive mesh (z=2) is closer than static mesh (z=0) — must win regardless
+    // of the order the backend appended its hits.
     expect(rm.hoveredNodePath).toBe(registry.getPathForNode(driveNode));
 
     const s = metrics.snapshot();
@@ -175,9 +192,9 @@ describe('RaycastManager timed intersect (metrics installed)', () => {
     rm.dispose();
   });
 
-  it('resolves the static node when the drive is not in the ray', () => {
-    const { registry, geo, staticParent, driveNode } = buildPickScene();
-    // Move the drive out of the ray path.
+  it('resolves the static node when the drive is not in the ray', async () => {
+    const { registry, bakeRegistry, staticParent, driveNode } = await buildPickScene();
+    // Move the drive out of the ray path (its mover chunk follows the node).
     driveNode.position.set(50, 0, 0);
     driveNode.updateMatrixWorld(true);
 
@@ -185,22 +202,20 @@ describe('RaycastManager timed intersect (metrics installed)', () => {
     const rm = makeManager(registry, highlighter);
     const metrics = new PickMetrics();
     rm.setMetrics(metrics);
-    rm.setRaycastGeometry(geo, []);
-    rm.enableHoverType('PickMetricsTestType', true);
+    install(rm, bakeRegistry);
 
     rm.updateFromXRController(new Vector3(0, 0, 10), new Vector3(0, 0, -1));
     expect(rm.hoveredNodePath).toBe(registry.getPathForNode(staticParent));
     rm.dispose();
   });
 
-  it('records a miss without clearing prior counters', () => {
-    const { registry, geo } = buildPickScene();
+  it('records a miss without clearing prior counters', async () => {
+    const { registry, bakeRegistry } = await buildPickScene();
     const highlighter = makeHighlighterMock();
     const rm = makeManager(registry, highlighter);
     const metrics = new PickMetrics();
     rm.setMetrics(metrics);
-    rm.setRaycastGeometry(geo, []);
-    rm.enableHoverType('PickMetricsTestType', true);
+    install(rm, bakeRegistry);
 
     rm.updateFromXRController(new Vector3(0, 0, 10), new Vector3(0, 0, -1));
     rm.updateFromXRController(new Vector3(500, 500, 10), new Vector3(0, 0, -1));
@@ -212,12 +227,11 @@ describe('RaycastManager timed intersect (metrics installed)', () => {
     rm.dispose();
   });
 
-  it('behaves identically without a metrics sink (fallback intersectObjects)', () => {
-    const { registry, geo, driveNode } = buildPickScene();
+  it('behaves identically without a metrics sink (fallback _collectHits)', async () => {
+    const { registry, bakeRegistry, driveNode } = await buildPickScene();
     const highlighter = makeHighlighterMock();
     const rm = makeManager(registry, highlighter);
-    rm.setRaycastGeometry(geo, []);
-    rm.enableHoverType('PickMetricsTestType', true);
+    install(rm, bakeRegistry);
 
     rm.updateFromXRController(new Vector3(0, 0, 10), new Vector3(0, 0, -1));
     expect(rm.hoveredNodePath).toBe(registry.getPathForNode(driveNode));

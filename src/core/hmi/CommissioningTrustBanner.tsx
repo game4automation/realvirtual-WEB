@@ -36,7 +36,7 @@
 
 import { useState } from 'react';
 import { Box, Button, Typography } from '@mui/material';
-import { Cable, WarningAmber } from '@mui/icons-material';
+import { Cable, Lock, WarningAmber } from '@mui/icons-material';
 import { ISA_AMBER } from './isa-colors';
 import { useUIVisible } from './ui-context-store';
 import { useModelProvenance } from '../rv-model-provenance';
@@ -62,6 +62,49 @@ export function CommissioningTrustBanner({ onReload }: CommissioningTrustBannerP
   // Nothing foreign on screen → nothing to decide. `source: 'local'` is what
   // every ordinary load publishes, and what clearModel() falls back to.
   if (!inCommissioning || provenance.source === 'local') return null;
+
+  // plan-560: a link opened with its password is trusted for THIS session only.
+  // There is no trust-store record to revoke, and a reload would lose the
+  // scrubbed `#k=` — so the banner states the fact and offers no action.
+  if (provenance.source === 'share-encrypted') {
+    return (
+      <Box
+        data-ui-panel
+        role="status"
+        data-testid="commissioning-trust-banner"
+        sx={{
+          position: 'fixed',
+          top: 58,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          zIndex: 9490,
+          pointerEvents: 'auto',
+          width: 'min(680px, calc(100vw - 32px))',
+        }}
+      >
+        <Box sx={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 1.25,
+          px: 2,
+          py: 1.25,
+          bgcolor: 'rgba(18, 42, 52, 0.97)',
+          border: '1px solid rgba(79,195,247,0.55)',
+          borderRadius: 2,
+          boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
+          backdropFilter: 'blur(calc(8px * var(--rv-ui-blur-scale, 1)))',
+        }}>
+          <Lock sx={{ fontSize: 20, color: '#fff', flexShrink: 0 }} />
+          <Typography
+            data-testid="commissioning-trust-encrypted-notice"
+            sx={{ fontSize: 12, fontWeight: 600, color: '#fff', lineHeight: 1.4 }}
+          >
+            Opened with password — live connections enabled for this session.
+          </Typography>
+        </Box>
+      </Box>
+    );
+  }
 
   const reload = () => (onReload ? onReload() : location.reload());
   const key = provenance.trustRecordKey ?? '';

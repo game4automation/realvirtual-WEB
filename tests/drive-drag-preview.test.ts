@@ -201,3 +201,31 @@ describe('DriveDragPreview — nested kinematics (scene hierarchy chain)', () =>
     driver.cancel({ viewer, source, node: a, position: 0 });
   });
 });
+
+describe('DriveDragPreview — frozen static members (in-session assignment)', () => {
+  it('thaws a frozen group member so the preview is visible', () => {
+    const { scene, nodes, groups, viewer } = makeEnv();
+    const axis = axisWithDrive('Axis', { Direction: 'LinearX' }, 'G');
+    scene.add(axis); nodes['Axis'] = axis;
+    const member = new Mesh(new BoxGeometry(1, 1, 1)); member.name = 'M'; member.position.set(5, 0, 0);
+    scene.add(member); nodes['M'] = member;
+    scene.updateMatrixWorld(true);
+    // The loader froze this mesh as static (it carried no Group at load time);
+    // only afterwards was it assigned to the axis' kinematic group in the editor.
+    member.matrixAutoUpdate = false;
+    member.matrixWorldAutoUpdate = false;
+    groups.register('G', member);
+
+    const source = resolveEditorDriveGizmoSource(viewer, 'Axis')!;
+    const driver = new DriveDragPreview(viewer);
+    driver.preview({ viewer, source, node: axis, position: -1000 });
+
+    expect(member.matrixAutoUpdate).toBe(true);
+    expect(member.matrixWorldAutoUpdate).toBe(true);
+    // Frozen, the decomposed write would never reach .matrix and world X stayed 5.
+    expect(member.getWorldPosition(new Vector3()).x).toBeCloseTo(6, 6);
+
+    driver.cancel({ viewer, source, node: axis, position: 0 });
+    expect(member.getWorldPosition(new Vector3()).x).toBeCloseTo(5, 6);
+  });
+});

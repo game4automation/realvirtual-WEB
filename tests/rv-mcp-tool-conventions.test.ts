@@ -25,6 +25,9 @@ const DOMAINS = new Set([
   'node', 'component', 'view', 'camera', 'select', 'selection', 'screenshot',
   'drive', 'signal', 'sensor', 'sim', 'transport', 'logic', 'mode',
   'layout', 'scene', 'editor', 'des', 'plc',
+  // plan-537: `web_record_video` — producing a video file is not a view or a
+  // screenshot (it steps the simulation and writes an MP4), so it gets its own verb.
+  'record',
   // plan-394. Deliberately NOT folded into `node`: that domain means structural
   // navigation throughout (find/tree/bounds), and a durable note is not that.
   'knowledge',
@@ -41,16 +44,39 @@ const DOMAINS = new Set([
   // tool because the name parses as domain+action anyway and leaves room for
   // later `web_link_*` tools.
   'link',
+  // plan-486 — the prompt queue a user fills by right-clicking a node in the
+  // viewer and typing an order. Deliberately NOT folded into `knowledge`: a
+  // note describes a machine durably, a prompt task is a one-way ORDER to a
+  // coding agent with a lifecycle (open → claimed) and is consumed once.
+  'prompt',
+  // 41179349 — `web_group_list/_set_visible/_set_listed`: the Display panel's Groups
+  // list as the panel sees it. Not folded into `scene` or `node`: a group is a
+  // registry row with its own visibility and listing state, not a scene-graph node.
+  'group',
+  // plan-567 — `web_mu_delete` / `web_mu_move`: a workpiece carrier taken off
+  // the line or set elsewhere by hand (Commissioning). Not folded into
+  // `transport`: that domain READS the material flow, these two act on one
+  // carrier by its engine id.
+  'mu',
+  // 8a34c524 (2026-10-08) — `web_collision_watch/_status/_reset`: session-only
+  // collision roles and the latched contact pairs. Not folded into `node` or
+  // `scene`: the tools manage a watch with its own lifecycle (watch → status →
+  // reset), not a property of one node. Absorbed at the 6.4.0 release.
+  'collision',
 ]);
 
 /**
- * Root-level tools allowed without a domain segment. `web_measure` and `web_render` come from
+ * Root-level tools allowed without a domain segment. `web_measure` and `web_eye` come from
  * McpObserveTools, which was missing from this lint entirely until plan-327 AP3 added the
  * delegate below — four tools were unchecked, and one dead name (`web_find`) survived here for
  * exactly that reason.
  */
 const ROOT_TOOLS = new Set([
-  'web_status', 'web_logs', 'web_errors', 'web_help', 'web_measure', 'web_render',
+  'web_status', 'web_logs', 'web_errors', 'web_help', 'web_measure',
+  // plan-740: `web_eye` is the agent camera's capture verb. Root-level because
+  // the picture is not about one domain, it IS the way every domain is looked
+  // at.
+  'web_eye',
   // plan-707: state-aware orientation. Root-level like web_status and web_help,
   // because "where am I" is not a question about one domain.
   'web_describe',
@@ -80,6 +106,43 @@ describe('MCP tool conventions', () => {
     expect(bad, `Names outside the domain vocabulary: ${bad.join(', ')}`).toEqual([]);
   });
 
+  /**
+   * plan-740 T7 — the camera verbs stopped refusing, so they must stop SAYING
+   * they refuse.
+   *
+   * `web_camera_orbit`, `_view` and `_fly` each carried "Refused while FPV,
+   * camera-follow or XR own the camera". Since the agent has its own camera
+   * body those three own the USER viewport only, and the tools move regardless
+   * (D-A7); the refusal lives on the double-click attach now. A stale sentence
+   * here is worse than no sentence: an agent reads it and does not even try.
+   *
+   * `web_view_sweep` is deliberately NOT exempt — it keeps the guard until
+   * Phase 3 moves it offscreen, so if it still carried the phrase this test
+   * would (correctly) fail and force the wording to be honest about scope.
+   */
+  it('no description still claims the old FPV / follow / XR refusal', () => {
+    const offenders = schemas
+      .filter((s) => /Refused while FPV/i.test(s.description ?? ''))
+      .map((s) => s.name);
+    expect(offenders, `stale refusal wording on: ${offenders.join(', ')}`).toEqual([]);
+  });
+
+  /**
+   * plan-740 — the camera verbs answer about the AGENT camera now. An agent
+   * that reads "the visible viewport camera moves" will keep sequencing
+   * screenshots around a camera it no longer drives.
+   */
+  it('the camera verbs name the agent camera in their description', () => {
+    for (const name of [
+      'web_camera_get', 'web_camera_set', 'web_camera_focus',
+      'web_camera_orbit', 'web_camera_view', 'web_camera_fly', 'web_camera_projection',
+    ]) {
+      const t = schemas.find((s) => s.name === name);
+      expect(t, `${name} must exist`).toBeTruthy();
+      expect(t!.description, `${name} must say whose camera it moves`).toMatch(/AGENT/);
+    }
+  });
+
   it('web_find stays deleted (renamed to web_node_find)', () => {
     expect(schemas.some((s) => s.name === 'web_find')).toBe(false);
     expect(schemas.some((s) => s.name === 'web_node_find')).toBe(true);
@@ -88,7 +151,7 @@ describe('MCP tool conventions', () => {
   it('covers every announced delegate, including McpObserveTools', () => {
     const names = new Set(schemas.map((s) => s.name));
     // These four were announced to agents but linted by nothing before plan-327 AP3.
-    for (const observed of ['web_measure', 'web_node_shape', 'web_scene_query', 'web_render']) {
+    for (const observed of ['web_measure', 'web_node_shape', 'web_scene_query']) {
       expect(names.has(observed), `${observed} must be covered by this lint`).toBe(true);
     }
     // 105 → 111 with the six `web_editor_mechanism_*` tools (plan-404 Phase 5).
@@ -133,7 +196,79 @@ describe('MCP tool conventions', () => {
     // now, and a hover has no agent-callable half. `web_editor_mechanism_snap_list`
     // still returns `circle-center` candidates from the same fit maths, but
     // cursor-bound: there is no longer a way to list every bore of a path.
-    expect(schemas.length).toBe(145);
+    // 145 -> 146 with plan-740 Phase 2: `web_eye`, the agent camera's capture
+    // verb. `web_render` was kept alongside it as a single-channel alias.
+    // 146 -> 147 with `web_view_ortho` (2026-09-11): the six orthographic views
+    // of a part as one mosaic per eye channel, next to `web_view_sweep`.
+    // 147 -> 148 with plan-479 Phase 6: `web_document_bind` (McpProjectTools).
+    // A document's connectRef/scriptRef/knowledgeRef set and cleared through MCP —
+    // its own tool rather than a fourth action of `web_document_update`, which is
+    // destructive and operates on FILES; a binding deletes nothing.
+    // 148 -> 145: `web_render`, `web_view_pick` and `web_view_gaze` removed.
+    // The alias earned nothing `web_eye` does not already do, and the two ray
+    // picks were the sharp tools an agent reached for instead of
+    // `web_view_sweep`, which answers "what is this" with occlusion-correct
+    // coverage per view rather than a single ray.
+    // 145 -> 144: `web_screenshot_annotated` removed too. `web_eye` with
+    // channels=idmask and explicit group `paths` renders the same Set-of-Mark
+    // frame and legend, so the labelled shot was a second way to ask one
+    // question. The one thing it did that the caller must now do itself: it
+    // diffed the requested paths against the visible ones and said
+    // `notVisible: true` per path, where idmask reports only what IS visible.
+    // 144 -> 145 with `web_layout_timings` (plan-753): the placement
+    // performance rings (decode, chunk-bake, scene-registration, long tasks)
+    // read through one root-level `layout` tool.
+    // 145 -> 148 with the three `web_group_*` tools (41179349): list, set_visible,
+    // set_listed — the Groups panel's eye and exclusion filter as tools.
+    // 148 -> 150 with plan-506: `web_document_info_get` / `_set`, the
+    // document description (summary + Markdown) stored in the GLB.
+    // 150 -> 156 with plan-729: six tools for Cartesian mechanism paths —
+    // `web_editor_mechanism_add_target`, `web_editor_mechanism_path_create`,
+    // `web_editor_mechanism_path_add_waypoint`, `web_editor_mechanism_path_remove_waypoint`,
+    // `web_editor_mechanism_path_move_waypoint` (writes) and
+    // `web_editor_mechanism_path_inspect` (read).
+    // 156 -> 160 with plan-501: drive sizing from a sampled trajectory —
+    // `web_editor_mechanism_trajectory_import`, `web_editor_mechanism_trajectory_run` (writes),
+    // `web_editor_mechanism_trajectory_inspect` and `web_editor_mechanism_trajectory_export` (reads).
+    // 160 -> 161 with plan-517: `web_component_schema` (read) — component
+    // fields from rv-odt.json plus the authoring rules of specification.md.
+    // 161 -> 165 with plan-760 Phase 2: the Quick Edit Groups section's verbs
+    // `web_editor_group_assign`, `_remove`, `_rename`, `_dissolve` (writes,
+    // views of `editor.group*`).
+    // 165 -> 166 with plan-539 F15: `web_sim_mode` (Simulation / PLC mode, get / set).
+    // 166 -> 167 with plan-537: `web_record_video` (deterministic MP4 recording).
+    // 167 -> 168 with plan-545: `web_signal_automap` (PLC auto-map check / apply).
+    // 168 -> 170 with plan-486: `web_prompt_list` / `web_prompt_claim`
+    // (McpPromptTools), the browser-side prompt queue a user fills from the
+    // context menu; the only delegate with no viewer accessor.
+    // 170 -> 171 with plan-761: `web_view_render_mode` (write, view of
+    // `view.renderMode` — the render-mode pill's shading segments).
+    // 171 -> 172 with plan-566: `web_signal_usage` (read) — the signal
+    // cross-reference list of the inspector's "Used by" section.
+    // 172 -> 174 with plan-567: `web_mu_delete` / `web_mu_move` (writes, views
+    // of `mu.delete` / `mu.move` — Delete key, context menu and the drag).
+    // 174 -> 176 with plan-589 Phase 2: `web_editor_signal_set_field` /
+    // `web_editor_signal_set_binding` (writes, views of `editor.signalSetField` /
+    // `editor.signalSetBinding` — the inspector's "Signal" and "PLC binding" sections).
+    // 176 -> 178 with plan-589 Phase 3: `web_signal_reconcile` (read — the
+    // reconcile report) and `web_editor_signals_create_from_interface` (write,
+    // view of `editor.signalsCreateFromInterface` — the report's one repair).
+    // 178 -> 181 with plan-590: `web_editor_signal_rename` (write, view of
+    // `editor.signalRename` — the inspector's rename dialog) and its two Problems
+    // actions `web_editor_signal_rename_repair` / `_recheck` (writes, views of
+    // `editor.signalRenameRepair` / `editor.signalRenameRecheck`).
+    // 181 -> 182 with plan-591: `web_view_visual_preset` (write, view of
+    // `view.visualPreset` — the two quality rows of the render-mode menu).
+    // NOTE (2026-10-11, still true): the LIVE count is three HIGHER than this pin.
+    // The extra three are `web_collision_watch` / `_status` / `_reset`, introduced
+    // by commit 8a34c524 (2026-10-08) WITHOUT updating this pin; they are neither
+    // plan-589's nor plan-590's nor plan-591's and are deliberately not absorbed
+    // here. plan-591 therefore raised the pin by exactly its OWN one tool, so this
+    // assertion stays red by exactly those same three and by nothing else. Until
+    // that commit's own follow-up fixes them, 185 is live against a pin of 182.
+    // 182 -> 185 at the 6.4.0 release: the three collision tools are absorbed
+    // deliberately (domain `collision` above) so the release ships a green suite.
+    expect(schemas.length).toBe(185);
   });
 
   /**
@@ -200,7 +335,7 @@ describe('MCP tool conventions', () => {
   // different lists. This pins the count of that ONE list.
   it('the shared instance list covers every linted delegate', () => {
     const names = new Set(schemas.map((s) => s.name));
-    for (const t of ['web_status', 'web_view_pick', 'web_render', 'web_editor_open',
+    for (const t of ['web_status', 'web_editor_open',
       'web_signal_bind', 'web_knowledge_set', 'web_describe', 'web_help',
       // plan-716 Phase 5 — the announced-but-unlinted delegate. `web_document_list`
       // is THE one document list; leaving it out of this list left it out of
@@ -245,7 +380,13 @@ describe('MCP tool conventions', () => {
         'web_describe',
         // plan-437: composing a URL is string work over live getters — it opens
         // nothing, mints no share and moves no viewport.
-        'web_link_compose']) {
+        'web_link_compose',
+        // plan-740: every capture renders OFFSCREEN through the agent camera.
+        // `web_view_sweep` joined this group in Phase 3 (D-A8 / review finding
+        // I3) — it used to fly the viewport through six poses, and now moves no
+        // camera at all. `web_screenshot` stays here as the human view.
+        'web_eye', 'web_view_sweep', 'web_screenshot',
+        'web_screenshot_burst', 'web_screenshot_analyze']) {
         expect(readOnly.has(n), `${n} must be read-only`).toBe(true);
       }
 
@@ -253,14 +394,21 @@ describe('MCP tool conventions', () => {
       for (const n of ['web_signal_set_bool', 'web_drive_jog', 'web_sim_reset',
         'web_editor_import_cad', 'web_editor_save', 'web_layout_place', 'web_plc_run',
         // plan-394: writes rv_extras into the document and thence into the GLB.
-        'web_knowledge_set']) {
+        'web_knowledge_set',
+        // plan-740 D-A8 / I2: the captures moved offscreen, but this still
+        // DRAGS THE DRIVE through its range. CONNECT takes readOnlyHint blind
+        // for its write gate, so this is the one that must not drift.
+        'web_editor_verify_drive',
+        // plan-761: switches the shading of the whole viewport AND persists it
+        // (the Visual tab's `renderMode`) — a write, not a viewport-transient.
+        'web_view_render_mode']) {
         expect(readOnly.has(n), `${n} must NOT be read-only`).toBe(false);
       }
 
       // The transient/viewport group stays a write on purpose: it persists nothing, but a
       // watching operator sees the view jump — a surprise on a running plant, not a feature.
       for (const n of ['web_camera_set', 'web_camera_focus', 'web_camera_orbit',
-        'web_camera_projection', 'web_view_isolate', 'web_view_pick', 'web_view_gaze',
+        'web_camera_projection', 'web_view_isolate',
         'web_select', 'web_select_similar', 'web_view_source_markers']) {
         expect(readOnly.has(n), `${n} is viewport-transient and must be gated as a write`).toBe(false);
       }

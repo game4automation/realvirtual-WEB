@@ -69,6 +69,16 @@ export interface LibraryCatalogEntry {
    * rather than aspirational.
    */
   documentId?: string;
+  /**
+   * SHA-256 (hex, lowercase, 64 chars) of the file behind `glbUrl` / `splatUrl`
+   * (plan-508). Cache key + integrity check of the blob cache — NEVER a
+   * resolution key (`rv-glb-reference-resolver.ts`). Written by both catalog
+   * builders and re-stamped by the deploy after signing; optional, a catalog
+   * without it keeps the url-keyed, revalidating cache behaviour.
+   */
+  sha256?: string;
+  /** Size in bytes of the file behind `glbUrl` / `splatUrl` (plan-508). */
+  sizeBytes?: number;
 }
 
 // ─── Origin policy (§2.6.3) ─────────────────────────────────────────────
@@ -122,8 +132,75 @@ export const LS_KEY_ORIGINS = 'rv-layout-library-origins';
 
 // ─── Local-folder constants ─────────────────────────────────────────────
 
-/** Subfolder holding persisted preview PNGs next to a local library. */
+/** Subfolder holding persisted preview PNGs — at the PROJECT ROOT (plan-744 F5). */
 export const THUMBNAILS_SUBFOLDER = '.thumbnails';
+
+/**
+ * A document id as a file NAME — injective, and safe on every file system.
+ *
+ * A document id is a path-id since plan-717, so it can carry `/`; on Windows
+ * `\ : * ? " < > |` are reserved as well. Replacing all of them with the same
+ * filler would be the obvious thing and the wrong one: `a/b` and `a:b` would
+ * become one file, and one asset's preview would overwrite another's.
+ *
+ * So every character outside `[A-Za-z0-9._-]` becomes `~` plus its UTF-16 code
+ * unit in FIXED four-digit hex, `~` itself included. Two details carry the
+ * argument: the escape character is one the safe set does NOT contain, so an
+ * escape can never be read as literal text; and the width is FIXED, because
+ * with a variable width a three-digit code point and a two-digit one followed
+ * by a literal `0` would produce the same name.
+ *
+ * `_` stays literal on purpose: every minted id carries one
+ * (`doc_press_1a2b`), and escaping it would turn every sidecar name into
+ * noise for no gain.
+ *
+ * Very long ids get a hashed tail rather than a path the file system refuses.
+ * The hash is over the WHOLE id, so two ids sharing a 100-character prefix
+ * still differ.
+ */
+export function encodeThumbnailId(documentId: string): string {
+  const id = typeof documentId === 'string' ? documentId : '';
+  const encoded = id.replace(
+    /[^A-Za-z0-9._-]/g,
+    c => `~${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+  if (encoded.length <= 120) return encoded;
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return `${encoded.slice(0, 100)}-${h.toString(36)}`;
+}
+
+/**
+ * Where a document's preview PNG lives: `<project>/.thumbnails/<id>.png`.
+ *
+ * Keyed by IDENTITY, not by location (plan-744 F5). The previous convention
+ * mirrored the asset's PATH under `library/.thumbnails/`, which meant a move
+ * or a rename silently orphaned the picture — and it only ever existed for
+ * `library/**`, so a model or a scene had no persisted preview at all. An id
+ * is frozen at birth (plan-717), so the sidecar survives both.
+ */
+export function thumbnailSidecarPath(documentId: string): string {
+  return `${THUMBNAILS_SUBFOLDER}/${encodeThumbnailId(documentId)}.png`;
+}
+
+/**
+ * The pre-plan-744 path-mirrored sidecar for a document, or null when the
+ * document never had one.
+ *
+ * Only `library/**` did: the old writer refused everything else. Read by the
+ * lazy migration in `resolve-document-thumbnail.ts` and by nothing that
+ * writes.
+ */
+export function legacyLibraryThumbnailPath(documentPath: string): string | null {
+  const path = typeof documentPath === 'string' ? documentPath : '';
+  if (!path.startsWith('library/')) return null;
+  const relative = path.slice('library/'.length);
+  if (relative === '') return null;
+  return `library/${THUMBNAILS_SUBFOLDER}/${relative.replace(/\.glb$/i, '.png')}`;
+}
 
 /** File extensions recognized as Gaussian Splat formats. */
 export const SPLAT_EXTENSIONS = new Set(['.splat', '.ksplat', '.ply']);

@@ -12,7 +12,7 @@ import {
 } from '@rv-private/render-backends/omniverse-selection-bridge';
 
 beforeAll(() => {
-  registerCapabilities('Drive', { hoverable: true, selectable: true });
+  registerCapabilities('Drive', { pick: 'select' });
 });
 
 function makeViewer() {

@@ -50,6 +50,9 @@ import type { NodeRegistry } from '../../engine/rv-node-registry';
 import { applyLocalPose } from '../../engine/rv-node-transform';
 import type { SignalMapping } from '../../../plugins/layout-planner/rv-layout-store';
 import { syncNodeSignalBindingPersistence } from '../../../plugins/signal-bind/signal-binding-persistence';
+import {
+  beginSignalSyncWave, endSignalSyncWave, syncSignalSubtree,
+} from '../../engine/rv-signal-editor-sync';
 
 export interface ExecutorContext {
   viewer: RVViewer;
@@ -57,13 +60,28 @@ export interface ExecutorContext {
 
 // ─── Public entry points ────────────────────────────────────────────────
 
+/**
+ * plan-589: every signal (re-)registration an op causes — a composite's
+ * children included — is ONE catalog wave, i.e. one `onCatalogChanged`. Mirrors
+ * `AssetExecutorContext.applyForward`; the wave nests, so the recursive
+ * composite calls below fold into the outermost one.
+ */
 export async function applyForward(op: RvSceneOp, ctx: ExecutorContext): Promise<void> {
+  beginSignalSyncWave(ctx.viewer.signalStore);
+  try {
+    await applyForwardInWave(op, ctx);
+  } finally {
+    endSignalSyncWave(ctx.viewer.signalStore);
+  }
+}
+
+async function applyForwardInWave(op: RvSceneOp, ctx: ExecutorContext): Promise<void> {
   if (op.kind === 'composite') {
     // The cast is the composite's one soft spot, and it is deliberate:
     // `RvCompositeOp.ops` is not origin-restricted (see the constructor helpers
     // in `rv-unified-ops.ts`). A stray asset-lineage child lands in the
     // primitive switch's `default`, which is a documented no-op, not a crash.
-    for (const child of op.ops) await applyForward(child as RvScenePrimitiveOp, ctx);
+    for (const child of op.ops) await applyForwardInWave(child as RvScenePrimitiveOp, ctx);
     return;
   }
   try {
@@ -74,9 +92,18 @@ export async function applyForward(op: RvSceneOp, ctx: ExecutorContext): Promise
 }
 
 export async function applyInverse(op: RvSceneOp, ctx: ExecutorContext): Promise<void> {
+  beginSignalSyncWave(ctx.viewer.signalStore);
+  try {
+    await applyInverseInWave(op, ctx);
+  } finally {
+    endSignalSyncWave(ctx.viewer.signalStore);
+  }
+}
+
+async function applyInverseInWave(op: RvSceneOp, ctx: ExecutorContext): Promise<void> {
   if (op.kind === 'composite') {
     for (let i = op.ops.length - 1; i >= 0; i--) {
-      await applyInverse(op.ops[i] as RvScenePrimitiveOp, ctx);
+      await applyInverseInWave(op.ops[i] as RvScenePrimitiveOp, ctx);
     }
     return;
   }
@@ -166,26 +193,63 @@ function removeConnectionTypeInverse(op: RemoveConnectionTypeOp): void {
 
 function addNodeForward(op: AddNodeOp, ctx: ExecutorContext): void {
   ctx.viewer.createComponentNode(op.spec);
+  syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.rebuildIKPaths?.();
   ctx.viewer.markRenderDirty?.();
 }
 
 function addNodeInverse(op: AddNodeOp, ctx: ExecutorContext): void {
-  ctx.viewer.removeComponentNode(op.nodePath);
+  removeNodeAndReleaseSignals(ctx, op.nodePath);
   ctx.viewer.rebuildIKPaths?.();
   ctx.viewer.markRenderDirty?.();
 }
 
 function removeNodeForward(op: RemoveNodeOp, ctx: ExecutorContext): void {
-  ctx.viewer.removeComponentNode(op.nodePath);
+  removeNodeAndReleaseSignals(ctx, op.nodePath);
   ctx.viewer.rebuildIKPaths?.();
   ctx.viewer.markRenderDirty?.();
 }
 
 function removeNodeInverse(op: RemoveNodeOp, ctx: ExecutorContext): void {
   ctx.viewer.createComponentNode(op.spec);
+  syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.rebuildIKPaths?.();
   ctx.viewer.markRenderDirty?.();
+}
+
+// ─── Signal sync for the scene lineage (plan-589) ───────────────────────
+//
+// The ASSET lineage syncs inside `AssetExecutorContext`; the SCENE lineage
+// mutates placement CONTENT and went past the SignalStore entirely (measured in
+// `signal-placement-ist.node.test.ts`). These two helpers close that gap. A
+// failure never rejects the op — the scene mutation has already landed.
+
+/** Re-sync the signals of the subtree at `nodePath` (no-op when it is gone). */
+function syncSignalsAt(ctx: ExecutorContext, nodePath: string): void {
+  const node = ctx.viewer.registry?.getNode(nodePath);
+  if (!node) return;
+  try {
+    syncSignalSubtree(ctx.viewer, node);
+  } catch (e) {
+    console.warn(`[scene-edits] signal sync failed for ${nodePath}:`, e);
+  }
+}
+
+/**
+ * Remove a component node AND release its signals. The node object must be
+ * captured BEFORE the removal: afterwards the registry no longer knows the
+ * path, and the sync derives "not live" from exactly that — it still needs the
+ * object to find the snapshot (identity = node, not path).
+ */
+function removeNodeAndReleaseSignals(ctx: ExecutorContext, nodePath: string): void {
+  const node = ctx.viewer.registry?.getNode(nodePath) ?? null;
+  ctx.viewer.removeComponentNode(nodePath);
+  if (!node) return;
+  try {
+    syncSignalSubtree(ctx.viewer, node);
+  } catch (e) {
+    console.warn(`[scene-edits] signal release failed for ${nodePath}:`, e);
+  }
 }
 
 // ─── transformNode ──────────────────────────────────────────────────────
@@ -219,6 +283,7 @@ function setFieldForward(op: SetFieldOp, ctx: ExecutorContext): void {
   writeUserDataField(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.value);
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.value);
+  syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -232,6 +297,7 @@ function setFieldInverse(op: SetFieldOp, ctx: ExecutorContext): void {
   }
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
+  syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -239,6 +305,7 @@ function unsetFieldForward(op: UnsetFieldOp, ctx: ExecutorContext): void {
   deleteUserDataField(ctx.viewer, op.nodePath, op.componentType, op.fieldName);
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, undefined);
+  syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -247,6 +314,7 @@ function unsetFieldInverse(op: UnsetFieldOp, ctx: ExecutorContext): void {
   writeUserDataField(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
   reapplySchemaForComponent(ctx.viewer, op.nodePath, op.componentType);
   syncSignalLinksRuntime(ctx.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
+  syncSignalsAt(ctx, op.nodePath);
   ctx.viewer.markRenderDirty?.();
 }
 
@@ -311,6 +379,14 @@ export function deleteUserDataField(
 export function reapplySchemaForComponent(viewer: RVViewer, nodePath: string, componentType: string): void {
   const reg = viewer.registry;
   if (!reg) return;
+  // plan-502 F13: LogicSteps are built by the logic engine, not the component
+  // registry — hand an edited step's fields to the running step instead.
+  if (componentType.startsWith('LogicStep_')) {
+    const stepNode = reg.getNode(nodePath);
+    const stepRv = stepNode?.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
+    viewer.logicEngine?.reapplyStepFields(nodePath, componentType, stepRv?.[componentType] ?? {});
+    return;
+  }
   const components = reg.getComponentsAt(nodePath);
   if (!components || components.length === 0) return;
   const entry = components.find(([type]) => type === componentType);

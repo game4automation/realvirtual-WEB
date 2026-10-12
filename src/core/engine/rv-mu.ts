@@ -9,7 +9,7 @@ import type { BufferGeometry, Material } from 'three';
 import type { Mesh } from 'three';
 import { AABB } from './rv-aabb';
 import { classifyShadows } from './rv-mesh-classifier';
-import { registerCapabilities } from './rv-component-registry';
+import { loadSchemaFromSpec, registerComponentSchema } from './rv-component-registry';
 import type { RVTransportSurface } from './rv-transport-surface';
 import type { MUDissolve, MUGrow } from './rv-mu-dissolve';
 import { getTslMaterials } from './materials/material-factory';
@@ -31,8 +31,10 @@ export function nextEngineMuId(): number {
 }
 
 /** Subsystems that may hold an MU in place (plan-259 O1b owner tag).
- *  'grip' = RVGrip fix/unfix; 'connection' = typed connection (StopOnExit). */
-export type MuHolder = 'grip' | 'connection';
+ *  'grip' = RVGrip fix/unfix; 'connection' = typed connection (StopOnExit);
+ *  'zone' = a Zone with the Hold effect (plan-521);
+ *  'user' = the commissioning drag gesture holds it while the pointer is down (plan-567). */
+export type MuHolder = 'grip' | 'connection' | 'zone' | 'user';
 
 /**
  * IMUAccessor — Unified interface abstracting over clone-based and
@@ -59,6 +61,11 @@ export interface IMUAccessor {
    *  Read by `IPhysicsMUHook.onMUDisposed` to free the body on any dispose
    *  path (F14) — hence part of the accessor interface. */
   physicsBodyId: string | null;
+  /** Authored rigid-body mass in kg (plan-467 F16), or undefined for the zone
+   *  default. Read at handover — an MU's payload weight is what makes the
+   *  drive-sizing chart meaningful, and Rapier's density default would give the
+   *  standard 0.2 m demo cube 8 g. */
+  physicsMassKg?: number;
 }
 
 /**
@@ -67,10 +74,93 @@ export interface IMUAccessor {
  * Created by RVSource, moved by RVTransportSurface, detected by RVSensor, removed by RVSink.
  * Implements IMUAccessor for unified access regardless of rendering backend.
  */
+// ── plan-469 spike state (dev-only) ───────────────────────────────
+
+/**
+ * A/B prototype switches that live below the transport manager (plan-469 Phase
+ * 0c). **Both false in production**; the perf harness flips them from
+ * `?proto=walk,bounds` via `RVTransportManager`.
+ *
+ * A module-level object rather than a manager field because both call sites
+ * (`RVMovingUnit.updateAABB`, `MUInstancePool.updateInstanceMatrix`) are reached
+ * without a manager reference.
+ */
+export const rvProtoFlags = {
+  oneWalk: false,
+  poolBounds: false,
+  /**
+   * plan-473 F2 — MEASUREMENT/REFERENCE switch, the inverse of a prototype
+   * switch: `true` restores the UNCACHED `updateAABB` of the reference path so
+   * an ABBA pair and the parity test have a reference side that does not run
+   * the production cache. Production is `false` (cache on).
+   */
+  refAabb: false,
+};
+
+/**
+ * plan-473 F2 — dev-only evidence that the cache actually fires. Counts the
+ * rotated-half-extent recomputations that ran (`recompute`) and the ones the
+ * quaternion comparison skipped (`skip`). Incremented only under
+ * `import.meta.env.DEV`, so a production bundle drops both branches.
+ */
+export const rvAabbCacheStats = { recompute: 0, skip: 0 };
+
+/** Reset the plan-473 F2 counters (tests / a fresh measurement window). */
+export function resetAabbCacheStats(): void {
+  rvAabbCacheStats.recompute = 0;
+  rvAabbCacheStats.skip = 0;
+}
+
+/** Cumulative pool-growth accounting for the long-step records (plan-469 F6):
+ *  `_grow()` is the prime suspect behind the rare 400-800 ms steps, and the
+ *  records need to say whether it fired at all in that tick. */
+export const muPoolGrowth = { count: 0, ms: 0 };
+
+/** Scratch for the single-walk AABB path — module-level, never allocated in the
+ *  hot path. */
+const _walkPos = new Vector3();
+const _walkQuat = new Quaternion();
+const _walkScale = new Vector3();
+
+/**
+ * Authored pose of a pre-placed MU (plan-516), captured at classification and
+ * restored by every reset. Runtime only — never serialized.
+ */
+export interface PreplacedSnapshot {
+  parent: Object3D;
+  position: Vector3;
+  quaternion: Quaternion;
+  scale: Vector3;
+  visible: boolean;
+}
+
 export class RVMovingUnit implements IMUAccessor {
   readonly node: Object3D;
   readonly aabb: AABB;
   readonly sourceName: string;
+
+  /** True for an MU authored in the scene (no Source spawned it, plan-516).
+   *  Its node belongs to the document: disposal detaches it, a reset puts it
+   *  back from {@link snapshot}. */
+  preplaced = false;
+
+  /** Authored pose of a pre-placed MU; null for spawned MUs. */
+  snapshot: PreplacedSnapshot | null = null;
+
+  /** The MU this one rests on as a PASSIVE load (plan-516 F3). Set ⇒ the MU is
+   *  a child of the carrier's node, not in `RVTransportManager.mus` and never
+   *  ticked (no transport, accumulation, vanish, physics or sensor pass). */
+  loadedOn: RVMovingUnit | null = null;
+
+  /** Passive loads resting on this MU (any number, plan-516 F2). */
+  readonly loadedMus: RVMovingUnit[] = [];
+
+  /** How deep (metres) a load may sit below this carrier's collider top and
+   *  still rest on it — a part in a jig, a cap over a valve end (plan-577 F2).
+   *  0 = the plain plan-516 contact within the tolerance. Authored as
+   *  `MU.LoadSeatDepth` in millimetres; read by `readLoadSeatDepth`
+   *  (`rv-mu-load.ts`) and limited to 80 % of the collider height where used. */
+  loadSeatDepth = 0;
 
   /** Which transport surface is currently moving this MU (null = free) */
   currentSurface: RVTransportSurface | null = null;
@@ -93,7 +183,8 @@ export class RVMovingUnit implements IMUAccessor {
 
   /** Owner tag (plan-259 O1b): which subsystem currently holds this MU in
    *  place. `'grip'` = attached to an RVGrip; `'connection'` = held by a typed
-   *  connection (StopOnExit). Each subsystem only releases what it holds
+   *  connection (StopOnExit); `'zone'` = held by a Hold zone (plan-521); `'user'` = the
+   *  commissioning drag gesture (plan-567). Each subsystem only releases what it holds
    *  itself — replaces the ownerless `isGripped` bool. Null = free. */
   heldBy: MuHolder | null = null;
 
@@ -113,6 +204,9 @@ export class RVMovingUnit implements IMUAccessor {
 
   /** Physics-provider body handle (`String(this.id)`); null while kinematic. */
   physicsBodyId: string | null = null;
+
+  /** Authored rigid-body mass in kg (plan-467 F16); undefined → zone default. */
+  physicsMassKg?: number;
 
   /** Whether this MU uses InstancedMesh rendering (false = clone-based) */
   readonly isInstanced = false;
@@ -212,12 +306,36 @@ export class RVMovingUnit implements IMUAccessor {
 
   // ─── Lifecycle ──────────────────────────────────────────────────
 
+
+  // ── plan-469 accumulation span stamps (probe-only) ─────────────
+  // The cell-union CACHE (`?proto=union`) is gone — plan-473 F3 / Alternative 4:
+  // it was slower than its reference in both A/B campaigns. The two span stamps
+  // below survive because the hit-rate probe still measures how often a query's
+  // cell span is stable, which is evidence about the grid, not a cache.
+  /** Packed cell span of the last accumulation query (see `SpatialGridXZ.spanKey`). */
+  _accumSpanKey = -1;
+  /** Tick at which the union was stamped; valid while no cell in the span
+   *  changed at or after it. */
+  _accumCacheTick = -1;
+
   /** Update AABB world position after transport movement. Re-derives the world
    *  axis-aligned extent from the MU's local half-extents under its current world
    *  rotation, so the detection/collision footprint follows the part as it is
    *  turned (e.g. by a turntable) — otherwise a rotated part is detected at the
    *  wrong point (a light-barrier beam breaks ~half-a-part-length off). */
   updateAABB(): void {
+    // plan-469 F4 prototype: one world-matrix walk instead of three
+    // (`getWorldQuaternion` here + `getWorldPosition`/`getWorldQuaternion` inside
+    // `aabb.update()`). Position AND quaternion come from a single decompose;
+    // the `localCenter` rotation semantics are unchanged (`AABB.updateFrom`).
+    // Off in production — then the three-walk reference path below runs.
+    if (rvProtoFlags.oneWalk) {
+      this.node.updateWorldMatrix(true, false);
+      this.node.matrixWorld.decompose(_walkPos, _walkQuat, _walkScale);
+      this.aabb.setHalfSizeFromRotatedExtents(this._localHalf, _walkQuat);
+      this.aabb.updateFrom(_walkPos, _walkQuat);
+      return;
+    }
     this.node.getWorldQuaternion(_aabbWorldQuat);
     this.aabb.setHalfSizeFromRotatedExtents(this._localHalf, _aabbWorldQuat);
     this.aabb.update();
@@ -225,6 +343,9 @@ export class RVMovingUnit implements IMUAccessor {
 
   /**
    * Dispose this MU - remove from scene and clear references.
+   * For a pre-placed MU (plan-516) this is detach-and-keep: the node is part
+   * of the document, so only its scene membership goes — a reset re-attaches
+   * it from the snapshot and `clearModel` hands it back to the model tree.
    * Does NOT dispose geometry or materials — Object3D.clone() shares
    * geometry and materials by reference with the template. Disposing
    * them here would destroy the shared GPU buffers used by the template
@@ -264,16 +385,28 @@ export function computeTemplateHalfSize(template: Object3D): Vector3 {
  * and overlap checks (grip, sensor) fail.
  */
 export function computeTemplateAABBInfo(template: Object3D): TemplateAABBInfo {
-  const box = new Box3().setFromObject(template);
+  template.updateWorldMatrix(true, true);
+  const inverse = new Matrix4().copy(template.matrixWorld).invert();
+  const relative = new Matrix4();
+  const meshBox = new Box3();
+  const box = new Box3();
+  // MU.updateAABB applies the spawn's world orientation. Measure the template
+  // in its OWN frame here, or a rotated CAD source gets rotated a second time.
+  template.traverse(node => {
+    const mesh = node as Mesh;
+    if (!mesh.isMesh || !mesh.geometry) return;
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+    if (!mesh.geometry.boundingBox) return;
+    relative.multiplyMatrices(inverse, node.matrixWorld);
+    meshBox.copy(mesh.geometry.boundingBox).applyMatrix4(relative);
+    box.union(meshBox);
+  });
   const size = new Vector3();
   box.getSize(size);
   const halfSize = size.multiplyScalar(0.5);
-  // localCenter = box center relative to node world position
   const boxCenter = new Vector3();
   box.getCenter(boxCenter);
-  const nodePos = new Vector3();
-  template.getWorldPosition(nodePos);
-  const localCenter = boxCenter.sub(nodePos);
+  const localCenter = boxCenter;
   return { halfSize, localCenter };
 }
 
@@ -298,6 +431,11 @@ export class InstancedMovingUnit implements IMUAccessor {
   readonly sourceName: string;
   readonly isInstanced = true;
 
+  // ── plan-469 F3 cell-union cache (dev-only prototype) ──────────
+  /** See `RVMovingUnit._accumSpanKey` — identical contract for pooled instances. */
+  _accumSpanKey = -1;
+  _accumCacheTick = -1;
+
   /** Which transport surface is currently moving this MU (null = free) */
   currentSurface: RVTransportSurface | null = null;
 
@@ -315,6 +453,9 @@ export class InstancedMovingUnit implements IMUAccessor {
 
   /** See `RVMovingUnit.physicsBodyId`. */
   physicsBodyId: string | null = null;
+
+  /** See `RVMovingUnit.physicsMassKg` (plan-467 F16). */
+  physicsMassKg?: number;
 
   /** See `RVMovingUnit.lastSurfaceTickId`. */
   lastSurfaceTickId?: number;
@@ -432,11 +573,51 @@ export class InstancedMovingUnit implements IMUAccessor {
 
   // ─── Lifecycle ──────────────────────────────────────────────────
 
+  // ── plan-473 F2: rotated-half-extent cache ──────────────────────
+  /** The four quaternion components the cached half-extent was derived from,
+   *  plus the slot they were read from. Compared BY VALUE on every tick — not a
+   *  dirty flag set in {@link setQuaternion}, because the pool's quaternion
+   *  array is also written directly (compute path, DES tween, multiuser
+   *  follower) and a setter flag would miss exactly those writes. */
+  private _aabbQx = 0;
+  private _aabbQy = 0;
+  private _aabbQz = 0;
+  private _aabbQw = 0;
+  /** Slot the cached values were read from; a swap-and-pop moves an MU to a
+   *  different slot, whose quaternion is a different four numbers. Comparing it
+   *  discards the cache on a slot change without needing a hook in the pool. */
+  private _aabbSlot = -1;
+  /** Starts INVALID — the first `updateAABB()` of an MU always recomputes. */
+  private _aabbCacheValid = false;
+
   updateAABB(): void {
     // Pool quaternions are stored in WORLD space (instances are root-parented),
     // so the per-instance quaternion is the world rotation directly. Re-derive the
     // world axis-aligned extent so a rotated part is detected at the right point.
-    this.aabb.setHalfSizeFromRotatedExtents(this._localHalf, this.getQuaternion());
+    //
+    // plan-473 F2: the rotated extent is a pure function of (localHalf,
+    // quaternion), and an MU on a straight belt keeps its orientation for its
+    // whole life — so the 3x3 rotation build plus nine abs-multiplies run only
+    // when the stored orientation actually changed. `aabb.update()` (the
+    // position refresh) still runs every tick, unchanged.
+    const idx = this.slotIndex;
+    const q = this.pool.quaternions;
+    const o = idx * 4;
+    const qx = q[o], qy = q[o + 1], qz = q[o + 2], qw = q[o + 3];
+    if (
+      rvProtoFlags.refAabb
+      || !this._aabbCacheValid
+      || idx !== this._aabbSlot
+      || qx !== this._aabbQx || qy !== this._aabbQy || qz !== this._aabbQz || qw !== this._aabbQw
+    ) {
+      this.aabb.setHalfSizeFromRotatedExtents(this._localHalf, this.getQuaternion());
+      this._aabbQx = qx; this._aabbQy = qy; this._aabbQz = qz; this._aabbQw = qw;
+      this._aabbSlot = idx;
+      this._aabbCacheValid = true;
+      if (import.meta.env.DEV) rvAabbCacheStats.recompute++;
+    } else if (import.meta.env.DEV) {
+      rvAabbCacheStats.skip++;
+    }
     this.aabb.update();
   }
 
@@ -519,8 +700,17 @@ export class MUInstancePool {
     this.localCenter = localCenter?.clone();
     this.maxInstances = maxInstances;
 
-    // Create InstancedMesh
-    const mat = Array.isArray(material) ? material[0] : material;
+    // Create InstancedMesh. A material ARRAY is kept when the geometry carries
+    // groups — three.js draws one group per material on an InstancedMesh just
+    // like on a Mesh, which is what lets a multi-part template (a loaded pallet:
+    // wooden board + carton boxes, merged into one geometry with two groups)
+    // take the instanced path without losing a material. Collapsing to
+    // `material[0]` here painted every part with the first material
+    // (plan-492 Phase 6, 2026-09-25). An array without groups is meaningless
+    // and still collapses.
+    const mat = Array.isArray(material)
+      ? (geometry.groups.length > 0 ? material : material[0])
+      : material;
     this.instancedMesh = new InstancedMesh(geometry, mat, maxInstances);
     this.instancedMesh.instanceMatrix.setUsage(DynamicDrawUsage);
     this.instancedMesh.count = 0; // Start with no visible instances
@@ -675,20 +865,61 @@ export class MUInstancePool {
       return;
     }
 
+    // plan-469 F5 prototype: carry the extents in the compose loop that already
+    // touches every position, so the separate O(N) `_updateBoundingSphere()`
+    // pass disappears. Conservative by construction — the min/max are the REAL
+    // composed positions, so teleports, moving platforms, lateral centring and
+    // spawn/release are all covered without any velocity assumption.
+    const bounds = rvProtoFlags.poolBounds && this.activeCount > 0;
+    let miX = Infinity, miY = Infinity, miZ = Infinity;
+    let maX = -Infinity, maY = -Infinity, maZ = -Infinity;
+
     for (let i = 0; i < this.activeCount; i++) {
-      _tmpPos.set(this.positions[i * 3], this.positions[i * 3 + 1], this.positions[i * 3 + 2]);
+      const px = this.positions[i * 3];
+      const py = this.positions[i * 3 + 1];
+      const pz = this.positions[i * 3 + 2];
+      _tmpPos.set(px, py, pz);
       _tmpQuat.set(this.quaternions[i * 4], this.quaternions[i * 4 + 1], this.quaternions[i * 4 + 2], this.quaternions[i * 4 + 3]);
       _tmpMat4.compose(_tmpPos, _tmpQuat, _oneVec);
       this.instancedMesh.setMatrixAt(i, _tmpMat4);
+      if (bounds) {
+        if (px < miX) miX = px; if (px > maX) maX = px;
+        if (py < miY) miY = py; if (py > maY) maY = py;
+        if (pz < miZ) miZ = pz; if (pz > maZ) maZ = pz;
+      }
     }
 
     this.instancedMesh.instanceMatrix.needsUpdate = true;
     this._cpuMatricesStale = false;
     this._dirty = false;
 
+    if (bounds) {
+      this._setBoundingSphereFromBox(miX, miY, miZ, maX, maY, maZ);
+      return;
+    }
+
     // Recompute bounding sphere to cover all active instances for frustum culling.
     // Uses positions array directly (O(n) but n = activeCount, typically small).
     this._updateBoundingSphere();
+  }
+
+  /** plan-469 F5: sphere around the axis-aligned box of the composed positions.
+   *  Centre = box centre, radius = half the box diagonal + the geometry radius.
+   *  Up to sqrt(3)x larger than the centroid radius (SOL R2#5); since the sphere
+   *  only drives frustum culling of the whole pool, a larger radius can at worst
+   *  cull LATER — never make instances disappear. */
+  private _setBoundingSphereFromBox(
+    miX: number, miY: number, miZ: number,
+    maX: number, maY: number, maZ: number,
+  ): void {
+    const geo = this.instancedMesh.geometry;
+    if (!geo.boundingSphere) geo.computeBoundingSphere();
+    const geoRadius = geo.boundingSphere?.radius ?? 0;
+    const hx = (maX - miX) / 2, hy = (maY - miY) / 2, hz = (maZ - miZ) / 2;
+    const sphere = this.instancedMesh.boundingSphere ?? new Sphere();
+    sphere.center.set(miX + hx, miY + hy, miZ + hz);
+    sphere.radius = Math.sqrt(hx * hx + hy * hy + hz * hz) + geoRadius;
+    this.instancedMesh.boundingSphere = sphere;
   }
 
   // ── GPU compute path internals (plan-271 Phase 4 SPIKE) ──────────────
@@ -794,6 +1025,16 @@ export class MUInstancePool {
 
   /** Grow pool by 2x when exhausted */
   private _grow(): void {
+    const growT0 = performance.now();
+    muPoolGrowth.count++;
+    try {
+      this._growInner();
+    } finally {
+      muPoolGrowth.ms += performance.now() - growT0;
+    }
+  }
+
+  private _growInner(): void {
     const oldMax = this.maxInstances;
     const newMax = oldMax * 2;
     console.warn(`[MUInstancePool] "${this.templateName}" pool exhausted (${oldMax}), growing to ${newMax}`);
@@ -937,11 +1178,11 @@ export function analyzeTemplate(template: Object3D): {
   return null;
 }
 
-// Register capabilities for MU
-registerCapabilities('MU', {
-  hoverable: true,
-  selectable: true,
-  badgeColor: '#78909c',
-  hoverEnabledByDefault: true,
-  exclusiveHoverGroup: true,
+// Register schema + capabilities for MU. `LoadSeatDepth` (plan-577) is the
+// marker's only consumed field; the schema makes it editable in the inspector.
+registerComponentSchema('MU', loadSchemaFromSpec('MU'), {
+  pick: 'select',
+  bake: 'keep',    // MU templates are cloned/spawned at runtime — never baked
+  authorable: true, // plan-516: pre-placed MUs are authored in the asset editor
+  ui: { badge: '#78909c' },
 });

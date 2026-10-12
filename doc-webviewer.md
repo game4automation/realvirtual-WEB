@@ -1,5 +1,9 @@
 # realvirtual WEB
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 **The open standard for browser-based 3D-HMI and Digital Twins in manufacturing.**
 
 realvirtual WEB brings industrial 3D visualization to the browser — load realvirtual GLB exports and run transport simulation, sensor collision, LogicStep sequencing, and drive animation with no installation required. WebGL, WebGPU, and WebXR (VR/AR) supported out of the box.
@@ -50,6 +54,80 @@ the inspector. Outside an active link mode a scene click never surfaces the
 popover. The popover separates **Control ·
 PLC → Viewer** from **Feedback · Viewer → PLC** and validates type and
 direction.
+
+### Signal units and unit-aware bindings (plan-512)
+
+A signal transports the RAW value of its source, in the source's unit — the
+SignalStore, the transports (CONNECT, WebSocket, MQTT), the FMU master and the
+behavior formulas never convert anything. What changed is that the unit is now
+KNOWN and the binding uses it:
+
+- **`SignalMeta.unit` / `unitDef`** (`rv-signal-store.ts`, merged additively like
+  `address`/`comment`/`source`; read through `getSignalMeta(name)`). v1 source:
+  FMU variables — `Fmu.init` sets `unit` from `FmuVariables[].unit` and `unitDef`
+  from the package's own `FmuUnits` (its `UnitDefinitions`, written by
+  `attach-fmu`), so two FMUs that spell a unit alike but define it differently
+  never collide. CONNECT / OPC UA / Unity units are follow-up plans; a signal
+  without a unit binds exactly as before.
+- **Unit kernel** `src/core/engine/rv-units.ts` — the FMI 2.0 `BaseUnit` model (SI
+  exponents incl. the pseudo base `rad`, plus factor/offset), a built-in table
+  (length, angle, speed, acceleration, time, `1`, and `K`/`degC` so an offset is
+  refused rather than reported unknown), `normalizeUnitName` (`mm/s²`→`mm/s2`,
+  `°`→`deg`, `rpm`→`1/min`, `Cel`→`degC`), `conversion(from, to, { fromDef })`
+  (source definition before the table) and `resolveSignalUnit` for quantity
+  tokens. Not to be confused with `rv-drive-units.ts`.
+- **Slot units in the schema** (rv-ODT keywords, see `doc-extending-webviewer.md`):
+  a signal slot declares `signalUnit` (its unit on the component side, often a
+  token like `@drive-position` = `mm` or `deg` by `Drive.Direction`) and
+  `scaleField` (the sibling number field that scales it).
+- **One factor rule** for command AND feedback slots:
+  `scaleField = conversion(signal unit → slot unit).factor` (command
+  `target = signal × S`, feedback `signal = target / S`). Binding `Ball.h` [m] to
+  `Drive_FollowPosition.Position` writes `Scale = 1000`.
+- **Where it is written.** The inspector slots, the planner popover and MCP
+  `web_signal_bind` all call `bindWithUnitScale()` (`plugins/signal-bind/unit-scale.ts`).
+  It runs ONE document transaction per action, serialised per document (a bind
+  queue — `RvDocument` transactions share one depth counter), in the order
+  *remove the slot's old mapping → set the factor → add the new mapping*, so the
+  factor only ever changes while the slot is unbound: forward, undo and redo
+  publish the first feedback with the factor then in force. Activation is the
+  SignalLinks executor's job (no optimistic `applyMappings`). Success is VERIFIED
+  from the resulting state (document extras, live component, manager binding)
+  inside the transaction; a mismatch throws and rolls everything back
+  (`persisted: false`).
+- **Never over the user (write rule).** The factor is written when the field is
+  not overridden (scene overlay ∪ reference overrides — `isFieldOverridden`, the
+  same union as the inspector's override dot), or when the replaced mapping
+  recorded an APPLIED factor (`SignalMapping.unitScale`, present only after a
+  real write) that the field still holds. A value the user typed — even `1` —
+  stays.
+- **Shared scale fields** (`Drive_Simple.ScaleSpeed`, `Drive_FollowPosition.Scale`
+  for `Position` + `CurrentPosition`, …): the first binding sets the field; a
+  later one with a DIFFERENT factor does not write and reports `conflict`.
+- **Status** — one evaluator (`evaluateUnitBinding`) for badge, Problems and the
+  bind decision, always from the current state: `auto` (field = factor),
+  `manual` (field ≠ factor; the badge click is `resetScaleToAuto`, the same
+  bracket that writes the factor AND the provenance), `conflict`, `mismatch`
+  (incompatible / offset), `unknown`, `not-effective` (the feedback formula would
+  ignore the field: `ScaleFeedbackPosition = false`, or
+  `Drive_FollowPosition.CurrentPositionScale ≠ 1`), `not-applied` (no document, or
+  a planner placement).
+- **Problems** `unit-mismatch`, `unit-unknown`, `unit-scale-conflict`,
+  `unit-scale-not-effective` (warnings) and, for placements, `unit-scale-not-applied`
+  (info, carries the factor to enter by hand), id `unit:<targetId>:<componentPath>:<slot>`.
+  They are re-derived by `reconcileUnitProblems` on the manager's
+  `addBindingsChangedListener` (fired after every `applyMappings` AND every
+  `unbindAll`) — so load, bind, unbind, bulk actions, undo/redo, repair and the
+  planner need no path of their own — plus when an FMU registers its signals
+  late, and cleared on a model switch. The load pass writes no field.
+- **UI.** The scale field shows a badge after its label (link = auto, link-off =
+  manual, warning otherwise; tooltip = the Problems sentence) next to the
+  override dot; the signal tooltip shows `Unit · m`; the picker shows the unit
+  chip after the name.
+- **v1 boundary.** Only main-model node targets get the automatic write; a
+  placement's mapping write is not a document op, so it gets `not-applied` and
+  the Problems hint. An edit of `Drive.Direction` is picked up by the badge at
+  render time and by the Problems at the next apply/reload.
 
 ### Internal PLC signals as link targets
 
@@ -143,34 +221,30 @@ switch away from the Three.js rendering backend.
 
 ## Quick Start
 
+Start in the standalone Community repository root (the folder containing `package.json`):
+
 ```bash
-cd Assets/realvirtual-WebViewer~
 npm install
-npm run dev          # Vite dev server with HMR
+npm run dev
 ```
 
-Drop `.glb` files into `public/models/` and they appear in the dev model
-selector - but that folder is **only for models that ship**. There are three
-places, and the difference is not cosmetic:
+Follow [Getting started](doc-getting-started.md) for the complete public-only walkthrough,
+[Projects and saving](doc-projects.md) for your own documents, and
+[Project plugin example](doc-project-plugin-example.md) for custom code.
 
-| Place | What lives there |
-|---|---|
-| `public/models/` | **What is delivered.** Only the demo models `public/project.json` declares. Enforced by the `publicModels_OnlyShippedDemos` guard test. |
-| `public/library/` | The delivered standard library (`PalletHandling` + `catalog.json`). |
-| `../realvirtual-WebViewer-Private~/projects/Development/` | **Everything internal** - test fixtures, internal reference models, the custom library, and `scratch/` for experiments. Never delivered, never published. |
-
-Put an experiment in `scratch/`. `public/models/` used to be where everything
-landed, for the simple reason that there was nowhere else; the Development
-project is that somewhere else (plan-395).
+The demo is declared by `public/demo-realvirtual/project.json`; its document files live
+beside that manifest. The shared component library is in `public/library/` and is
+subscribed to through `libraries[]`. Dropping a GLB into `public/models/` does not
+register a document. Import it through the app or add it to your project's manifest.
+A private sibling repository is not required for Community development.
 
 ```bash
-npm run build        # Production build → dist/
-npm run preview      # Preview production build
-npm test             # Run browser tests (headless Chromium via Playwright)
-npm run test:node    # Run Node.js tests (fs, glob, ESLint — see below)
-npm run test:all     # Run both: Node tests + browser tests
-npm run test:watch   # Watch mode
-npm run lint         # ESLint (flat-config, boundaries/dependencies rule)
+npm run build        # Local production output in dist/
+npm run preview      # Serve that output over HTTP
+npx tsc --noEmit     # Community type check
+npm test            # Browser tests; install Playwright Chromium first
+npm run test:node   # Node tests
+npm run lint
 ```
 
 **Test naming convention:** Files matching `tests/*.node.test.ts` run in Node
@@ -179,6 +253,15 @@ browser environment. Use the Node config for tests that require `fs`, glob impor
 or the ESLint instance itself.
 
 ## Workspace Modes
+
+### Ribbon definition preview
+
+Editor mode automatically performs a side-effect-free, one-shot Ribbon solve after a
+definition or transform change. It shows routing order and tangent markers, resolved
+roller wrap sides, dancer travel/strand information, and winder envelopes without
+starting simulation or changing PLC outputs. The preview disappears on mode and model
+changes. `RibbonWinder.SpeedControl` is WebViewer-native and therefore reads `None` on
+Unity imports until explicitly authored in the WebViewer.
 
 realvirtual WEB is organized into **workspace modes** — switch them from the mode
 dropdown in the top-left toolbar. Exactly one mode is active at a time; switching a
@@ -217,6 +300,10 @@ Commissioning *connects it to your plant*, Editor *authors its own content*.
 
 Switch modes via the dropdown or the `?mode=viewer|hmi|des|planner|commissioning|editor` URL parameter, so a
 shared link can boot directly into a workspace (e.g. `?doc=<documentId>&mode=planner`).
+The editor entry is `?doc=new&mode=editor`: `main.ts` mints a fresh document in the project in
+view (falling back to My Workspace when that project is read-only), hands it to the editor as a
+pending explicit open — which skips the resume chain below — and, once the mode is set, calls
+`requestUnifiedImportOpen()` so the CAD import dialog is up before the user clicks anything.
 A locked-down deployment can pin a single mode (the dropdown then hides).
 
 Inside an **iframe** the mode switcher additionally disappears: embedding a viewer in a foreign
@@ -289,6 +376,115 @@ test run…"* / *"Leaving editor…"* overlay appears instead of a blank viewpor
 Big assets take a moment on both edges of a test run — that is the export and
 re-import that guarantee the test behaves like the saved asset.
 
+### Recent documents
+
+The dashboard opens with **Recently opened** above the project list: the ten
+documents you last worked on, across *all* your projects. One click restores the
+project, the document **and** the workspace mode you were using it in — an HMI
+demo comes back in HMI, a layout in Planner, a CAD part in the Editor.
+
+Each row carries the document's **project-relative path** under its name, so two
+documents called *Line 3* in different folders are told apart at a glance. When
+the row is too narrow the folder part gives way first, then the project name; the
+file name is the last thing to shrink, and hovering shows the whole path. There is
+no OS path — a browser is never told where on disk a linked folder lives.
+
+The same list is a keystroke away from anywhere: **Ctrl/Cmd+Shift+F** opens a
+Quick-Open popover over the viewport. Arrow keys and Home/End move, Enter opens,
+Escape dismisses and gives the focus back. It is not offered in Viewer mode —
+that workspace has no project screen at all.
+
+| | |
+|---|---|
+| **Size** | 10 entries, shared by every project |
+| **Identity** | a row is a *(project, document)* pair, so the same document id in two projects is two rows |
+| **Order** | most recently opened first. Deliberately no timestamps and no "2 hours ago" — the order already says it |
+| **Stored in** | `localStorage`, key `rv-project/recent-documents`, schema version 2, on this device only |
+
+**The path is recorded, not looked up.** It is written when the document opens,
+because most rows point at projects that are *closed* — reading their manifest at
+render time would raise the browser's folder-permission prompt that the dashboard
+deliberately defers until you click. Renaming or moving a document inside the app
+re-points its row; a change made outside the app (in Explorer, say) is only noticed
+the next time you open it.
+
+**Upgrading to schema 2 empties the list once.** The path became a mandatory field,
+and entries written by an older build have none, so they are discarded rather than
+shown half-complete. The list refills itself as you work; nothing else is lost.
+
+**What "the mode" means.** It is the mode the document was last *used* in, not
+the mode it was loaded in — opening a document in the Editor passes through a
+transitional Viewer state, and that state belongs to nobody. Switching mode
+while a document is open re-stamps that document's entry, so the list keeps up
+with you without your having to reopen anything.
+
+**The mode is restored on a recents click, and nowhere else.** Picking a
+different document in the project tree stays mode-neutral, exactly as before
+(the workspace mode belongs to the session, not to the file). The recents click
+is the one explicit "put me back where I was" gesture.
+
+**When a click cannot do all of it:**
+
+- *Unsaved changes* in the open scene are asked about first, and Cancel leaves
+  everything exactly as it was — nothing opens, nothing switches.
+- The **Editor's own exit guard** is asked before anything moves. Vetoing it
+  cancels the whole open rather than half of it.
+- A **project whose folder access lapsed** shows a lock icon; the browser asks
+  for access on the click, which is the gesture allowed to pay for it.
+- A **document that has since been deleted** is dropped from the list, with a
+  message saying so.
+- A **demo project** is listed and opens normally, but its mode is not restored.
+- **Unlinking or deleting a project** removes its recents with it.
+
+**Kiosk deployments record nothing.** With `mode.lock` set (or a project plugin
+locking the workspace), there is no section, no shortcut and no ring — a
+single-purpose 3D-HMI has nowhere else to go.
+
+Recents are per-device and per-browser, and a second tab's changes appear in the
+first without a reload. Firefox and Safari have no File System Access API, so
+only bundled projects and *My Workspace* documents can appear there.
+
+### Finding a model
+
+Two searches, one rule: every word you type must appear somewhere (in any order,
+case-insensitive), and a word that starts a name segment — at the beginning or
+after `/ _ - .` or a space — ranks above one found mid-word. `line demo` finds
+`demo-line.glb`; `line` lists `line3.glb` above `pipeline.glb`. On a tie the
+list keeps its own order. There is no fuzzy matching and no prefix syntax.
+
+**Quick-Open type-ahead.** The **Ctrl/Cmd+Shift+F** popover has a search field on
+top that holds the focus while you type. The recently opened list narrows and
+re-ranks live over the document name, the project name and the path; matched
+letters are highlighted in the name. Arrow keys and Home/End move through the
+narrowed list, Enter opens the highlighted entry (never while an IME is still
+composing), Escape closes. Changing the term puts the highlight back on the best
+match; *Nothing matches* is said out loud instead of showing an empty list. Every
+open starts with an empty field. Opened by hovering the Projects icon, the popover
+does not take the focus — click into the field to search, and it stays open while
+you type even after the mouse has left.
+
+**Project search.** With a project open, the dashboard's search field (*Search
+this project…*) searches the **whole** project — every subfolder and every
+attached library — not just the folder in view. As soon as a term is typed, the
+folder's cards give way to one flat list of matching documents, files and
+folders, grouped by project and library in tree order. Each row names the folders
+it sits in (the middle folds into `…` past four levels; hover for the full path).
+Click selects the row and shows its details; Enter or double-click opens a
+document, and navigates to a folder (the search clears and the folder's cards
+appear). Attachments, CONNECT configurations, knowledge files and scripts are
+selected, never opened. Arrow keys and Home/End only move the keyboard focus
+through the list, so on a phone they do not keep raising the detail sheet; on a
+touch screen a chevron on the right of each openable row opens it. The
+classification chips and the tag still narrow document hits (folder hits stay),
+and their counts describe the search result. The list shows at most 200 rows and
+says how many more matched. An empty field is the familiar card view, unchanged.
+
+**`/` and Ctrl/Cmd+K.** While the dashboard is open on a project, both keys focus
+the dashboard's search field (with its text selected) instead of the scene search
+behind it. Everywhere else — dashboard closed, or open on the project list — they
+reach the scene search exactly as before, and neither ever fires while you are
+typing in a field.
+
 ### Pending placements (Planner)
 
 Dragging a library asset must not wait for its GLB — a large CAD asset can take
@@ -329,9 +525,11 @@ real ports); grid snap, magnetic bbox snap and drop-to-surface work purely on th
 AABB and stay active. Real ports become available for the *next* drag once the
 swap has landed — a dropped object never re-snaps itself.
 
-**Two cache layers, two kinds of de-duplication** (`model-cache.ts`,
-`core/engine/rv-asset-blob-cache.ts`): the blob cache de-duplicates in-flight
-*fetches* URL-wide and persists bytes in the Cache API bucket `rv-planner-glbs`;
+**Two cache layers, two kinds of de-duplication** (`core/engine/rv-model-cache.ts`
+— owned by the viewer's placement instancer `viewer.placements`, not by the
+planner plugin — and `core/engine/rv-asset-blob-cache.ts`): the blob cache de-duplicates in-flight
+*fetches* per URL + catalog hash and persists verified bytes in the Cache API bucket `rv-assets-glb-v2`
+(plan-508; the legacy `rv-planner-glbs` bucket is deleted on first open);
 `ModelCache._inflight` de-duplicates in-flight *decodes*, which is what makes the
 hover prefetch pay off — the drag's own `getOrLoad` joins the prefetch's promise
 instead of decoding the same GLB a second time. Every caller still receives its
@@ -460,7 +658,7 @@ wins over the default viewer mode.
 
 ### The demo is a project
 
-Since plan-726 there is no channel that opens "the demo model". `public/project.json`
+Since plan-726 there is no channel that opens "the demo model". `public/demo-realvirtual/project.json`
 is an authored, checked-in manifest — `id: prj_sample`, slug `demorealvirtual` — and it
 is the single source of truth for what the demo contains and what it starts with. All
 four delivery channels boot through it:
@@ -469,7 +667,7 @@ four delivery channels boot through it:
 |---|---|
 | Hosted demo (`web.realvirtual.io`) | `/` opens the project and loads its start document straight into 3D. No dashboard in between. |
 | Community download (CONNECT embed) | The gate's "Start the demo" opens the same project and the same start document out of the bundled manifest. |
-| Dev checkout | Identical, because the manifest is in `public/` and is served in dev too. |
+| Dev checkout | Identical, because the manifest is in `public/demo-realvirtual/` and is served in dev too. |
 | Share / embed links | `?doc=<id>` addresses a document of that project; `?project=demorealvirtual` selects the project by slug. |
 
 Three rules follow from it, and each of them is load-bearing:
@@ -481,19 +679,17 @@ Three rules follow from it, and each of them is load-bearing:
 - **The demo is read-only.** `BundledBackend` is HTTP; there is nothing to write
   to. Saving goes through the existing "Save into project as…" path and lands in
   the writable *My Workspace* project.
-- **A broken manifest degrades, it does not break.** A 404, unparseable JSON, or
-  a manifest that fails `isValidProjectV2()` falls back to the synthetic demo
-  project **and logs a warning** — the demo still loads.
+- **A missing or invalid manifest does not create a synthetic project.** Check the
+  manifest request in the browser Network panel and the logged load error. Repair
+  the path, JSON or hosting configuration before expecting its documents to appear.
 
 The start-document reference is matched leniently by `findStartDocument()`: exact
 path, then id, then a *unique* file name. That last branch exists because five
 delivered customer manifests carry a bare filename against a `models/`-prefixed
 path; an ambiguous name is refused rather than guessed.
 
-> **Dev built-ins are not the product path.** Dropping a `.glb` into
-> `public/models/` still makes it selectable in the dev model list. It does **not**
-> make it part of the demo — only `public/project.json` does, and only what that
-> file declares is deployed.
+A directory is storage, not a catalogue: only documents declared in the project's
+manifest appear as project documents. See [Projects and saving](doc-projects.md).
 
 ### The receiver's view is part of the link
 
@@ -502,7 +698,7 @@ The Share dialog asks **what the recipient should get**, and the answer rides in
 
 | Choice | Link | The recipient lands in |
 |---|---|---|
-| **View only** (default) | `…?glb=…&mode=viewer` | the spectator workspace: the model and its running kinematics |
+| **View only** (default) | `…?glb=…&mode=viewer` | the spectator workspace: the model and its running kinematics, with the same Play/Pause, Reset and speed controls as Commissioning |
 | **Commissioning** | `…?glb=…&mode=commissioning` | Inspector, Hierarchy, CONNECT and the signal tools |
 
 Before plan-423 a shared link carried no mode at all, so the receiver was dropped into whatever
@@ -639,6 +835,13 @@ src/
 │   │   ├── rv-replay-recording.ts       # ReplayRecording component
 │   │   ├── rv-erratic.ts                # Drive_ErraticPosition
 │   │   ├── rv-drive-sew-movilink.ts     # Drive_SEWMovilink (SEW MOVI-C control/status word)
+│   │   ├── rv-drive-profidrive-speed.ts # Drive_ProfidriveSpeed (PROFIdrive telegram 1)
+│   │   ├── rv-drive-profidrive-pos.ts   # Drive_ProfidrivePos (PROFIdrive telegram 111 / EPOS)
+│   │   ├── rv-drive-festo-fhpp.ts       # Drive_FestoFHPP (Festo FHPP, Record Select + Direct mode)
+│   │   ├── rv-drive-unidrive-motor.ts   # Drive_UniDriveMotor (control/status bits + int setpoints)
+│   │   ├── rv-drive-proportional-valve.ts # Drive_ProportionalValve (dead band, hysteresis, spool)
+│   │   ├── rv-drive-continous-destination.ts # Drive_ContinousDestination (destination change = start)
+│   │   ├── rv-drive-pulse-encoder.ts    # DrivePulseEncoder (toggling pulse signal on a Drive)
 │   │   ├── rv-mu.ts                     # MovingUnit (incl. instanced MU pool)
 │   │   ├── rv-source.ts                 # MU spawner
 │   │   ├── rv-sink.ts                   # MU consumer
@@ -667,13 +870,21 @@ src/
 │   │   │
 │   │   │── # Rendering, raycast, optimization ────────────────────────────
 │   │   ├── rv-raycast-manager.ts        # Unified hover/click/XR raycaster
-│   │   ├── rv-raycast-geometry.ts       # BVH groups + face-range hit resolution
+│   │   ├── rv-pick-utils.ts             # Shared pick predicates (isPickableMesh, findContentAncestor, isAuthoredHidden)
+│   │   ├── rv-pick-backend.ts           # RaycastBackend over the baked chunks (triangle → segment → owner node) + the .raycast override
+│   │   ├── rv-pick-structure.ts         # Own CPU pick structure: segments / clusters / SAH tree + ray traversal
+│   │   ├── rv-pick-build.ts             # Pure build (Morton + radix sort + SAH), worker and inline share it
+│   │   ├── rv-pick-build-port.ts        # Shared worker pool, epoch abort, inline fallback
+│   │   ├── rv-pick-build-worker.ts      # Module worker wrapper around the build
+│   │   ├── rv-instance-pick-index.ts    # RaycastBackend over real meshes (authoring loads / non-baked loads)
 │   │   ├── rv-highlight-manager.ts      # Highlight overlays + edge glow
 │   │   ├── rv-selection-manager.ts      # Selection state + events
 │   │   ├── rv-gizmo-manager.ts          # Generic 3D gizmo overlays (sensors, etc.)
-│   │   ├── rv-batched-render.ts         # Motion-blob BatchedMesh arenas (static + per-drive; uber + per-material)
-│   │   ├── rv-batch-table.ts            # Arena registry + source-mesh → instance map
-│   │   ├── rv-batch-visibility.ts       # Per-instance visibility reconcile (setVisibleAt)
+│   │   ├── rv-bake-pipeline.ts          # bake(): model → few chunks (uber + textured + per mover) — the ONE batching path (planner placements + loaded model, plan-753)
+│   │   ├── rv-bake-registry.ts          # BakedAsset instances (cloned planner placements + the identity placement of the loaded model), chunk pick resolution
+│   │   ├── rv-placement-instancer.ts    # THE placement primitive (viewer.placements): resolveBaked (one bake key) + materialize (one order) + deferred reload queue / whenMaterialized — viewer-owned, works without the planner
+│   │   ├── rv-placement-integrate.ts    # Planner-independent registration of a placed subtree (naming scan, processExtras, drives, behaviors, LogicSteps) + the no-planner defaults
+│   │   ├── rv-model-cache.ts            # ModelCache: decode + bake cache of placeable GLBs, document-scoped (moved from plugins/layout-planner/model-cache.ts, which re-exports it)
 │   │   ├── rv-uber-material.ts          # Uber-material (PBR atlas-shared)
 │   │   ├── rv-material-dedup.ts         # Material deduplication
 │   │   │
@@ -715,6 +926,8 @@ src/
 │       ├── left-panel-manager.ts        # LeftPanel mutual exclusion coordinator
 │       ├── layout-constants.ts          # Shared positioning constants
 │       ├── shared-sx.ts                 # Reusable MUI sx style fragments
+│       ├── chunk-row-labels.ts          # Chunk row labels "kind + size" + fold-row label (plan-505)
+│       ├── rv-baked-geometry-section.tsx # Inspector section "Baked geometry" for a selected chunk (plan-505)
 │       ├── chart-theme.ts              # Shared ECharts theme constants
 │       ├── chart-constants.ts           # Chart color/size constants
 │       ├── group-visibility-store.ts    # Group visibility state
@@ -757,7 +970,6 @@ src/
 │   ├── drive-order-plugin.ts            # Topological CAM/Gear drive sort
 │   ├── camera-startpos-plugin.tsx       # Per-model camera start position
 │   ├── connection-system-plugin.ts      # Typed connections (edges, StopOnExit)
-│   ├── adaptive-nav-plugin.ts           # Distance-adaptive navigation
 │   ├── kiosk-plugin.tsx                 # Kiosk / idle-tour mode
 │   ├── signal-bind/                     # Signal-link mode, popover, drop targets
 │   │  # Dev-only (NOT core) ────────────────────────────────────────────
@@ -772,7 +984,7 @@ src/
 │   ├── annotation-plugin.ts             # 3D markers, labels, drawing
 │   ├── rv-annotation-renderer.ts        # Annotation render helpers
 │   ├── aas-link-plugin.tsx              # AAS / AASX linking + tooltip
-│   ├── aas-link-parser.ts               # AASX ZIP/index parser
+│   ├── aas-link-parser.ts               # AAS detail per shell (nameplate, technical data, PDFs)
 │   ├── docs-browser-plugin.tsx          # PDF / docs browser panel
 │   ├── blueprint-plugin.ts              # Blueprint / 2D plan view
 │   ├── drive-recorder-plugin.ts         # Drive recording (runtime)
@@ -905,7 +1117,7 @@ Plugin activation depends on whether the model declares an `rv_plugins` list:
 
 In selective mode, core plugins (drive sorting, sensor monitoring) always activate regardless of the `rv_plugins` list. This ensures essential infrastructure is never accidentally disabled.
 
-See **[Model-Specific Plugin Configuration](#model-specific-plugin-configuration)** for how to declare `rv_plugins`.
+See [Extending WEB](doc-extending-webviewer.md) for how to declare `rv_plugins`.
 
 Plugins with `slots` automatically register React components into HMI layout positions: `kpi-bar`, `button-group`, `messages`, `views`, `search-bar`, `settings-tab`, `toolbar-button`, `overlay`. See **[doc-extending-webviewer.md § 5](doc-extending-webviewer.md)** for the full slot reference.
 
@@ -913,14 +1125,14 @@ Plugins with `slots` automatically register React components into HMI layout pos
 
 | Tier | Loaded when | Can be removed | Examples |
 |------|------------|----------------|----------|
-| **Core** (`core: true`) | Always — survive model switches | No (`removePlugin()` blocked); `disablePlugin()` works on any plugin | `drive-order`, `sensor-monitor`, `transport-stats`, `camera-events`, `camera-startpos`, `rv-extras-editor`, `signal-bind`, `connection-system`, `adaptive-nav`, `kiosk`, `interface-manager` |
+| **Core** (`core: true`) | Always — survive model switches | No (`removePlugin()` blocked); `disablePlugin()` works on any plugin | `drive-order`, `sensor-monitor`, `transport-stats`, `camera-events`, `camera-startpos`, `rv-extras-editor`, `signal-bind`, `connection-system`, `kiosk`, `interface-manager` |
 | **Global Private** | Always when private folder present | Yes | `layout-planner`, `des-plugin`, `des-hmi` |
 | **Model-Specific** | Only when matching GLB is loaded | Yes (auto-removed on model switch) | `kpi-demo`, `demo-hmi`, `webxr`, `multiuser`, `fpv`, `annotations`, `aas-link`, `docs-browser`, `blueprint`, `drive-recorder`, `sensor-recorder`, `order-manager`, `machine-control`, `maintenance` |
 
 `debug-endpoint` and `mcp-bridge` are registered unconditionally in dev builds but are **not**
 `core: true` — a project may remove them.
 
-Model-specific plugins are defined in `plugins/index.ts` files per model folder. The `ModelPluginManager` auto-discovers them via `import.meta.glob` and loads/unloads them when models are switched. See **[doc-extending-webviewer.md](doc-extending-webviewer.md) § Per-Model Plugin System** for how to create model-specific plugins.
+Project plugins are bound explicitly by `documents[].scriptRef`. Use a direct module under the project’s `plugins/` folder, with paired registration/unregistration exports. See the [public project example](doc-project-plugin-example.md). Built-in source-tree packs remain a separate build-time integration mechanism.
 
 See **[doc-extending-webviewer.md](doc-extending-webviewer.md)** for detailed plugin development guide, UI slot system, event bus, hooks reference, and examples.
 
@@ -934,6 +1146,29 @@ MUs on conveyors do not penetrate each other: each moving MU clamps its per-tick
 
 Configuration: per TransportSurface via **Accumulate** (boolean, default `true`) and **MinGap** (mm, default `0`) in the GLB/scene extras; deployment-wide off-switch via settings.json `simulation.accumulateDefault: false`. Diagnostics: `mu.blocked` per MU and `blockedMuCount` in the `web_transport_status` MCP tool.
 
+#### Pre-placed MUs and loads (plan-516)
+An MU authored in the scene is **live**, exactly as in Unity — it no longer has to come out of a Source. The classification is implicit (no schema field, no export change): an MU node is a **Source template** when a Source references it — as the Source node itself, as its resolved `ThisObjectAsMU` template, or through an ancestor of either — and **pre-placed** otherwise. Templates stay hidden as before; pre-placed MUs stay visible.
+
+- **Lifecycle.** The loader classifies the MUs of the main model (`classifyPreplacedMUs`, `rv-scene-loader.ts`) after the Sources resolved their templates; a logic-gated (signature) load keeps every MU hidden and classifies at the gate release. At **sim start** (model load with active logic, `resetSimulation()`, the switch back into continuous mode) `RVTransportManager.activatePreplaced()` registers them: each free MU is attached — world pose kept — to its transform-neutral spawn parent (`resolveSpawnParent`, the Sources' rule) and joins `mus`. Every reset restores the authored parent, pose and visibility from a snapshot (`restorePreplaced(activate)`): `resetSimulation()` re-activates, `clearModel()`, a mode switch and an executor dispose never do. A Sink only detaches a pre-placed MU; the reset brings it back.
+- **Loads by collider.** An MU whose collider bottom rests on another MU's collider top (±5 mm, `LOAD_TOLERANCE_MM`) and whose collider centre lies inside that MU's XZ footprint is its **load** — hierarchy and "topmost" play no role. A carrier holds any number of loads (a tray with four parts); stacks resolve to the nearest MU below. Loads are **passive**: children of the carrier's node, not in `mus`, never ticked (no transport, accumulation, vanish, physics or sensor pass) — 14 pallets with three parts each are 14 simulated MUs. The collider box comes from the MU's own solid colliders (`rv-mu-collider-bounds.ts`: Box and Mesh colliders, rotated boxes as world AABB of the oriented box, child MUs excluded, no Rigidbody needed); only an MU without any collider falls back to its mesh bounds. Resolution runs once per activation, O(n log n) over the collider tops.
+- **Grip.** Candidates are the active MUs **and** their load trees, each judged by its own collider — a part is found even when only it (not its pallet) is in the grip range or the `PartToGrip` volume; the smallest collider-to-grip-point distance wins. Picking a load unloads it. `place()` in Auto mode: free GripTarget → the MU right below the part (same collider rule, the part becomes its load and rides along) → scene root. This is web semantics; it does not mirror Unity's grip cascade.
+- **Seats (plan-577, Web only so far).** A carrier may declare `MU.LoadSeatDepth` (mm, default 0): a load whose collider bottom lies up to that depth BELOW the carrier's collider top still rests on it — a part standing in a jig, a cap over a valve end. The depth belongs to the carrier and applies to every load on it (cap on valve = the seat depth of the valve). Guards: the depth is limited to 80 % of the carrier's collider height, a load's bottom never lies below the carrier's bottom, and the centre/footprint rules stay. `resolveLoads` widens its height window only by the largest seat depth present and judges every candidate with its own depth — scenes without a seat depth resolve exactly as before. The value is read at load, for every Source clone from its template (the clone loses its extras), and again at every activation — an inspector edit takes effect at the next reset, never live. The inspector shows `LoadSeatDepth` on every `MU` (and `LoadOnCarrier` on every `GripTarget`) with its default even when the stored extras lack the key. The Unity component has no such field yet (separate plan).
+- **Place on a carrier (plan-577, Web only so far).** A `GripTarget` with `LoadOnCarrier` is a drop POSE, not a holder: a Grip in `PlaceMode` `Auto` aligns the part — with everything it carries — at the target (`AlignPosition` / `AlignRotation` as before) while still holding it, then decides in one step (`decideCarrierPlacement`, `rv-mu-load.ts`): every foreign MU (active roots and their load trees, MUs held by another grip or zone, physics-owned and instanced ones) is checked against the moving tree with the 1 mm overlap inset; an MU the part rests on (seat window above) may overlap the PART as its seat. Exactly one such seat and nothing else in the way → the part becomes that MU's passive load and the target stays free. Any other overlap — also only by a carried load — or two seats at once (ambiguous) → the place is refused: the part stays in the grip with its pose, and the Problems panel gets one warning per grip + target (`grip-seat-occupied`, "Grip could not place part — seat occupied"); the next successful place of that grip and every simulation reset clear it. No MU below and nothing in the way → the classic placement on the target (target occupied). Zones ignore `LoadOnCarrier`. Picking a part nested in another one's box (a cap over a valve end) needs a `PartToGrip` sensor with a part filter (`LimitSensorToTag`) — the plain nearest-box search takes the enclosing valve. Picking a valve with a cap on it takes the cap along (it stays the valve's load).
+- **Sensors / Sinks.** The sensor tick sees active MUs only; a sensor with `LimitSensorToTag` also checks the load trees on demand, so a tag-limited sensor finds a part on a pallet. A Sink consuming a carrier takes its loads with it.
+- **Limits (plan-519).** Planner placements keep the template semantics (an MU inside a placement stays hidden); in DES mode and in a multiuser **client** session pre-placed MUs are visible but static (the multiuser plugin sets `preplacedActivationBlocked`); MUs spawned by a Source never become loads automatically. An MU under a non-uniformly scaled parent is not simulated (one console warning). Older GLBs whose free MUs were previously invisible now show them — intended (Unity parity). The activation thaws a pre-placed MU node the loader froze (`matrixAutoUpdate` false — a mesh-node MU such as the laser-welding cap), and the restore recomposes the local matrix: before plan-577 such a node kept the stale matrix of the carrier it was last placed on and came back from a reset at a wrong pose as a free MU.
+
+#### Zones — Detect / Block / Hold (plan-521)
+A `Zone` (`rv-zone.ts`, spec §7a.66) is a box (`Center`/`Size`, local mm) on any node; it moves with that node's axis and carries any combination of three effects on MUs. It is the preferred way to author stoppers, singulators, sensor boxes, clamps, index lifts and simple grippers — the editor's *Add Component* list offers it first. `Sensor`, `TransportStopper` and `Grip` stay unchanged next to it (no migration); a Unity counterpart follows in a later plan, a Unity round trip keeps the extras.
+
+- **Detect** — `occupied` while a live MU overlaps the box (with `Block`: the box grown by 1 mm per side, so a part arrested in front of it stays occupied even after the belt stops) or while the zone holds an MU; optional `SignalOccupied`, written on change only. `LogicStep_WaitForZone` waits for occupied / free.
+- **Block** — kinematically transported, not held MUs stop at contact: the same swept-AABB kernel as `TransportStopper` (`rv-swept-aabb.ts`), including its rule that a part already inside a lowered box may move out.
+- **SingleRelease** (plan-530, opt-in, needs `Block`, ignored with `Hold`) — a Block zone on a stopper releases exactly ONE MU per lowering, so pallets may accumulate touching (belt `MinGap` 0) like on a real pallet transfer line. The zone keeps a fixed **home box** from its init pose (the stopper must start raised; reset, field edits and an owner change recompute it from that pose, only a reload takes a new one). Lowered = inactive or the box moved more than 1 mm off home. On the lowering the MU whose leading face waits at the entry face of the home box gets the release token (direction from its surface; nearest first, tie-break smallest MU id; nobody waiting → the first arrival gets it one tick after touching). The token MU still stops at the actual box while that is in its path; every other eligible MU is caught at the home face — one that already overlaps the home box only continues when its leading face is past the exit face. A disposed token MU does not free a second pass: the next MU waits for the next lowering. While released, Detect also reports an MU waiting at the home face, so `LogicStep_WaitForZone` and `SignalOccupied` keep working while the stopper is down. A released zone blocks even while inactive. Eligible = clone MU, not physics-owned, not held, not loaded, not being removed; all other MUs see plain Block. Not gated: lift / carrier motion of an MU, `TransportStopper`, DES. A box moved permanently during a run (layout drag) stays released until the zone is initialised again (reload / placement re-init).
+- **Hold** — contained MUs (fully inside, 1 mm tolerance) are attached to the zone node (owner tag `heldBy = 'zone'`, shared hold kernel `rv-mu-hold.ts` — the same attach/detach code `Grip` uses); passive loads ride along. `HoldAcquire` `OnActivate` takes the MUs inside at the switch-on, `WhileActive` also later ones; `HoldCount` `One` caps the zone at one held MU in total (nearest the centre). On deactivation an MU goes back onto a transport surface below it (lowered onto its top), else onto the nearest free GripTarget within `GripTargetSearchRadius`, else it stays where it is. A zone never takes an MU a Grip or a connection holds, and `ConnectionHoldController.hold()` never takes one a zone holds.
+- **Activation** — `Always`; `Signal` (bool, `InvertSignal`); `Axis`: the `ActivationDrive` stands still (not running, not jogging, no behaviour motion, position unchanged since the last tick) inside `AxisFrom`..`AxisTo`. A moving box with `Always` blocks as soon as it crosses the path.
+- **Tick** — in the transport manager: box, activation and Hold release/acquire *before* the MU loop (an MU contained at the switch-on cannot ride out first), Block inside it, Detect after the MU AABB/grid update. MUs that arrived since the last tick are indexed first, so a zone sees them in their arrival tick. 100 zones × 500 MUs cost about 0.07 ms per tick in the measurement of `zone-core.test.ts`.
+- **Authority** — DES never runs the transport manager; a multiuser follower sets `zone.isOwner = false` (box and gizmo only, held MUs let go in place) and back when the session is left.
+- **Gizmo / handles** — box edges plus translucent faces in the effect colour (Hold violet > Block orange > Detect green), faint while inactive, denser faces while occupied; visible in the editor and the test run, never exported. In the asset editor a selected zone gets six face handles (resize, opposite face fixed) and a centre handle (move); one drag is one undo step, Escape cancels, Shift snaps to 5 mm. `web_transport_status` lists every zone with its state.
+
 #### Source markers (floor ring + label)
 Every Source carries an always-visible **floor marker** — a thin semi-transparent ring on the ground plus a camera-oriented label sprite showing the source's node name. The marker is visible in **Play, Pause, AR and Layout-Planner modes** so spawn locations stay identifiable even before the first MU appears. Each source's ring/label color is derived deterministically from its name (golden-ratio hue hash), giving consistent visual separation across sessions.
 
@@ -945,22 +1180,80 @@ Toggle globally via **Settings → Visual → Show source markers** (default ON)
 
 Opt-in rigid-body physics for free 3D material behavior — MUs falling off conveyor ends, sliding down chutes, tipping and stacking in bins. Kinematic transport (including the accumulation gap clamp above) stays the default and is unchanged; physics only takes over per MU at natural handover points.
 
-- **Activation**: Settings → Simulation → **Physics (whole scene)** (default OFF, stored in `localStorage['rv.physics']`, takes effect on the next model load). Without explicit physics zones in the model, enabling the toggle treats the whole scene as one zone with default parameters (friction 0.8, restitution 0).
-- **Full physics (Beta)**: a second switch, **Full physics — all conveyors** (`localStorage['rv.physics.full']`, only effective while the main switch is on). Every non-radial transport surface then runs as a physical belt and MUs become dynamic bodies the moment they enter a surface — accumulation pressure is computed by the physics engine instead of the gap clamp. Radial (turntable) surfaces stay kinematic (v1 exclusion).
-- **`WebPhysicsZone` extras contract**: zones are box volumes authored as `WebPhysicsZone` rv_extras in the GLB (schema `schema/v1/rv-odt.json`, spec section 7a): `ZoneEnabled`, `WholeScene`, `Friction`, `Restitution`, `RemoveBelowY`, `ShowGizmo`, `StaticColliders` (node paths of additional fixed collision geometry), `BoxCollider` (center/size). Today zones come from test fixtures or programmatic authoring; Layout-Planner zone authoring writes the same contract (follow-up). Overlapping zones: the first registered zone wins, configs are never mixed.
+- **Activation (plan-525)**: physics is ON for a model when the model itself asks for it — an authored, enabled `WebPhysicsZone` switches physics on for that model, without any Browser setting, so a delivered link works in a fresh browser profile. The effective state is computed centrally (`computeEffectivePhysics` in `rv-physics-registry.ts`) from four inputs, in this order:
+
+  | settings.json `simulation.physicsEnabled` (kill-switch) | enabled authored zone in the model | `SceneSettings.physicsEnabled` | Browser preference `rv.physics` | Physics |
+  |---|---|---|---|---|
+  | `false` | any | any | any | **off** |
+  | not `false` | yes | any | any | **on** |
+  | not `false` | no (or only disabled zones) | `true` / `false` | any | the flag |
+  | not `false` | no | absent | on / off | the preference |
+
+  The Browser preference is Settings → Simulation → **Physics (whole scene)** (default OFF, `localStorage['rv.physics']`). It is only a preference: while a zone model is loaded, switching it off keeps that model's physics on; the preference applies after the next model switch. When a model switched physics on by itself, Settings → Simulation says so ("Physics enabled by this model"). Without explicit physics zones in the model, the preference treats the whole scene as one zone with default parameters (friction 0.8, restitution 0) — the plugin's synthetic zone never counts as a model zone, and a model that carries zone extras (even only disabled or broken ones) never gets the synthetic whole-scene zone.
+- **Full physics (Beta)**: a second switch, **Full physics — all conveyors** (`localStorage['rv.physics.full']`, only effective while the main switch is on — a zone model never switches it on by itself, and an authored `SceneSettings` flag switches it off). Every non-radial transport surface then runs as a physical belt and MUs become dynamic bodies the moment they enter a surface — accumulation pressure is computed by the physics engine instead of the gap clamp. Radial (turntable) surfaces stay kinematic (v1 exclusion).
+- **`WebPhysicsZone` extras contract**: zones are box volumes authored as `WebPhysicsZone` rv_extras in the GLB (schema `schema/v1/rv-odt.json`, spec section 7a): `ZoneEnabled`, `WholeScene`, `Friction`, `Restitution`, `RemoveBelowY`, `ShowGizmo`, `StaticColliders` (node paths of additional fixed collision geometry). The volume is the `BoxCollider` (center/size) of the SAME node — since plan-525 that box wins over the node's mesh bounds. Overlapping zones: the first registered zone wins, configs are never mixed.
+- **Authoring in the asset editor (plan-525)**: Quick Edit → Components → **Box Collider** / **Physics Zone**, the inspector's Add Component menu and `web_editor_add_component` share one rule path:
+  - a node carries **one** box collider (a "collider node"); a second one is refused. Several boxes = several collider nodes;
+  - "Add Box Collider" on a node that draws geometry creates an empty child **`Collider`** (identity transform) and puts the box there, in one undo step — only an empty collider node survives the destructive bake on its own;
+  - a new box is stored explicitly as `center {0,0,0}`, `size {0.1,0.1,0.1}` m;
+  - "Add Physics Zone" adds a missing 1 × 1 × 1 m `BoxCollider` to the same node in the same undo step (an existing box is kept), `WholeScene` false.
+
+  The inspector shows `center` / `size` in **mm** (stored in metres, Unity convention: `center.x` is negated on read) and warns below **3 mm** thickness — thin walls let fast parts tunnel. `web_editor_set_field` writes metres. Box colliders get a yellow wireframe while authoring (asset editor and its test run), never in a delivered viewer, never pickable, never exported. With the commercial asset editor the box of a selected Zone, Box Collider or Physics Zone can also be dragged in the viewport (centre + six face handles, Shift = 5 mm raster, Escape cancels, one undo step); the zone volume and its wireframe follow the drag live, the physics world is rebuilt on the next load / test start.
+- **Recipe — a chute**: build a thin or concave static shape from several collider nodes: one tilted `Collider` for the floor, one per side wall (each ≥ 3 mm thick), a `BoxCollider` on the catch plate, and one `WebPhysicsZone` whose box covers the whole station. Keep `Friction` below tan(tilt) so parts slide (tan 30° ≈ 0.58). A `Grip` with `PlaceMode: Physics` releases the part into the zone with the gripper's own velocity; outside a zone (or with physics off) it places like `Static`, with one console warning per grip.
 - **Handover at the conveyor end**: a belt is never cut by a zone boundary — a surface is either fully kinematic or fully physics-managed. An MU that runs off a conveyor end inside a zone becomes a dynamic body with the belt's exit velocity (also at v=0); a settled, upright MU (25° tolerance) resting over a kinematic surface returns to the kinematic pipeline with its exact pose. Tipped-over MUs stay physics-owned and rest where they fell.
 - **`PhysicsMode` on surfaces and sensors**: per-instance boolean extras flag. A `PhysicsMode` surface fully inside a zone becomes a friction-driven physical belt; a `PhysicsMode` sensor inside a zone detects via physics collider events or a physics raycast (`onChanged` fires exactly as in the kinematic path). Physics-managed sensors only see physics-owned MUs — leave `PhysicsMode` off for sensors that must see both.
-- **Implicit static geometry + guards**: a BoxCollider node inside a zone that carries no simulation component becomes fixed collision geometry automatically (bins, chutes, frames). Four guards protect the world against broken model data — each of them silently skips the node, except the last: a node deactivated in Unity (`activeSelf: false` on it or on any ancestor), an invisible node (its own or an ancestor's `visible = false`), a degenerate box definition (NaN/Infinity component, size ≤ 0 in any axis — checked for the legacy `BoxCollider` key *and* every `colliders[]` entry, the first valid entry wins), and a box that spans ≥ 90 % of the scene extent in at least two axes. The last case is almost always a broken CAD collider scale: the box swallows the cell, every MU spawns inside it and gets shot out by the solver's depenetration. It is discarded with one console warning per node:
+- **Implicit static geometry + guards**: a BoxCollider node inside a zone that carries no simulation component becomes fixed collision geometry automatically (bins, chutes, frames). Since plan-525 the box is registered **oriented** — centre through the node's world matrix, half extents × world scale, the node's world rotation — exactly like the explicit `StaticColliders` path; its world AABB only decides zone membership and the oversize guard. **Behaviour change for existing models:** a *rotated* Unity BoxCollider used to become its world AABB with no rotation (a solid block that filled a tilted chute); it now keeps its tilt. Axis-parallel, unscaled boxes produce bit-identical bodies, and the number of static bodies is unchanged. Four guards protect the world against broken model data — each of them silently skips the node, except the last: a node deactivated in Unity (`activeSelf: false` on it or on any ancestor), an invisible node (its own or an ancestor's `visible = false`), a degenerate box definition (NaN/Infinity component, size ≤ 0 in any axis — checked for the legacy `BoxCollider` key *and* every `colliders[]` entry, the first valid entry wins), and a box that spans ≥ 90 % of the scene extent in at least two axes. The last case is almost always a broken CAD collider scale: the box swallows the cell, every MU spawns inside it and gets shot out by the solver's depenetration. It is discarded with one console warning per node:
   ```
   [physics-zone] implicit static box "Turbine-cut" (38.2×38.5×16.0 m) spans the scene — skipped (broken collider scale?)
   ```
   Scenes with empty or planar bounds have fewer than two comparable axes; there the guard deliberately fails open. Collision geometry that is meant to be invisible (invisible walls) must be authored explicitly through the zone's `StaticColliders` node paths — those are registered regardless of visibility.
 - **Automatic floor plate**: the synthetic WholeScene zone (the convenience default when the toggle is on and the model has no authored zone) gets an invisible static plate `floor:synthetic`, so MUs that fall stay visible instead of dropping into the `RemoveBelowY` guard. Its top face is flush with `boundingBox.min.y` and it spans the scene footprint plus a margin. Note the fallback semantics: `boundingBox.min.y` is the underside of *all* render geometry, not necessarily the visible hall floor — with pits or basements in the model the plate sits under that geometry (it is never placed above `min.y`, so it can never cut visible geometry). For an exact floor height author an explicit zone with `StaticColliders`. Authored zones never get a plate.
-- **Kill switches**: settings.json `simulation.physicsEnabled: false` disables physics deployment-wide (wins over the user toggle); `simulation.physicsSurfaceDefault: false` keeps every surface kinematic (wins over `PhysicsMode` and full physics).
+- **Kill switches**: settings.json `simulation.physicsEnabled: false` disables physics deployment-wide (wins over the user toggle AND over authored zones); `simulation.physicsSurfaceDefault: false` keeps every surface kinematic (wins over `PhysicsMode` and full physics).
 - **Exclusions**: physics runs only in the continuous simulation kernel — switching to DES tears the physics world down; an active multiuser/live connection (Unity is the pose authority) disables physics entirely.
-- **Diagnostics**: read-only line in Settings → Simulation ("N zones / M bodies / X ms step") and `physicsOwnedCount` / `physicsBodies` in the `web_transport_status` MCP tool.
+- **Diagnostics**: read-only line in Settings → Simulation ("N zones / M bodies (K kinematic) / X ms step" — the parenthesis appears only while moving machine parts are registered) and `physicsOwnedCount` / `physicsBodies` / `physicsKinematicBodies` in the `web_transport_status` MCP tool.
 
 The physics engine itself is a **private provider** (Rapier, Rust → WASM) behind the public `PhysicsProvider` registry — open-source builds without a registered provider are a strict no-op and load zero physics bytes. See [doc-extending-webviewer.md](doc-extending-webviewer.md) for the provider contract.
+
+#### Moving machine parts and payload feedback (plan-467)
+
+While physics is on, machine parts that MOVE also collide: a pusher pushes, a lift table lifts, a gripper pad carries. And what they carry flows back into the force analysis — the drive torque in Quick Edit → Mechanism → Forces is the loaded machine, not the empty one.
+
+**Which parts become moving colliders.** A node qualifies when it carries **authored collider extras** and is moved by something the viewer knows: it sits under a **Drive** node, or a **mechanism link owns it** (the link's subtree *and* its kinematic-group followers). Two hard rules follow from that sentence:
+
+- **Collider extras are mandatory — there is no mesh-AABB fallback for moving parts.** Implicit static geometry still falls back to the render bounds; a moving part does not, because a bounding box that is silently wrong on a gripper finger is worse than a gripper that visibly does nothing. Author a `BoxCollider` or a `MeshCollider` in Unity.
+- **Two shapes only.** `BoxCollider` → a cuboid, with the authored `center` offset and the node's world scale honoured. `MeshCollider` → a **convex hull** of the node's render primitives (multi-material nodes included), decimated to at most `PHYSICS_HULL_MAX_POINTS` = 512 vertices. A concave `MeshCollider` is hulled with a console warning rather than refused; a degenerate mesh whose hull fails is skipped, and physics keeps running. No triangle mesh — a trimesh on a kinematic body lets parts fall through it on interpenetration.
+- `enabled: false` and `isTrigger: true` colliders are excluded, as everywhere else. A part in the moving set is never *also* registered as an implicit static box, so nothing is left behind at its start position.
+- Zone membership is decided **once, at zone build time**, by overlapping the collider's own AABB with the zone. The default WholeScene zone covers everything; with explicit zones, a part that only later drives *into* a zone stays invisible there (v1 limitation). A zone can opt out entirely with `movingColliders: false` in its config.
+
+**The tick contract** (asserted by `tests/rv-physics-order.test.ts` — this order is a contract, not an accident):
+
+```
+kernel.tick(dt)                    Drives write node transforms
+TickStage.SIM, order 200           mechanism forward solve → writeBackTick
+                                   → solveDynamics(dt, gravity, link_wrench of tick N−1)
+physics plugin, order 20 (post)    conveyor velocities
+                                   → pushPoses()       setNextKinematicTranslation/Rotation
+                                   → provider.step(dt)
+                                   → forEachContactLoad() → setExternalLinkLoad per link
+                                   → syncPoses()       MU poses back into the scene
+                                   → sensors
+```
+
+Poses are pushed **before** `step()` with `setNextKinematicTranslation/Rotation`, never with `setTranslation`: only the "next" form gives Rapier a contact velocity, and a teleported body pushes nothing. The push also wakes MUs resting on a part that starts moving — no manual `wakeUp()` is needed (Rapier ≥ 0.19.2).
+
+**Contact loads.** After the solve, every reporting link body is asked for its contact manifolds. The **normal** share is taken exactly per contact pair from the manifold (`−normal · contactImpulse · N/((N+1)·dt)`, with `N` = the solver's iteration count read at runtime), which is what makes a stack of two parts report both their weights and a part lying half on static geometry report only its half. The **friction** share comes from the touching MU's own momentum balance, `m·(g − a)` projected into the contact tangent plane and split across that MU's partners by their share of its normal impulse. Force and moment are expressed in **world axes, SI, with the moment about the WORLD ORIGIN** — the same reference point the solver's `inward_pass` accumulates about, so loads from several bodies of one link simply add. The registry sums them per mechanism link and hands them to `rvk_solve_dynamics` as the ABI-v4 `link_wrench` parameter, where they are subtracted after the inertia term (RNEA `f = I·a − f_ext`). An MU's mass is part of the contract: `PhysicsZoneConfig.muMassKg` (default `PHYSICS_DEFAULT_MU_MASS_KG` = 1 kg), overridable per MU with a `PhysicsMassKg` extras field — Rapier's default density would give a 0.2 m cube 8 g and make every payload meaningless.
+
+**What v1 does not do** — stated plainly, because a drive is sized against these numbers:
+
+- **Stacked friction is not passed down.** The *weight* of a part stacked on another part reaches the link correctly; the *friction* it exerts on the part below does not travel through it. Sliding stacks under-report the tangential load.
+- **The MU's angular acceleration is ignored.** A tipping part contributes its contact forces and their lever arms, but not its rotational inertia term.
+- **One tick of latency.** The physics step runs after the mechanism stage, so tick N's contact loads reach the dynamics of tick N+1 — the same accepted latency as the belt-velocity hand-off.
+- **Build-time zone membership** (see above) and **no CCD between kinematic and dynamic bodies** — Rapier does not do that pair, so CCD is enabled on the MUs instead, which catches a fast gripper tunnelling through a thin part.
+- The mechanism stays **position-driven**: contact loads are analysis input only, never a cause of motion. The same drive motion without any MU produces bit-identical poses.
+
+**Cost.** In `tests/rv-physics-perf.test.ts` (50 kinematic bodies against 50 MUs, 600 ticks) a tick averages **~1.0 ms** with the contact channel, against **0.211 ms** for the same scene with moving colliders but no load reporting. That is a stress case — a real cell has single-digit reporting link bodies; the channel's cost is roughly per reporting-body × touching-MU pair.
+
+**Testing.** Rapier is installed out-of-band, so the physics suites skip themselves when it is missing. In the private acceptance run that skip is a failure: set **`RV_PHYSICS_REQUIRE_WASM=1`** and the core cases (`rv-physics-contact-loads`, `mechanism-contact-e2e`, `physics-spike-*`) fail loudly instead of passing quietly.
 
 ### Machining (CSG material removal)
 
@@ -1006,12 +1299,12 @@ Objects can ride **paths** (lines and arcs, arc-length parametrized) instead of 
 
 Two library components ride this substrate (in `src/behaviors/`, built with `defineLibraryComponent` — see [doc-behavior-modelling.md](doc-behavior-modelling.md)):
 
-- **`Agv`** — an autonomous path-following vehicle. One arc-length movement scalar (`PathTraveler`), speed/ramps from the shared drive ramp (drive parity, mm/s), pose from the path tangent. Traffic control is **raycast-free**, the way professional material-flow tools do it: 1D arc-length **headway** to the vehicle ahead (car-following ramp, `SafetyDistance`/`MinGap`/`LookAhead`/`HeadwayGain`) plus **zone reservation** (control-point model — a zoned path must be claimed before entry, `claim`/`release` in `rv-zone-registry.ts`). Signals: `Agv.Run`, `Agv.Moving`, `Agv.Position` (mm), `Agv.AtNode` (pulse), `Agv.Blocked`.
+- **`Agv`** — an autonomous path-following vehicle with the distance control of real AGVs (plan-558). Every vehicle drives ONE closed-form motion plan (`rv-motion-profile.ts`): trapezoid / triangle speed profile with `Acceleration` / `Deceleration` (mm/s²), braking exactly into its stop, curve limit `v ≤ √(LateralAcceleration·R)` in every arc, docking crawl (`DockingSpeed` over the last `DockingDistance` before a service stop). Traffic is a raycast-free **trajectory-based moving block** (`rv-movement-authority.ts`, VDA-5050 terms: the plan's stop is the *movement authority*): a follower plans against the **planned trajectory** of the vehicle ahead on its own route and keeps `SafetyGap` between its front and the leader's rear at every instant (bodies from `VehicleLength` / `VehicleWidth`, 0 = mesh bounds, the root may sit anywhere on the body). Merges are **zones** (`zone` / `zoneCapacity`, `rv-zone-registry.ts`): claimed before the front enters, released when the rear has left, a release wakes the waiters (FIFO). Optional **scanner fields** (`ScannerFields`, `ScannerReactionTime`, `ProtectiveMargin`, `WarningMargin`): protective field `v·t_r + v²/2b + ProtectiveMargin`, warning field + `WarningMargin`, evaluated at planning time against the leader's planned trajectory — warning caps the speed at `max(DockingSpeed, v_leader)`, protective stops (restart 0.5 s after the exit). Signals: `Agv.Run`, `Agv.Moving`, `Agv.Position` (mm), `Agv.AtNode` (pulse), `Agv.Blocked` (stopped by traffic), `Agv.Speed` (mm/s), `Agv.Slowed`, `Agv.FieldWarning`, `Agv.FieldProtective`. Statistics: Transport / Working / **Slowed** / **Stopped** (free time) / Empty / Failure. `UseAcceleration = false` keeps the legacy jump semantics (continuous: the old car-following step mode with `SafetyDistance`/`MinGap`/`LookAhead`/`HeadwayGain`). The overlay category **Safety fields** (default off) draws the fields on the floor (`agv-scanner-field-plugin.ts`).
 - **`OverheadConveyor`** — a circulating chain on a closed path: one chain phase scalar, N carriers at fixed pitch (`(s_chain + i·pitch) mod L`), gravity-oriented carrier pose.
 
 **Routing is project logic, not built in.** Vehicles follow `successors[0]` by default; junction decisions, arrival tracking, and dispatch come from id-based hooks (`selectNextPath(candidateIds, ctx) → id`, `onArrive(pathId, travelerId)`, `requestDispatch(travelerId)`) that a project script (JS-in-GLB) fills via its `routing.*` handlers — see [doc-scripting.md](doc-scripting.md). Only plain JSON crosses the script boundary; the path graph is queryable by id via `self.paths`.
 
-**DES coupling and its parity boundary.** In the event kernel a path leg is one arrival event (`transit = length / speed`) with a `path` tween for visible arc-true interpolation; an occupied zone reschedules the arrival check (a discrete poll). Determinism parity between the continuous and event kernels holds **for the conflict-free case only** (free track, no zone contention): arrival times, end poses, and FastForward end states match. **Under contention the two kernels intentionally diverge in their momentary trajectory** — continuous runs a smooth car-following ramp per tick, the event kernel a discrete reschedule-until-free — while arrival order, end state, and throughput converge. There is no shared discretized conflict model; only conflict-free trajectories are comparable moment by moment.
+**Both kernels run the same planner (plan-558).** In the event kernel a vehicle schedules ONE leg event per PLAN (not per path piece); the `path` tween samples the profile position over time (accelerating / braking vehicles render exactly), re-plans happen only at triggers (leg end, task / service, a changed leader plan, a zone release, a horizon extension at its braking point, a scanner field transition) and are coalesced into one deterministic flush per sim instant (leaders first, then vehicle id; at most four per vehicle and instant, then an immediately *safe* hold plan). **Routing is decided at planning time** and kept by later re-plans until the task changes; with a project router installed every piece end is announced (`router.onArrive`) at its exact arrival time — without one, `traveler.path` / `Agv.Position` are synced lazily at the vehicle's own events. The continuous kernel evaluates the SAME plan `x(t)` per tick and runs the plan events on its own exact-time clock, so conflict-free trajectories are identical in both kernels (≤ 1 mm, several piece ends per tick included), and contended runs keep the same order and end state. DES snapshots of scenes with AGVs are an explicit non-goal: taking one warns, restoring refuses cleanly.
 
 ### LogicStep Engine
 Port of Unity's LogicStep sequencing — roughly 25 step types are built in `rv-logic-engine.ts`:
@@ -1092,6 +1385,131 @@ Internal dev builds include a browser-side IEC 61131-3 soft PLC: write Structure
 ### Drive Physics
 Ported from Drive.cs — acceleration/deceleration, position limits, rotation and linear movement. CAM/Gear master-slave dependencies resolved via topological sort.
 
+### FMU (Functional Mock-up Units, plan-498)
+
+`Fmu` (`src/core/engine/rv-fmu.ts`) attaches an **FMI 2.0 Co-Simulation** unit to a
+node. It is authored in the web asset editor only — context menu **FMU anhängen…** /
+**FMU entfernen** (`src/core/hmi/FmuAttachAction.tsx`), running as the ops `attach-fmu` /
+`detach-fmu` on the document op protocol (`src/core/ops/rv-fmu-ops.ts`), so undo/redo,
+dirty state and draft recovery come for free. Unity neither exports nor imports these
+FMUs. The browser never executes an FMU: **realvirtual CONNECT** runs it (Windows x64,
+in-process, `doc-connect-interfaces.md` § FMI).
+
+- **In the file.** The extras carry `StepSize`, `Tolerance`, `AllowViewerToFmu`,
+  `RestartOnReset`, `FmuEmbed` (file name, SHA-256, GUID, model name, byte length,
+  `bufferView`), `FmuVariables` (per variable also `initial`, `min`, `max`,
+  `declaredType`, `enumItems` since plan-502 — older files have none, no clamp then) and
+  `FmuStartOverrides`; since plan-512 `FmuUnits` (the package's `UnitDefinitions`,
+  written by `attach-fmu`; see § Signal units). The package bytes are a plain glTF `bufferView` in the BIN chunk,
+  written by the asset writer (`rv-asset-glb-export.ts`, one view per SHA; index list in
+  `asset.extras.realvirtual.fmuBufferViews`). Loading puts them into the binary resource
+  store (`rv-binary-resources.ts`) — see [doc-extending-webviewer.md](doc-extending-webviewer.md).
+- **Signals.** The viewer creates one signal child per supported variable on every
+  load and every attach: path `<node>/Signals/<variable>`, wire name
+  `<node>.<variable>` (inside a placement prefixed with the placement, like every
+  signal). The children are runtime products and are never saved. Direction follows the
+  PLC convention: output / calculated parameter → `PLCOutput*` (read), input / tunable
+  parameter → `PLCInput*` (written by the viewer when `AllowViewerToFmu`).
+  Real → Float, Integer/Enumeration → Int, Boolean → Bool. **String variables get no
+  signal** (inspector "not supported", Problems `fmu-variable-unsupported`). Each child
+  carries the variable's unit as `SignalMeta.unit` (+ `unitDef` from `FmuUnits`), so a
+  binding writes the unit factor itself (plan-512, § Signal units). Any other
+  component binds to these children like to any PLC signal — the demo model drives a
+  `Drive` through `Drive_FollowPosition.Position = Ball/Signals/h`.
+- **States.** `unsupported` (no package / bytes missing) · `standalone` (no CONNECT
+  transport — children show start values) · `idle` · `uploading` · `needs-trust` ·
+  `starting` · `running` · `error`. Hierarchy badge and inspector block use the state
+  colour; the inspector offers **Vertrauen & starten**, **Stop**, **Re-provision**.
+- **Modes.** *Standalone*: nothing runs. *CONNECT*: the core plugin
+  `FmuProvisioningPlugin` (`src/plugins/fmu-provisioning-plugin.ts`) acts only while
+  the live transport is the CONNECT gateway (same origin as the gateway URL): `GET
+  /fmu/{sha}` → upload once per SHA → consent → `POST /fmu/instances` with the
+  registered wire names → `running`. *Unity-Live*: the plugin provisions nothing (Unity
+  does not know web-authored FMUs).
+- **Consent.** First contact with a package, or a changed SHA, opens the blocking
+  `FmuTrustDialog` (model, GUID, generator, file, SHA). The FMU runs as native code
+  inside the gateway, so trust is granted per SHA and per CONNECT installation, from the
+  browser; there is no "trust everything". Once trusted, later loads start automatically.
+- **Instances and leases.** Every `Fmu` node in every document/placement context is its
+  own CONNECT interface (instance key `<documentId>#<path>`, placements with their
+  layout ids). A tab holds a lease (TTL 60 s, renewed every 20 s); CONNECT stops an
+  interface without leases. The viewer never deletes interfaces itself.
+- **Known limits (v1).** No FMU↔FMU coupling; an FMU that allows only one instance per
+  process refuses the second one ("restart required"); only win64 binaries run.
+
+#### Parameters, start-value overrides and restarts (plan-502)
+
+The Inspector renders `Fmu.FmuVariables` as the section **Inputs & Parameter**
+(`src/core/hmi/rv-fmu-parameters-field-renderer.tsx`, registered in `App.tsx`): one row per
+variable that may carry an override, grouped *Parameter* / *Inputs*, label
+`description ?? name`, unit suffix, tooltip with vr/causality/variability. Editor by type:
+number with the `min`/`max` clamp and a range hint (`NumberEditor` `min`/`max`), checkbox,
+enum dropdown (names shown, the integer written).
+
+- **Rules** (`rv-fmu.ts`, mirrored by CONNECT): `fmuOverrideAllowed` — `causality` ∈
+  {`parameter`, `input`} and not `constant` (no `calculatedParameter`, no output/local);
+  `fmuLiveWritable` — `input` or `parameter` + `tunable`; `fmuRestartRequired` — the rest
+  of the allowed ones, i.e. `parameter` + `fixed` (BouncingBall: `e` live, `g` restart,
+  `v_min` not at all). String variables get no row (as they get no signal).
+- **Live rows** write the signal on every editor commit (`createSignalWriter`, no force
+  pin); **Als Startwert übernehmen** stores the value, **Zurück auf Start** removes the
+  override and writes the model-description start live. Markers: *changed* (live ≠ start)
+  and *Override* (stored), independently. With `AllowViewerToFmu = false` the live editors
+  are locked with a hint; storing a start value still works. Without CONNECT the rows stay
+  editable with the hint that live values need CONNECT.
+- **Fixed parameters** edit a local draft (no live write, no op per keystroke), hint
+  *fest · wirkt nach Neustart*; the button writes ONE op and the instance restarts.
+- **Overrides** live in `FmuStartOverrides { <variable>: <string> }` (the original `start`
+  stays in `FmuVariables[]`), written by `setFmuStartOverride` / `clearFmuStartOverride`
+  (`rv-fmu-ops.ts`, one `setField`, the last removal an `unsetField`) — undo, dirty state and
+  drafts come for free. `RVFmu.reapplyConfig()` (schema reapply of both executors) is the one
+  change path: it re-reads the map, seeds the children with `override ?? start` while the
+  instance is not running, and reports `overrides-changed { restartRequired, live }`.
+  Re-attaching an FMU keeps valid overrides; one whose name is gone or changed type stays
+  in the map as a conflict row (Problems `fmu-override-orphaned`, info).
+- **CONNECT sets start values, never the viewer.** Every `POST /fmu/instances` carries the
+  complete allowed map as `startOverrides`; CONNECT validates it (`422
+  fmu-override-invalid` → state `error`, Problems `fmu-error` naming variable and reason),
+  applies it natively before the FMU leaves initialization (rv-fmi ABI v2) and decides:
+  only live-writable overrides changed → persisted in place, no restart; a fixed one
+  changed → exactly one restart. The plugin sends the map again on every
+  `overrides-changed` (a generation counter drops older in-flight answers) and waits for
+  `startGeneration + 1` after a restart-requiring change.
+- **Restart evidence.** `/status` reports `startGeneration` and `simTime` per FMI
+  interface; the Inspector's status block shows `start #<n> · t = <s> s`.
+- **`RestartOnReset`** (default `true`): `simulation-reset` (Reset / Shift+R /
+  `web_sim_reset`) restarts a running instance — the model starts again from its start
+  values (the ball falls from h = 1 again).
+- **`Restart` control signal.** Every `Fmu` gets a viewer-owned child
+  `<node>/Signals/Restart` (`PLCInputBool`, wire `<node>.Restart`, stamped
+  `_rvFmuControl`, never announced to CONNECT and never saved). A rising edge restarts the
+  instance; the plugin puts it back to `false`. Any LogicStep can therefore restart an FMU:
+  `LogicStep_SetSignalBool { Signal: <node>/Signals/Restart, SetToTrue: true }` followed by
+  `LogicStep_Delay` in a top-level `LogicStep_SerialContainer` (top-level containers loop —
+  there is no `Loop` field). **Storm guard:** edges while a restart is under way and during
+  the first second after `running` are ignored.
+- **Restart mechanics.** `requestRestart()` releases this tab's lease (awaited) and
+  provisions again — CONNECT drops the interface and recreates it under the same id. If
+  another tab still holds a lease, the interface keeps running and the restart is dropped
+  with a warning (CONNECT has no explicit restart endpoint).
+- **LogicStep edits apply live.** An Inspector edit of `LogicStep_Delay.Duration` or
+  `LogicStep_SetSignalBool.SetToTrue` reaches the running step
+  (`RVLogicEngine.reapplyStepFields`, called from `reapplySchemaForComponent`) — a shorter
+  `Duration` ends the current wait at once. Other LogicStep fields apply after a reload.
+  Reset (Shift+R / `resetSimulation()`) restarts the LogicSteps from their first step,
+  exactly as after a load, so a looping sequence keeps running. Its first
+  `SetSignalBool Restart` usually lands in the storm guard of the restart `RestartOnReset`
+  just triggered and is ignored; the sequence restarts the FMU again after its first
+  `Delay`.
+
+Demo: document **FMU Demo (BouncingBall)** of the DemoRealvirtual project
+(`public/demo-realvirtual/fmu-demo.glb`, BouncingBall from the Reference FMUs v0.0.40,
+BSD-2, `fmu-demo.LICENSE.txt`): `Ball` (Fmu + `Drive` + `Drive_FollowPosition` on
+`Ball/Signals/h`, stored start value `e` = 0.95 so the ball keeps bouncing) and `Sequence`
+(`RestartBall` → `Wait` 12 s, looping), which restarts the ball every 12 s. Rebuilt by `RV_BUILD_FMU_DEMO=1 npx vitest run
+tests/fmu-demo-model.build.test.ts` (recipe `tests/helpers/fmu-demo-scene.ts`); live
+acceptance `tests/fmu-parameters-live.e2e.test.tsx` (skipped without `RV_CONNECT_URL`).
+
 ### WebSensor (3D-HMI status indicator)
 Pure UI marker authored in Unity (`Packages/io.realvirtual.professional/Runtime/WebViewerHMI/WebSensor.cs`) and rendered exclusively by realvirtual WEB (`rv-web-sensor.ts`). Four visual states — **Low / High / Warning / Error** plus an **Unbound** fallback — driven by either:
 
@@ -1100,6 +1518,28 @@ Pure UI marker authored in Unity (`Packages/io.realvirtual.professional/Runtime/
 
 ISA-101-aligned colors (grey / blue / amber / red), with amber blinking at 1 Hz and red at 2 Hz. The visualization is delegated to the generic `GizmoOverlayManager` and supports six shapes (box / transparent-shell / mesh-overlay / sphere / sprite / text). When `Label` is set, an additional camera-facing text gizmo renders the label above the node. See `Sensor isolation` below for the end-user control. For developer-side customization (corporate-design overrides, custom int-mapping defaults), see [doc-extending-webviewer.md § 19](./doc-extending-webviewer.md#19-websensor--initwebsensor-configuration-api).
 
+### WebLabel (text in the 3D scene, plan-529)
+A WEB-only component (`rv-web-label.ts`, no Unity counterpart, not part of rv-ODT v1) that puts authored text on a node. It travels with the model in the GLB `rv_extras` and is added in the asset editor (**Add Component → Web Label**) or with `web_editor_add_component`.
+
+- **Mode `Billboard`** — camera-facing sign with a constant on-screen size, always readable, drawn on the overlay layer (built through `rv-label-sprite.ts`).
+- **Mode `Plate`** — flat sign in the node's local XY plane facing local **+Z**, depth-tested and hidden by geometry in front of it, 2 mm in front of the node plane. Rotate the node (or put the label on a child empty) to aim it.
+
+| Field | Meaning |
+|-------|---------|
+| `Text` | Plain text, `\n` starts a new line (max 500 characters). Multi-line editor in the Property Inspector. |
+| `Url` | Optional link; a click on the label opens it in a new tab. Only absolute `http`/`https` links open — anything else is ignored with one console warning. |
+| `FontSize` | Billboard: on-screen size in CSS px (0 = 14). Plate: text height in mm (0 = 20). |
+| `TextColor`, `BackgroundColor` | Unity colour `{r,g,b,a}` (0…1); background alpha < 1 makes a see-through sign. |
+| `PlateWidth`, `PlateHeight` | Plate size in mm; 0 = from the text. An explicit size shrinks the text to fit. |
+| `Offset` | Label position in mm, node-local. |
+| `MaxDistance` | m, 0 = always. Beyond 80 % the label fades, beyond 100 % it is hidden and not clickable. |
+
+All labels can be switched off with **Display → Overlays → Labels** (overlay category `labels`). Screen size, fade and the toggle are evaluated every frame in the render path by the viewer-owned `WebLabelManager`, so they work with the simulation stopped, paused and in the editor.
+
+**Links:** a click opens the link when the pointer is released without dragging; a Billboard link wins even over geometry in front of it (it is drawn on top), a Plate link only when no opaque part is closer. Label clicks do not depend on the simulation running and never select the node. **Limitation:** in WebXR (VR/AR) labels are visible but **not clickable** — the AR tap path does not know labels (desktop and touch only, plan-529 decision).
+
+Example: the Laser Welding Assembly Station demo carries a `WebLabel_Credit` plate on the front of its lower frame ("Model courtesy of Villette Oh (GrabCAD)").
+
 ### Lamp (signal-light material)
 
 `Lamp` is the browser counterpart of Unity's `Lamp.cs`. It changes the
@@ -1107,7 +1547,7 @@ emissive color and intensity of the first eligible mesh on the component node
 or below it; helper meshes whose names start with `_` are skipped. The runtime
 clones every material slot so a lamp never changes another mesh that shared the
 authored material. Lamp meshes stay outside material deduplication, uber
-material conversion, and BatchedMesh arenas so signal changes remain visible
+material conversion, and the bake (they are `keep` meshes) so signal changes remain visible
 and the normal hover/selection path continues to work.
 
 The component reads `SignalLampOn` and the Unity-compatible
@@ -1165,9 +1605,9 @@ emissive, one without — and swaps between them. Equal `baseMaterial` /
 material is left untouched.
 
 **Rendering.** The cap mesh is flagged `_rvSceneButtonMesh` and therefore stays
-out of material deduplication, uber-material baking and the BatchedMesh arenas
+out of material deduplication, uber-material baking and the bake chunks
 — it moves and changes material at runtime. The static button base stays
-batched. Press/turn animation and the momentary release timers run in the
+baked. Press/turn animation and the momentary release timers run in the
 viewer-owned `SceneButtonManager` (`viewer.sceneButtonManager`), ticked in
 `CoreSubsystems.visuals(dt)`.
 
@@ -1217,7 +1657,7 @@ the minimum derived from a 15° per-joint limit (21), reported in the status lin
 All geometry lives in the **chain-local bind frame**, so a chain under a moving
 kinematic parent, a planner-relocated asset or a multiuser transform moves as a
 whole without deforming. Chains are excluded from material dedup, uber-material
-baking and BatchedMesh arenas; picking runs through an invisible envelope hull
+baking and the bake chunks; picking runs through an invisible envelope hull
 registered as an auxiliary raycast target, since a `SkinnedMesh` never enters
 the pick BVH. GLB export restores the original meshes and prunes the rig — the
 rig is rebuilt deterministically on load. If calibration or the follower
@@ -1260,7 +1700,7 @@ stage so an element never lags its own drive by a frame, and
 loop — deliberately not from the `simulation-reset` event, which fires before
 the drives are reset.
 
-Chain subtrees are excluded from BatchedMesh arenas (they move every tick) and
+Chain subtrees are keep meshes of the bake (they move every tick) and
 kept matrix-dynamic by the static-freeze pass. Degrading is quiet and total: a
 missing or under-sampled `Spline`, or an unresolvable template, makes the chain
 inert with a warning; an unresolvable `ConnectedDrive` places the elements and
@@ -1300,7 +1740,7 @@ removing one in the editor takes effect on the next tick.
 `SpinMode: Texture` (followers only) is the cheap way to show a spinning roller:
 the node stays still and its MANTLE material scrolls by `v / (2πr)·dt` instead.
 Such a roller costs no per-tick transform and is frozen as static geometry (it
-stays out of the BatchedMesh arenas all the same — an arena shares one material
+stays out of the bake chunks all the same — a chunk shares one material
 and has no per-instance UV offset). `MantleMesh` names the mesh that scrolls;
 left empty it is the roller node itself, or the largest mapped mesh child outside
 a `Faces` node, so the end discs stay put. The effective mode is decided per tick:
@@ -1325,6 +1765,22 @@ A winder must be the FIRST or the LAST entry of its path's `Rollers`; it feeds
 `DiameterMm`, `WoundLengthMm`, `Empty` and `Full` back as PLC input signals. A
 winder with a rotational drive is a driven roller like any other, with `R(t)` for
 its radius — so its surface speed rises as its roll grows.
+
+`WrapDeg` (degrees, default `0`) is how far the web is **shown wrapping the roll**
+before it reaches the running tangent, on an unwinder, or after it leaves it, on a
+rewinder. An open path starts and ends at a tangent POINT, which is geometrically
+right and looks wrong: the strip appears out of thin air beside the reel. A
+`WrapDeg` of 270 prepends an arc at roller 0 and appends one at roller `n-1`, so
+the band visibly comes off the parent roll and is taken up on the reel — which is
+what the `DemoRibbonSlitter` does on all three of its winders.
+
+The arc rides on the same circle as the rest of that roller, so it follows `R(t)`
+through the ordinary dirty-gate rebuild with no extra code, and `0` — the default —
+reproduces the plan-459/460 geometry bit for bit. Unlike an inner wrap, whose
+sweep is derived from two tangent points and folded into `[0, 2π)`, this sweep is
+given directly and is **not** normalised: `WrapDeg: 450` really is a lap and a
+quarter. The field is read only when the winder is the first or last entry of a
+path — which, since a winder may not sit anywhere else, is everywhere it is legal.
 
 **`RibbonDancer`** is a roller that also **travels** and thereby stores web. It is
 what lets two drives of one machine run at slightly different surface speeds
@@ -1427,7 +1883,7 @@ is a modelling one). The comparison is re-run whenever a path reports a changed
 `sidesVersion`, not only when the groups are built: `Auto` is re-resolved on every
 solve, so a travelling dancer can flip a shared side in the middle of a run.
 
-Web subtrees are excluded from BatchedMesh arenas and kept matrix-dynamic by the
+Web subtrees are keep meshes of the bake and kept matrix-dynamic by the
 static-freeze pass, exactly like `Chain`. Degrading is quiet and total: an
 unresolvable roller, a winder in the middle of the list, a roller axis off by
 more than 2°, or two circles that admit no tangent make the path inert with a
@@ -1442,6 +1898,107 @@ point of a dancer, on screen. `Idler_02` runs in `SpinMode: Texture`.
 It is **internal**, not in the public demo project; tests reach it through
 `DEV_GLB.ribbonSlitter`. Generated by the private
 `scripts/build-demo-ribbon-slitter.mjs`.
+
+#### Web tension (plan-471)
+
+By default the web is **taut** and carries no force. Setting
+`RibbonPath.TensileStiffnessNPerMmWidth > 0` makes tension a state of the model:
+the path is partitioned into **zones** between consecutive BOUNDARY rollers — the
+two ends, every driven roller, and the dancer — and each zone carries one signed
+strain `eps`, integrated from the standard span model of web handling,
+
+```
+L * d(eps)/dt = (v_B - v_A) + eps_in * v_A - eps * v_B      ->   T = K * w * eps
+```
+
+with `L` the **mechanical** length of the zone: its free spans plus the wrap arcs
+of the idlers inside it, never the arcs at its own boundaries (there the web lies
+on the roller and cannot stretch), and taken from the analytic segment lengths,
+never from sample indices. The step is **implicit** Euler, which is
+unconditionally stable for `v_B >= 0`; the explicit form blows up as soon as
+`dt * v_B / L > 2`, which a 60 Hz tick over a 200 mm span at 1 m/s already does.
+
+The stiffness is a **secant stiffness per unit width** (N/mm of width at 100 %
+strain), read off the strip tensile curve of EDANA/INDA NWSP 110.4. `E*A` is
+deliberately not the input: the caliper of a nonwoven is compressible and not
+uniquely defined, and there is no Hookean region at all — which is also why
+`MaxStrainPercent` is mandatory rather than decorative.
+
+Three signs, one rule:
+
+| `eps` | | |
+|---|---|---|
+| `> 0` | taut | `T = K * w * eps`, exactly today's geometry |
+| `= 0` | the limit | exactly today's geometry |
+| `< 0` | slack | `T = 0` — a rope does not push — and the excess `\|eps\| * L` **sags** |
+
+The sag is a quartic bump `f(s) = 16 d s^2 (1-s)^2` on the free spans only,
+distributed in proportion to their length, in the direction of gravity projected
+perpendicular to the chord and expressed in the PATH's own local frame (so a web
+under a rotated parent still hangs downwards in the world). `f'(0) = f'(1) = 0`
+is the whole reason it is a quartic: the sagging line leaves both contact points
+ALONG the chord, where a parabola would put a visible kink exactly at the roller.
+Depth from excess is `d = sqrt(D * L / (256/105))`, capped at `L/2`; past
+`d/L = 0.17` the closed form is more than 5 % out on the excess and the readout
+marks the zone `~`. Only EXISTING samples are displaced — count, step and indices
+are untouched — and the line tangents come from `f'(s)` analytically, never from
+a central difference, which would reach across the line/arc corner.
+
+A driven boundary contributes its OWN surface speed even where its section is led
+by a roller further downstream — that difference is the only thing that ever
+builds tension. An end roller WITHOUT a drive is dragged by the nearest driven
+roller in the direction the web reaches it from: the first one downstream for a
+free unwinder, the first one upstream for a free rewinder, falling back to the
+section speed when that side has none.
+
+**A loaded dancer is a tension setter.** `RibbonDancer.LoadN > 0` imposes
+`T = LoadN / Strands` on both neighbouring zones immediately and algebraically,
+while the carriage POSITION keeps following the speed difference alone — so
+changing the load at equal speeds changes the tension and moves nothing. `0` (the
+default) is the purely kinematic dancer.
+
+**Colour is a dead band, not a gradient.** Inside `ToleranceBandPercent` around
+`TargetTensionNPerM` the web is not tinted at all — the customer's material is
+left alone — and outside it the saturation grows continuously from a visible step
+at the band edge to full at the alarm threshold: blue below, orange above, and
+fully saturated cyan (`SLACK`) / magenta (`OVER`, `BROKEN`) pulsing at the two
+alarms. Cold/warm rather than red/green, and a hard Yes/No edge rather than a
+shade to estimate. The two alarms additionally set an **emissive** term, because
+`.color` multiplies the map and would be invisible on a dark film.
+
+A render group is the intersection `(section, zone)`: the scroll lives at the
+section, the tint at the zone, and neither partition refines the other. The group
+COUNT is topology-only (`sections + zones - 1`, coincident boundaries becoming
+zero-width groups), so a travelling dancer updates group RANGES in place and the
+warm tick allocates nothing.
+
+Thresholds **alarm, they do not clamp**. The single latching rule of the whole
+feature is `BreakForceNPer50mm`: reaching the strain it implies freezes that
+zone until a simulation reset. Signals: `TensionN`, `SpecificTensionNPerM` and
+`StrainPercent` measure the LAST zone; `IsSlack`, `IsOverstretched` and
+`IsBroken` are an OR over all of them. `ShowTensionLabels` adds the readout
+overlay (`rv-ribbon-tension-overlay.ts`): a label per zone with N/m, PLI, strain
+and a trend arrow, plus a force and travel-bar gizmo on a loaded dancer.
+
+**The fallback is hard.** At `TensileStiffnessNPerMmWidth <= 0` the partition is
+never built and no new code path is entered, so a document without tension
+produces a bit-identical sample buffer and group list — which
+`tests/ribbon-tension-render.test.ts` pins with `toStrictEqual`. Not modelled in
+this revision, each for a stated reason: slit paths (the strips share a web
+before the cut and would have to share a strain — reported once, then run taut),
+reverse running (the zone direction would have to flip — frozen, warned once),
+more than one dancer per path, UV stretch, necking, and brake torque / taper.
+
+The mathematics lives in two more import-free modules,
+`engine/ribbon/ribbon-tension-math.ts` and `engine/ribbon/ribbon-sag-math.ts`.
+Demo document:
+`../realvirtual-WebViewer-Private~/projects/Development/models/DemoRibbonTension.glb`
+— a driven unwinder, three nips, a dancer loaded to 100 N and a surface rewinder,
+with an 800 mm demo span between `Nip_1` and `Nip_2`. Slow `Nip_2` to 784 mm/s
+and that zone sags and turns cyan; raise it to 816 and it turns magenta without
+changing shape. Generated by the private
+`scripts/build-demo-ribbon-tension.mjs`; tests reach it through
+`DEV_GLB.ribbonTension`.
 
 ### Mechanisms (rigid-body kinematics)
 
@@ -1472,6 +2029,101 @@ see the solved pose. Driven joints (`DrivenBy`) are boundary conditions; every
 other generalized coordinate is solved by a bounded damped Newton-Raphson
 iteration. `KinematicTarget` runs on `TickStage.PRE` instead, writing drive
 values that the drive phase then applies normally.
+
+#### Cartesian paths: `MechanismPath` + `MechanismTarget` (plan-729)
+
+A mechanism that can be solved inversely (a Delta above all) drives defined
+Cartesian paths with two more components. A **`MechanismTarget`** is a
+waypoint: its node's world position IS the target, so it is authored by moving
+the node. A **`MechanismPath`** names the mechanism, the `TargetLink` whose
+origin follows the path (a Delta: the platform) and the ordered waypoint list.
+Per waypoint the motion is **Linear** — a straight line with a trapezoid (or,
+on a short segment, triangle) profile from `computeRampedSpeed()` and one
+warm-started inverse solve per tick — or **PointToPoint** — the waypoint is
+solved once at segment start, then every driving Drive moves with its own
+physics, speeds scaled so the axes arrive together (an approximation: the
+jerk-limited smooth core shifts arrival by a few ticks).
+
+Paths tick in the same manager, on `TickStage.PRE` order 20 — before the
+`KinematicTarget`s (40), the drives, and the forward solve on `TickStage.SIM`.
+A running path **claims its Drives** through the axis ownership
+(`rv-axis-ownership.ts`); a `KinematicTarget` on the same mechanism suspends its
+solve while its Drives are owned by someone else, and a path does not start
+while another owner (DES, the IK-target editor) holds them — it starts on the
+first tick after the release. An unreachable waypoint, a solve that fails for
+three ticks in a row, or a joint jump above `RVMechanismPath.maxJointJumpPerTick`
+(a solution-branch flip) **stops the path hard**: `Reachable=false`,
+`SignalEnded` stays low, `LastError` says why. It is never clamped silently onto
+the nearest reachable pose.
+
+Starting: `SignalStart` (rising edge; a replayed level only re-synchronises the
+edge baseline), `LoopPath`, `StartNextPath`, or `LogicStep_MechanismPath` —
+which the public logic engine builds through the plugin step registry
+(`rv-logic-step-registry.ts`), because the step type is private. Authoring: the
+quick-edit section's *Paths & Targets* rows and the `web_editor_mechanism_*`
+path tools (`add_target`, `path_create`, `path_add_waypoint`,
+`path_remove_waypoint`, `path_move_waypoint`, `path_inspect`).
+
+#### Drive sizing from a sampled trajectory: `MechanismTrajectory` (plan-501)
+
+A **`MechanismTrajectory`** is one drive-sizing case as asset parameters: a
+sampled Cartesian path (`Samples`, flat `[x, y, z, …]` millimetres, uniform
+raster `SampleIntervalMs`, `Frame` `z-up` or `y-up`), the `TargetLink` and the
+point on it the samples describe (`TcpOffsetMm`, link-local), and a payload
+(`PayloadMassKg` at `PayloadOffsetMm`, a point mass merged into the target
+link's mass record with the parallel-axis theorem). The sample frame is the
+`KinematicMechanism` node's world pose (position + rotation, never its scale).
+A CSV (`time;X;Y;Z`, `;` / `,` / Tab, decimal point or comma, s or ms; velocity
+and acceleration columns are ignored) fills it from the panel or
+`web_editor_mechanism_trajectory_import`. One validator
+(`validateTrajectoryConfig`) judges EVERY input path — import, GLB load,
+`setField`, run, playback: 2…20000 finite triples, positive raster, output
+raster a whole multiple of it.
+
+**Run sizing** pushes every sample through inverse solve → forward solve →
+anchor check (≤ 0.5 mm, otherwise one retry from the previous sample's state,
+then the run is invalid) → inverse dynamics, on a SECOND solver instance created
+from the mechanism's blob with the payload merged into block 7 — the live
+mechanism, the 10 Hz force recorder and the viewer are never touched. It runs in
+the trajectory's own raster (not the 60 Hz tick), after 8 rest samples that fill
+the kernel's derivative history, time-sliced so no main-thread block exceeds
+25 ms. Joint values are converted to rad / m BEFORE the central differences;
+torque is the kernel's `driveForce` (N·m at the joint = gearbox output). A sample
+counts only when every stage reports OK; the preroll tolerates only "history
+short". One run per mechanism at a time; a model switch aborts it. The result
+carries a `configRevision`, and **Export axes** (panel) /
+`web_editor_mechanism_trajectory_export` (MCP) refuse a run that is stale,
+incomplete, aborted or failed. The export is one SERVOsoft text per driven axis
+(`<Name>_<Joint>.txt`: Tab, CRLF, decimal comma, C `%.20e` with round-half-even,
+columns Time / Velocity / Acceleration / Payload / Thrust / Torque, Payload and
+Thrust zero). A `MechanismPath` with `Trajectory` set plays the samples back on
+the simulation clock instead of its waypoint list.
+
+**Seeing the path (plan-511).** Select a mechanism — its node, a link, one of its
+trajectories, paths or waypoints — and the viewer draws what it is asked to drive,
+in every mode including HMI: each valid `MechanismTrajectory` as a 3 px line in
+its sample frame, coloured by path speed (light blue slow → green → orange → red
+fast, the ramp of the force arrows; the scale is 0 … the fastest sample of that
+trajectory), with a green start and a red end marker; and each `MechanismPath`
+WITHOUT a trajectory as its waypoint polyline (segment colour = the interpolation
+into its end target: Linear light blue, PointToPoint magenta) with a numbered
+marker per target. While a path plays a trajectory a white point runs along it —
+exactly the setpoint handed to the inverse solve, TCP offset included — and the
+line stays in the frame frozen at the start even if the mechanism moves; after
+the end it follows the mechanism's live pose again. **`ShowPath`** (Quick Edit
+checkbox *Show path* on the trajectory and the path row, or any field tool)
+draws a component permanently without selection; it is per component — a path
+with `ShowPath` shows the trajectory it plays, not its siblings. Invalid
+trajectories draw nothing (their findings stay in the panel). The drawing is an
+overlay (`MechanismTrajectoryVisualizerPlugin`, private, toggleable like every
+plugin): no depth test, never a pick or raycast target, no effect on bake, export
+or screenshots beyond the visible line.
+
+`MechanismBody.InertiaOverrideLocalKgMm2` (`[Ixx, Iyy, Izz, Ixy, Ixz, Iyz]`
+about the COM, link-local, kg·mm²) replaces the computed tensor after the mass
+override scaled it. An unusable value is a hard `InertiaOverrideInvalid`
+finding: the link is withheld from the force analysis and sizing runs refuse —
+there is never a silent fallback onto the computed tensor.
 
 Two data rules are worth knowing because they are easy to get wrong:
 
@@ -1543,7 +2195,7 @@ joint row has **Anchor A**, **Anchor B** and **Axis**:
   uncontrolled and unchanged.
 
 The 3D interaction reuses the existing pipelines rather than paralleling them
-(see `doc-render-picking.md`): the gated hit comes from
+(see [public picking and cleanup contract](doc-extending-webviewer.md#picking-and-cleanup)): the gated hit comes from
 `RaycastManager.raycastForRVNodeDetailed()`, exactly like the `pivot-pick`
 eyedropper, and only the geometric refinement — *which triangle* — is a local
 raycast against the already-resolved node. Every commit path ends in the same
@@ -1736,6 +2388,9 @@ Selecting a node with a `Drive` component shows a passive orange overlay visuali
 ### Component Event Dispatcher
 Per-component event callbacks for `onHover` / `onClick` / `onSelect` are routed centrally via `viewer.componentEventDispatcher` — components implement optional methods on the `RVComponent` interface and the dispatcher resolves which component matches each viewer-level event (via `node.userData._rvComponentInstance` + parent-chain walk). Exception-isolated and listener-leak-safe. See [doc-extending-webviewer.md § 18](./doc-extending-webviewer.md#18-component-event-dispatcher-viewercomponenteventdispatcher).
 
+### Agent Eye Monitor (what the AI is looking at)
+A filmstrip of the last 12 images the MCP bridge produced **for the agent** — reachable from a small badge beside the AI button in the ActivityBar, shown in a floating "Agent Eye" panel (`AgentEyeMonitorPanel.tsx`, `AgentEyeMonitorBadge.tsx`, `agent-eye-monitor-store.ts`). Where the cyan cone shows the agent camera's *body*, this shows its *pictures*. The images are tapped at the two encoders every image answer already passes through (`canvasToRvImage` / `canvasesToRvImages`), so there is no extra render pass and no second encode: the strip holds exactly the bytes that went out, idmask channels and Set-of-Mark numbers included. One tool call is one cell however many channels it carried; click a cell for the full image with a channel switch. The ring buffer is capped twice — 12 captures **and** 12 MB of decoded blob bytes — and holds nothing across a reload. A new capture opens the panel if it was closed, without ever taking focus. The badge is always present while the HMI is visible, including with no bridge and an empty history, because it is the only way to reach the panel's empty state. The panel says *"produced for the agent"* and means it: it is not a live view, and it is not proof of receipt. Absent in the embed viewer (no bridge, no React HMI); local to your own tab in a multiuser session. See [doc-ai-integration.md § *Agent Eye Monitor*](./doc-ai-integration.md).
+
 ### AI Alarm Assistant (demo)
 The standard demo ships a FANUC CRX alarm tile (`src/plugins/demo/robot-alarm/`) for **SYST-320 — Contact Force Exceeds Limit**. The card offers a prominent **Ask AI** button and a **History** icon button (badge = note count). Ask AI shows a short "analyzing" spinner, then types out a structured answer: diagnosis, recommended steps, a **live excerpt pulled from the bundled FANUC PDF** with a page deep-link, a summary of what previous operators did, and a **Sources** block whose entries open the manual at the cited page. The History dialog lists the operator notes and lets a visitor add their own (stored in `localStorage`); a new note is considered in the next answer. The assistant answer is generated client-side via an `AlarmAssistantProvider` seam — no backend — while the PDF excerpt and page links are real.
 
@@ -1755,36 +2410,29 @@ Everything is **config-gated via `settings.json`**: `diagnostics.diagnoseUrl` en
 
 Unified raycast pipeline (`rv-raycast-manager.ts`) consolidates hover, scene click, and XR controller raycasting into a single Three.js `Raycaster`. Hover is throttled at 50 ms.
 
-**BVH-grouped geometry** (`rv-raycast-geometry.ts`):
-Instead of iterating all scene meshes per ray, the loader builds **merged BVH groups**:
+**Pick geometry = the bake** (plan-753/756). The loaded model and every planner placement are `BakedAsset` instances of the viewer's `BakeRegistry` (`rv-bake-pipeline.ts`, `rv-bake-registry.ts`): a few chunk meshes (one static, one per textured material, one per mover, each split by group partition), and each chunk carries realvirtual's own CPU **pick structure** — *segments* (one triangle run per surviving node, with the node that a click on it selects), Morton-sorted *clusters* with one box each, and a binned-SAH tree over those boxes (`rv-pick-structure.ts`). The `PickBackend` (`rv-pick-backend.ts`) raycasts those chunk meshes and resolves the hit triangle through its segment to the owner node in O(1) — no binary search, no ancestor walk-up at runtime. An unowned segment of an **opaque** chunk blocks the ray (nothing is selected, and nothing behind it either); a transparent chunk lets the ray pass, and hidden nodes are skipped during the traversal. A plain `THREE.Raycaster` gets the same structure through an instance `.raycast` override that returns an ordinary `Intersection`. Authoring loads (`preserveHierarchy`) and loads that did not bake (static batching switched off) pick real meshes through the `InstancePickIndex` backend instead. `InstancedMesh` MU pools and aux targets (gizmos, energy-chain hulls) are the manager's own targets on every load.
 
-- **One merged BVH for all static meshes** — never animates, baked once.
-- **One merged BVH per kinematic Drive group** — re-used as the drive moves; only the group transform updates.
-- **`InstancedMesh` targets for MU pools** — single instanced draw, single BVH.
+**Raycast readiness:** a baked chunk is never raycast without its structure — `bake()` builds it in a worker pool and resolves only when every chunk has it, so the first hover after scene entry is as fast as the thousandth. The remaining pick surfaces (collision, transport, instance pick) use per-mesh three-mesh-bvh trees built asynchronously after `model-loaded` by one reused background worker, with a time-sliced inline fallback where no `Worker` exists; until such a tree lands, those raycasts use the native three.js fallback. The `'raycast-ready'` viewer event signals full completion.
 
-Each ray is tested against this small set of grouped geometries. Hit-to-node resolution uses **face-range binary search** (O(log n)) — the loader records, for every face range in a group, which `realvirtual` ancestor owns it. No ancestor walk-up at runtime.
-
-**Raycast readiness:** BVH trees are built asynchronously after `model-loaded` — one reused background worker builds the merged groups first, then the per-mesh geometries; a time-sliced inline fallback covers environments without `Worker`. Hover and click work immediately after load through the native three.js raycast fallback and switch to BVH acceleration per geometry as trees complete. The `'raycast-ready'` viewer event signals full completion.
-
-**Hoverability is capability-driven**: `getCapabilities(type).hoverable` (from [rv-component-registry.ts](src/core/engine/rv-component-registry.ts)) decides whether a component type takes part in hover/click. There is no separate Three.js layer per type; the raycaster runs `layers.enableAll()`.
+**Hoverability is capability-driven**: `getCapabilities(type).pick` (from [rv-component-registry.ts](src/core/engine/rv-component-registry.ts)) decides whether a component type takes part in hover/click. There is no separate Three.js layer per type; the raycaster runs `layers.enableAll()`.
 
 **Key features:**
-- **Pointer hover**: Throttled at 50 ms, resolves the hit face to its registered `realvirtual` ancestor via face-range lookup.
+- **Pointer hover**: Throttled at 50 ms, resolves the hit triangle to its node via the chunk's segment table.
 - **XR controller ray**: `updateFromXRController(origin, direction)` for VR/AR controller raycasting.
 - **AR tap selection**: 9-point sampling (`arTapRaycast()`) for touch tolerance on mobile AR.
 - **Click detection**: `raycastForRVNode(e)` for scene click without altering hover state.
 - **Exclude filters**: Skip highlight overlays, sensor viz meshes, and custom exclusions.
 - **Visibility gate**: Runtime-hidden subtrees (WebVisibility signal, Groups panel) are not hoverable/clickable — the ray falls through to what's behind.
-- **Highlight integration**: Instrument-Blue hover/selection highlight via `RVHighlightManager` (OutlinePass silhouette for rendered meshes, overlay fill + edges for batched content).
+- **Highlight integration**: Instrument-Blue hover/selection highlight via `RVHighlightManager` (OutlinePass silhouette on chunk-window proxies in the planner, chunk-overlay fill in HMI/DES, overlay pairs on keep meshes).
 - **Metrics**: pick-path timings (raycast split, resolve, highlight apply, strategy) live in Settings → Dev Tools → "Picking & Highlight".
 
 **Highlight Manager** (`rv-highlight-manager.ts`):
 - Two independent channels: hover (light blue `0x4aa3ff`) and selection (deep blue `0x1e88ff`)
-- Strategy per apply: OutlinePass silhouette → overlay fill + `EdgesGeometry` (batched/hidden content) → bounding-box fallback (dense subtrees)
+- Strategy per apply: chunk-outline / chunk-overlay for baked roots (pooled drawRange wrapper proxies over the chunk geometry, no `EdgesGeometry`) → OutlinePass silhouette → overlay fill + `EdgesGeometry` (keep meshes, editor) → bounding-box fallback (dense subtrees)
 - Cached `EdgesGeometry` (WeakMap) for GC-free repeated highlights
 - Two modes: static snapshot (brief hover) and tracked (overlays follow moving meshes)
 
-**Architecture + hard invariants** (batched arenas, pick geometry, layer/AO contracts, do-not-touch rules) are documented in the internal render/picking design note, which is not part of this repository. The canonical source is `src/core/engine/rv-batched-render.ts`, `rv-batch-table.ts`, `rv-batch-visibility.ts` and `rv-raycast-geometry.ts`.
+**Architecture + hard invariants** (bake chunks, pick geometry, layer/AO contracts, do-not-touch rules) are documented in the internal render/picking design note, which is not part of this repository. The canonical source is `src/core/engine/rv-bake-pipeline.ts`, `rv-bake-registry.ts`, `rv-pick-backend.ts` and `rv-pick-structure.ts`.
 
 **Events emitted:**
 - `object-hover` — `{ node, nodeType, nodePath, pointer, hitPoint, mesh }`
@@ -1868,10 +2516,58 @@ const { visible } = useTooltipState();  // VisibleTooltip[] — all currently vi
 
 ### Hierarchy Panel
 
-The Hierarchy Panel (left dockable panel, owned by `RvExtrasEditorPlugin`) renders a tree of every node carrying `userData.realvirtual` plus the live overlay-override state. Two view modes:
+**The Hierarchy Panel IS the scene graph** (plan-754 D1). Since Phase 2 a row is
+an `Object3D`: the root is `viewer.scene`, `children` is the whole answer, and
+everything a row shows — label, badges, path, eye state — is read off the object
+(`src/core/hmi/hierarchy-rows.ts`). Nothing is filtered out by kind, so the floor,
+the lights, gizmos, chunk meshes and hover overlays all get a row. What the panel
+used to render was a *projection*: a tree rebuilt from the path strings of the
+nodes that happened to carry `rv_extras`, with raw Three.js children grafted back
+in lazily for LayoutObject / CADLink, a synthetic `Geometry` type for bare meshes
+and a separate composition view for the planner. All four are deleted.
 
-- **All** — virtualised tree with expand/collapse. Its expanded-independent structural tree is cached, while placed LayoutObject/CADLink children are injected lazily without rebuilding unaffected branches (see below).
-- **Drives / Sensors / Signals / Logic** — flat, virtualised view filtered by component family. Logic mode preserves container indentation.
+Two badges carry what the projection used to imply:
+
+| Badge | Means |
+|-------|-------|
+| `runtime` | The `NodeRegistry` does not know this node and it is not a chunk mesh: a light, the floor, a gizmo, an overlay, a pooled MU. Read-only, not addressable by path. Hidden **by default**; the chip *Show runtime objects* in the panel's search-and-filter section brings them back, the footer says how many are hidden (`… · 5 runtime hidden`, click to show), and a search always finds them regardless of the toggle. |
+| `chunk` | A mesh the bake produced — the merged triangles of one boundary × partition × material (partition = the `Group` combination, plan-755). Also unregistered, but it IS the document's geometry, so it is never `runtime`. Labelled "kind + size" (`Merged · 84.2k tris` for an uber chunk, `Brushed Steel · 12k tris` for a textured one, prefixed `MC01.13 · ` when partitioned; plan-505); that is a DISPLAY label — never a boundary or file name — and `Mesh.name` stays the chunk key and the pick identity. |
+| `baked` | The **fold row** `Geometry · N chunks · M tris` (plan-505): a boundary's direct chunk meshes are listed behind ONE display-only row after its real children. It is the only row that is not an `Object3D` — no path, not selectable, no context menu, not an MCP target; a click (or Enter/Space) opens it, its expand key is `<boundary uuid>::baked`. |
+
+**Baked geometry is hidden by default** (plan-505). The chip *Show baked geometry*
+next to *Show runtime objects* (persisted as `rv-hierarchy-show-baked`) brings the
+fold rows and chunk rows back; the footer says how many chunks are hidden
+(`… · 26 baked chunks hidden`, click to show). A search ignores the toggle and opens
+the fold of a matching chunk. A chunk that is SELECTED — picked in 3D, via MCP
+`web_select`, or in the tree — stays visible despite the toggle, dimmed, with the
+tooltip *Shown despite filter (selected)*; a path-less selection is revealed by
+object (`RvExtrasEditorPlugin.selectObject` → `revealObject`). The eye of fold and
+chunk rows is disabled: baked geometry is hidden through its boundary or the Groups
+panel. Selecting a chunk shows the inspector section **Baked geometry** (boundary
+link, partition, material (with an sRGB swatch for untextured colour materials), triangles, vertices, pick segments,
+chunk key) above the generic Mesh section.
+
+The **eye** is enabled exactly when the row's subtree contains something drawable.
+A node whose triangles were merged into an ancestor's chunk cannot be hidden on
+its own (D8), so its eye is disabled with a "merged into &lt;boundary&gt;" tooltip
+rather than doing nothing silently. A `Group`'s geometry is the exception
+(plan-755): the bake gives every group combination inside a boundary its own
+chunks under a synthetic **partition object** (`<boundary>/<key>`, e.g.
+`MC01.13` or `CNCCase|CNCDoor`; read-only in the inspector), and the eye of
+that row — like the Groups panel — hides exactly that geometry. The nodes that
+carried only the `Group` are gone from the tree. Row keys are `Object3D.uuid`, not paths —
+paths change on rename/reparent and do not exist for unregistered nodes.
+
+Two view modes:
+
+- **All** — virtualised tree with expand/collapse, flattened on demand for the
+  EXPANDED part only, so a 70k-node model costs as many rows as the user opened.
+  Structural change is picked up through `childadded` / `childremoved` listeners
+  on expanded objects only, coalesced to one re-flatten per frame.
+- **Drives / Sensors / Signals / Logic** — flat, virtualised view filtered by component family, built from a scene walk over `userData.realvirtual`. Logic mode preserves container indentation.
+
+The same graph and the same two badges are what `web_node_tree`, `web_node_find`
+and `web_node_bounds` report, so the agent and the panel never disagree.
 
 #### The model root row
 
@@ -1908,35 +2604,122 @@ identical either way — only the root entry and the reachable depth per call di
 
 #### LayoutObject expand behavior
 
-Placed catalog items (LayoutObjects from the Layout Planner) are expandable like normal GLB nodes. When the user opens the chevron on a LayoutObject:
+Placed catalog items (LayoutObjects from the Layout Planner) expand like any
+other node, because they are any other node: their children are their real
+children. There is no lazy injection any more (it was deleted with the projection
+in plan-754 Phase 2) and expanding a row has **no** `NodeRegistry` side effect —
+opening a row is UI state and must not change the set of addressable paths.
 
-- Inner nodes that carry their own `userData.realvirtual` (drives, sensors, signals, etc.) appear as normal child rows and route through the Property Inspector as standalone selections.
-- Mesh-only descendants (no `userData.realvirtual`) appear as dimmed/italic rows. They are selectable for highlight + Transform-only inspection.
-- Sub-paths are registered on demand into the `NodeRegistry`, so plugins that query by path (`viewer.registry.getNode('RC/Drive-Lin-X')`) see them as first-class nodes.
+What is under a placement is what the bake left there: its logic nodes and its
+chunk meshes. The library file's CAD hierarchy is not rebuilt under the placement
+(plan-753), so there are no bare CAD rows to inject — see
+[doc-node-paths.md](doc-node-paths.md) §9. A chunk row is inspectable read-only
+(Transform + the Mesh section) and carries the `chunk` badge.
 
 Selection sources differentiate intent:
 
 - 3D-viewport picks resolve up to the LayoutObject root (so the whole placed object highlights and lifts together).
-- Tree clicks keep the explicit sub-path, exposing nested drive properties to the inspector.
+- Tree clicks keep the explicit node, exposing nested drive properties to the inspector.
 
 When the LayoutObject's `Locked` flag is set, edits on any sub-path are rejected (`updateOverlayField` returns `false` and logs a warning). The root row itself stays editable so the user can unlock it without first reverting nested changes. Deleting a LayoutObject purges every overlay entry whose path falls under that subtree, so re-placing a catalog item with the same root name starts from defaults.
 
+### Bottom-right view cluster (plan-578)
+
+The floating cluster at the lower right edge of the viewport (`TopBar.tsx`) carries the
+view controls. It used to be five pills with 13 segments and ~460 px wide — a third of a
+1280 px laptop, competing with the right-docked window. It is now **one glass strip of
+~130 px of square cells** (`data-testid="view-cluster"`, `role="toolbar"`), with no function removed;
+everything moved into a dropdown, behind a condition, or behind `⋯`:
+
+```
+[Follow · Sit-On] ┃ [Render ▾] ┃ [1 · 2 · +] ┃ [Eye · Display · ⋯ ▾]
+```
+
+| Group | Contents | Rule |
+|-------|----------|------|
+| Follow / Sit-On | follow and ride-along camera | rendered **only** while a followable part is selected — the `CameraFollowPlugin` leaves the mode itself on deselection. Sits at the strip's **outer (left) end**: the strip is right-anchored, so their arrival moves nothing else; they fade in (120 ms) |
+| Render mode | **one** segment showing the active mode's icon, opening Unlit / Shaded / Toon (+ Wireframe in the Editor workspace), then the two quality rows **Max Quality** / **Fast** (plan-591) | absent when the Visual settings are locked (`lockSettings` / `lockedTabs: ['visual']`) — the quality rows included. The trigger icon keeps showing the MODE: quality is a second axis and is deliberately not represented there |
+| Camera | only the **occupied** bookmark slots (as numbers), then one `+` segment that saves the current view into the first free slot | the `+` disappears when all three slots are taken. Click / Enter restores, long-press / Shift+Enter overwrites (green flash). Global **1 / 2 / 3** restore, **Shift+1/2/3** save — not while typing, not in the asset editor (`cameraBookmarkKey`) |
+| View | the eye (toggle HMI, **H**), the Display panel (only with groups or overlay categories), the overflow `⋯` | `⋯` holds VR / AR, First-Person View (**F**) and every row a plugin contributes through the **`view-overflow`** slot — Record video lives there. `⋯` disappears only when it has nothing at all to offer |
+
+Below the mobile breakpoint (900 px) the tool row docks along the bottom edge and the search
+button floats above it at the right; the strip then rises above the dock and steps left of
+that button (`MOBILE_DOCK_CLEARANCE` / `MOBILE_SEARCH_CLEARANCE` in `TopBar.tsx`) — it used to
+sit underneath both, invisible and unclickable. On a coarse pointer (tablet, panel PC) the
+pill and every segment grow to the 44 px hit target.
+
+**A plugin row in `⋯`:** register `{ slot: 'view-overflow', component, label }`; the component
+renders an `ActionMenuRow` (exported from `action-group.tsx`) **directly**, without a wrapper
+element — `MenuList` walks the DOM for the arrow keys. The row closes the menu itself
+(`useActionDropdownClose`), so it behaves exactly like a built-in row. `label` names the row
+in the `⋯` tooltip. `toolbar-button-trailing` still renders a legacy pill beside the strip.
+
+Three building blocks make this work, all in `action-group.tsx`:
+
+- **`ActionDropdownSegment`** — a segment that opens a menu **upwards** (the cluster sits at
+  the lower edge). It is a non-modal `Popper` + `MenuList`, deliberately not a MUI `Menu`:
+  `Menu` is a `Modal` and would cover its own trigger, which makes a shared trigger+paper
+  hover zone impossible. Mouse hover opens after 150 ms and closes 250 ms after the pointer
+  left **both** trigger and paper; click, Enter and Space do the same without hover (touch
+  and keyboard have no hover at all). A click on a menu the hover dwell already opened
+  **pins** it (and focuses the active row) instead of toggling it shut — the natural "rest,
+  then click" used to close the menu the user had just watched appear. `Escape` is the only
+  closing key inside the menu — the arrow keys belong to `MenuList` — and the focus only
+  returns to the trigger after an `Escape`, never after a hover timeout or a click-away. The
+  paper is the theme's Glass Floating tier with its blur (nothing overridden), carries no
+  `box-shadow` (DESIGN.md §4), fades in over 100 ms and leaves at once, and applies
+  `useUIZoom` itself, because portal content does not inherit the HMIShell scale.
+- **`ActionMenuRow`** — one cell of the open menu. The menu is an **icon tower**: square
+  cells exactly as large as the trigger it grows out of (`--rv-dropdown-cell`), no text in
+  the cell. Name, shortcut key chip (mono) and — while a command refuses — its reason live
+  in ONE tooltip to the left (`DropdownTipContext`: the mouse takes it over, keyboard focus
+  claims it only when the focus is visible, so a click-open shows none). A refusing cell
+  is `aria-disabled`, not MUI-`disabled`: that would set `pointer-events: none` and the
+  reason tooltip could never appear; the click is refused in the handler. The reason is
+  also announced via `aria-description`, never a native `title=`. `kind` sets the role:
+  `radio` (render modes), `checkbox` (VR, FPV), `action` (Record video). Built-in rows wrap
+  a command view (`useCommandView`), so enabled state, reason text and MCP afterglow come
+  from the command layer exactly as for a flat segment.
+- **Square segments.** An icon-only segment is a square (`aspect-ratio: 1`, 14px icon);
+  a dropdown trigger stays square too and marks itself with a small corner wedge
+  (`data-rv-caret`) instead of a caret next to the icon. Segments with text (the sim speed)
+  keep their padding.
+- **`withDividers(segments)`** — divider interpolation over an **already filtered** array.
+  The segment producers (`useCameraSegments()`, `useFollowSegments()`) return flat arrays of
+  only what is visible, so a conditional segment cannot leave a leading, doubled or missing
+  divider behind. This is not a `children` walk on purpose: a component that returns `null`
+  is still a truthy child, and a Fragment collapses its segments into one.
+  **`withGroupDividers(groups)`** does the same one level up: hairlines inside a group, a
+  brighter, inset `ActionGroupDivider` between groups, empty groups vanish with their seam.
+  That is why the render mode and the overflow are hooks too (`useRenderModeSegment()`,
+  `useViewOverflowSegment()`) — a component returning `null` would leave a seam behind.
+
+**The trap worth remembering:** a collapsed dropdown has no rows in the DOM, and the MCP
+choreography finds its buttons *by DOM selector*. Both the pre-choreography
+(`prepareCommandChoreography` → `simulateButtonClick`, which scrolls, hovers and presses) and
+the afterglow would silently fall away for an agent-driven mode switch. The collapsed trigger
+therefore carries `data-rv-button-proxy="<key> <key> …"` for the keys it stands in for, and
+the lookup in `button-sim-store.ts` asks for the original **first** and the proxy only as a
+fallback — a single `querySelector('A, B')` would answer in document order, where the portaled
+Popper stands after the toolbar and the trigger would win even with the menu open.
+Whoever collapses UI has to check who SEARCHES for those elements.
+
 ### WebXR (VR/AR)
-VR on Quest, Vision Pro, PCVR. AR with hit-test surface detection and model placement. Uses `setAnimationLoop` for XR frame callback.
+VR on Quest, Vision Pro, PCVR. AR with hit-test surface detection and model placement. Uses `setAnimationLoop` for XR frame callback. The VR/AR entry point now lives in the view cluster's overflow dropdown (see above), not as its own toolbar segment.
 
 ### Simulation Control (Play / Pause / Reset)
 
 The TopBar SimController plugin exposes two buttons next to the existing tools:
 
 - **Play / Pause toggle** — toggles the `'user'` pause reason via `viewer.setSimulationPaused('user', …)`. Pausing freezes every `onFixedUpdate` consumer (drives, transport, sources, sinks, LogicSteps). `onRender` keeps running so the scene stays interactive (camera, selection, gizmos).
-- **Reset** — calls `viewer.resetSimulation()`, which clears all MUs, resets LogicSteps to `Idle` **and snaps every drive back to its authored `StartPosition`** (`RVDrive.reset()`). Only **signals** are intentionally left alone — blanket-resetting them would fight Live mode, so each component re-establishes the signals it owns in its `onReset` / `onStart` handler. See [doc-lifecycle.md](doc-lifecycle.md) §6.2.
+- **Reset** — calls `viewer.resetSimulation()`, which clears all MUs, restarts the LogicSteps from their first step (reset to `Idle`, then started again like after a load) **and snaps every drive back to its authored `StartPosition`** (`RVDrive.reset()`). Only **signals** are intentionally left alone — blanket-resetting them would fight Live mode, so each component re-establishes the signals it owns in its `onReset` / `onStart` handler. See [doc-lifecycle.md](doc-lifecycle.md) §6.2.
 
 Keyboard shortcuts (enabled by default, suppressed inside text inputs):
 
 | Key       | Action                          |
 |-----------|---------------------------------|
 | `Space`   | Toggle Play / Pause             |
-| `Shift+R` | Reset MUs + LogicSteps + drives |
+| `Shift+R` | Reset MUs + drives, restart LogicSteps |
 
 #### Pause is a multi-reason set
 
@@ -1965,7 +2748,7 @@ When the MCP bridge is connected, the following tools are exposed:
 | Tool                  | Purpose                                                    |
 |-----------------------|------------------------------------------------------------|
 | `web_sim_play_pause`  | Toggle or explicitly set the `'user'` reason                |
-| `web_sim_reset`       | Clear MUs + LogicSteps + reset drives (`resetSimulation()`) |
+| `web_sim_reset`       | Clear MUs, restart LogicSteps, reset drives (`resetSimulation()`) |
 
 ## Context-Sensitive Help
 
@@ -2077,6 +2860,47 @@ Drop targets:
 - **Signal slot rows** — the inline Property-Inspector rows AND the signal-bind popover rows (both `SignalSlotRow`): dropping a CONNECT signal onto a slot row creates the mapping through the same code path as the picker (type/direction validated by `slotAcceptsSignal` in `src/plugins/signal-bind/drop-accept.ts`).
 - **3D scene** — dragging over a placed element with bindable slots auto-opens its signal-bind popover (debounced ~250 ms, `src/plugins/signal-bind/scene-drag-open.ts`), so the drop can land directly on a slot row. Leaving the element without dropping closes the auto-opened popover again. Requires the planner signal-linking feature (`signalBindingManager`).
 
+### Signal cross-reference — "Used by" (plan-566)
+
+Every signal can say where it is used. `viewer.signalUsage` (`src/core/engine/rv-signal-usage-index.ts`) indexes six kinds of usage, grouped in this order: **Components** (a schema signal slot, a reference field whose rv-ODT target is a signal, a `ComponentReference` whose wire type names a PLC signal, or the fixed string fields `WebSensor.SignalBool` / `SignalInt` and `ConnectSignal`), **Logic steps**, **PLC** (ST program lines with `declaration` / `read` / `write` / `read-write`, read from the current `PLCProgram.Code` of every program through the public `PlcRuntime.getSignalUsages()` seam), **Operator panel** (each element of a `WebOperatorPanel` config), **Bindings** (the binding inventory, orphaned links included) and **CONNECT bridges** (1:1 mappings by source and destination, mirror rules by pattern). References resolve in the scope of the node that carries them, exactly like the runtime (`NodeRegistry.resolveSignalReference`), so placements never see each other's signals; an unresolved reference stays in the list, marked.
+
+Where it shows: a **Used by (N)** block in the Property Inspector of a selected signal node; a small count chip on every signal row of the Hierarchy and of the CONNECT signal list that opens the same list in a popover (also for process-image signals without a scene node); a "Used by N" line in the signal chip's tooltip; and the MCP tool `web_signal_usage`. A click jumps to the place: the node (hierarchy + inspector), the PLC editor at the line (only while the PLC plugin registers its `PlcNavigation`), or the CONNECT panel at the bridge row. A name two signal nodes share is flagged and grouped by signal path.
+
+The index is built lazily by the first reader and only invalidated — never rebuilt — by model load / clear, placements, editor structure and field changes, every committed SceneStore op (undo / redo included), binding changes, operator panels, CONNECT bridge changes and the PLC editor's dirty flag; nothing runs per frame.
+
+## Remove and move workpiece carriers in Commissioning (plan-567)
+
+In the **Commissioning** workspace a carrier (MU) can be taken off the line or set somewhere else by hand, while the simulation runs or is paused (`src/plugins/mu-interaction-plugin.ts`, engine `src/core/engine/rv-mu-manipulation.ts`):
+
+- **Remove** — select a carrier and press **Delete**, or right-click it › **Remove workpiece carrier**. The carrier goes together with every part riding on it (a click on a part addresses its carrier); several selected carriers ask for a confirmation. Connection holds (StopOnExit, belt-stop refcount included) are released, script-station ledgers forget the carrier, and sensors and zones are re-evaluated at once — a paused line shows the freed sensor and writes its signal immediately (`RVTransportManager.refreshDetection()`). There is no undo: an authored (pre-placed) carrier comes back on the next simulation reset, workspace switch or model reload.
+- **Move** — drag a carrier: it follows the pointer over the tops of the transport surfaces, the outline is green where it can be dropped and red where the spot is occupied or there is no surface; release drops it (collider bottom on the surface top, rotation kept), **Esc** cancels and restores pose, parent, surface state and a GripTarget it sat on. While dragged the carrier is held with owner `'user'`.
+- **Not available** for pooled (instanced) carriers, physics-owned carriers, carriers held by a gripper, a zone or a station (move only), in the DES kernel and in a multiuser client session — the context menu and the drag hint name the reason.
+- **MCP**: `web_mu_delete(id)` and `web_mu_move(id, x, y, z, surface?)` are views of the same commands (`mu.delete` / `mu.move`); the ids come from `web_transport_status` (`mus[].id`).
+
+## Operator Panel Config Editor (plan-555)
+
+In the Property Inspector, `WebOperatorPanel` › **Config** is a JSON editor on mouse and
+keyboard devices (Monaco, the same editor as the script and PLC editors, loaded on first use):
+
+- **Apply** with **Ctrl+Enter** (Cmd+Enter on macOS) or by clicking outside the field. Text
+  that is not JSON is never applied — the list under the field says why ("Not applied — fix
+  the JSON first."). One apply is one undo step.
+- **Completion**: property names and the allowed values (`capColor`, lamp `color`,
+  `variant`, `tone`, `icon`) from the panel schema; inside any `"signal": "…"` — also in
+  `flashWhen`, `when`, `all`, `any`, `not` — the signals of the loaded model. Hovering a
+  signal shows its value, address and comment (and its type when the model knows it).
+- **Snippets** at an element position of `buttons`, `selectors`, `estops`, `stackLight`,
+  `status` and `chips` (Ctrl+Space).
+- **Problems** are underlined where they are (e.g. `buttons[0].signal 'BT9' not found in
+  model`); the list under the field stays.
+- **Expand editor** (icon at the right) opens a large movable window on the same text.
+- If the stored config changes while you are editing (undo, an MCP write), your text stays
+  and a hint offers **Ctrl+Enter** (overwrite) or **Escape** (reload the stored config).
+- Text that was not applied when you select another node is kept and comes back as
+  **Unapplied draft restored** when you return (for the session).
+- On **touch devices** the field stays the plain text field; the dev flag
+  `rv-webviewer-json-editor` = `0` forces it everywhere (`doc-web-debugging.md`).
+
 ## Typed Connections
 
 Typed, directed connections link two components logically — persisted in the rv-ODT `Connections` block (`connections` edge list + `connectionTypes` signatures, `schema/v1/rv-odt.json` section 7g), so a GLB is self-describing. A connection is a named **bidirectional call**: the source invokes the target with request parameters; the target answers — usually deferred through a reply handle — with response parameters. Edges are 1:n capable (several edges may share a source or a target).
@@ -2103,7 +2927,7 @@ Editing: the Property Inspector's **Connections** section lists in/out edges as 
 
 ## Unified CAD Import
 
-All geometry sources are imported through one entry point: the **Import** button (left tool toolbar, available in every workspace mode) opens the Unified Import Dialog. Its tabs come dynamically from the import provider registry (`viewer.importProviders`):
+All geometry sources are imported through one entry point: the **Import** button (left tool toolbar, available in every workspace mode) opens the Unified Import Dialog. The deep link `?doc=new&mode=editor` opens the same dialog automatically on top of a freshly minted asset document (see *Workspace modes* above). Its tabs come dynamically from the import provider registry (`viewer.importProviders`):
 
 | Provider | Source | Build |
 |----------|--------|-------|
@@ -2208,7 +3032,7 @@ It docks on the right and shares that slot with the Quick Edit window — openin
 - **Clone-on-write.** The loader's dedup pass means one material instance routinely backs hundreds of parts, so applying a preset *assigns* a different instance and never mutates the attached one. Painting a subassembly cannot change parts elsewhere that happened to share its material.
 - **One instance per distinct value.** Painting 400 parts "Steel" yields a single shared material, so the exported GLB does not carry 400 identical definitions. Undo re-attaches the exact original instances, preserving whatever sharing existed before.
 
-**Editor mode only, by design.** Editor mode loads with `preserveHierarchy: true`, which skips the uber bake and nulls the `BatchTable`, so every node keeps its own real material. In batched modes the same assignment would be a silent no-op — batched source meshes render at `layers.mask = 0` and the arena keeps drawing the baked appearance. The plugin's `modes: ['editor']` gate is what keeps the window out of those modes.
+**Editor mode only, by design.** Editor mode loads with `preserveHierarchy: true`, which skips the uber bake and the chunk bake, so every node keeps its own real material. In baked modes the same assignment would have nothing to act on: a merged part has no mesh and no material of its own any more — its triangles and their baked appearance live in the chunk (plan-754). The plugin's `modes: ['editor']` gate is what keeps the window out of those modes.
 
 ## Asset Editor Op Log — Bulk Edits and Failure
 
@@ -2315,13 +3139,13 @@ apply unchanged — no special case in `setMaterial`, picking or the GLB export.
 
 Right-click a single selected mesh → **Separate ▸**
 
-- **Into parts…** — connected components, found by union-find over
+- **Into parts** — connected components, found by union-find over
   position-quantized vertices.
-- **By material group…** — one part per `geometry.groups` entry, each carrying
+- **By material group** — one part per `geometry.groups` entry, each carrying
   the material of its own slot. Offered only when the mesh has ≥ 2 groups.
 
-The click opens a confirmation dialog reporting the part count; nothing is applied
-until it is confirmed.
+The click splits the mesh at once — no preview, no confirmation; the op is
+undoable. A dialog appears only when nothing was split, to say why.
 
 **Weld and output are separate roles.** The weld (`weldVertexIds`) quantizes the
 **position only**, and exists only to build the connectivity graph; the output
@@ -2333,15 +3157,12 @@ parameter, no UI setting) is therefore a **quantization resolution, not a distan
 tolerance**: two points closer than the resolution can still land in adjacent grid
 cells and stay separate.
 
-**Where the work runs.** Weld, union-find and the attribute copy run in a Web
-Worker (`rv-mesh-separator-worker.ts`) behind `RVMeshSeparatorClient`, in two
-phases — `analyze` for the preview, `extract` only after confirmation. Measured on
-a workstation, a main-thread run costs 63–380 ms from ~200k vertices upward, which
-is exactly the range this feature targets. Request buffers are **copied, never
-transferred** (a transfer would detach the live source geometry's `ArrayBuffer` and
-take rendering and raycasting down with it); responses are transferred. Every
-request carries a monotonic id, and an answer whose id is stale is dropped — that
-is how dialog cancel, a geometry change and `dispose()` abort.
+**Where the work runs.** Weld, union-find and the attribute copy run on the main
+thread, in one step, inside `AssetDocument.separateMesh()` — the same path the
+context menu and the MCP tool `web_editor_separate` take. Measured on a
+workstation that costs 63–380 ms from ~200k vertices upward. An earlier version
+ran it in a Web Worker in two phases behind a preview dialog; that was removed
+because a worker that never answered left the dialog busy forever.
 
 **What the op does** (`separateMesh`, `rv-asset-executors.ts`). The source mesh is
 replaced by a **same-named `Group`**, so its path stays valid:
@@ -2364,12 +3185,12 @@ replaced by a **same-named `Group`**, so its path stays valid:
 **Not eligible:** instanced, skinned, morph-target and interleaved geometry (they
 cannot be copied attribute by attribute), a mesh that is already a single island,
 and — in island mode only — a multi-material mesh, which is routed to the group
-mode instead. The reason is reported in the dialog.
+mode instead. The reason is reported in a dialog.
 
-**Draw calls.** Editor mode does not bake, so each part is its own draw call; the
-dialog states the count. Loading the result in a batched mode does *not* merge the
-parts back into one geometry: `rv-batched-render.ts` registers every unique
-geometry as its own `BatchedMesh` slot and every mesh as its own instance.
+**Draw calls.** Editor mode does not bake, so each part is its own draw call.
+Loading the result in a baked mode stages the parts
+into the static chunk like any other geometry (`rv-bake-pipeline.ts`), so the
+draw-call count of the editor is not what a runtime load pays.
 (`buildMergeBatches()` in `rv-mesh-merge-batch.ts` *would* concatenate candidates
 into one arena, but it has no caller in this tree — `meshMergeRegistry` is an
 unwired seam.)
@@ -2488,34 +3309,66 @@ moment, so save → reopen → save is a fixpoint and a later CAD re-import stil
 finds every node where it was authored.
 
 The rule exists because it was broken. `applyKinematicParenting()` (Phase 8b of
-`loadGLB`) re-parents kinematic group members under their `Kinematic` node —
-correct for a runtime load, mirroring `Kinematic.Awake()` in Unity. It was the
-only structure-mutating load phase without a gate (10b, 10c/10d and 13b all have
-one). So every editor reopen restructured the live tree, the next save exported
-that restructuring, and `relativePathMap()` in `rv-cadlink-reimport.ts` — which
-builds its match keys by walking `children` down from the CAD root — no longer
-traversed the moved nodes at all. They vanished from the re-import **silently**:
-not matched, not even reported as unmatched, components and all.
+`loadGLB`, deleted with plan-757 Phase 3 commit B) re-parented kinematic group
+members under their `Kinematic` node at init time — correct for a runtime load,
+mirroring `Kinematic.Awake()` in Unity. It was the only structure-mutating load
+phase without a gate (10b, 10c/10d and 13b all had one). So every editor reopen
+restructured the live tree, the next save exported that restructuring, and
+`relativePathMap()` in `rv-cadlink-reimport.ts` — which builds its match keys by
+walking `children` down from the CAD root — no longer traversed the moved nodes
+at all. They vanished from the re-import **silently**: not matched, not even
+reported as unmatched, components and all.
+
+**Since plan-757 Phase 3 commit B the guard is structural.** The init
+(`initSubtree`) has no re-parent pass left in any mode, and no home-pose window
+(`'bracket'` / `'defer'`) to protect one: re-parenting happens exactly once, in
+`prepare` of the recipe — the `Kinematic` pre-bake hook, on the throwaway tree
+of a BAKED load, before any component exists — and the `Drive` hook stamps the
+authored home the init reads. A runtime load therefore still moves the members
+(their geometry rides the axis' mover chunk), while every load that does not
+bake (the asset editor, its test session, a load without a bake registry, a
+document that draws nothing) sees the authored tree. The init only resolves the
+group NAMES (`resolveKinematicGroupNames`) so `isKinematic()` and the editor's
+group-assignment menu answer identically everywhere (plan-727 F9).
 
 ### Two flags, deliberately not one
 
 | Flag | Means | Set by |
 |------|-------|--------|
-| `preserveHierarchy` | skip the uber-material bake and the static/kinematic mesh merges; every node stays visible and individually pickable | asset editor, **and `RVEmbedViewer`** |
-| `preserveAuthoringHierarchy` | never mutate the node hierarchy: skip kinematic re-parenting | asset editor **only** |
+| `preserveHierarchy` | skip the bake entirely; every node stays in the tree, visible and individually pickable — and, because the recipe is the only re-parent mechanism, the tree stays authored | asset editor |
+| `preserveAuthoringHierarchy` | this init runs in the editor: components that materialise runtime geometry must not build it (`ComponentContext.authoring`); until commit B it also gated the init's re-parent pass, which is gone | asset editor (`loadModel`, `_rebuildComponents()`) |
 
-They must not be merged. `RVEmbedViewer` (`src/embed/rv-embed-viewer.ts`) is a
-*simulating production runtime* that sets `preserveHierarchy` purely for
-pickability while still requiring the re-parenting — gating Phase 8b on that flag
-would leave embedded kinematic groups behind their moving axis, with no error and
-no log. The Layout Planner's `processExtras()` placement calls likewise stay
+They must not be merged, and neither is "the editor flag" by accident: they mean
+different things and one caller could legitimately want only the first.
+
+**`RVEmbedViewer` no longer sets `preserveHierarchy`** (plan-754 D20). It is a
+*simulating production runtime*, so it now runs the full pipeline
+(`load → prepare → bake → drop → place → init`) through `ModelCache` with its own
+`BakeRegistry` and chunk pick backend — the same performance and the same pick
+model as the main viewer, instead of an unbatched tree kept only for pickability.
+The historic reason it set the flag (pickability) is gone: after the bake the
+chunk windows ARE the pick surface. The kinematic re-parenting it always needed
+still runs — it is an `onPreBake` hook now, so gating it on `preserveHierarchy`
+was never a question. The Layout Planner's placement init calls likewise stay
 ungated.
 
-Guarded by `tests/rv-authoring-hierarchy-invariant.test.ts` (which asserts
-positively that `preserveHierarchy` alone does **not** gate) and
-`tests/rv-kinematic-save-reload-cycle.test.ts` (the save/reload fixpoint over a
-full structure + transform signature). Any future load-time hierarchy mutation
-has to respect `preserveAuthoringHierarchy` or those tests go red.
+The only entry that does NOT bake is therefore the **asset editor** (it authors
+the tree). There is **no runtime rollback of the bake** (plan-757 Phase 3,
+2026-09-22): the Visual-tab switch went with commit A, the localStorage override
+`rv-webviewer-static-merge` and its module `rv-static-merge-flag.ts` were
+deleted with commit B (a stored value is ignored), and the only rollback is a
+deploy revert. A bake that FAILS is a load error: `loadGLB` rejects with
+`BakeFailedError` and the Problems panel carries a `bake-failed` entry; no
+unbaked tree is loaded in its place. The pick structure has a rollback of its
+own inside `PickBackend` (dev flag `rv-webviewer-pick-structure` = `0`, the
+linear segment walk — `doc-render-picking.md` §1.1).
+
+Guarded by `tests/rv-authoring-hierarchy-invariant.test.ts` (a baked runtime
+load moves the members into the axis' chunk; every non-baking load, flag or no
+flag, keeps the authored tree) and `tests/rv-kinematic-save-reload-cycle.test.ts`
+(the save/reload fixpoint over a full structure + transform signature). Any
+future load-time hierarchy mutation belongs in a pre-bake hook, or those tests
+go red.
 
 ### Why members still move when nothing is re-parented
 
@@ -2526,8 +3379,9 @@ rebuilds the matrix from the quaternion a drive writes, i.e. the drive reports
 running and the geometry stands still. `reclassifyKinematicGroupsDynamic()`
 (Phase 8a-bis) therefore asks the semantic question — *is this mesh moved by a
 drive?* rather than *does it hang under one?* — and re-marks every resolved
-kinematic group's members dynamic. It runs in **all** modes (in runtime loads it
-is idempotent to Pass 3 of `applyKinematicParenting`) and is monotone: it only
+kinematic group's members dynamic. It runs in **all** modes (on a baked template
+the members already sit under the axis, so it is a no-op there; the runtime
+re-parent pass it used to be idempotent to is deleted) and is monotone: it only
 ever sets `matrixAutoUpdate` to `true`.
 
 ### Known limitation
@@ -2554,7 +3408,20 @@ Weak devices automatically get the published **"Fast"** visual preset (Unlit ren
 - **Boot seed** — on a fresh install (no persisted visual settings), a standalone WebGL probe classifies the GPU tier; mobile devices and integrated/software GPUs seed "Fast", everything else "Default".
 - **FPS watchdog** — after each model load (5 s grace period), `viewer.currentFps` is sampled (15 valid samples, hidden-tab samples skipped); a median below 20 fps switches to "Fast" at runtime.
 
-Both stages show a one-time modal ("Performance mode enabled", dismissed with OK) and act **at most once per device** — the localStorage flag `rv-auto-quality-applied` guarantees a manual preset choice is never overridden afterwards. The preset can be changed anytime under **Settings → Visual → Preset**.
+Both stages show a one-time modal ("Performance mode enabled", dismissed with OK) and act **at most once per device** — the localStorage flag `rv-auto-quality-applied` guarantees a manual preset choice is never overridden afterwards.
+
+The preset can be changed anytime under **Settings → Visual → Preset** — and since plan-591
+straight from the viewport: the render-mode menu in the bottom-right cluster ends in two
+action rows, **Max Quality** (the shipped "Default" look: shadows, reflections, native
+resolution) and **Fast** (the way back). That matters because a Fast-seeded device could not
+reach full quality from the viewer at all before, and not at all under
+`lockedTabs: ['visual']` — where the rows stay hidden too, by design.
+
+Antialiasing is the one dial a preset cannot change live: it is a renderer *constructor*
+parameter, so switching it raises a non-blocking hint with a **Reload now** button instead of
+reloading behind your back. On **touch devices** that hint is suppressed: the boot path vetoes
+antialias there regardless of the stored preset, so a reload could not resolve the difference
+(lifted by plan-592). `web_status` reports `visualPreset` and `antialiasActive`.
 
 ## Library Thumbnails
 
@@ -2709,7 +3576,7 @@ no demo chip and no close button over the viewport.
 ### AAS resolution contract
 
 An AAS surface only appears when the link can actually be resolved. The resolvability is decided
-once per model load — where the project-specific `assetsBasePath` is known — and written to
+against the ONE active AAS source (`getActiveAasSource()`, see *Project AASX* below) and written to
 `node.userData._rvAasResolution`; tooltip, detail panel, inspector button, doc-mode click, sidebar
 counter and "Add to Cart" all read that one marking.
 
@@ -2728,7 +3595,75 @@ visible error on purpose — hiding it would mask a broken deployment.
 Links attached at runtime (`attachDriveDatasheets`, layout-planner placements) are marked
 `pending` synchronously and classified by `resolveAasSubtree()`, which is driven from the viewer's
 `model-loaded` and `layout-content-added` events so it also runs in modes where `AasLinkPlugin`
-is not loaded.
+is not loaded. Every change of a source's index (scan, import, project switch) re-classifies the
+scene: the source `revision` is part of the pass key, and a pass whose revision moved on while it
+read the index drops its result.
+
+### Project AASX (plan-596)
+
+A **Projekt-AASX** is an `.aasx` file directly in `<project>/aasx/` (flat — subfolders are not
+scanned). An `AASLink` references it by its **AAS id** (`AASLink.AASId`, unchanged — no new field,
+no export change); the project index maps the id to the file.
+
+**Sources** (`src/core/aas/rv-aas-source.ts`). Every AAS surface — tooltip, detail panel, PDF
+viewer, order manager, layout planner, resolution pass — reads `getActiveAasSource()`:
+
+| Source | Reads | Notes |
+|--------|-------|-------|
+| `ProjectAasSource` | the open project's `aasx/` through its `ProjectBackend` | folder: lazy `File`, ranged reads; bundled: decrypted by the backend; browser: OPFS |
+| `UrlAasSource` | a deployed `aasx/` directory (`public/aasx`, or the model's explicit `pluginConfig['aas-link'].assetsBasePath` + `aasx/`) | through the decrypt seam; HTTP range reads on unencrypted deploys |
+| `MergedAasSource` | project over deploy | **the project wins per AAS id**; the deploy-wide index stays the fallback (the SEW demo motors keep working inside a customer project) |
+
+`lookupAas(source, id)` returns the entry **with the source that listed it**, and the archive is
+opened from exactly that source — a file name present in both never mixes up two archives.
+
+**Index** (`src/core/aas/rv-aasx-project-index.ts`). When a project is adopted, after an import and
+on `rescanProjectAasx()`, a `folder` or `browser` project scans `aasx/*.aasx`: stat (size +
+`lastModified`) against the stored index, parse only what changed (4 in parallel, a broken file is
+recorded and the scan goes on), drop removed files, resolve a duplicate id to the alphabetically
+first file (Problems entry `aasx-duplicate-id`; unreadable files → `aasx-unreadable`). The result is
+written as `aasx/index.json` only when it changed **and** the backend is writable and still the open
+project; a read-only folder keeps it in memory. Runs are serialised per backend: a request during a
+run folds into ONE follow-up run, and only the last run writes. A `bundled` (hosted) project never
+scans — its `listAllFiles` is a manifest listing without AASX — it reads the delivered
+`aasx/index.json` only.
+
+`aasx/index.json` (project format; the reader also accepts the flat deploy-wide format):
+
+```json
+{
+  "version": 1,
+  "generator": "realvirtual-web",
+  "entries": { "<aas id>": { "file": "24_Festo.aasx", "idShort": "…", "productName": "Servo motor", "manufacturer": "Festo SE & Co. KG", "globalAssetId": "…" } },
+  "files": { "24_Festo.aasx": { "size": 953121, "lastModified": 1754235960000, "aasIds": ["<aas id>"], "shells": [ … ] } },
+  "duplicates": { "<aas id>": ["a.aasx", "b.aasx"] }
+}
+```
+
+**Reading archives** (`src/core/aas/rv-aasx-package.ts`, zip.js, dynamically imported). Only the
+ZIP directory, `[Content_Types].xml`, the OPC relationships (`_rels/.rels` → `aasx-origin` →
+`aas-spec`, with or without `www.`) and the AAS spec part are read — a 127 MB AASX costs about
+70 KB at scan time. XML (V1/V2/V3) and JSON are normalised into one model; nameplate values are
+found by IRDI (`0173-1#02-AAW338` product designation, `0173-1#02-AAO677` manufacturer) with the
+`idShort` as fallback. The detail of an id shows **that shell** and only its referenced submodels;
+PDF types come from `mimeType` (V2) or `contentType` (V3).
+
+**On demand.** A model start reads the index only (search text = product name, manufacturer,
+idShort); an archive is opened when a tooltip, the detail panel or a PDF asks for it — at most 2
+opens at a time, at most 3 packages kept open (LRU: the reader is closed and its object URLs are
+revoked), and a project switch releases every package of the previous project. AAS-generated
+`_rvPdfLinks` are written when a detail is loaded and **replaced** (never appended) on reload;
+links of other origins stay.
+
+**Inspector.** `AASLink.AASId` has its own renderer (`rv-aaslink-aasid-field-renderer.tsx`): a
+dropdown of the active index (`<product name | idShort> — <file>`), *Other ID…* for free text, a
+visible "AAS ID not found in project" for a value the index does not know, and — in a writable
+project — **Import AASX…**, which copies the picked file to `aasx/` under a free name (`-2`, `-3`),
+rescans and sets the id (with a second dropdown when the file holds several shells). Every write is
+the inspector's undoable `setField` op.
+
+Hosted and password-protected deploys carry `aasx/` like any other project content; see
+`doc-deploy.md` § *Password protection* for the encryption of AASX files.
 
 ### Settings Priority
 
@@ -2832,6 +3767,8 @@ function KpiBar() {
 | `?lockSettings` | Locks settings (highest priority) |
 | `?lockSettings=false` | Explicitly unlocks |
 | `?model=models/demo.glb` | Load specific model |
+| `?mode=<id>` | Boot into a workspace mode (`viewer`, `hmi`, `des`, `planner`, `commissioning`, `editor`) |
+| `?doc=new&mode=editor` | Editor entry: mint a new asset document, open the editor and the CAD import dialog |
 | `?renderer=webgpu` | Use WebGPU renderer |
 | `?option=<id>` | Load a **model variant** (see below) |
 
@@ -3107,8 +4044,36 @@ sidecar on the other end. `project.json` caches it for listing; when the two
 disagree, **the file wins**. The same vocabulary drives the share dialog
 (`rv_share`), so a shared assembly arrives as an assembly.
 
-**Where you see it.** The Projects dashboard has **no tabs**. It shows **one
-tree** (`ProjectTree.tsx`, model in
+### Picking a project: Add and New (plan-743)
+
+The dashboard's first screen is a flat list in two sections — **Bundled** (the
+shipped demo) and **Projects** — with two verbs in the Projects header:
+
+- **Add** links a folder you already have. One picker, one directory listing,
+  and the listing decides what it was: a folder with its own `project.json` is
+  linked and opened; a folder that merely *contains* project folders has each
+  child linked and **nothing written to it**; a folder with no manifest anywhere
+  is offered as a project — a recursive, uncapped `.glb` scan with a live
+  counter and Cancel writes `project.json` when it finishes. Cancel leaves the
+  folder exactly as it was found, because the manifest is the last step.
+  Dragging an OS folder onto the dashboard does the same thing.
+- **New** asks for a name and a location (the parent folder is remembered), and
+  shows the canonical folder name live before it creates anything.
+
+There is **no workspace root** any more, and no "Switch workspace". Every
+project carries its own folder handle, so permission is asked for when a project
+is opened and never when the list is drawn: a project whose grant lapsed shows a
+quiet lock icon, a refused grant says so on its row, and a folder that moved
+keeps its place with **Locate…** and **Remove from list** (which forgets the
+link and touches no file). The implicit browser project is the last row, named
+*Browser project* — "lives in this browser".
+
+Upgrading from an older build deletes the workspace keys rather than migrating
+them (see doc-persistence.md § *Retired by plan-743*); pointing **Add** at the
+old workspace root once restores the whole list.
+
+**Where you see it.** Inside a project the dashboard has **no tabs**. It shows
+**one tree** (`ProjectTree.tsx`, model in
 [`rv-project-tree.ts`](src/core/project/rv-project-tree.ts)): root 1 is the
 project folder, roots 2..n are the attached catalogs — URL, GitHub or Asset
 Manager — marked as such and restructurable only where they are writable. (A
@@ -3251,6 +4216,27 @@ as *files*, so it carries the two verbs that lead out of the browser:
   **CONNECT stays the one place a configuration is written**; the browser is read-only about it by
   decision (there is deliberately no second JSON editor beside CONNECT's live working set).
 
+**The three reference slots on the document hero card** (plan-718, plan-479). A selected document's
+hero card carries the references that belong to it, as Unity-style reference fields: **CONNECT**
+(`connectRef` → a `*.connect.json`), **PLUGIN** (`scriptRef` → a `.ts`/`.tsx` under the project's
+`plugins/`) and **KNOWLEDGE** (`knowledgeRef` → a `*.knowledge.md` or `.md`). All three behave the
+same way: drag the file's card onto the slot to bind it, the chip then shows the file name, a click
+on it reveals the file in the tree, the **×** clears the binding — and each is equally reachable
+without a mouse through the card's *Bind CONNECT configuration… / Bind plugin… / Bind knowledge
+file…* menu entries, which open a keyboard-driven picker listing only the project's valid
+candidates. A drop the slot cannot accept says why, in the card's own notice box, instead of failing
+quietly. `project.json` is never edited by hand for any of this, and `web_document_bind` is the same
+write over MCP.
+
+The PLUGIN slot has one thing the other two do not: a **runtime state**. Its chip reports not only
+that a file is bound but what happened to it on the last model load — *loaded* (from this build or
+from the project at run time), *missing* (the file is not in the project), *no exports* (the file
+carries no `registerModelPlugins`/`unregisterModelPlugins` pair, found by reading the source, never
+by running it), or *failed* (the import or the registration threw), each with the detail on hover.
+That diagnosis used to exist only as a `debugWarn` in the browser console. Because a document names
+its module directly, the module may be the plugin file itself — a collecting `plugins/index.ts` is
+no longer needed. Authoring rules: [`doc-scripting.md`](doc-scripting.md), *Project code*.
+
 Details: [`doc-persistence.md`](doc-persistence.md) §2.0-0, §3.6a, §3.6b, §3.7, §3.10.
 
 ## Document Storage — everything the user owns IS a GLB (plan-397, plan-716)
@@ -3288,10 +4274,21 @@ autosave bakes the *whole* log onto the *same* base bytes each time, so repeated
 saves are deterministic rather than cumulative.
 
 **References.** A node carrying `AssetReference` does not contain its subtree —
-it names another asset, which composition resolves and grafts in immediately
-after the parse, before any of the loader's tree passes. The referencing file
-carries an `AssetOverrides` layer; the referenced file is never modified. Trust
-is per subtree: a signed root does not lend its signature to unsigned content.
+it names another asset. **A reference is a placement, always (plan-757 Phase 2):**
+on a runtime load (`viewer.loadModel`, the embed) the loader leaves every
+non-`embedded` reference node empty and the viewer's `PlacementInstancer`
+materialises it after the bake through the same `ModelCache` recipe as a planner
+placement, recursively for references inside placed assets — nothing is grafted
+at runtime, the main model is the placement at the origin that is not cloned.
+History: until plan-757 composition used to resolve and graft references into the
+tree right after the parse, which kept every referencing document on the unbaked
+path. The asset editor (an authoring load) still composes and grafts, because it
+edits and saves the composed tree. The referencing file carries an
+`AssetOverrides` layer; the referenced file is never modified. Trust is per
+subtree and per chain: a signed root does not lend its signature to unsigned
+content, and a containing asset's weaker verdict gates the assets inside it.
+See `doc-node-paths.md` §9 for the paths, markers and save rules of nested
+content.
 
 **Flat export.** "Embed references" writes the composed tree with every
 reference marked `embedded: true` and its origin (`assetId` + `sha256`) kept, so
@@ -3351,11 +4348,124 @@ explicitly (`?debug=plugins`).
 
 ## Camera Controls
 
-- **Right mouse**: Orbit
-- **Middle mouse**: Pan
-- **Scroll**: Zoom
+- **Right mouse drag**: orbit around the focus point (`controls.target`), as before plan-515 (default); with the **Orbit around point under cursor** setting (Settings → Mouse & Touch, `visual.navigateAroundCursorPoint`) around the surface point under the cursor at the press (empty background keeps the previous orbit point)
+- **Middle mouse drag**: pan — the cursor's point on the plane through the focus point stays under the cursor (default); with **Orbit around point under cursor** the grabbed surface point stays under the cursor (Shift / Ctrl swap the two buttons)
+- **Scroll**: zoom toward the surface under the cursor (default, **Zoom to mouse cursor** on); with that setting off (`visual.wheelZoomToCursor = false`) toward the surface in the middle of the view (plan-515)
+- **Trackpad pinch (ctrl+wheel)**: zoom toward the surface under the fingers, in both settings
+- **Trackpad two-finger drag**: orbit
+- **Touch**: one finger orbits around the focus point (around the touched point with **Orbit around point under cursor**), pinch zooms toward the surface under the pinch midpoint, two fingers pan and keep that point under the fingers
+- **F**: frame the selection (the whole scene when nothing is selected); **Shift+F**: frame the whole scene
 - Damping enabled (default factor 0.2, `DEFAULT_ORBIT_NAVIGATION_SETTINGS` in `rv-orbit-controls-config.ts`; user-configurable together with rotate/pan/zoom speed)
 - Auto-fit to model bounding box after load
+
+**Scale-adaptive navigation (plan-515).** The wheel belongs to the
+`NavigationController` (`src/core/engine/rv-navigation-controller.ts`) — the only
+wheel path: a capture-phase listener on the viewer container takes wheel events
+whose target is the canvas (HMI panels in the container keep scrolling), so
+OrbitControls never sees them (since Phase 2 it gets no DOM input at all). Per frame at
+most one `RaycastManager.raycastSurface()` (the selection gates without the
+hover-type gate; a blocked, unselectable surface still counts). The anchor of a mouse-wheel
+notch is the cursor by default (`NavigationController.wheelZoomToCursor = true`,
+the pre-515 `zoomToCursor` feel) and the canvas centre when it is off (persisted
+setting `wheelZoomToCursor`, applied by `applyVisualSettings` and live through
+`setControlsConfig({ wheelZoomToCursor })`); a trackpad pinch always anchors under
+the fingers. A notch moves the
+camera along the picked ray by the fraction `s` = 0.2 × Zoom speed of the distance
+to the surface — never through it, never closer than 0.5 mm, the view direction
+unchanged; `controls.target` is put back on the view axis, so `controls.update()`
+cannot swing the view. Zoom-out is clamped at 20 scene radii. Ortho zooms
+`camera.zoom` about the same anchor (visible height 1 mm … 40 radii); a projection
+switch folds the ortho zoom into distance, so the extent survives persp ↔ ortho.
+Any navigation input completes a running projection tween first. Near/far are set
+per frame on both cameras from `SceneScale` (`rv-scene-scale.ts`, the one source
+of content bounds; recomputed on `model-loaded`, `layout-content-added`,
+`layout-transform-update`, `layout-drag-end`, `model-cleared`, and — while the
+simulation runs — grow-only for drive subtrees and MUs every 500 ms): far is never
+capped, near = max(focus/200, far/1e7, 10 µm). F / Shift+F / Escape are handled on
+the viewer container (focusable; the main viewer also takes keys from outside every
+viewer, e.g. the hierarchy). The framing floor of F, `fitToNodes`, `focusByPath`
+and `frameSceneContent` is 1 mm (was 10 cm). The former "Adaptive Nav" setting is
+gone; a stored value is ignored. The Escape-exits-isolate capture listener is scoped
+the same way (only keys that belong to this viewer).
+
+**Orbit, pan and touch (plan-515 Phase 2).** The controller is the only mouse,
+wheel and touch path: OrbitControls stays the camera state holder (`target`,
+`update()`, damping/speed settings, `enabled` as the take-over switch) but its
+mouse/touch mapping is off and its DOM listeners are disconnected while a
+controller is attached. **Defaults = the pre-515 OrbitControls feel** (decision
+2026-09-29 — only the scale fixes of plan-515 stay: the surface dolly, the
+zoom-out cap, dynamic near/far, scale-derived constants): right-drag and one
+finger orbit around the **fixed `controls.target`** (no pick at the press), and
+middle-drag pans on the plane through `controls.target` ⟂ view direction, keeping
+the cursor's point on that plane under the cursor (pan ∝ target distance). The
+option `NavigationController.navigateAroundCursorPoint` (persisted setting
+`navigateAroundCursorPoint`, default off, Settings → Mouse & Touch → **Orbit around
+point under cursor**, live through `setControlsConfig({ navigateAroundCursorPoint })`)
+switches to a **pivot kept separately from `controls.target`**: a press over a
+surface sets it to the surface point under the cursor, a press over empty
+background keeps the same world point; a pan then grabs the surface point under
+the cursor, one finger orbits around the touched point. Yaw turns about world Y,
+pitch about the camera's right axis (clamped 0.01 rad from the poles); position
+and orientation rotate together (`orbitAboutPivot` in `rv-navigation-math.ts`),
+so the view never jumps and the pivot keeps its pixel. Middle-drag pans on the
+plane through the grabbed point ⟂ view direction (`panKeepPoint`: ray-plane only,
+no pick during the drag). Touch: two fingers pinch toward the surface under their
+midpoint (the wheel's dolly / ortho zoom with the finger-distance ratio — in both
+modes) and pan. After every action `controls.target` is back on the view axis.
+Own inertia after a release (`velocity × (1 − dampingFactor)` per frame);
+`pointercancel` / `lostpointercapture` end a gesture without residual motion, any
+new input stops the inertia. The pivot resets to `controls.target` whenever
+someone else moves the camera — `CameraManager.cameraEpoch` (camera flights:
+fitToNodes / F / focus / bookmarks, projection switches, Follow / Sit-On) or a
+changed `controls.target` (view-state restore, multiuser take-over, annotations).
+Guards: `controls.enabled === false` (FPV, XR, Sit-On, shared view, gizmo drags) →
+no gesture; a camera flight cancels a drag and its inertia. While orbit-Follow
+runs, orbit (right-drag, one finger, inertia) turns about the CARRIED follow target
+(also with the surface-pivot option) — the follow keeps the new offset, no snap
+back — a pinch dollies toward it, the wheel zooms, and a middle-drag pan is an inert
+gesture (the follow always pulled a pan back to the part). The gesture's `'start'`
+goes out first, so an agent-eye follow still lets go and the drag becomes an
+ordinary one. `'start'` / `'end'` go out once per gesture
+on the controls (tooltips, agent eye, damping render budget). A pivot grab without
+movement changes nothing a multiuser broadcast carries. Per drag tick the
+controller and the math allocate nothing (measured, `navigation-allocations`).
+
+**Embed parity (plan-515 Phase 1b).** `RVEmbedViewer` runs the same controller with
+its own `RaycastManager` + `PickBackend` (rebuilt per load, hover off — surface
+picks only), its own `SceneScale` (bounds walk shared with the main viewer:
+`computeContentBoundsInto` / `computeMovingBoundsInto`) and near/far per rendered
+frame; perspective only. Its canvas is the keyboard scope (focusable, non-primary):
+F / Shift+F frame the scene through a `SelectionManager` without selection.
+`suspendContext()` releases controller, picker and key listener, `resumeContext()`
+re-wires them to the new canvas, `dispose()` leaves no DOM listener. Scope checks
+use `composedPath()`, so a key inside an embed's shadow root never reaches the main
+viewer.
+
+**Scale-derived constants (plan-515 Phase 3).** Four former metre constants follow
+`SceneScale` (pure functions in `src/core/engine/rv-scale-constants.ts`, re-applied on
+`SceneScale.onChange`, so placements and moving content update them too):
+- **Orientation gizmo** axis click: the old minimum distance (`2 · (model root → target)`
+  when that is > 0.5 m, else a floor) with the fixed 5 m floor replaced by
+  `min(5 m, 2 · scene radius)`, at least 1 mm — large scenes behave as before (a
+  zoomed-in user stays close), a 0.33 m model no longer jumps to ≥ 5 m; an empty scene
+  keeps the old 5 m.
+- **Ground checker** square (`viewer.groundSquareSize`): 1-2-5 value nearest to
+  `min(0.5 m, maxDim / 10)`, at least 1 mm — every model with maxDim ≥ 5 m keeps 0.5 m
+  (10 m machine, 500 m hall), only smaller ones get finer squares (0.33 m model → 5 cm);
+  an empty scene keeps 0.5 m. Independent of the disc size, so the 15 m authoring floor keeps its extent
+  while the checker still scales.
+- **FPV** for models < 3 m: eye height `0.5 · maxDim`, walk speed crosses the model in
+  3 s, sprint 2× (0.33 m → 0.165 m, 0.11 m/s); larger models keep 1.7 m / 2.5 m/s /
+  5 m/s. A value the user changed in the settings (anything but the store default) wins;
+  the derived values are never persisted, so the store's ranges are unchanged.
+- **Shadow camera**: pad `max(1.2 · maxDim, 5 cm)`, near `max(maxDim / 1000, 0.1 mm)`,
+  far `max(4 · maxDim, 0.5 m)`, sun `2 · maxDim` from the content centre — set at load
+  and refitted whenever the scale changes (was pad ≥ 5 m, near 0.1 m, far ≥ 50 m, which
+  clipped the shadows of sub-metre models).
+
+Acceptance: `tests/browser/scale-extremes.browser.test.ts` (500 m ground + 5 mm cube:
+initial fit, wheel to < 5 cm with rendered pixels, F, near + far at once, transform and
+simulation-moved content, pick p95, the constants for 500 m, 10 m and 0.33 m).
 
 ## Known Limitations
 
@@ -3365,9 +4475,24 @@ explicitly (`?debug=plugins`).
 
 Ported DriveBehaviours: `Drive_Simple`, `Drive_Cylinder`, `Drive_DestinationMotor`,
 `Drive_Speed`, `Drive_FollowPosition`, `Drive_Gear`, `Drive_PositionSwitch`,
-`Drive_ErraticPosition` and `Drive_SEWMovilink` (`RVDriveSEWMovilink`,
+`Drive_ErraticPosition`, `Drive_SEWMovilink` (`RVDriveSEWMovilink`,
 `rv-drive-sew-movilink.ts` — MOVILINK control word 1 / status word 1 with both
-speed encodings). Behaviours outside that list are not ported.
+speed encodings), `Drive_ProfidriveSpeed` and `Drive_ProfidrivePos` (PROFIdrive
+telegram 1 / 111 with the PROFIdrive state machine), `Drive_FestoFHPP`,
+`Drive_UniDriveMotor`, `Drive_ProportionalValve`, `Drive_ContinousDestination`
+and the add-on `DrivePulseEncoder`. Not ported: `Drive_Sequence`,
+`Drive_MeasureSpeedPosition`, `ForceDrive`, `StartDriveOnCondition`,
+`LogicStopDriveOnSensor`. The full mapping table is in `doc-unity-to-web.md`.
+
+`Drive_Cylinder.Mode` (plan-570, Web only so far — the Unity component has no such
+field yet) selects the valve behaviour. `Legacy` (default) latches `Out` / `In` as
+before (`OneBitCylinder` / `InvertOutputLogic` apply). The level-based modes ignore
+both flags and latch nothing: `DoubleActing` (5/3 valve, closed centre) moves only
+while exactly one of `Out` / `In` is true and holds where it stands when both are
+false or both true; `SingleActingPositive` moves to `MaxPos` while `Out` is true and
+springs back to `MinPos`; `SingleActingNegative` is the mirror image. `Enable` true,
+a simulation reset and a re-apply evaluate the levels present at that moment.
+Contract: `schema/v1/specification.md` § Drive_Cylinder.
 
 A SEW station is connected through CONNECT's MQTT **Json** topic mode: the
 Connect panel imports a SEW symbol table (`Name;Typ;Richtung`,

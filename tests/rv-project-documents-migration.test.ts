@@ -24,12 +24,11 @@ import {
   rollbackDocumentsMigration,
 } from '../src/core/project/rv-project-documents-migration';
 import {
-  assetDocumentsOf,
   readDocuments,
-  sceneDocumentsOf,
   sectionOfDocument,
   stableDocumentId,
 } from '../src/core/project/rv-project-documents';
+import { assetDocumentsOf, sceneDocumentsOf } from './helpers/document-sections';
 import {
   RV_PROJECT_SCHEMA_VERSION,
   isValidProjectV2,

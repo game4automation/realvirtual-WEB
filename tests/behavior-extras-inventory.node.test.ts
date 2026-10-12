@@ -126,6 +126,16 @@ const ALLOWLIST: readonly string[] = [
   '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_1 :: Agv',
   '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_2 :: Agv',
   '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_3 :: Agv',
+  // Reviewed 2026-10-07: the plan-903/558 AGV DES demo scene - eight
+  // path-following vehicles, intended `Agv` payloads on the continuous path.
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_1 :: Agv',
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_2 :: Agv',
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_3 :: Agv',
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_4 :: Agv',
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_5 :: Agv',
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_6 :: Agv',
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_7 :: Agv',
+  '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_8 :: Agv',
 
   // ── embedded self-spawning pallets / cell sources + sinks (engine-owned) ──
   'public/library/PalletHandling/CartonBox.glb :: CartonBox :: Source',
@@ -153,6 +163,37 @@ const ALLOWLIST: readonly string[] = [
   // The public copies under public/library/PalletHandling above are the same
   // assets and still cover the case.
   '../realvirtual-WebViewer-Private~/projects/mauser3dhmi/models/MauserCageline30.glb :: UsedWhenOperatingTwinWithoutPLC_Connection/Tube :: Source',
+  // plan-569 (2026-10-09): the laser welding demo's FG05 cap feed (a Source driven by a
+  // plant pulse, SourceGenerate) and the cap sink on the return conveyor (DeleteOnlyTag
+  // "Cap") — engine-owned continuous path, same pattern as the cell sources above.
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: CapRemoval_Sink :: Sink',
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: FG05_CapSource :: Source',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: CapRemoval_Sink :: Sink',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: FG05_CapSource :: Source',
+  // plan-569 Teil 4: the valve body circulates the same way - a source at the entry stopper
+  // (plant pulse, SourceGenerate) and a sink on the return conveyor (DeleteOnlyTag "Valve").
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: PartFeed_Source :: Source',
+  'public/demo-realvirtual/LaserWeldingAssemblyStation.glb :: ValveRemoval_Sink :: Sink',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: PartFeed_Source :: Source',
+  '../realvirtual-WebViewer-Private~/projects/LaserWeldingAssemblyStation/LaserWeldingAssemblyStation-570.glb :: ValveRemoval_Sink :: Sink',
+  // Reviewed 2026-09-13: the Festo cell's two boxes are the same embedded
+  // self-spawning pattern as the pallets above - a `Source` on a hidden inner
+  // node (AutomaticGeneration, PlaceOnTransportSurface), engine-owned, so
+  // nothing changes on the continuous path.
+  // 2026-10-07: same two boxes, re-parented in the Festo hierarchy rework
+  // (e06801631_asm/... -> Machine/Assembly/Boxen/...) — unchanged pattern, path only.
+  '../realvirtual-WebViewer-Private~/projects/festo/Festo.glb :: Machine/Assembly/Boxen/Box-Front :: Source',
+  '../realvirtual-WebViewer-Private~/projects/festo/Festo.glb :: Machine/Assembly/Boxen/Box-Rear :: Source',
+  // Reviewed 2026-09-27: the Festo logo demo (private b760563, "authored MU
+  // physics for the Festo logo demo") spawns and removes its logo MUs through
+  // an engine-owned Source/Sink pair - same case as the boxes above.
+  '../realvirtual-WebViewer-Private~/projects/festo/Festo.glb :: LogoSource :: Source',
+  '../realvirtual-WebViewer-Private~/projects/festo/Festo.glb :: LogoUnload :: Sink',
+  // Reviewed 2026-10-07: CPTC META_201 material flow (private 8eafd47, "META_201 material
+  // flow + physics chute") — an authored part Source feeding the physics chute and a Sink
+  // at its end, engine-owned like the Festo pairs above.
+  '../realvirtual-WebViewer-Private~/projects/CloverParkTechnicalCollege/META_201.glb :: ChuteSink :: Sink',
+  '../realvirtual-WebViewer-Private~/projects/CloverParkTechnicalCollege/META_201.glb :: PartSource :: Source',
 ];
 
 const ROOTS = [
@@ -179,15 +220,24 @@ describe('plan-455 §9.9 — the binding inventory is a frozen contract', () => 
     ).toEqual([]);
   });
 
-  it('the continuous kernel newly binds ONLY the three AGVs', () => {
+  it('the continuous kernel newly binds ONLY the AGVDemo three and the AGVFactory eight', () => {
     const continuous = HITS
       .filter(h => !h.placed && !ENGINE_OWNED.has(h.type))
       .map(key).sort();
 
+    // Strict frozen list: AGVDemo.glb (plan-455) + AGVFactory.glb (plan-903/558).
     expect(continuous).toEqual([
       '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_1 :: Agv',
       '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_2 :: Agv',
       '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVDemo.glb :: AGV_3 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_1 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_2 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_3 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_4 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_5 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_6 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_7 :: Agv',
+      '../realvirtual-WebViewer-Private~/projects/DiscreteEventSimulation/scenes/AGVFactory.glb :: AGV_8 :: Agv',
     ]);
   });
 

@@ -8,7 +8,7 @@
  * through the manager (F1/F2/F3/F9).
  */
 import { describe, expect, it, afterEach } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within, waitFor } from '@testing-library/react';
 import { ComponentSignalSlots } from '../src/plugins/signal-bind/InlineSignalSlots';
 import { makeInlineSlotFixture } from './_inline-slot-fixture';
 
@@ -49,9 +49,12 @@ describe('inline empty slot rows (plan-325 9.5)', () => {
 
     fireEvent.click(await screen.findByRole('option', { name: 'ModelSig' }));
 
-    // Bound through the manager: internal mapping is live immediately.
-    f.mgr.tick(0.02);
-    expect(f.mgr.getBindingLiveness(f.nodePath, 'Backward', '.')).toBe('live');
+    // Bound through the manager: internal mapping is live as soon as the
+    // (plan-512: queued, unit-aware) bind has run.
+    await waitFor(() => {
+      f.mgr.tick(0.02);
+      expect(f.mgr.getBindingLiveness(f.nodePath, 'Backward', '.')).toBe('live');
+    });
     // The row now shows the assignment chip + unlink.
     expect(await screen.findByLabelText('unbind Backward')).toBeTruthy();
     const backward = screen.getByTestId('slot-row-.-direct-property-Backward');

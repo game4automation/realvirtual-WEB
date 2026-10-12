@@ -31,6 +31,9 @@
 
 const CHANNEL_NAME = 'rv-scene-writes';
 
+/** The id of the one `stale-draft` notice (plan-546). */
+export const STALE_DRAFT_NOTICE_ID = 'stale-draft';
+
 export type SceneSyncNotice =
   | {
       kind: 'other-tab';
@@ -82,6 +85,27 @@ export type SceneSyncNotice =
       message: string;
     }
   | {
+      /**
+       * Unsaved changes of the open document were set aside (plan-546).
+       *
+       * Reported when a document draft was made on an older revision of the
+       * file than the one now on disk: the FILE is loaded, the draft kept under
+       * `draft/~stale/<documentId>/…`, and the user decides — Restore brings the
+       * newest set-aside draft back, Discard drops all of them. Bound to its
+       * `documentId`, never to "whatever is open".
+       */
+      kind: 'stale-draft';
+      documentId: string;
+      /** Document name, for the sentence. */
+      name: string;
+      /**
+       * Which sentence: the newest entry was made on an OLDER file revision, or
+       * on the CURRENT one (an entry Restore swapped aside).
+       */
+      variant: 'older-file' | 'other-changes';
+      message: string;
+    }
+  | {
       kind: 'orphaned-bindings';
       /** Model whose load produced the finding — reported once per load (F9). */
       modelId: string;
@@ -116,6 +140,9 @@ export function sceneSyncNoticeId(notice: SceneSyncNotice): string {
     case 'moved': return 'moved';
     case 'missing-document': return `missing-document:${notice.documentId}`;
     case 'autosave-error': return `autosave-error:${notice.slot}`;
+    // One id, not one per document: the notice belongs to the document that is
+    // OPEN, and opening another one replaces or clears it (plan-546 AC 10).
+    case 'stale-draft': return STALE_DRAFT_NOTICE_ID;
     case 'orphaned-bindings': return `orphaned-bindings:${notice.modelId}`;
   }
 }
@@ -366,6 +393,38 @@ export function reportAutosaveError(slot: string, reason: string): void {
 /** The matching recovery: the next successful autosave of `slot` withdraws it. */
 export function clearAutosaveError(slot: string): void {
   clearSceneSyncNotice(`autosave-error:${slot}`);
+}
+
+/**
+ * Surface set-aside unsaved changes of the open document (plan-546).
+ *
+ * The sentence follows the NEWEST set-aside entry: made on an older file
+ * revision ("older-file"), or on the current one ("other-changes" — what a
+ * Restore leaves behind when the user had edited after the first notice).
+ */
+export function reportStaleDraft(
+  documentId: string,
+  name: string,
+  variant: 'older-file' | 'other-changes' = 'older-file',
+): void {
+  emit({
+    kind: 'stale-draft',
+    documentId,
+    name,
+    variant,
+    message: variant === 'other-changes'
+      ? `You have other unsaved changes to "${name}".`
+      : `Your unsaved changes to "${name}" were made on an older version of the file. `
+        + 'The newer file is loaded.',
+  });
+}
+
+/** Withdraw the `stale-draft` notice — optionally only when it is about `documentId`. */
+export function clearStaleDraftNotice(documentId?: string): void {
+  const current = latest.get(STALE_DRAFT_NOTICE_ID);
+  if (!current) return;
+  if (documentId !== undefined && current.kind === 'stale-draft' && current.documentId !== documentId) return;
+  clearSceneSyncNotice(STALE_DRAFT_NOTICE_ID);
 }
 
 /**

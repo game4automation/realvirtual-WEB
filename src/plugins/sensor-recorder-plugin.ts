@@ -18,13 +18,22 @@ export class SensorRecorderPlugin implements RVViewerPlugin {
   readonly recorder = new SensorDataRecorder(3000, 10);
 
   private viewer: RVViewer | null = null;
+  private _offReady: (() => void) | null = null;
 
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     this.viewer = viewer;
     this.recorder.setSensors(viewer.transportManager?.sensors ?? []);
+    // Sensors of placed references register AFTER this callback (scene-ready
+    // contract) — take the complete list once they are all in.
+    this._offReady?.();
+    this._offReady = viewer.on('placements-materialized', (info) => {
+      if (!info.aborted && info.materialized > 0) this.recorder.setSensors(viewer.transportManager?.sensors ?? []);
+    });
   }
 
   onModelCleared(): void {
+    this._offReady?.();
+    this._offReady = null;
     this.recorder.clear();
   }
 

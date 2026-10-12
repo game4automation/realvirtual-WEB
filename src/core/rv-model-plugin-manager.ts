@@ -16,6 +16,7 @@ import { debug, logInfo, debugWarn } from './engine/rv-debug';
 import type { RVViewer } from './rv-viewer';
 import { applyEnvironmentPreset, hasUserEnvironmentOverride, type EnvironmentPresetName } from './hmi/environment-presets';
 import { isContextActive, _subscribe as subscribeUiContext } from './hmi/ui-context-store';
+import { modeContext, type ModeId } from './rv-mode-manager';
 import { peekPersistedActivePanels } from './hmi/left-panel-manager';
 import {
   loadRuntimeScript,
@@ -23,6 +24,13 @@ import {
   type RuntimeScriptConsent,
   type RuntimeScriptSource,
 } from './rv-script-runtime-loader';
+import {
+  clearPluginBindingState,
+  reportPluginBinding,
+  reportPluginFailed,
+  reportPluginLoaded,
+  type PluginBindingFailure,
+} from './rv-plugin-binding-state';
 
 // ─── Types ─────────────────────────────────────────────────────────────
 
@@ -42,6 +50,14 @@ export interface ModelPluginModule {
    * the Environment settings tab (changes persist for the session).
    */
   defaultEnvironmentPreset?: EnvironmentPresetName;
+  /**
+   * Authoring modes (e.g. `['des']`) in which this module stays registered
+   * although the planner context is active. Without it, every authoring mode
+   * suppresses model plugins for a clean planning workspace — which also drops
+   * project simulation logic a DES run needs (an AGV work plan, a dispatcher).
+   * The plain planner mode keeps suppressing unless it is listed here too.
+   */
+  runInAuthoringModes?: readonly ModeId[];
   /** Register all plugins for this model. */
   registerModelPlugins(viewer: RVViewer): void;
   /** Unregister (remove) all plugins that were registered. */
@@ -111,12 +127,12 @@ const pluginModuleImporters: Record<string, () => Promise<ModelPluginModule>> =
 const privatePluginModuleImporters: Record<string, () => Promise<ModelPluginModule>> =
   __RV_HAS_PRIVATE__
     ? import.meta.glob<ModelPluginModule>([
-        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.ts',
-        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.tsx',
-        '../../../realvirtual-web-pro/projects/*/plugins/index.ts',
-        '../../../realvirtual-web-pro/projects/*/plugins/index.tsx',
-        '../../../projects/*/plugins/index.ts',
-        '../../../projects/*/plugins/index.tsx',
+        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/**/*.ts',
+        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/**/*.tsx',
+        '../../../realvirtual-web-pro/projects/*/plugins/**/*.ts',
+        '../../../realvirtual-web-pro/projects/*/plugins/**/*.tsx',
+        '../../../projects/*/plugins/**/*.ts',
+        '../../../projects/*/plugins/**/*.tsx',
       ], { eager: false })
     : {};
 
@@ -145,12 +161,12 @@ if (import.meta.env.DEV) {
 const privatePluginSourceImporters: Record<string, () => Promise<string>> =
   __RV_HAS_PRIVATE__
     ? import.meta.glob<string>([
-        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.ts',
-        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/index.tsx',
-        '../../../realvirtual-web-pro/projects/*/plugins/index.ts',
-        '../../../realvirtual-web-pro/projects/*/plugins/index.tsx',
-        '../../../projects/*/plugins/index.ts',
-        '../../../projects/*/plugins/index.tsx',
+        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/**/*.ts',
+        '../../../realvirtual-WebViewer-Private~/projects/*/plugins/**/*.tsx',
+        '../../../realvirtual-web-pro/projects/*/plugins/**/*.ts',
+        '../../../realvirtual-web-pro/projects/*/plugins/**/*.tsx',
+        '../../../projects/*/plugins/**/*.ts',
+        '../../../projects/*/plugins/**/*.tsx',
       ], { eager: false, query: '?raw', import: 'default' })
     : {};
 
@@ -172,6 +188,14 @@ export async function discoverDeclaredScriptRefs(
   if (wanted === '') return [];
   const out: Array<{ scriptRef: string; models: string[] }> = [];
   for (const [path, load] of Object.entries(privatePluginSourceImporters)) {
+    // Aggregators only (plan-479 Phase 3, R11). The migration reads exactly one
+    // thing — a `models: []` declaration — and that only ever appears in a
+    // collecting `index.ts`. With the glob opened this loop would otherwise
+    // FETCH the source text of every helper file of the project on every
+    // project open (nine of them for Toray), for an answer none of them can
+    // give. Not an execution cost, but a real one, and the `index.` filter in
+    // `_findByModelName` does not cover it: that one walks a different glob.
+    if (!isAggregatorModulePath(path)) continue;
     const segments = path.replace(/\\/g, '/').split('/');
     const pluginsIdx = segments.indexOf('plugins');
     if (pluginsIdx <= 0) continue;
@@ -201,6 +225,88 @@ export function discoveredPluginModulePaths(): string[] {
   return Object.keys(allImporters);
 }
 
+/**
+ * The exports a project script must carry to be a plugin module (plan-479 F4).
+ *
+ * `export function registerModelPlugins`, `export const registerModelPlugins =`
+ * and `export async function …` are the three spellings that occur in the tree.
+ * Deliberately NOT exhaustive: `export { x as registerModelPlugins }` is not
+ * matched, exactly as `discoverDeclaredScriptRefs` does not match every
+ * spelling of `models: []`. The consequence of a miss is a warning chip on a
+ * plugin that works — visible, wrong in the harmless direction, and corrected
+ * by the runtime verdict the moment the module actually loads.
+ */
+function exportRegex(name: string): RegExp {
+  return new RegExp(`\\bexport\\s+(?:async\\s+)?(?:function|const|let|var)\\s+${name}\\b`);
+}
+
+const REGISTER_EXPORT = exportRegex('registerModelPlugins');
+const UNREGISTER_EXPORT = exportRegex('unregisterModelPlugins');
+
+/** What {@link scanPluginExports} found in a file's source text. */
+export interface PluginExportScan {
+  /** Both halves of the pair are exported — this file can be a plugin module. */
+  isPluginModule: boolean;
+  hasRegister: boolean;
+  hasUnregister: boolean;
+  /** The scan could not read the file at all (not in the build, or unreadable). */
+  unreadable: boolean;
+}
+
+/**
+ * {@link scanPluginExports} against a source text that is already in hand.
+ *
+ * Split out so the RULE is testable without a glob — the glob resolves to
+ * whatever happens to be on the machine running the test, which is the one
+ * thing a test of the rule must not depend on.
+ */
+export function scanPluginExportsIn(source: string): PluginExportScan {
+  const text = String(source ?? '');
+  const hasRegister = REGISTER_EXPORT.test(text);
+  const hasUnregister = UNREGISTER_EXPORT.test(text);
+  return {
+    isPluginModule: hasRegister && hasUnregister,
+    hasRegister,
+    hasUnregister,
+    unreadable: false,
+  };
+}
+
+/**
+ * Does the file at this `scriptRef` export the plugin pair — WITHOUT running it?
+ *
+ * The same `?raw` mechanism {@link discoverDeclaredScriptRefs} uses, and the
+ * reason F4 is answerable at all: the question "is this file a plugin" must not
+ * be answered by importing the file, because importing it is precisely what a
+ * user who bound the wrong file does not want to happen.
+ *
+ * `projectFolder` narrows to the open project's copy, case-insensitively on the
+ * one segment, exactly like {@link pathIsInProject}. A reference nothing matches
+ * comes back `unreadable` — "no answer", which the chip must not paint as "no
+ * exports": a project whose code is not in this build resolves at runtime.
+ */
+export async function scanPluginExports(
+  scriptRef: string,
+  projectFolder: string | null = null,
+): Promise<PluginExportScan> {
+  const miss: PluginExportScan = {
+    isPluginModule: false, hasRegister: false, hasUnregister: false, unreadable: true,
+  };
+  const ref = normalizeScriptRef(scriptRef);
+  if (ref === '') return miss;
+  for (const [path, load] of Object.entries(privatePluginSourceImporters)) {
+    if (!moduleMatchesScriptRef(path, ref)) continue;
+    if (!pathIsInProject(path, projectFolder)) continue;
+    try {
+      return scanPluginExportsIn(await load());
+    } catch (e) {
+      debugWarn('plugins', `Could not read the source of ${path}: ${e}`);
+      return miss;
+    }
+  }
+  return miss;
+}
+
 /** What a {@link ModelPluginManager} needs from the outside world. */
 export interface ModelPluginManagerOptions {
   /**
@@ -218,6 +324,22 @@ export interface ModelPluginManagerOptions {
    * runs inside `loadModel()` and the composition root already knows both.
    */
   scriptRefProvider?: (ctx: { modelUrl: string; modelName: string }) => string | null | undefined;
+  /**
+   * The folder of the OPEN project, or null when no project is open (plan-477
+   * Phase 0 / F15).
+   *
+   * A `scriptRef` is project-RELATIVE, and the only entry the discovery glob
+   * loads is `plugins/index.ts` — so every project that carries code carries the
+   * identical reference, and the reference alone names one module per project.
+   * Without this the resolver took whichever of them the glob happened to list
+   * first, which is a defect three shipped projects have been carrying silently.
+   *
+   * A function, and a seam, for the same reason `scriptRefProvider` is one: the
+   * manager must not import the project store, and the open project changes
+   * underneath a long-lived manager. Returning null keeps the old behaviour,
+   * which is what a model that is not a document of any project wants.
+   */
+  projectFolderProvider?: (ctx: { modelUrl: string; modelName: string }) => string | null | undefined;
   /**
    * Where the project's own files can be read from — the runtime mode of stage
    * 2b (§2.6 mode 2).
@@ -263,6 +385,49 @@ export function moduleMatchesScriptRef(modulePath: string, scriptRef: string): b
   return path === ref || path.endsWith(`/${ref}`);
 }
 
+/**
+ * Whether a discovered module path belongs to the named project (plan-477 F15).
+ *
+ * `projectFolder === null` means "no open project" and accepts everything —
+ * the pre-Phase-0 behaviour, kept for models that are not a document of any
+ * project and for the bundled public model plugins, which have no project
+ * folder to be in.
+ *
+ * The comparison is on the folder segment that precedes `plugins/`, matched
+ * case-insensitively: a project folder (`Toray`) and the `canonicalName` the
+ * caller holds (`toray`) legitimately differ in case, and
+ * `validate-project.mjs` accepts that on purpose.
+ */
+export function pathIsInProject(modulePath: string, projectFolder: string | null): boolean {
+  const wanted = String(projectFolder ?? '').trim().toLowerCase();
+  if (wanted === '') return true;
+  const segments = normalizeScriptRef(modulePath).replace(/^(\.\.\/)+/, '').split('/');
+  // plan-539 F6b: a bundled public model plugin (`/src/plugins/models/<X>/index.ts`)
+  // has no project folder to be in — it ships with every build, the public deploy
+  // included, so a project's `scriptRef` may name it from any project.
+  if (segments[0] === 'src' && segments[1] === 'plugins' && segments[2] === 'models') return true;
+  const pluginsIdx = segments.indexOf('plugins');
+  if (pluginsIdx <= 0) return false;
+  return segments[pluginsIdx - 1].toLowerCase() === wanted;
+}
+
+/**
+ * Is this glob path an AGGREGATOR module — a file named `index.*`?
+ *
+ * The one shape that may carry a legacy `models: string[]` declaration, and
+ * therefore the only shape the deprecated name resolver has any reason to
+ * IMPORT. Both halves of `_findByModelName` ask this, so the fast path's "which
+ * folder is this" and the slow path's "may I execute this" cannot drift apart
+ * (plan-479 Phase 3).
+ *
+ * Exported so a test can assert the rule against the paths Vite really
+ * produced, rather than only against injected ones (Finding T6).
+ */
+export function isAggregatorModulePath(modulePath: string): boolean {
+  const segments = String(modulePath ?? '').replace(/\\/g, '/').split('/');
+  return segments.findIndex(s => s.startsWith('index.')) > 0;
+}
+
 // ─── Manager ───────────────────────────────────────────────────────────
 
 export class ModelPluginManager {
@@ -283,12 +448,31 @@ export class ModelPluginManager {
   private _moduleKeyByLookup = new Map<string, string>();
   private readonly _importers: Record<string, () => Promise<ModelPluginModule>>;
   private readonly _scriptRefProvider: ModelPluginManagerOptions['scriptRefProvider'];
+  private readonly _projectFolderProvider: ModelPluginManagerOptions['projectFolderProvider'];
   private readonly _runtimeScriptSource: ModelPluginManagerOptions['runtimeScriptSource'];
   private readonly _runtimeScriptConsent: RuntimeScriptConsent | undefined;
+  /**
+   * Where the module of the resolution in flight came from, and whether that
+   * resolution already published a specific failure (plan-479 Phase 4).
+   *
+   * Per-resolution scratch rather than durable state: the published state lives
+   * in `rv-plugin-binding-state`, and these two only exist so the outer
+   * `_findByScriptRef` does not overwrite the inner runtime path's more precise
+   * diagnosis with its own vaguer one.
+   */
+  private _resolvedFrom: 'bundle' | 'runtime' = 'bundle';
+  private _reportedFailure = false;
+
+  /** Publish one failure and remember that a specific one was published. */
+  private _fail(scriptRef: string, reason: PluginBindingFailure, detail: string): void {
+    this._reportedFailure = true;
+    reportPluginFailed(scriptRef, reason, detail);
+  }
 
   constructor(opts: ModelPluginManagerOptions = {}) {
     this._importers = opts.importers ?? allImporters;
     this._scriptRefProvider = opts.scriptRefProvider;
+    this._projectFolderProvider = opts.projectFolderProvider;
     this._runtimeScriptSource = opts.runtimeScriptSource;
     this._runtimeScriptConsent = opts.runtimeScriptConsent;
   }
@@ -302,9 +486,17 @@ export class ModelPluginManager {
    */
   invalidateScript(scriptRefOrModulePath: string): void {
     const ref = normalizeScriptRef(scriptRefOrModulePath);
-    const viaLookup = this._moduleKeyByLookup.get(`ref:${ref}`);
+    // Since plan-477 the lookup key carries the project (`ref:<folder>:<ref>`),
+    // so one reference can have several entries — invalidate ALL of them, or a
+    // saved script would go stale in every project but the one that happened to
+    // resolve last.
+    const viaLookup = new Set(
+      [...this._moduleKeyByLookup]
+        .filter(([lookup]) => lookup.startsWith('ref:') && lookup.endsWith(`:${ref}`))
+        .map(([, moduleKey]) => moduleKey),
+    );
     const keys = [...this.moduleCache.keys()].filter(
-      key => key === viaLookup
+      key => viaLookup.has(key)
         || key === scriptRefOrModulePath
         || key === `runtime:${ref}`
         || moduleMatchesScriptRef(key, ref),
@@ -332,8 +524,27 @@ export class ModelPluginManager {
   private _lastViewer: RVViewer | null = null;
   /** Current planner-active state, tracked to detect transitions. */
   private _plannerActive = false;
+  /**
+   * Has the FIRST model of this session been loaded? The persisted left-panel
+   * peek in `onModelLoading` is a boot-only prediction and is consulted only
+   * while this is false (see the comment there).
+   */
+  private _bootLoadSeen = false;
   /** Unsub for the UI-context store subscription. */
   private _ctxUnsub: (() => void) | null = null;
+
+  /**
+   * A module for the current model was resolved, but its plugins have NOT been
+   * registered yet — the planner-mode deferral above.
+   *
+   * Read by `RVViewer._collectBakeClaims()`: in that state no plugin exists to
+   * answer `bakeClaims()`, so the bake's D17 claim set is not empty, it is
+   * UNKNOWN (plan-754 Phase 1c). Resolved before `loadGLB` runs, because
+   * `onModelLoading` is awaited first.
+   */
+  hasDeferredModelPlugins(): boolean {
+    return this.activeModule !== null && !this._registered;
+  }
 
   /** Extract the project folder name from a private plugin path, or null for public plugins. */
   private extractProjectFolder(path: string): string | null {
@@ -390,34 +601,70 @@ export class ModelPluginManager {
   private async findModuleWithPath(
     modelName: string,
     scriptRef: string | null,
+    projectFolder: string | null,
   ): Promise<{ mod: ModelPluginModule; projectFolder: string | null } | null> {
-    if (scriptRef) return this._findByScriptRef(scriptRef);
+    if (scriptRef) return this._findByScriptRef(scriptRef, projectFolder);
     return this._findByModelName(modelName);
   }
 
+  /**
+   * Resolve a `scriptRef` to a module, within the open project when one is known.
+   *
+   * `projectFolder` narrows the candidate set to modules that live under
+   * `/projects/<projectFolder>/` — the fix of plan-477 Phase 0. It is matched
+   * case-INSENSITIVELY on that one segment, for the same reason
+   * {@link discoverDeclaredScriptRefs} does: a project's folder and its
+   * `canonicalName` legitimately differ in case (`Toray` / `toray`), and the
+   * caller has the latter. The reference TAIL stays case-sensitive (K3) — that
+   * is a statement about a filename, and unchanged.
+   *
+   * `projectFolder === null` is the old behaviour, unchanged: the first module
+   * whose path ends with the reference wins. That is what a model outside every
+   * project gets, and a bundled public model plugin has no project folder at all.
+   */
   private async _findByScriptRef(
     scriptRef: string,
+    projectFolder: string | null = null,
   ): Promise<{ mod: ModelPluginModule; projectFolder: string | null } | null> {
     const ref = normalizeScriptRef(scriptRef);
-    const lookup = `ref:${ref}`;
+    this._resolvedFrom = 'bundle';
+    // Per project: two projects legitimately reference the same file NAME and
+    // must not share one cache entry (the whole point of the fix).
+    const lookup = `ref:${projectFolder ?? ''}:${ref}`;
     const hit = this._cached(lookup);
     if (hit) return hit;
 
     for (const [path, importer] of Object.entries(this._importers)) {
       if (!moduleMatchesScriptRef(path, ref)) continue;
+      if (!pathIsInProject(path, projectFolder)) continue;
       try {
         return await this._loadModule(path, importer, [lookup]);
       } catch (e) {
         debugWarn('plugins', `Failed to load model plugins from ${path} (scriptRef "${ref}"): ${e}`);
+        // plan-479 F6: the same diagnosis, on the chip instead of in the
+        // console — this is the one place the user can see it.
+        this._fail(ref, 'import-failed', `Importing ${path} failed: ${e}`);
         return null;
       }
     }
     // Nothing in this build carries that file. Stage 2b: the project may carry
     // it itself, compiled, next to the source — read it out of the project and
     // import it. Still no name fallback; the reference is still authoritative.
+    this._resolvedFrom = 'runtime';
     const runtime = await this._findByRuntimeScript(ref, lookup);
     if (runtime) return runtime;
 
+    // Only when the runtime path had nothing more specific to say: it reports
+    // `import-failed` and `no-exports` itself, and overwriting those with the
+    // vaguer "resolves to nothing" would lose the useful half.
+    if (!this._reportedFailure) {
+      this._fail(
+        ref,
+        'unresolved',
+        `"${ref}" matches no module in this build and no compiled .js sibling in `
+        + 'the project.',
+      );
+    }
     debugWarn(
       'plugins',
       `scriptRef "${ref}" resolves to no bundled module and no runnable .js sibling in the `
@@ -458,6 +705,8 @@ export class ModelPluginManager {
       const why = lastRuntimeScriptFailure();
       if (why === 'denied' || why === 'import-failed') {
         debugWarn('plugins', `Runtime script for "${ref}" was not loaded (${why}).`);
+        this._fail(ref, 'import-failed', `The project's compiled script for "${ref}" `
+          + `was not loaded (${why}).`);
       }
       return null;
     }
@@ -471,6 +720,8 @@ export class ModelPluginManager {
         `Runtime script "${loaded.jsRef}" exports no registerModelPlugins/unregisterModelPlugins `
         + 'pair — nothing to register.',
       );
+      this._fail(ref, 'no-exports', `"${ref}" exports no registerModelPlugins/`
+        + 'unregisterModelPlugins pair — there is nothing to register.');
       return null;
     }
     logInfo(`Model plugins for "${ref}" loaded from the project at runtime (v${loaded.version}).`);
@@ -484,8 +735,19 @@ export class ModelPluginManager {
     const hit = this._cached(lookup);
     if (hit) return hit;
 
-    // Try each importer — check folder name match first (fast path)
+    // Try each importer — check folder name match first (fast path).
+    //
+    // Aggregators only, like the slow path below (plan-479 Phase 3, R2). The
+    // `folderName` half already implied it — it is null for a non-index file —
+    // but the `projectName` half did NOT: it reads the segment before
+    // `plugins/`, which every helper file of a project shares with its
+    // aggregator. So with the glob opened, a model named after its project
+    // would have imported whichever helper `Object.entries` happened to list
+    // first, and a helper that throws would have aborted the whole resolution
+    // (the catch below returns null rather than continuing). Every real match
+    // in the tree is an `index.` module, so nothing legitimate is lost.
     for (const [path, importer] of Object.entries(this._importers)) {
+      if (!isAggregatorModulePath(path)) continue;
       // Extract folder name from path: /src/plugins/models/DemoRealvirtualWeb/index.ts → DemoRealvirtualWeb
       const segments = path.replace(/\\/g, '/').split('/');
       const indexIdx = segments.findIndex(s => s.startsWith('index.'));
@@ -509,7 +771,20 @@ export class ModelPluginManager {
     // Slow path: load all modules and check their `models` array. DEPRECATED —
     // `documents[].scriptRef` replaces it, and this path is read for one release
     // generation so an unmigrated project keeps working (F10/F5).
+    //
+    // Restricted to `index.` modules, exactly like the fast path above
+    // (plan-479 Phase 3, R2). This loop calls `importer()` — it EXECUTES the
+    // module, with every side effect and every chunk fetch that implies, purely
+    // to read `mod.models`. While the discovery glob only ever matched
+    // `plugins/index.ts` that cost one module per project; the moment the glob
+    // opens to `plugins/**` it would be every helper file of every project, on
+    // every model load that has no `scriptRef`. So the filter is a CORRECTNESS
+    // guard, not an optimisation, and it stays even if the glob is ever closed
+    // again (R15): a `models: []` declaration only ever lives in an aggregator,
+    // which is what an `index.` module is — verified across all five private
+    // projects, where not one of the 17 helper files exports the pair.
     for (const [path, importer] of Object.entries(this._importers)) {
+      if (!isAggregatorModulePath(path)) continue;
       try {
         const mod = await importer();
         if (mod.models && mod.models.includes(modelName)) {
@@ -556,9 +831,20 @@ export class ModelPluginManager {
     // also peek the persisted left-panel state directly to decide whether
     // to skip plugin registration up-front, avoiding a register→unregister
     // flash of the demo HMI on reload-while-planner-was-open.
-    this._plannerActive =
-      isContextActive('planner') ||
-      peekPersistedActivePanels().has('layout-planner');
+    //
+    // BOOT ONLY. After the first load the live context is the truth: the
+    // planner plugin has read its persisted state by then, and a stale
+    // `layout-planner` in localStorage (left behind by an earlier visit to the
+    // planner demo) would otherwise defer the plugins of every later model
+    // switch that is not followed by a mode change — a recents click onto the
+    // demo from HMI mode loaded the model with none of its HMI (2026-09-26).
+    // The boot case is safe on its own: main.ts applies the workspace mode
+    // AFTER the load, and that context change replays the deferred
+    // registration through `_handleContextChange`.
+    const persistedPlannerOpen =
+      !this._bootLoadSeen && peekPersistedActivePanels().has('layout-planner');
+    this._bootLoadSeen = true;
+    this._plannerActive = isContextActive('planner') || persistedPlannerOpen;
     this._ensureContextSubscription();
 
     // Same model — nothing to do
@@ -590,7 +876,23 @@ export class ModelPluginManager {
       // consequence of no reference is "no project code", which is a normal state.
       debugWarn('plugins', `scriptRef provider failed for '${modelName}': ${e}`);
     }
-    const findResult = await this.findModuleWithPath(modelName, scriptRef);
+    // …and WHICH project's copy of that reference (plan-477 Phase 0). Same
+    // contract as above: a provider that throws leaves the resolution
+    // project-less, which is the pre-Phase-0 behaviour, not a failed load.
+    let openProjectFolder: string | null = null;
+    try {
+      openProjectFolder = this._projectFolderProvider?.({ modelUrl: resolveUrl, modelName }) ?? null;
+    } catch (e) {
+      debugWarn('plugins', `project folder provider failed for '${modelName}': ${e}`);
+    }
+    // plan-479 F6: the chip says "bound" from here on, and is corrected the
+    // moment the resolution has an answer. Reported BEFORE resolving so a slow
+    // or hanging resolution shows this document's state, not the last one's.
+    this._reportedFailure = false;
+    if (scriptRef) reportPluginBinding(scriptRef);
+    else clearPluginBindingState();
+
+    const findResult = await this.findModuleWithPath(modelName, scriptRef, openProjectFolder);
     if (findResult) {
       const { mod, projectFolder } = findResult;
       try {
@@ -620,12 +922,22 @@ export class ModelPluginManager {
         this.activeModule = mod;
         this.activeModelName = modelName;
 
-        if (this._plannerActive) {
+        if (this._isSuppressed(mod)) {
           debug('plugins', `Skipped model plugins for '${modelName}' (planner active — will register on exit)`);
         } else {
           debug('plugins', `Loading model plugins for '${modelName}'${projectFolder ? ` (project: ${projectFolder})` : ''}`);
-          viewer.withDefaultOrigin('project', () => mod.registerModelPlugins(viewer));
+          try {
+            viewer.withDefaultOrigin('project', () => mod.registerModelPlugins(viewer));
+          } catch (e) {
+            // The one failure the manager only ever wrote to `console.error`:
+            // the module is there, it imported, and its own registration threw.
+            // Nothing else can tell the user that (plan-479 F6).
+            if (scriptRef) this._fail(scriptRef, 'register-threw',
+              `registerModelPlugins threw: ${e}`);
+            throw e;
+          }
           this._registered = true;
+          if (scriptRef) reportPluginLoaded(scriptRef, this._resolvedFrom);
           logInfo(`Model plugins loaded for '${modelName}'`);
         }
       } catch (e) {
@@ -655,16 +967,29 @@ export class ModelPluginManager {
     this._ctxUnsub = subscribeUiContext(() => this._handleContextChange());
   }
 
+  /**
+   * Should `mod` stay unregistered right now? Planner context active, and no
+   * mode the module opted into via `runInAuthoringModes` is active. A mode's
+   * `mode:<id>` context is set BEFORE the planner's activate hook raises the
+   * `planner` context, so entering an opted-in mode never unregisters first.
+   */
+  private _isSuppressed(mod: ModelPluginModule): boolean {
+    if (!this._plannerActive) return false;
+    return !mod.runInAuthoringModes?.some((m) => isContextActive(modeContext(m)));
+  }
+
   private _handleContextChange(): void {
-    const inPlanner = isContextActive('planner');
-    if (inPlanner === this._plannerActive) return; // not a planner transition
-    this._plannerActive = inPlanner;
+    this._plannerActive = isContextActive('planner');
 
     const viewer = this._lastViewer;
     const mod = this.activeModule;
     if (!viewer || !mod) return;
 
-    if (inPlanner && this._registered) {
+    // Reconcile on EVERY context change, not only planner toggles: a switch
+    // between two authoring modes (DES ↔ planner) keeps `planner` on but
+    // flips the mode context an opt-in depends on.
+    const suppressed = this._isSuppressed(mod);
+    if (suppressed && this._registered) {
       // Planner just activated — pull model plugins out of the workspace.
       debug('plugins', `Planner active — unregistering model plugins for '${this.activeModelName}'`);
       try {
@@ -673,8 +998,8 @@ export class ModelPluginManager {
         console.error(`[ModelPluginManager] Error unloading plugins for '${this.activeModelName}':`, e);
       }
       this._registered = false;
-    } else if (!inPlanner && !this._registered) {
-      // Planner just deactivated — register the deferred plugins. Each
+    } else if (!suppressed && !this._registered) {
+      // Planner deactivated (or an opted-in mode entered) — register the deferred plugins. Each
       // plugin's onModelLoaded fires retroactively via viewer.use() (see
       // RVViewer.use → retroactive call when _lastLoadResult is set).
       debug('plugins', `Planner inactive — registering model plugins for '${this.activeModelName}'`);

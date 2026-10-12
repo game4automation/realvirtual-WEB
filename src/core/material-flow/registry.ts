@@ -101,9 +101,9 @@ export function registerMaterialFlow(def: MaterialFlowDefinition): void {
   if (getRegisteredFactories().has(type)) return;
   try {
     registerComponentSchema(type, def.schema as ComponentSchema, {
-      filterLabel: 'MaterialFlow',
-      hierarchyVisible: true,
-      inspectorVisible: true,
+      ui: { filter: 'MaterialFlow', category: 'material-flow' },
+      ...(def.bake ? { bake: def.bake } : {}),
+      ...(def.pick ? { pick: def.pick } : {}),
     });
   } catch (e) {
     console.warn(`[material-flow] registerComponentSchema('${type}') failed:`, e);

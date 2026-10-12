@@ -2,9 +2,10 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+// plan-596: the XML → detail mapping moved to aas-detail.ts (lazily loaded by
+// the parser, off the entry chunk); the assertions are unchanged.
+import { parseAasXml, parseDocuments } from '../src/plugins/aas-detail';
 import {
-  parseAasXml,
-  parseDocuments,
   cleanLabel,
   loadIndex,
   loadAasxById,

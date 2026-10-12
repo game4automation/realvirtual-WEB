@@ -6,11 +6,18 @@
  *
  * When the private folder (realvirtual-WebViewer-Private~) is absent,
  * Vite resolves `@rv-private/private-plugins` to this stub.
- * The function body is empty — no private plugins to register.
+ * Both functions are empty — no private plugins to prefetch or register — but
+ * the SIGNATURES are the same contract the private entry and the generated
+ * customer entry export (plan-598, `src/core/rv-private-features.ts`).
  */
 
 import type { RVViewer } from '../core/rv-viewer';
+import { NO_PREFETCHED_FEATURES, type PrivateFeatureModules } from '../core/rv-private-features';
 
-export async function registerPrivatePlugins(_viewer: RVViewer): Promise<void> {
+export function prefetchPrivateFeatures(): PrivateFeatureModules {
+  return NO_PREFETCHED_FEATURES;
+}
+
+export async function registerPrivatePlugins(_viewer: RVViewer, _mods?: PrivateFeatureModules): Promise<void> {
   // No private plugins available in public build
 }

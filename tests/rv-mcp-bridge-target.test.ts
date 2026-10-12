@@ -31,6 +31,10 @@ function ctx(overrides: Partial<McpBridgeTargetContext> = {}): McpBridgeTargetCo
     protocol: 'http:',
     host: 'plant.example.com:8443',
     isDevServer: false,
+    // plan-541: the base case is a page CONNECT served (marker cookie) — without
+    // it a non-loopback host like plant.example.com would count as "hosted".
+    servedByConnect: true,
+    isLoopbackPage: false,
     explicitPort: false,
     bridgePort: DEFAULT_BRIDGE_PORT,
     authToken: undefined,
@@ -140,5 +144,42 @@ describe('resolveMcpBridgeTarget', () => {
         }),
       ),
     ).toBe('ws://localhost:18714/webviewer?apikey=x');
+  });
+});
+
+// plan-541 § 9.1: a page CONNECT did not serve, on a non-loopback origin, aims at
+// the local CONNECT — no URL parameter, and the port field always applies.
+describe('resolveMcpBridgeTarget — hosted page', () => {
+  const hosted: McpBridgeTargetContext = {
+    protocol: 'https:', host: 'web.realvirtual.io', isDevServer: false,
+    servedByConnect: false, isLoopbackPage: false, explicitPort: false, bridgePort: '5100',
+  };
+
+  it('targets localhost CONNECT on the default port', () => {
+    expect(resolveMcpBridgeTarget(hosted)).toBe('ws://localhost:5100/webviewer');
+  });
+
+  it('honours a non-default port without URL parameter', () => {
+    expect(resolveMcpBridgeTarget({ ...hosted, bridgePort: '5200' })).toBe('ws://localhost:5200/webviewer');
+  });
+
+  it('keeps same-origin when served by CONNECT (marker cookie)', () => {
+    expect(resolveMcpBridgeTarget({ ...hosted, host: '10.0.0.5:5100', protocol: 'http:', servedByConnect: true }))
+      .toBe('ws://10.0.0.5:5100/webviewer');
+  });
+
+  it('keeps same-origin on a loopback page', () => {
+    expect(resolveMcpBridgeTarget({ ...hosted, host: 'localhost:5100', protocol: 'http:', isLoopbackPage: true }))
+      .toBe('ws://localhost:5100/webviewer');
+  });
+
+  it('carries the key in the URL — the hosted branch is cross-origin, no cookie travels', () => {
+    expect(resolveMcpBridgeTarget({ ...hosted, authToken: 'k 1', preferCookieAuth: true }))
+      .toBe('ws://localhost:5100/webviewer?apikey=k%201');
+  });
+
+  it('an explicitly pinned Node port still wins on a hosted page', () => {
+    expect(resolveMcpBridgeTarget({ ...hosted, explicitPort: true, bridgePort: NODE_FALLBACK_PORT }))
+      .toBe('ws://localhost:18714/webviewer');
   });
 });

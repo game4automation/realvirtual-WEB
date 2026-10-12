@@ -43,7 +43,7 @@ import {
   type PhysicsVec3,
   type PhysicsZoneConfig,
 } from '../src/core/engine/rv-physics-registry';
-import { PHYSICS_FIXED_DT } from '../src/core/engine/rv-physics-constants';
+import { PHYSICS_DEFAULT_MU_MASS_KG, PHYSICS_FIXED_DT } from '../src/core/engine/rv-physics-constants';
 import type { ComponentContext } from '../src/core/engine/rv-component-registry';
 import { PhysicsZonePlugin } from '@rv-private/plugins/physics-zone-plugin';
 import { RapierPhysicsProvider } from '@rv-private/physics/rv-rapier-provider';
@@ -118,7 +118,7 @@ class MockPhysicsProvider implements PhysicsProvider {
   ready = true;
   failed = false;
   /** Deep-copied snapshots — callers hand in REUSED scratch objects. */
-  added: Array<{ muId: string; pose: PhysicsPose; half: PhysicsVec3; vel: PhysicsVec3 }> = [];
+  added: Array<{ muId: string; pose: PhysicsPose; half: PhysicsVec3; vel: PhysicsVec3; massKg: number }> = [];
   removed: string[] = [];
   conveyors: Array<{ id: string; center: PhysicsVec3; half: PhysicsVec3; quat: PhysicsQuat; friction: number }> = [];
   velocities: Array<{ id: string; vel: PhysicsVec3 }> = [];
@@ -147,12 +147,13 @@ class MockPhysicsProvider implements PhysicsProvider {
   setConveyorVelocity(id: string, vel: PhysicsVec3): void {
     this.velocities.push({ id, vel: { ...vel } });
   }
-  addDynamicMU(muId: string, pose: PhysicsPose, halfExtents: PhysicsVec3, initialVel: PhysicsVec3): void {
+  addDynamicMU(muId: string, pose: PhysicsPose, halfExtents: PhysicsVec3, initialVel: PhysicsVec3, massKg: number): void {
     this.added.push({
       muId,
       pose: { pos: { ...pose.pos }, quat: { ...pose.quat } },
       half: { x: halfExtents.x, y: halfExtents.y, z: halfExtents.z },
       vel: { x: initialVel.x, y: initialVel.y, z: initialVel.z },
+      massKg, // plan-467 F16 — recorded so the handover mass is observable
     });
     this.poses.set(muId, { pos: { ...pose.pos }, quat: { ...pose.quat } });
   }
@@ -172,6 +173,11 @@ class MockPhysicsProvider implements PhysicsProvider {
     }
   }
   getSettledBodies(): string[] { return [...this.settled]; }
+  // plan-467 moving colliders — this mock does not exercise them; the methods
+  // exist so the mock still satisfies the PhysicsProvider contract.
+  addKinematicBody(): void {}
+  setKinematicPose(): void {}
+  forEachContactLoad(): void {}
 }
 
 // ─── Fake viewer for the PhysicsZonePlugin (clipping-plugin pattern) ────────
@@ -606,6 +612,7 @@ describe('real Rapier WASM — conveyor origin reset (skips when not installed)'
         { pos: { x: -1.5, y: 0.1, z: 0 }, quat: { x: 0, y: 0, z: 0, w: 1 } },
         { x: 0.1, y: 0.1, z: 0.1 },
         { x: 0, y: 0, z: 0 },
+        PHYSICS_DEFAULT_MU_MASS_KG,
       );
 
       const belt: PhysicsVec3 = { x: 0.5, y: 0, z: 0 }; // 0.5 m/s +X

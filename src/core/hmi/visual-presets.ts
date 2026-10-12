@@ -59,7 +59,46 @@ export interface VisualPreset {
   settings: VisualPresetSettings;
 }
 
+/** What an apply did (plan-591). `antialias` is a renderer CONSTRUCTOR
+ *  parameter, so a preset that flips it only takes effect after a reload —
+ *  `antialiasNeedsReload` is the one signal the reload hint is derived from, and
+ *  it is produced HERE so every view (menu row, Visual tab, MCP tool) gets the
+ *  same answer instead of recomputing it. */
+export interface ApplyPresetResult {
+  /** Name of the preset that was applied. */
+  name: string;
+  /** Which tier it was resolved from: a shipped `public/presets` file, or a
+   *  browser-local one. */
+  source: 'shipped' | 'local';
+  /** True when the applied `antialias` now differs from the renderer's actual
+   *  `antialiasActive` — i.e. a reload would change the picture. */
+  antialiasNeedsReload: boolean;
+}
+
+/** Where a preset NAME may be resolved from (plan-591 F12). `'shipped'` means
+ *  only `public/presets` — a browser-local preset of the same name must not
+ *  hijack it; `'any'` is the generic tier order of {@link listPresets}. */
+export type PresetSource = 'shipped' | 'any';
+
 const LOCAL_KEY = 'rv-visual-presets';
+
+/**
+ * How many preset applies have happened in this session (plan-591).
+ *
+ * The reload hint is DERIVED (`settings.antialias !== viewer.antialiasActive`),
+ * so a plain boolean could not tell "dismissed" from "shown again": after a
+ * dismiss the very same apply would never bring it back. This counter is the
+ * second half of the snapshot — the hint is visible while
+ * `mismatch && epoch !== dismissedEpoch`, so EVERY apply shows it again, the
+ * identical one included. Session state only, nothing persisted.
+ *
+ * Incremented BEFORE the apply persists, so a listener woken by
+ * `saveVisualSettings` already reads the new value.
+ */
+let _applyEpoch = 0;
+
+/** Current apply epoch — see {@link _applyEpoch}. */
+export function getVisualPresetApplyEpoch(): number { return _applyEpoch; }
 
 /** Pick the preset-relevant subset of a full settings object, in canonical
  *  field order, deep-cloned so a preset never aliases live state. The stable
@@ -154,7 +193,16 @@ function mergePresetOverBase(base: VisualSettings, preset: VisualPreset): Visual
 /** Apply a preset: merge its fields over the current settings, persist, and
  *  push the whole thing to the viewer via the shared apply path (capability
  *  gating, render-mode switch, etc. all handled there). */
-export function applyVisualPreset(viewer: RVViewer, preset: VisualPreset): void {
+export function applyVisualPreset(viewer: RVViewer, preset: VisualPreset): ApplyPresetResult {
+  // F10 (plan-591): drop the APPLIED wireframe view FIRST — the same step
+  // `setRenderMode` takes (render-mode-controller.ts). While it is applied,
+  // `_suppressWireframeEnvironment` runs per rendered FRAME and switches
+  // shadows / AO / reflection back off right after this apply turned them on,
+  // while `matchPreset` happily reports "Default". Only the applied state, never
+  // the latent editor toggle: outside the editor that toggle is a setting the
+  // user will find again, and a quality click must not clear it.
+  if (viewer.wireframeActive) viewer.wireframe = false;
+  _applyEpoch += 1;
   const merged = mergePresetOverBase(loadVisualSettings(), preset);
   saveVisualSettings(merged);
   // A visual preset carries an explicit environment look (ground/floor/background
@@ -164,6 +212,38 @@ export function applyVisualPreset(viewer: RVViewer, preset: VisualPreset): void 
   // matching and the dropdown would show "Custom" after reload.
   markEnvironmentUserModified();
   viewer.applyVisualSettings(merged);
+  return {
+    name: preset.name,
+    // Identity, not name: a local preset may share its name with a shipped one.
+    source: _published.includes(preset) ? 'shipped' : 'local',
+    antialiasNeedsReload: merged.antialias !== viewer.antialiasActive,
+  };
+}
+
+/**
+ * Apply the preset with the given NAME, resolved from the tier `source` names
+ * (plan-591 F12).
+ *
+ * The one entry point behind the command `view.visualPreset`, and therefore
+ * behind all three of its views (the quality rows of the render-mode menu, the
+ * Visual tab's dropdown, the MCP tool). `source` travels all the way here
+ * instead of stopping at the caller's lookup: a row that resolved the SHIPPED
+ * "Default" must not end up applying a browser-local one of the same name,
+ * which is exactly what dispatching on the bare name would do
+ * ({@link listPresets} lets local win on a clash).
+ *
+ * Returns null when the name does not exist in that tier — deliberately no
+ * fallback to the other tier: the caller refuses with a reason instead of
+ * silently applying something else.
+ */
+export function applyVisualPresetByName(
+  viewer: RVViewer,
+  name: string,
+  source: PresetSource = 'any',
+): ApplyPresetResult | null {
+  const preset = presetsForSource(source).find((p) => p.name === name);
+  if (!preset) return null;
+  return applyVisualPreset(viewer, preset);
 }
 
 /** On a fresh install (no persisted visual settings), seed the named published
@@ -225,7 +305,13 @@ let _published: VisualPreset[] = [];
 
 /** Fetch the shipped preset manifest (`public/presets/index.json`) and each
  *  referenced `<stem>.preset.json`. Safe to call anytime; a missing manifest
- *  (404) just yields no published presets. */
+ *  (404) just yields no published presets.
+ *
+ *  The preset files are fetched in PARALLEL (plan-598 F2): they are independent
+ *  and the boot awaits this on a first visit (the seed needs the list), so a
+ *  serial loop cost one round trip per preset on the critical path. The ORDER
+ *  of the resulting list is still the manifest order — `Promise.all` keeps the
+ *  index, and a failed file is dropped exactly as before. */
 export async function loadPublishedPresets(): Promise<void> {
   try {
     const base = import.meta.env.BASE_URL ?? '/';
@@ -233,17 +319,15 @@ export async function loadPublishedPresets(): Promise<void> {
     if (!idxResp.ok) return;
     const stems = await idxResp.json();
     if (!Array.isArray(stems)) return;
-    const loaded: VisualPreset[] = [];
-    for (const stem of stems) {
+    const results = await Promise.all(stems.map(async (stem): Promise<VisualPreset | null> => {
       try {
         const r = await fetch(`${base}presets/${encodeURIComponent(String(stem))}.preset.json`, { cache: 'no-store' });
-        if (r.ok) {
-          const p = await r.json();
-          if (isValidPreset(p)) loaded.push(p);
-        }
-      } catch { /* skip a bad file */ }
-    }
-    _published = loaded;
+        if (!r.ok) return null;
+        const p = await r.json();
+        return isValidPreset(p) ? p : null;
+      } catch { return null; /* skip a bad file */ }
+    }));
+    _published = results.filter((p): p is VisualPreset => p !== null);
   } catch { /* no presets dir — fine */ }
 }
 
@@ -257,6 +341,32 @@ export function listPresets(): VisualPreset[] {
   for (const p of _published) byName.set(p.name, p);
   for (const p of loadLocalPresets()) byName.set(p.name, p);
   return [...byName.values()];
+}
+
+/**
+ * Only the SHIPPED presets — the `public/presets` files, without the
+ * browser-local tier (plan-591 F12).
+ *
+ * The two fixed quality rows mean a specific, known look: the "Default" that
+ * ships with the product. {@link listPresets} lets a local preset of the same
+ * name win, so a user who once saved a throwaway "Default" would have hijacked
+ * "Max Quality". An export in the module that owns `_published` — no outside
+ * access to a module private.
+ */
+export function listShippedPresets(): VisualPreset[] {
+  return [..._published];
+}
+
+/**
+ * THE one resolver behind `source` (plan-591 F12).
+ *
+ * Both the validity check of the command (`enabled`) and its apply (`run`) go
+ * through this, so the list a refusal text is derived from is the same list the
+ * apply resolves against. Two lists would mean a row can mark a preset active,
+ * or accept it, that it would never actually apply.
+ */
+export function presetsForSource(source: PresetSource = 'any'): VisualPreset[] {
+  return source === 'shipped' ? listShippedPresets() : listPresets();
 }
 
 /**

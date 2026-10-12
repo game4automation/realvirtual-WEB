@@ -1,5 +1,19 @@
 # Extending realvirtual WEB
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
+Start with the runnable [Community project plugin](doc-project-plugin-example.md). This is the detailed extension reference; [Events](doc-events-and-hooks.md) owns the event catalog, [Lifecycle](doc-lifecycle.md) owns execution order, and [UI visibility](doc-ui-visibility.md) owns presentation rules.
+
+> Ribbon editor overlays use the `ribbon-preview` overlay category and descriptive
+> `GizmoOptions.kind` tags. Extensions should treat these gizmos as transient,
+> non-pickable authoring aids and hide them around custom capture/export passes via
+> `RibbonEditorPreview.beginExportPass()` / `endExportPass()`. Unity does not export
+> `RibbonWinder.SpeedControl`; its imported default is `None`. The built-in MCP
+> screenshot path already applies this guard; custom GLB and thumbnail exporters
+> must bracket their own clone/render operation.
+
 Guide for building custom plugins, adding UI components, and extending realvirtual WEB with new functionality.
 
 ## Architecture at a Glance
@@ -17,11 +31,13 @@ HMIShell.tsx (React)
   ...
 ```
 
-Three extension points:
+Four extension points:
 
 1. **Plugins** — lifecycle callbacks, simulation data, event emission, optional UI slot registration
 2. **Events** — typed pub/sub between plugins and UI
 3. **UI Components** — Left panels, chart overlays, tooltips, slot-based layout areas
+4. **Commands** — one definition per user action; buttons, menu items, shortcuts and MCP write
+   tools are views of it ([§5b](#5b-commands--buttons-menus-shortcuts-and-mcp-tools-as-views))
 
 > **For wiring a single GLB to drives, sensors, transports, signals and AAS
 > links, use Component Behaviors — not plugins.** See
@@ -166,6 +182,12 @@ The Unity scene is exported as a **GLB file** with custom `extras` data on each 
 | `Drive_Cylinder` | `RVDriveCylinder` | `rv-drive-cylinder.ts` |
 | `Drive_ErraticPosition` | `RVErraticDriver` | `rv-erratic.ts` |
 | `Drive_SEWMovilink` | `RVDriveSEWMovilink` | `rv-drive-sew-movilink.ts` |
+| `Drive_ProfidriveSpeed` / `Drive_ProfidrivePos` | `RVDriveProfidriveSpeed` / `RVDriveProfidrivePos` | `rv-drive-profidrive-speed.ts` / `rv-drive-profidrive-pos.ts` |
+| `Drive_FestoFHPP` | `RVDriveFestoFHPP` | `rv-drive-festo-fhpp.ts` |
+| `Drive_UniDriveMotor` | `RVDriveUniDriveMotor` | `rv-drive-unidrive-motor.ts` |
+| `Drive_ProportionalValve` | `RVDriveProportionalValve` | `rv-drive-proportional-valve.ts` |
+| `Drive_ContinousDestination` | `RVDriveContinousDestination` | `rv-drive-continous-destination.ts` |
+| `DrivePulseEncoder` | `RVDrivePulseEncoder` | `rv-drive-pulse-encoder.ts` |
 | `Sensor` | `RVSensor` | `rv-sensor.ts` |
 | `TransportSurface` | `RVTransportSurface` | `rv-transport-surface.ts` |
 | `Source` | `RVSource` | `rv-source.ts` |
@@ -266,15 +288,19 @@ registerComponent({
   type: 'MyComponent',
   schema: RVMyComponent.schema,
   capabilities: {
-    hoverable: true,           // Highlight on mouse hover
-    selectable: true,          // Can be clicked/selected
-    inspectorVisible: true,    // Shown in Property Inspector (default: true)
-    hierarchyVisible: true,    // Shown in Hierarchy Browser (default: true)
-    tooltipType: 'drive',      // Tooltip content type (must match tooltip-registry key)
-    badgeColor: '#4fc3f7',     // Badge color in hierarchy browser
-    filterLabel: 'My Components', // Label in search/filter dropdown (null = not filterable)
-    hoverEnabledByDefault: true,  // Hover enabled after scene load
-    exclusiveHoverGroup: false,   // Part of Drive/Sensor/MU toggle (default: false)
+    pick: 'select',            // 'none' | 'select' | 'action' — pointer interaction (default 'none')
+    bake: 'chunk',             // 'merge' | 'chunk' | 'keep' — what the planner bake does with its meshes (default 'merge')
+    ui: {
+      badge: '#4fc3f7',        // Badge color in the hierarchy browser
+      filter: 'My Components', // Label in the search/filter dropdown + visibility auto-filters (null = not filterable)
+      category: 'transport',   // Coarse hierarchy-chip / search-group category (see ui.category below)
+      tooltip: 'drive',        // Tooltip content type (must match a tooltip-registry key)
+      priority: 10,            // Tooltip section priority — HIGHER is the primary section (default 5)
+      hidden: false,           // true hides the component from inspector + hierarchy chips
+    },
+    authorable: false,         // addable in the asset editor's "Add Component" section
+    // claimsNode: false,      // pure annotation: the node DISAPPEARS from baked models unless something else claims it (default true)
+    // onPreBake: (node, extras, ctx) => { ... },  // see "capabilities.onPreBake" below
   },
   create: (node) => new RVMyComponent(node),
   // Optional hooks:
@@ -284,7 +310,7 @@ registerComponent({
 });
 ```
 
-The `capabilities` field is optional. When omitted, conservative defaults apply (not hoverable, not selectable, visible in inspector/hierarchy). All capability fields are optional — only specify what differs from defaults.
+The `capabilities` field is optional. When omitted, conservative defaults apply (`pick:'none'`, `bake:'merge'`, visible, not filterable, no tooltip). All capability fields are optional — only specify what differs from defaults.
 
 **Standalone capability registration** — For types without a factory (e.g., pipeline types, AAS links), use `registerCapabilities()` directly:
 
@@ -293,45 +319,283 @@ import { registerCapabilities } from './rv-component-registry';
 
 // Register capabilities for a type that has no factory (no create() needed)
 registerCapabilities('AASLink', {
-  hoverable: true,
-  selectable: true,
-  tooltipType: 'aas',
-  badgeColor: '#26a69a',
-  hoverEnabledByDefault: true,
+  pick: 'select',
+  ui: { tooltip: 'aas', badge: '#26a69a', filter: 'AAS', category: 'info', priority: 3 },
 });
 ```
 
-**Capability reference:**
+**Capability reference (plan-753 §2.3):**
 
 | Capability | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `hoverable` | boolean | `false` | Highlight on mouse hover |
-| `selectable` | boolean | `false` | Can be clicked/selected |
-| `inspectorVisible` | boolean | `true` | Shown in Property Inspector |
-| `hierarchyVisible` | boolean | `true` | Declared but **not read anywhere** — see the note below |
-| `tooltipType` | string/null | `null` | Tooltip content type (key in tooltip-registry) |
-| `badgeColor` | string | `'#90a4ae'` | Hex color for hierarchy browser badge |
-| `filterLabel` | string/null | `null` | Label in search/filter dropdown |
-| `hoverEnabledByDefault` | boolean | `false` | Auto-enable hover after scene load |
-| `exclusiveHoverGroup` | boolean | `false` | Part of Drive/Sensor/MU toggle group |
-| `authorable` | boolean | `false` | Can be added to a node in the asset editor's "Add Component" section (needs a complete schema — initial values come from `getSchemaDefaults`) |
+| `pick` | `'none' \| 'select' \| 'action'` | `'none'` | Pointer interaction. `select` = hover + tooltip + click selects the node. `action` = hover + click fires `component.onClick` **without** selecting (3D buttons, switches, doors — until the chunk pick backend of plan-753 Phase 3 lands, the gate treats it like `select`). Every `pick !== 'none'` type is hover-enabled at model load; `RVViewer.setExclusiveHoverMode()` narrows that to one type among those that also carry a `ui.filter`. |
+| `bake` | `'merge' \| 'chunk' \| 'keep'` | `'merge'` | Bake role of the node's meshes (`rv-bake-chunk.ts`). `chunk` = a MOVER: the subtree is cut into its own chunk under the mover node and transformed as a unit (Drive, Kinematic, Grip, TransportSurface, Cam, SceneButtonMoveable, PlacementMeta …); it also keeps the node matrix-dynamic in `freezeStaticMatrices`. `keep` = the ORIGINAL meshes stay individual and are never baked (Lamp, MU, Source, Chain, ribbon web, MachiningVolume, Pipe/Tank, EnergyChain rig …). `merge` (the default, also Sink) = staged into the enclosing chunk. Read per node via `bakeRoleOf(node)`: `keep` > `chunk` > `merge` across the node's components, an authored `rv.BakeRole` extras value overrides, no registered component → `undefined` (the bake inherits). |
+| `ui.badge` | string | `'#90a4ae'` | Hex color for the hierarchy browser badge |
+| `ui.filter` | string/null | `null` | Label in the search/filter dropdown, the visibility auto-filters and the exclusive hover group. Also the FINE second level of the hierarchy filter: the entry in a category chip's ▾ menu |
+| `ui.category` | string/null | `null` | Coarse category (plan-597): one hierarchy filter chip and one global-search result group. Ids, in their fixed chip/search order: `drives`, `sensors`, `transport`, `material-flow`, `process`, `robotics`, `signals`, `logic`, `hmi`, `physics`, `info`, `other`. Resolved by `categoryOf(typeKey)` (`rv-component-category.ts`): the exact key's capabilities, else the `_N` base type, else a built-in rule for types without a declaration of their own (`PLCInput*`/`PLCOutput*`/`ConnectSignal` → signals, `LogicStep_*` → logic, `Drive_*` → drives, `Source`/`Sink`/`MU`/`DES*` → material-flow, `Grip`/`GripTarget` → robotics, …), else `other`. An id outside the list is normalised to `other` (DEV warning). Every literal `ui.filter` declaration must also carry a `ui.category` other than `other` — `tests/component-category-coverage.node.test.ts` scans the source for it |
+| `ui.tooltip` | string/null | `null` | Tooltip content type (key in tooltip-registry) |
+| `ui.priority` | number | `5` | Tooltip section priority for hover AND pinned bubbles — the **higher** priority is the primary section |
+| `ui.hidden` | boolean | `false` | Hide the component from the Property Inspector and the hierarchy chips (`isHiddenComponentType`) |
+| `authorable` | boolean | `false` | Can be added to a node in the asset editor's "Add Component" section (needs a complete schema — initial values come from `getSchemaDefaults`). A type whose rv-ODT `$def` has no defaults persists explicit authoring defaults in its add path instead — `BoxCollider` (plan-525: `center` 0, `size` 0.1 m, one per node, a child `Collider` on a mesh node) and `WebPhysicsZone` (adds a missing 1 m `BoxCollider` in the same undo step) go through `collider-add-rules.ts` of the asset editor. |
+| `onPreBake` | function | none | Static hook on the TYPE, run over the throwaway graph before the bake — see *`capabilities.onPreBake`* below. Extras keys with the `_N` dedup suffix (`Group_1`) dispatch to their base type; a hook gets the node's full extras and runs once per (node, type). |
+| `claimsNode` | boolean | `true` | Does a component of this type keep its node alive through the destructive bake? `false` = pure annotation: **a node that carries nothing else DISAPPEARS from every baked model** — it survives only as reference target, `bakeClaims()` claim, `Snap-*` port, keep mesh or ancestor of a survivor. Declared by `Group` and the Unity export markers (`rigidbody`, `renderer`, `colliders`, `BoxCollider`, `MeshCollider`, `RuntimeUIWindow`, `RuntimeInteractable`); the set is frozen in `tests/bake-claims-node.test.ts`. `BoxCollider` is authorable since plan-525 (factory `RVBoxCollider`, visible in the inspector) and still declares `claimsNode: false` — an authored collider lives on an EMPTY node, which the survival model keeps by its authored-collider rule, while the same marker on a CAD mesh stays pure annotation. Read it through `claimsNodeOf(key)`, which resolves `_N` keys to their base type; an unknown type claims. Leave it at the default unless your type really is data about geometry that nobody addresses by path. |
+
+Node-level getters: `pickModeOf(typeOrNode)` (strongest mode across the node's components, `action` > `select` > `none`), `bakeRoleOf(node)`, `uiOf(type)`; type queries: `getPickableTypes()`, `getFilterableTypes()`, `getTypesWhere(pred)`, `getTypesWithCapability('pick' | 'bake' | 'authorable')`.
+
+#### Surviving the bake (plan-754)
+
+The bake is **destructive**: after it, a node that nobody claimed does not exist.
+It is not hidden, not masked and not merely unregistered — it was never built into
+the template that reaches the scene. What survives is: any node with an rv
+component whose type claims its node (`claimsNode`, default true — a `Group` or
+a Unity export marker alone claims nothing), any node a reference points at, a `Snap-*` port, the ancestor chain of
+a survivor (so survivor paths never change), and the keep meshes. So if your
+extension needs a node at runtime, it has to say so BEFORE the bake. There are
+three ways, in order of preference:
+
+**1. A component on the node.** The normal case, and the one that also gets you a
+path, an inspector and a badge. Declare the role your component needs:
+
+> **Whoever touches a mesh is `keep`. A reference can only claim a node or a
+> boundary.** Rewrites geometry or swaps a material → `keep`. Only moves or hides
+> the subtree → `chunk`. Neither → leave it at `merge`: the node survives, its
+> triangles go into the enclosing chunk, and pick/highlight still reach it through
+> its index window. Mesh ownership is always LOCAL to a component sitting on the
+> node — there is deliberately no way to claim someone else's mesh from a distance.
+
+**2. `bakeTarget` on a reference field.** A `componentRef` / `componentRefArray`
+field declares what it claims for its TARGET:
+
+```typescript
+// rv-component-registry.ts
+export interface FieldDescriptor {
+  /** Reference fields only. Default 'merge' (target survives as a node);
+   *  'chunk' makes the target a chunk boundary. NEVER 'keep'. */
+  bakeTarget?: 'merge' | 'chunk';
+}
+```
+
+Read it through `bakeTargetOf(desc)` — never off the descriptor directly. The
+effective role of a node is the STRONGEST of its own component roles and every
+incoming tag, `keep > chunk > merge > unclaimed (= removed)`. Because the default
+is `merge`, an untagged reference is still safe: its target survives. Tag `chunk`
+when the referrer moves, hides, scales, scrolls or clones the target as a unit —
+`KinematicJoint.BodyA/BodyB` and `WebVisibility.AdditionalTargets[]` are the
+canonical examples. The generated rv-ODT schema does not carry this keyword (D15),
+so the tagged fields — including the handful of path-string and name-in-subtree
+references — are declared in one TS table, `REFERENCE_BAKE_TARGETS`
+(`src/core/engine/rv-bake-survival.ts`). Add a row there rather than a fourth
+resolver.
+
+**3. `RVPlugin.bakeClaims()` — a bare CAD node a plugin needs.** When the node you
+need carries nothing and you cannot change the GLB, claim it by path. Claims are a
+**main-model input only** (plan-757 D5): they are collected by the viewer for the
+document it loads and never for a planner placement — a placed asset is baked by the
+`ModelCache` through the same recipe (`prepareAndBake`, `src/core/engine/rv-prepare-and-bake.ts`)
+but without a plugin layer, so a bare node your plugin needs inside a *placed* asset
+must carry a component (or be a reference target) in the asset's own file. A claim that
+is nevertheless addressed into a placement — its path starts with the placement's
+document path (`Layout/Arburg_1/…`) or with the asset's root name (`Arburg/…`), or it
+resolves inside the instance — kept nothing, and the viewer says so: one
+`plugin-claim-not-applicable` entry per (placement, claim) in the Problems panel
+(`src/core/hmi/problems-store.ts`), cleared with the document. Nothing is logged to the
+console for it, and the main model's removal report lists the same claim as unresolved.
+Claim paths are read by the same resolver as every component reference: as written
+inside the asset, else with the root name stripped (`Conveyor/Label` and `Label` both
+name the conveyor's label), else unresolved:
+
+```typescript
+// A model plugin that attaches an error badge to a bare CAD leaf at runtime.
+export default class CagelinePlugin implements RVViewerPlugin {
+  id = 'mauser-cageline';
+
+  // Collected by the viewer BEFORE the bake and fed into the survival model
+  // next to the reference tags. Without this the node is pruned and the
+  // getNode() below returns undefined.
+  bakeClaims() {
+    return [
+      { path: 'MauserCageline30/Station_12/Housing/ErrorLamp', role: 'chunk' as const },
+      { path: 'MauserCageline30/Station_12/Gate', role: 'merge' as const },
+    ];
+  }
+
+  onModelLoaded(result: LoadResult, viewer: RVViewer): void {
+    const lamp = viewer.registry.getNode('MauserCageline30/Station_12/Housing/ErrorLamp');
+    if (!lamp) return;               // claim unresolved, or a different document
+    attachWebError(lamp);
+  }
+}
+```
+
+`role: 'merge'` keeps the node addressable (its mesh is merged); `role: 'chunk'`
+additionally gives it its own chunk mesh, which is what you need if you want to
+MOVE or HIDE it. A claim whose path does not resolve is reported in the bake
+removal report, never thrown — a plugin may serve several documents. The
+authoring-side alternatives are equally valid and usually better: put a component
+on the node, or author `rv.BakeRole` on it in the GLB.
+
+#### `capabilities.onPreBake` — structural preparation before the bake
+
+Some components need to change the tree, or read geometry, BEFORE it is merged:
+the kinematic re-parenting, the drive HOME pose the mover chunks are baked
+against, the sensor beam, a body's mass from its mesh. Those run as a **static**
+hook on the component TYPE, over the throwaway `tmp` graph:
+
+```typescript
+registerComponent({
+  type: 'MyComponent',
+  capabilities: {
+    bake: 'chunk',
+    onPreBake: (node, extras, ctx) => {
+      // extras and tree only — see the rule below
+      const box = ctx.localBounds(node);
+      if (box) extras._myBeamLength = box.max.z - box.min.z;
+    },
+  },
+  // …
+});
+```
+
+`PreBakeContext` is deliberately tiny: `root`, `resolvePath(path)`,
+`localBounds(node)` (the ONE sanctioned geometry read), `keepMaterial(id, mat)`
+and `notifyReparented(node, previousPath)` so a re-parented subtree keeps its
+authored path resolvable as an alias.
+
+> **Hard rule: extras and tree only.** No component instance, no signal store and
+> no live registry exists when a hook runs. A hook may re-parent nodes and write
+> plain-data numbers into `extras`; it must not resolve other components, read or
+> write signals, or keep a reference to anything. Break it and the bake silently
+> depends on an initialisation order again, which is the whole class of bug the
+> pipeline removed. A lint test enforces that no hook imports a runtime instance
+> API.
+
+The matching rule for AFTER the bake: **no component reads source geometry at
+init.** If you need geometry, declare `keep` or `chunk` and read your own mesh; if
+you need a NUMBER derived from geometry, compute it in `onPreBake`. A component
+type without a hook goes through the pipeline unchanged.
+
+**Partition labels — your own hideable chunks (plan-755).** A hook may also stamp
+`node.userData._rvPartition = ['MyLabel', …]` (`RV_PARTITION_KEY`,
+`src/core/engine/rv-bake-chunk.ts`; plain strings only). The bake then splits
+the geometry below that node off the enclosing chunk: a chunk is
+**boundary × partition × material**, where the partition is the sorted set of
+labels between a mesh and its chunk boundary, joined with `|`. Per boundary and
+partition the scene gets ONE synthetic node named after the partition
+(`<boundary>/<label>`, static geometry: `<root>/<label>`) that parents those
+chunk meshes — set `.visible` on it and exactly that geometry hides, without
+paying a chunk boundary per node. This is how `Group` works: its built-in hook
+stamps the resolved group names, and the Groups panel hides and isolates the
+resulting objects. The rules:
+
+- Labels stop at a boundary and the boundary's OWN stamp does not partition (all
+  of its meshes would share it) — hide the boundary node instead.
+- Nested labels combine: a mesh under `A` and `B` lands in one object `A|B`. A
+  chunk key is an identity; never split it on `|`.
+- The synthetic node (`userData._rvSynthetic`) is rebuilt by every bake: address
+  it at runtime, never persist a path, an override or a reference against it.
+- The bake does not know what a label means. The extras a partition object
+  carries come from ONE builder slot, `registerPartitionExtras()`, which the
+  Group side owns — do not replace it from a plugin; find your object by path.
+- Placements and the embed facade run the same recipe as the main model since
+  plan-757 (history: until then they used to run no pre-bake hooks, so a
+  planner-placed library asset had no partition objects). A placed asset is
+  partitioned exactly like the document that opens the same file; only plugin
+  `bakeClaims()` stay a main-model input (D5).
 
 > **There is no `simulationActive` capability.** Earlier revisions of this table
 > listed one; it never existed in `ComponentCapabilities` and nothing ever read
 > it. A component that needs a per-frame tick gets a **dedicated viewer-owned
 > manager** instead — see § Per-frame components below.
 
-> **`hierarchyVisible` currently does nothing** (measured, plan-431 §2.8).
-> `rg -n "hierarchyVisible" src` finds 11 hits: the declaration, the default and
-> nine components that SET it — and not one place that reads it. The hierarchy builds
-> its type list in `RvExtrasEditorPlugin._scanEditableNodes`, which filters
-> through `isHiddenComponentType()`, i.e. through **`inspectorVisible`** only. So
-> a type set `hierarchyVisible: false` still gets a chip — `rv-jt-data.ts` sets
-> it precisely to keep JT metadata out of the hierarchy, and the chip is there
-> anyway. The flag that actually removes a type from BOTH surfaces is
-> `inspectorVisible: false`.
-> Documented rather than fixed: making it live would change what existing models
-> show. Set it for intent, but do not rely on it.
+> **The old 12-field capabilities block is gone (plan-753 Phase 4b).** Until
+> Phase 4 a declaration could still spell out `hoverable`, `selectable`,
+> `hoverEnabledByDefault`, `exclusiveHoverGroup`, `badgeColor`, `filterLabel`,
+> `tooltipType`, `hoverPriority`, `pinPriority`, `inspectorVisible`,
+> `hierarchyVisible`; the adapter `normalizeCapabilities()` mapped it with a
+> one-time warning. The registration entry points now take `ComponentCapabilities`
+> only — a legacy field is a **type error**. External plugin bundles that still
+> use the old shape must migrate with this table (release note):
+>
+> | old | new |
+> |---|---|
+> | `selectable: true` | `pick: 'select'` |
+> | `hoverable: true, selectable: false` | `pick: 'select'` for info nodes; `pick: 'action'` for `PushButton3D`, `EmergencyButton3D`, `HandleSwitch3D`, `SceneButtonMoveable`, `WebSafetyDoor` |
+> | `hoverable: false, selectable: false` | `pick: 'none'` (the default — may be omitted) |
+> | `hoverEnabledByDefault`, `exclusiveHoverGroup` | **gone** — every pickable type hovers by default; the hover-mode toggle groups by `ui.filter` |
+> | `badgeColor`, `filterLabel`, `tooltipType` | `ui.badge`, `ui.filter`, `ui.tooltip` |
+> | `hoverPriority`, `pinPriority` | `ui.priority` (= the old `hoverPriority`; pinned bubbles use the same value) |
+> | `inspectorVisible: false` | `ui.hidden: true` |
+> | `hierarchyVisible` | **gone** — it never did anything (plan-431 §2.8: nothing read it; `ui.hidden` is the flag that removes a type from both surfaces) |
+>
+> `bake` had no legacy counterpart; a migrated declaration keeps the `merge`
+> default until its author decides otherwise. The movers and runtime-mutated
+> types that the old `MOVER_KEY` / `EXCLUDED_SUBTREE_KEYS` lists named carry
+> their role explicitly.
+
+> **Plugin-visible changes of plan-754 (release note).** The bake became
+> destructive and the hierarchy became the scene graph. Five things an external
+> plugin or private project can notice:
+>
+> | Change | What to do |
+> |---|---|
+> | **`registry.getNode(path)` returns `undefined` for any unclaimed node of a baked model** — the main model included, not only raw CAD parts under a placed catalog item. | Null-check it (you should already). If you need a bare node, declare `RVPlugin.bakeClaims()`, put a component on it, or author `rv.BakeRole` in the GLB — see *Surviving the bake*. |
+> | **`ModeDescriptor.hierarchyScope: 'composition'` is gone**, with `projectComposition`, `buildCompositionTree` and `COMPOSITION_CHILD_TYPES`. | Remove the field from your mode registration — it is a type error. The one real tree plus the flat type filters replaces it. |
+> | **`refreshEditableNodes()` is a deprecated no-op** for one release. | Delete the call. There is no scanned node list left to refresh. |
+> | **The selection snapshot gained `nodes`.** Selection identity is the `Object3D` now; `selectedPaths` / `primaryPath` are derived and cover only what the registry addresses. `web_selection_get` mirrors this with a `nodes[]` field. | Keep reading paths if that is all you need; read `nodes` when a chunk mesh, a light or an overlay must also count as selected. |
+> | **`BakedAsset.master` → `BakedAsset.template`**, and `ModelCache` keeps only that template after a bake. | Rename the field. If you needed the FULL source hierarchy, `ModelCache.decodeFresh(cacheKey)` is the one uncached door to it (the asset editor and `descend` use it); `getOrLoad*` never yields non-survivors after a bake. |
+
+> **Plugin-visible changes of plan-755 (release note).** `Group` became a
+> partition key of the chunk instead of a node that survives for its own sake.
+>
+> | Change | What to do |
+> |---|---|
+> | **Group-only nodes are no longer addressable in a baked model.** A node that carried only a `Group` (plus export markers) is removed, together with plain ancestors only it kept alive — about 12,600 paths on a CAD model grouped down to solids. `registry.getNode(path)` returns `undefined` for them. | Address the group's geometry through its partition object (`<boundary>/<key>`), claim the node with `RVPlugin.bakeClaims()`, put a real component on it, or work in the editor (it never bakes). |
+> | **New capability `claimsNode`** (default `true`). The former implicit rule "hidden + `merge` = export marker" is gone; `Group` and seven marker types declare `false`. | Nothing, unless you registered a hidden, role-less marker type of your own and relied on its nodes being pruned: declare `claimsNode: false` explicitly. |
+> | **Partition objects.** New synthetic nodes named after a group combination (`MC01.13`, `CNCCase\|CNCDoor`) appear under chunk boundaries, carry `Group` extras and `userData._rvSynthetic`, and parent chunk meshes. `BakedChunk` gained `partition`, `partitionLabels`, `groupObject`; chunk keys may contain a `grp:<key>` segment. | Do not assume a chunk mesh is a direct child of `chunk.owner` (use `chunk.groupObject ?? chunk.owner`), do not parse chunk keys, and skip `_rvSynthetic` nodes when you persist anything. A group's members now include these objects. |
+
+### Units on fields and signal slots (plan-512)
+
+Three rv-ODT keywords carry units into the `FieldDescriptor` (`loadSchemaFromSpec`
+copies them; `inline-schemas-baseline.ts` pins them):
+
+| Keyword | On | Meaning |
+|---|---|---|
+| `unit` | number fields | Unit of the value (UCUM-style: `mm`, `mm/s2`, `s`). The SSOT of the inspector suffix — `getFieldUnit()` reads the schema first and falls back to `FIELD_UNITS` only for fields without one (`field-unit-schema-ssot.test.ts` keeps both in step, alias-normalised). A `Vector3`'s `unit` is documentation only. |
+| `signalUnit` | signal slots (`componentRef` + `signal`) | Unit of the slot's value on the COMPONENT side: a unit (`mm`) or a quantity token resolved through `Drive.Direction` of the carrying node — `@drive-position` (`mm`/`deg`), `@drive-speed` (`mm/s`/`deg/s`), `@drive-acceleration` (`mm/s2`/`deg/s2`). No drive (or `Virtual`) → no unit → no auto-scale. |
+| `scaleField` | signal slots | The sibling NUMBER field of the same component that scales the slot. Binding a signal with a known unit writes `conversion(signal unit → signalUnit).factor` there. |
+
+```json
+"Position": {
+  "$ref": "#/$defs/ComponentReference",
+  "signal": "PLCOutputFloat",
+  "signalUnit": "@drive-position",
+  "scaleField": "Scale",
+  "description": "..."
+}
+```
+
+Rules when you declare them on a new behavior:
+
+- **Both or neither.** `signalUnit` without `scaleField` does nothing.
+- **One factor rule for both directions.** Your behavior must compute a command as
+  `target = signal × S (+ offset)` and a feedback as `signal = (target − offset) / S` —
+  then the same `S` is right for both. A formula of any other shape (a percentage
+  normalisation like `Drive_ProfidriveSpeed.SetpointScale`, a dimensionless setpoint)
+  must NOT be annotated.
+- **Shared fields are allowed.** Several slots may name the same `scaleField`
+  (`Drive_Simple.Speed`/`Accelaration`/`IsAtSpeed` → `ScaleSpeed`); the first binding
+  sets it, a later one with another factor reports `unit-scale-conflict` instead of
+  overwriting.
+- **Feedback formulas that can switch the scaling off** (like `ScaleFeedbackPosition`)
+  need a gate in `FEEDBACK_GATES` (`plugins/signal-bind/unit-scale.ts`), or the badge
+  would claim `auto` for a factor nobody applies.
+- **A scale field has no `unit`** — it is a pure factor.
+- The annotated set is pinned positively AND negatively by
+  `tests/field-unit-schema-ssot.test.ts`; adding a slot means adding its row there.
+
+A source declares its unit through `SignalMeta.unit` (+ an optional resolved
+`unitDef`, which wins over the built-in table): `store.setSignalMeta(name, { unit: 'm' })`.
+Nothing converts the VALUE — the unit only feeds the factor of a binding.
 
 ### A metadata entry with no factory (data that is not a component)
 
@@ -354,9 +618,8 @@ registerComponentSchema('NodeKnowledge', {
   // …
 }, {
   authorable: true,
-  hoverable: false,      // data, not an interactive object — no tooltip, no HMI surface
-  selectable: false,
-  badgeColor: '#8d6e63',
+  pick: 'none',          // data, not an interactive object — no tooltip, no HMI surface
+  ui: { badge: '#8d6e63' },
 });
 ```
 
@@ -410,6 +673,41 @@ fieldRendererRegistry.register({
   component: NodeKnowledgeNoteRenderer,   // gets FieldRendererProps
 });
 ```
+
+#### JSON fields in the inspector: `RvJsonEditor` (plan-555)
+
+A field that holds JSON (today `WebOperatorPanel.Config`) gets a Monaco JSON editor
+instead of a text area — the same editor core as the script and ST editors, loaded
+lazily. The parts are field-neutral and live in `src/core/hmi/json-editor/`:
+
+- `RvJsonEditor.tsx` — inline editor (4–15 lines, auto height) plus an **Expand editor**
+  window on the same model. Applies on blur / Ctrl+Enter / closing the window / unmount
+  through your `onCommit(text, target)`, against the edit target captured at mount; a
+  write that has not come back through `value` yet is deduplicated. External value
+  changes update a clean model as one undo step; a dirty model keeps the text and shows
+  a conflict hint (Ctrl+Enter overwrites, Escape reloads). Text that was not applied is
+  kept as a draft per model URI and restored on the next mount. Render it with
+  `key={docId + '|' + nodePath}`.
+- `rv-json-field-context.ts` — `JsonFieldContext` per model URI
+  (`rv-json://<componenttype>.<fieldname>/<docId>/<nodePath>.json`, built by
+  `jsonFieldUri`): `schemaId` + `schema` (completion / hover only), `signalKeys` +
+  `signals()` (read fresh per request), `snippets` (per `arrayKey`) and `validate(text)`
+  (your rules → markers, owner `rv-json-rules`).
+- `rv-json-monaco-loader.ts` — `loadJsonMonaco()`: JSON worker, `schemaValidation:
+  'ignore'`, ONE completion + ONE hover provider for `json` that look the context up by
+  URI. The only module besides the script loader that may import `monaco-editor`
+  (`tests/plc-import-boundary.node.test.ts`).
+- `rv-json-path-ranges.ts` — JSON path ↔ text range (`jsonc-parser`).
+- `src/core/hmi/monaco/rv-monaco-workers.ts` — `registerMonacoWorker(labels, factory)`:
+  the one `MonacoEnvironment.getWorker` of the page, first registration per label wins,
+  `'*'` is the generic fallback. Every Monaco loader (public and private) registers here
+  instead of writing `self.MonacoEnvironment`.
+
+Your field renderer must import the editor only through `React.lazy` (the renderer
+module is in the entry chunk — see `WebOperatorPanelHost.tsx` →
+`operator-devices/operator-panel-json-context.ts`), keep a plain text field for touch
+devices and as the Suspense / error fallback, and honour the dev flag
+`rv-webviewer-json-editor` (`isJsonEditorEnabled()` in `rv-dev-load-flags.ts`).
 
 #### Rendering Markdown in a renderer: use `LazyMarkdown`
 
@@ -484,6 +782,86 @@ virtual components such as behavior live state and snap data) skips both
 That branch is only reachable for the inspector's own `virtualComponents` list,
 never for a persisted rv_extras entry.
 
+### Inspector UI for your own components (building blocks)
+
+A custom field renderer, an extra section or a component action draws with the
+same four blocks the built-in sections use, so its values sit on the same
+column as every other row:
+
+- `InspectorRow` (`core/hmi/rv-inspector-row.tsx`) — one label → value row;
+  `dot` holds an override marker (click = reset), `trailing` an icon button,
+  `labelTitle` the tooltip. A message is an `InspectorRow` with an empty label.
+- `InspectorSubheader` (`core/hmi/rv-inspector-blocks.tsx`) — a group heading
+  inside your section.
+- `InspectorActionRow` — wraps your buttons so they start on the value column
+  (`inspectorActionButtonSx` styles a new one). Component actions registered
+  through `componentActionRegistry` are wrapped for you.
+- `DetailsDisclosure` — collapsed technical details (hashes, GUIDs, versions)
+  with a one-line summary.
+
+Colours, font sizes and the monospace stack come from `core/hmi/shared-sx.ts`
+(`INK_*`, `FS.*`, `ICON_SIZE.*`, `MONO`, `ACCENT` …); numbers are parsed and
+shown with `parseDecimal` / `formatDecimal` (`core/hmi/rv-number-format.ts`,
+comma and dot both accepted). UI text is English.
+
+```tsx
+import { InspectorRow } from '../../core/hmi/rv-inspector-row';
+import { InspectorSubheader, DetailsDisclosure } from '../../core/hmi/rv-inspector-blocks';
+import { formatDecimal } from '../../core/hmi/rv-number-format';
+import { FS, INK_LOW, MONO } from '../../core/hmi/shared-sx';
+
+export function PumpStatusRenderer({ value }: FieldRendererProps) {
+  const s = value as { rpm: number; serial: string };
+  return (
+    <>
+      <InspectorSubheader>Runtime</InspectorSubheader>
+      <InspectorRow label="Speed" labelColor={INK_LOW}>
+        <Typography sx={{ fontSize: FS.label, fontFamily: MONO }}>{formatDecimal(s.rpm, 1)} rpm</Typography>
+      </InspectorRow>
+      <DetailsDisclosure title="Device details" summary={s.serial}>
+        <InspectorRow label="Serial" labelColor={INK_LOW}>…</InspectorRow>
+      </DetailsDisclosure>
+    </>
+  );
+}
+```
+
+#### Where a component action appears (`placement`, `danger`, `group`)
+
+An action registered with `componentActionRegistry.register(type, [...])` is
+drawn by the section according to three optional fields of `ComponentAction`:
+
+- `placement: 'body'` (default) — a button in the section's action row, for
+  machine **operations** (Jog, Stop, Toggle, Auto-assign).
+- `placement: 'menu'` — an item of the section header's ⋮ menu
+  (`InspectorSectionMenu`), for **component management** (Replace…,
+  Re-import…, Remove). Such an action never appears as a body button.
+- `danger: true` — a destructive menu item: sorted last, behind a divider, in
+  the theme's error red. There is no confirmation dialog; in the editor the
+  removal is undone with Undo. A `danger` action belongs in the menu.
+- `group: '<name>'` — consecutive body actions with the same group render as
+  ONE segmented control (`Jog − | Stop | Jog +`, `inspectorSegmentedGroupSx`);
+  a group is a set of commands, not a selection toggle.
+
+```ts
+componentActionRegistry.register('Pump', [
+  { id: 'jog-back', label: 'Jog −', group: 'jog', onClick: (ctx) => jog(ctx, -1) },
+  { id: 'stop',     label: 'Stop',  group: 'jog', onClick: (ctx) => stop(ctx) },
+  { id: 'jog-fwd',  label: 'Jog +', group: 'jog', onClick: (ctx) => jog(ctx, +1) },
+  { id: 'replace',  label: 'Replace…', placement: 'menu', onClick: (ctx) => replace(ctx) },
+  { id: 'remove',   label: 'Remove', placement: 'menu', danger: true, onClick: (ctx) => remove(ctx) },
+]);
+```
+
+`tests/browser/inspector-action-layout.browser.test.tsx` holds the layout
+guardrail (a segment group stays on one line at a 320 px inspector) and checks
+that no menu / danger action is a body button.
+
+The inspector files are linted for this (`rv/hmi-design` in `eslint.config.js`,
+gated by `tests/hmi-design-lint.node.test.ts` in `npm run test:all`); the full
+rules are in `DESIGN.md` (repository root), and `?rvDev=inspector-gallery` on the
+dev server shows every block in every state.
+
 ### Per-frame components (the manager pattern)
 
 Components are not ticked by the engine. A component that has to do something
@@ -549,13 +927,19 @@ is the only thing holding a design together, the design is usually the problem.
 **Querying capabilities:**
 
 ```typescript
-import { getCapabilities, getTypesWithCapability } from './rv-component-registry';
+import { getCapabilities, getPickableTypes, getTypesWhere, bakeRoleOf } from './rv-component-registry';
 
-// Get resolved capabilities for a type (always returns Required<ComponentCapabilities>)
-const caps = getCapabilities('Drive');  // { hoverable: true, badgeColor: '#4fc3f7', ... }
+// Get resolved capabilities for a type (always returns ResolvedCapabilities — every field present)
+const caps = getCapabilities('Drive');  // { pick: 'select', bake: 'chunk', ui: { badge: '#4fc3f7', ... }, authorable: true }
 
-// Get all types with a specific capability
-const hoverableTypes = getTypesWithCapability('hoverable');  // ['Drive', 'Sensor', 'MU', ...]
+// Get all types the pointer can interact with
+const pickable = getPickableTypes();  // ['Drive', 'Sensor', 'MU', ...]
+
+// Any predicate over the resolved form
+const hoverGroup = getTypesWhere((c) => c.pick !== 'none' && c.ui.filter !== null);
+
+// Per node: the bake role across its components (undefined = no registered component)
+const role = bakeRoleOf(node);  // 'merge' | 'chunk' | 'keep' | undefined
 ```
 
 **Step 2: Import in scene loader** — Add a single side-effect import in `rv-scene-loader.ts`:
@@ -578,6 +962,39 @@ That's it — the factory loop in the loader auto-discovers the component from t
 | `vector3` | `Vector3` | `THREE.Vector3` | `unityCoords: true` negates X |
 | `componentRef` | Unity Object ref | `RVComponent \| null` | Resolved from hierarchy path |
 | `enum` | C# enum | via `enumMap` | GLB string → TS value |
+
+### Text in the scene: the label contract, the Plate exemption and label clicks (plan-529)
+
+**Canvas text goes through `rv-label-sprite.ts`.** Every text sprite (`createLabelSprite`, `replaceLabelTexture`) sits on an overlay layer, is not tone-mapped and neither tests nor writes depth — otherwise GTAO, bloom and tone mapping smear it. `labelContractViolations()` walks a scene and reports every canvas-textured **Sprite** that breaks this; `tests/label-sprite-contract.test.ts` runs it over every producer. A `WebLabel` Billboard is built through this factory and passes it.
+
+**The one sanctioned exception is a `WebLabel` Plate** (`rv-label-plate.ts`): a sign ON the machine must be hidden by geometry in front of it, so it is a depth-tested, depth-writing `Mesh` on layer 0, flagged `userData._rvLabelPlate`. The contract checks sprites only, which keeps the exemption narrow; the contract test pins both halves (a Plate is not reported, a Billboard still passes). The texture still comes from `createLabelTexture()` (sRGB, anisotropy, mipmaps); the material colour scales the texture below the default bloom threshold and the plate stands 2 mm off the node plane against AO darkening. Do not copy this for other text — if your text must be occluded, reuse `rv-label-plate.ts`.
+
+**Runtime visuals are never saved.** Anything a component builds from its extras at load (label sprite, plate, rigs, clones) must carry a marker that `pruneRuntimeHelpers()` in `rv-asset-glb-export.ts` removes before export — for WebLabel that is `userData._rvWebLabel`. Otherwise the editor's save writes the visual into the file and the next load builds a second one next to it; `tests/rv-web-label-export.test.ts` checks save → reload → save does not grow.
+
+**Label clicks do not use the component ACTION pick.** Capabilities are frozen per type; `WebLabel` is statically `pick:'select'` (since 2026-10-12 — a label names an object, so the labelled node is a hover / selection target and a pick owner of its merged geometry in the bake; before that it was `'none'` and a label-only node such as a cabinet was an owner-less, blocking chunk segment at runtime) and never `'action'`. The label VISUALS are aux raycast targets of their node (`WebLabelHost.pick`, Billboards `onTop`), so hovering a label hovers the object and a click selects AND frames it; the hover / selection state draws a border on the label and a pin line down to the object (`WebLabelHost.emphasis`). Link clicks stay separate: the viewer-owned `WebLabelManager` (`ctx.webLabelManager`, threaded through `InitSubsystems` like every manager) is asked FIRST inside the canvas `pointerup` handler, after the click-vs-drag threshold and after the transform gizmo / marquee had their chance to stop the event. It raycasts only its own effectively visible, linked labels; a Billboard hit wins, a Plate hit only when `RaycastManager.raycastSurface()` (a stateless query) reports no opaque surface closer. The URL is checked with `isSafeExternalUrl()` (absolute `http`/`https` only) and opened synchronously with `openExternal()` (`noopener,noreferrer`). Hover over a linked label sets the pointer cursor with priority over the raycast manager (`RaycastManager.cursorOverride`). The manager's per-frame pass (`tick()`) runs in the **render path**, not in `CoreSubsystems.visuals()`, because the latter stops with the simulation. XR taps are not routed to labels (documented limitation).
+
+### Plugin LogicStep types (`rv-logic-step-registry.ts`)
+
+`RVLogicEngine` builds the built-in `LogicStep_*` types in a `switch`. A step
+whose runtime lives in a plugin — above all a PRIVATE one, which the public
+engine must never import — registers a builder instead:
+
+```typescript
+import { registerLogicStepBuilder } from '../core/engine/rv-logic-step-registry';
+
+const off = registerLogicStepBuilder('LogicStep_MechanismPath', (ctx) => {
+  // ctx: data (the step's rv_extras), node, stepType, registry, signalStore, scope
+  const ref = ctx.data['MechanismPath'] as ComponentRef | undefined;
+  const path = ctx.registry.resolve(ref, ctx.scope).component;
+  return new MyStep(path);  // an RVLogicStep, or null for "no step"
+});
+```
+
+The `default:` branch of `buildStep()` asks the registry before it warns, so an
+unregistered type keeps the old behaviour (`console.warn`, no step). A second
+registration replaces the first; the returned function removes exactly its own
+builder. Add the type to the `CONSUMED` map in `rv-extras-validator.ts` and give
+it an rv-ODT `$def` + `logicSteps` index entry like any other step.
 
 ### Signal Store
 
@@ -694,6 +1111,8 @@ viewer.setControlsConfig({
   zoomSpeed: 1.2,
   dampingFactor: 0.05,
   enabled: true,
+  wheelZoomToCursor: true,    // mouse wheel zooms to the cursor (default; false = to the view centre)
+  navigateAroundCursorPoint: false, // orbit / pan about controls.target (default; true = about the surface point under the cursor)
 });
 
 // Toggle renderer stats logging (renders info, draw calls).
@@ -742,9 +1161,65 @@ fields plugins commonly read; `LoadResult` carries more (`modelConfig`, `recorde
 batching/dedup results, `raycastGeometrySet`, …) — the full shape is in
 [src/core/engine/rv-scene-loader.ts](src/core/engine/rv-scene-loader.ts).
 
-### NodeRegistry growth from lazy LayoutObject expansion
+### The hierarchy is the scene graph — and `getNode()` may return undefined
 
-When the user expands a LayoutObject row in the Hierarchy Panel, the tree builder injects the Three.js subtree into the panel and registers any previously-unseen child paths in `NodeRegistry`. Plugins that iterate `registry.forEachNode(...)` should therefore not assume the set of paths stays stable for the lifetime of a model — new paths can appear at any time when the user opens a placed catalog item. Treat `NodeRegistry` as an open set: keep listeners idempotent and address nodes by path (`getNode(path)`), never by integer index.
+Since plan-754 the Hierarchy Panel renders `viewer.scene` directly: a row IS an
+`Object3D` and `children` is the whole tree. There is no projection and no lazy
+injection any more (`buildStructureTree`, `applyLazyInjection`, the synthetic
+`Geometry` type and the composition view are deleted), so expanding a row has
+**no NodeRegistry side effect** — expanding is UI state, and UI state must not
+change the set of addressable paths. Registration belongs to the two places that
+actually put geometry into the scene: the loader and `registerPlaced`.
+
+What this means for a plugin:
+
+- The set of registered paths no longer grows because a user opened a row. It still changes on model load, placement and structural edits, so `NodeRegistry` remains an open set — keep listeners idempotent and address nodes by path (`getNode(path)`), never by integer index.
+- **A node can be browsable without being resolvable.** `registry.getNode(path)`
+  returns `undefined` for **any unclaimed node of a baked model — the main model
+  included**, not just for raw CAD parts under a placed catalog item. After the
+  destructive bake an unclaimed node is gone entirely, and the rows that remain
+  without a path are the runtime objects (lights, gizmos, overlays) and the chunk
+  meshes. Code that reacts to a hierarchy selection must tolerate that, exactly as
+  it must tolerate a stale path. If you NEED a bare node to stay resolvable, claim
+  it — see *Surviving the bake* above.
+- **`hierarchyScope` is gone.** A `ModeDescriptor` used to declare
+  `hierarchyScope: 'composition'` so the planner saw each placed asset as one row.
+  There is one tree now, the real one, with flat type filters and the
+  `runtime` / `chunk` badges on top; `projectComposition` / `buildCompositionTree`
+  and `COMPOSITION_CHILD_TYPES` no longer exist. Remove the field from any mode
+  registration — it is a type error.
+- **`refreshEditableNodes()` is a deprecated no-op** for one release. The panel has
+  no scanned node list left to refresh, so there is nothing to invalidate; the
+  method survives only so an existing external caller does not throw. Delete your
+  call.
+
+### Placements pick through their chunks
+
+There is no separate pick geometry for placements (the plan-745 placement
+raycast bundles and the merged static / per-drive groups went with plan-753
+Phase 4b). A placement is a `BakedAsset` instance of the viewer's
+`BakeRegistry`; its chunk meshes ARE its render geometry and its pick
+geometry, and the `PickBackend` (installed once per load by the viewer) resolves a
+hit triangle through the chunk's segment table to that segment's owner node. A
+placement appears on `instantiate` and disappears on `release`; nothing
+scene-wide is rebuilt.
+
+What a plugin author needs to know:
+
+- **Iterate pick meshes through `viewer.bakeRegistry.pickMeshes`** (chunk +
+  keep meshes of every live instance — the main model and every placement),
+  never by walking the scene for `__raycastBVH` meshes: those do
+  not exist any more.
+- **Never `dispose()` a chunk geometry.** It is shared by every instance of the
+  asset; `disposeSubtree` / `disposeModelSubtree` skip geometries registered
+  in `chunkMetaOf`, and the `BakedAsset` frees them at refcount 0 once retired.
+- **Highlights on baked roots** go through `chunk-outline` / `chunk-overlay`
+  (pooled wrapper proxies with their own `drawRange` over the chunk geometry —
+  never `drawRange` on the chunk itself). Keep meshes and plain nodes without
+  a window use the ordinary overlay pairs.
+- **Virtual / DES entries** (`buildVirtualNode`) are the one non-baked kind of
+  placement: their meshes register as aux raycast targets resolving to the
+  placement root — add on register, remove on delete.
 
 ### Selection sources (`selectNode(path, showInspector, source)`)
 
@@ -1319,6 +1794,56 @@ moment the plugin is enabled — i.e. on the mode transition that activates it. 
 must therefore not assume `onModelLoaded` has already run by the time `init()` returns; do model-
 dependent setup in `onModelLoaded` / `onModeActivate`, never in `init()`.
 
+### `model-loaded` is not "the scene is complete" — `whenSceneReady()`
+
+`onModelLoaded` / `model-loaded` mean: the document's **own** GLB is parsed, registered and
+announced. For a **layout document** the placed references are *not* in the scene yet — the core
+materialises them asynchronously afterwards (`viewer.placements`, one bake per asset, smaller
+assets first), which takes seconds on a real layout. Until then those placements are missing from
+the scene graph, the `NodeRegistry`, the `SignalStore`, snap pairing, bounds and the transport
+topology. The contract (`src/core/engine/rv-scene-ready.ts`):
+
+| Name | Meaning |
+|---|---|
+| `viewer.placements.state` | `'idle' \| 'materializing'`; counters in `viewer.placements.progress` (`total`, `materialized`, `pending`, `missing`). |
+| event `placements-materialized` | **exactly once per load**, payload `{ aborted, total, materialized, missing }` — right after `model-loaded` for a document without references, else when the last reference is instantiated (or failed into its placeholder); `aborted: true` when the document changed first. |
+| event `placements-state-changed` | `{ state }` on every flip (busy indication). |
+| `viewer.whenSceneReady(): Promise<void>` | **the join point**: no load in flight AND placements idle. Follows a document change (resolves for the new document); never rejects. |
+
+Rules of thumb for a plugin:
+
+- Work that is correct **per placement** follows `layout-content-added` (`{ root, chunks?, keep? }`)
+  and needs nothing else — that is how the clip tools, AAS resolution, the planner's snap pairing
+  and the transport topology stay correct. Since plan-757 Phase 2 the event also fires for every
+  **nested** placement root — a reference inside a placed asset, materialised by the core instancer
+  (`isNestedPlacementRoot(root)`, `_layoutNestedOf`): it is CONTENT of its record's placement, not
+  a record (the planner refreshes the hierarchy and the snap pairing for it, nothing else), and it
+  is released with its parent, innermost first, each with its own `layout-content-removed`. Its counterpart is `layout-content-removed`
+  (`{ root, path }`, emitted by the planner's remove path BEFORE the subtree leaves the scene):
+  undo whatever you attached to that root. The `WebComponentPlugin` does exactly this pair
+  (plan-757 §2.8): a placement's `WebComponent` scripts are wired on `layout-content-added` under
+  the same session-wide `allowScripts` rule as the main model's, and disposed on
+  `layout-content-removed` — a placement is the main model at another origin.
+- Work that snapshots or judges the **whole** scene in `onModelLoaded` (lists of drives / sensors,
+  "does this path resolve", framing, statistics) re-runs on `placements-materialized` or awaits
+  `viewer.whenSceneReady()`. The core already does this for: the simulation (held with the pause
+  reason `placements-materializing` while the scene is incomplete), one batched `drives-changed`
+  (drive order, recorder, `useDrives`), the DES re-bind, the ground disc and the camera re-fit
+  (only when nobody moved the camera since the load framed it).
+- **Never** hand `viewer.whenSceneReady()` to `viewer.trackLoadingWork()` from `onModelLoaded`:
+  `loadModel` drains that queue before it returns, and the join point waits for `loadModel` — a
+  deadlock. Use `void viewer.whenSceneReady().then(...)` and re-check that your `LoadResult` is
+  still `viewer.lastLoadResult`.
+
+```typescript
+onModelLoaded(result: LoadResult, viewer: RVViewer): void {
+  this.rebuild(viewer);                       // the document's own content
+  void viewer.whenSceneReady().then(() => {
+    if (viewer.lastLoadResult === result) this.rebuild(viewer);   // + every placed reference
+  });
+}
+```
+
 ### Plugin Order
 
 The `order` property controls execution order within each phase (Pre, Post, Render). Lower values run first:
@@ -1351,7 +1876,11 @@ source. Treat `rv-viewer-events.ts` as the list, this table as the map:
 ```typescript
 interface ViewerEvents {
   // Lifecycle
-  'model-loaded':       { result: LoadResult };
+  'model-loaded':       { result: LoadResult };   // scene may still be incomplete → whenSceneReady()
+  'placements-materialized': { aborted: boolean; total: number; materialized: number; missing: number }; // once per load
+  'placements-state-changed': { state: 'idle' | 'materializing' };
+  'layout-content-added':   { root: Object3D; chunks?: Mesh[]; keep?: Mesh[] };  // one placement is live
+  'layout-content-removed': { root: Object3D; path: string | null };            // …and is leaving (planner remove)
   'model-cleared':      void;
   'connection-state-changed': { state: 'Connected' | 'Disconnected'; previous: 'Connected' | 'Disconnected' };
   'simulation-pause-changed': { paused: boolean; reasons: readonly string[]; reason: string };
@@ -1637,6 +2166,160 @@ function CustomPanel() {
 
 ---
 
+## 5b. Commands — Buttons, Menus, Shortcuts and MCP Tools as Views
+
+A **command** is the ONE definition of a user action (plan-499): label, the rule that says whether
+it can run *and why not*, the execution, the undo label and the MCP mirror. Buttons, context-menu
+items, keyboard shortcuts and the bodies of MCP write tools are **views** of the command — none of
+them carries its own copy of the rule. That is what makes "the tooltip of a disabled button" and
+"the `{error}` an agent receives" the same string by construction, and what lets the viewer show
+which button the AI just used.
+
+### The registry
+
+`src/core/hmi/rv-command-registry.ts` holds `commandRegistry` (open, eager):
+
+```typescript
+commandRegistry.register({
+  id: 'sim.reset', label: 'Reset simulation', readOnly: false, shortcut: 'Shift+R',
+  scope: 'none',                 // 'editor' = needs the active asset document (guard texts reused)
+  available: true, unavailableReason: 'Not available',
+  argsSchema: {},                // COMMAND args (name → 'string' | 'number' | 'boolean' | 'string[]')
+  buttonKey: () => 'sim.reset',  // the button the afterglow / choreography targets
+  mcp: { tool: 'web_sim_reset', params: [] },   // 1:1 mirror, checked by the parity gate
+  eagerImpl: resetImpl,          // open impls in memory: enabled() is synchronous from the start
+  impl: () => Promise.resolve(resetImpl),       // lazy impls: `import('@rv-private/...')`
+});
+```
+
+An implementation is `{ visible?(ctx), enabled(ctx, args), run(ctx, args) }`. `enabled()` returns
+`true` or `{ reason, details? }` and is formulated on the **args** (not on the selection) —
+views pass the selection as args. `run()` returns the value the tool body serialises; a failure
+after `enabled()` said yes is thrown as `CommandError(message, details)`.
+
+Every trigger goes through ONE dispatcher, never `run()` directly:
+
+```typescript
+const r = await commandRegistry.execute('layout.remove', { id: null }, { origin: 'ui', viewer });
+// r = { ok: true, value } | { ok: false, kind: 'disabled' | 'unavailable' | 'invisible' | 'stale' | 'threw' | 'unknown', reason, details? }
+```
+
+Order: unknown → `available` (community stub first, before any mode guard) → context + guard →
+lazy impl → identity recheck → `visible` → `enabled` → identity recheck → `run` → `onExecuted`.
+A cached implementation runs synchronously up to its own first `await`, so a key press or click
+has its effect in the same tick. `ctx.origin` ('ui' | 'mcp' | 'shortcut') exists for attribution
+only (a signal written by the bridge is booked as `mcp`); a rule never depends on it.
+
+UI-local gates that are not rules of the action (`busy`, a running test session, "select a single
+object") stay on the view as `disabled` and are OR-ed with the command's answer.
+
+**Where commands live:** editor commands — open descriptors in `editor-command-descriptors.ts`,
+private implementations in `@rv-private/plugins/asset-editor/editor-commands` (community stub:
+`impls = {}` → `ERR_EDITOR_UNAVAILABLE`); planner — `plugins/layout-planner/planner-commands.ts`;
+sim / drives / signals — `plugins/sim-controller/sim-commands.ts`; rigid-body mechanisms (plan-504)
+— open descriptors in `mechanism-command-descriptors.ts`, private implementations in
+`@rv-private/plugins/asset-editor/mechanism/mechanism-commands` (same stub rule). Each exposes an
+idempotent `ensure…CommandsRegistered(registry?)`; the owning plugin calls it in its constructor, the
+MCP bridge before every call (the editor and mechanism descriptors additionally register when the
+MCP tool module loads, so a first call never meets "Unknown command").
+
+### Views
+
+| View | How it binds |
+|------|--------------|
+| `ActionSegment` (open, `core/hmi/action-group.tsx`) | `command={{ id, args?, buttonKey?, viewer?, invoke? }}` instead of `onClick` — the TypeScript union forbids both |
+| `ActionButton` (private Quick Edit primitive) | same `command=` prop; `label` overrides the command label |
+| any other button (`IconButton`, a card) | `const view = useCommandView({ id, args, viewer })` → `view.onClick`, `view.disabled`, `view.reason`, `view.dataAttrs` (spread them: `data-rv-command-id` / `data-rv-button-id`), `view.simPhase`, `view.touch` + `aiTouchSx(view.aiTouch, getAiTouchMs())` |
+| context-menu item | `ContextMenuItem.command = { id, args: (target) => …, buttonKey? }`; `ContextMenuLayer` dispatches with origin `ui` (mouse) or `shortcut` (menu chord); the item keeps its local one-letter `shortcut` and its own label |
+| inspector action | `ComponentAction.command = { id, args: (ctx) => …, buttonKey? }`; `rv-component-section` renders it through the command. Keep an `onClick` that dispatches the SAME command for programmatic callers |
+| keyboard | the handler keeps its guards (editable target, modifiers, test-run lock) and then calls `execute(id, args, { origin: 'shortcut' })` |
+| interactive view | `CommandRef.invoke` — a click opens a picker / menu / placement mode; the dispatch happens when it completes (the speed menu, a library entry, "Pivot to Object", Anchor A/B, "Assign Drive") |
+| control view | a control that is not a button — a select, a slider, a small form — dispatches `execute(id, args, { origin: 'ui', buttonKey })` itself with its new value. `useCommandView` still gives it the rule (`disabled`, `reason`) and the afterglow (`aiTouch`); it carries **no** `data-rv-button-id`, so an MCP call gets no simulated hover/press on it, only the afterglow |
+
+Button keys: a command with several buttons (Rotate X/Y/Z, one library entry per catalog id, one
+Jog button per drive) derives its `buttonKey(args)`; view and tool binding compute the same key.
+With several ROWS of the same kind mounted, the key names the row (`mech.pin-mass:<path>`,
+`mech.axis:<jointPath>#<componentType>`), so only the addressed row glows. When the button
+disappears on success (Add Body, Fix), the key names the surrounding row container instead
+(`mech.body-row:<path>`, `mech.finding-row:<jointPath>#<code>`) — the
+container renders the afterglow (`useAiTouch`) under its own attribute, never `data-rv-button-id`,
+because the click choreography would find an ancestor with that id before the button inside it.
+
+**Example — the Mechanism section (plan-504).** Readiness is not execution: the Anchor A button is
+an interactive view of `mechanism.setAnchorSnap`, whose `enabled()` only checks the joint (so the
+button is clickable before anything is picked); the click arms the viewport pick, and the pick's
+completion dispatches the command with the picked point:
+
+```tsx
+<ActionButton
+  label="Anchor A"
+  command={{
+    id: 'mechanism.setAnchorSnap',
+    args: () => ({ path: joint.nodePath, componentType, side: 'A' }),   // readiness
+    invoke: () => startMechanismPick(viewer, 'anchor', 'Pick anchor A', (pick) => {
+      void commandRegistry.execute('mechanism.setAnchorSnap',              // execution
+        { path: joint.nodePath, componentType, side: 'A', pickJson: pickResultToJson(pick) },
+        { origin: 'ui', viewer });
+    }),
+  }}
+/>
+```
+
+`run()` demands exactly ONE source (`candidateId` from `web_editor_mechanism_snap_list` XOR
+`pickJson`) and throws a `CommandError` before any write otherwise; cancelling the pick dispatches
+nothing. The density select and the jog slider of the same section are control views, the limits
+form commits through its "Apply" button (one undo step per Apply, never per keystroke).
+
+### MCP tool bindings
+
+A write tool declares the command it is a view of in its decorator — metadata only, the wire schema
+is unchanged:
+
+```typescript
+@McpTool('Reset the simulation: …', { readOnly: false, command: 'sim.reset' })
+async webSimReset(ctx?: McpCallContext): Promise<string> {
+  return this._json(await this._dispatch(ctx, 'webSimReset', {}), (v) => ({ ok: true, ...v }));
+}
+```
+
+- **1:1** — `command: 'id'`: the wire args ARE the command args (`argsSchema` must equal the wire
+  shape, `mcp` mirrors the `@McpParam`s).
+- **Multiplexer** — `command: { branches, normalize? }`: a **branch table** (`when` wire values →
+  `id`, `args(wire)`, `requires`, `buttonKey`), e.g. `web_editor_pivot` per `mode`,
+  `web_editor_shortcut` per key chord. No free resolver function — the gate checks every branch.
+
+The bridge resolves the binding ONCE per call, before any wait (`buildCallContext`: command, args,
+button key, document handle, selection), runs the **preflight** (`preload` + `enabled()`; a refusal
+gets no hover/press choreography and no afterglow), then calls the body with the context as its
+trailing argument. The body's only job is `dispatchBoundCommand(ctx)` plus serialisation — never a
+second resolution. On success the bridge's `onExecuted` listener starts the **afterglow** on the
+target button (`button-sim-state.ts`: ~3 s, accent colour + "AI" marker, `aria-description="Triggered
+by AI"`, colour/opacity only — no transform, so `prefers-reduced-motion` needs nothing extra) and the
+AI status pill shows the command label.
+
+### The parity rule
+
+Every MCP write tool (`readOnly: false`) is **either** bound to a command **or** listed in
+`NO_UI_WRITE_TOOLS` (`tests/rv-command-mcp-parity.node.test.ts`) with a specific reason — "there is
+no button to be a view of" or "the UI counterpart is not a one-click action with an enablement rule"
+(viewport gestures, the agent camera, settings toggles, document/dialog flows, form fields, agent
+routines). "Not yet migrated" is not a reason. Two tests enforce it:
+
+- `rv-command-mcp-parity.node.test.ts` (metadata gate): every write tool bound or allow-listed;
+  1:1 mirror and annotations match; every multiplexer branch exists, maps to the hand-kept
+  expectation table and produces exactly the command's args shape; the counts are pinned
+  (96 write tools: 45 bound, 51 allow-listed — plan-504 bound the eleven Mechanism section tools;
+  `web_editor_mechanism_set_anchor` stays a millimetre field input; the five plan-729 path tools and
+  the two plan-501 trajectory writes are allow-listed with their reasons).
+- `rv-command-bindings-execution.test.ts` (execution gate): every bound tool dispatches exactly ONE
+  `execute` with the expected id/args (`EXPECTED_DISPATCH`), serialises the pre-migration result
+  shape, and answers a refusal as `{error: reason, ...details}`.
+
+Adding a write tool therefore means: bind it (`command:` + an `EXPECTED_DISPATCH` row) or add it
+to the allow-list with its reason — and bump the counts.
+
+---
+
 ## 6. React Hooks Reference
 
 | Hook | Returns | Purpose |
@@ -1677,20 +2360,20 @@ export function useAlarm() {
 
 The tooltip system (`core/hmi/tooltip/`) uses **a single headless controller** (`GenericTooltipController`) plus a registry of **content providers** and **data resolvers**. To add a tooltip for a new component type:
 
-### Step 1: Declare `tooltipType` on the component capability
+### Step 1: Declare `ui.tooltip` on the component capability
 
-When registering the component (in [rv-component-registry.ts](src/core/engine/rv-component-registry.ts) via `registerComponent({ type: 'Sensor', ... })`), set `capabilities.tooltipType` to a stable string key:
+When registering the component (in [rv-component-registry.ts](src/core/engine/rv-component-registry.ts) via `registerComponent({ type: 'Sensor', ... })`), set `capabilities.ui.tooltip` to a stable string key:
 
 ```typescript
 registerComponent({
   type: 'Sensor',
   schema: RVSensor.schema,
-  capabilities: { hoverable: true, tooltipType: 'sensor' },
+  capabilities: { pick: 'select', ui: { tooltip: 'sensor' } },
   create: (node) => new RVSensor(node),
 });
 ```
 
-For types that have no factory (e.g. AAS links), use `registerCapabilities('AASLink', { tooltipType: 'aas', ... })` instead.
+For types that have no factory (e.g. AAS links), use `registerCapabilities('AASLink', { pick: 'select', ui: { tooltip: 'aas', ... } })` instead.
 
 ### Step 2: Register a Content Provider AND a Data Resolver
 
@@ -1730,13 +2413,13 @@ tooltipRegistry.registerDataResolver('sensor', (node, viewer) => {
 import './core/hmi/tooltip/SensorTooltipContent';
 ```
 
-That's it. No controller code, no event subscriptions — `GenericTooltipController` (already mounted in `App.tsx`) reads `node.userData.realvirtual` keys on hover and selection, looks up `getCapabilities(key).tooltipType`, and calls your data resolver.
+That's it. No controller code, no event subscriptions — `GenericTooltipController` (already mounted in `App.tsx`) reads `node.userData.realvirtual` keys on hover and selection, looks up `getCapabilities(key).ui.tooltip`, and calls your data resolver.
 
 **Bonus — generic PDF links**: any node with `node.userData._rvPdfLinks` automatically gets a PDF section appended at the bottom of its tooltip via `PdfTooltipSection`. No registration needed.
 
 **Positioning modes:** `cursor` (follows mouse), `world` (3D→screen projection), `fixed` (screen position).
 
-**Priority:** When multiple tooltip sections show at once, the **lower** `priority` number wins (default `5` for hover via `caps.hoverPriority`).
+**Priority:** When multiple tooltip sections show at once, the **higher** `priority` number is the primary section (`tooltipStore` sorts descending; default `5` via `caps.ui.priority`, used for hover AND pinned bubbles).
 
 ---
 
@@ -1901,6 +2584,184 @@ const toggle = (id: string) => setOpenChart(prev => prev === id ? null : id);
 | TopBar | 1200 | Top bar with KPI badges |
 | KPI Charts | 1400 | OEE, Parts/h, Cycle Time panels |
 | Drive Chart | 1500 | Drive chart overlay |
+
+---
+
+## 8c. A Control Window in a Project Plugin
+
+A `ControlWindow` is the operator counterpart of the chart overlays above: the same chrome
+(drag by the title bar, glass surface, remembered position), minus the one thing an operator
+panel must not have — a way to close it. It collapses to its title bar instead, and remembers
+that across reloads. There is no close button and Escape does nothing.
+
+It lives in `src/core/hmi/ControlWindow.tsx` and carries three controls, deliberately few and
+deliberately distinct (ISA-101: a latching selector and a momentary button must not look alike):
+
+| Control | Semantics |
+|---------|-----------|
+| `LatchGroup` | one of N, latched, the active one lit. `value = null` is a real state: the model matches no option. |
+| `MomentaryButton` | press-and-hold. `onPress` down, `onRelease` up. Omit `onRelease` for a one-shot action. |
+| `ControlSlider` | a continuous value, live in its own label, `onChange` live and `onCommit` at the end of the drag. |
+
+### Where the window is defined
+
+In the project's own plugin module — `projects/<name>/plugins/index.ts`, the only entry the
+discovery glob loads — bound to a document by `documents[].scriptRef` in `project.json`:
+
+```jsonc
+// projects/Development/project.json
+{ "path": "models/DemoRibbonTension.glb", "name": "DemoRibbonTension",
+  "scriptRef": "plugins/index.ts" }
+```
+
+```ts
+// projects/Development/plugins/index.ts
+import type { RVViewer } from '@rv/core/rv-viewer';
+import { RibbonTensionControlsPlugin } from './ribbon-tension-controls-plugin';
+
+let registered: string[] = [];
+
+export function registerModelPlugins(viewer: RVViewer): void {
+  const plugin = new RibbonTensionControlsPlugin();
+  viewer.use(plugin);
+  registered.push(plugin.id);
+}
+
+export function unregisterModelPlugins(viewer: RVViewer): void {
+  for (const id of registered) viewer.removePlugin(id);
+  registered = [];
+}
+```
+
+Every project uses that same `scriptRef`, so the resolver narrows by the OPEN project
+(`ModelPluginManager`, `projectFolderProvider`). Nothing to configure — but it does mean the
+project has to be open: a bare `?model=` URL loads the GLB without any project code. The e2e
+route is `?projectUrl=<deploy root>`.
+
+### The window itself
+
+```tsx
+export const RibbonTensionControls = ({ plugin }: { plugin: RibbonTensionControlsPlugin }) => {
+  const snap = useSyncExternalStore(plugin.subscribe, plugin.getSnapshot);
+  return (
+    <ControlWindow title="Ribbon Tension" panelId="ribbon-tension-controls">
+      <ControlGroup label="Situation">
+        <LatchGroup ariaLabel="Situation" value={snap.latch} disabled={!snap.ready}
+          options={[{ id: 'slack', label: 'Slack' }, { id: 'normal', label: 'Normal' }]}
+          onChange={(id) => plugin.applyLatch(id)} />
+      </ControlGroup>
+      <ControlSlider label="Nip 2" unit="mm/s" min={700} max={900} value={snap.nip2MmPerS}
+        disabled={!snap.ready} onChange={(v) => plugin.setNip2(v)} />
+      <MomentaryButton label="Load x2" disabled={!snap.ready}
+        onPress={() => plugin.holdDouble(true)} onRelease={() => plugin.holdDouble(false)} />
+    </ControlWindow>
+  );
+};
+```
+
+Register it in the `overlay` slot with a `visibilityId` and **no** `visibilityRule`. The
+Mauser HMI hides its window with `hiddenIn: ['viewer']`; copying that rule here hides the
+operator panel in exactly the mode it exists for.
+
+### Four rules the lifecycle imposes
+
+1. **Read the model in `onStart`, never in `init`.** `init` runs at `viewer.use()`, which is
+   before `loadGLB`. Until `onStart` has run, publish `ready: false` and render the controls
+   disabled.
+2. **The model is the truth.** Keep only the latch in your store; read slider values back out
+   of the model. Reconcile once per `onFrame` — not a fixed-step hook, because `onFrame` also
+   runs while the simulation is paused, and an external change (MCP, console) must still move
+   the slider. Convert units in ONE function, match the latch with a tolerance, and return the
+   SAME snapshot object when nothing changed, or the window re-renders 60 times a second.
+3. **Two resets, and they are different.** A *Reset* button is a demo reset: set your values
+   and latch, explicitly. The global `resetSimulation()` emits `simulation-reset` BEFORE
+   `drive.reset()` runs, so a listener that reads values there reads the old ones — clear the
+   latch, set a one-shot flag, and let the next `onFrame` read what the reset restored.
+4. **Do not subscribe to `model-cleared`.** `onModelCleared` calls `onDestroy` first; release
+   your references there.
+
+---
+
+## 8d. Quick Edit — Groups section (plan-760)
+
+The asset editor's Quick Edit window has a **Groups** section directly under **Kinematics**
+(private `plugins/asset-editor/groups/GroupsList.tsx`, mounted by `KinematicsPanel.tsx`). It
+lists every authored `Group` component of the document — kinematic groups included — and is
+built from the same row primitives as the Kinematics list (`list-row-primitives.tsx`: row shell,
+fold chevron, eye/isolate actions, filter row). Auto-filter categories, overlay categories and
+baked partition objects are not groups and never appear here; the editor does not bake.
+
+**What a row shows and does.** Resolved name (a prefixed group reads `Prefix · Suffix`, only the
+suffix is editable), member count, an accent dot (`GROUP_ACCENT` `#80deea` for a plain group,
+`KINEMATIC_ACCENT` `#ce93d8` for a group a `Kinematic*` owns), and on hover the actions Isolate,
+Eye, Rename, Dissolve and *Remove selection from group*. Hovering a row previews its members as
+an overlay; **clicking** a row selects all members (those with a registry path) and makes the
+group the **Auto Assign target** — it does not switch the mode on. The chevron folds open the
+member rows (indent, path tooltip, click = select, `×` = remove from this group), capped at
+`MEMBER_ROW_CAP = 200` with an "and N more… (filter to narrow)" row beyond that. The section has
+its own filter row (substring on the resolved name; pending and armed groups always stay listed)
+and its own resize handle (`GROUPS_LIST_HEIGHT` 240, min 120, max 1200, stored under
+`rv-groups-list-height`).
+
+**Add Group / pending rows.** The footer button *Add Group* (`data-rv-button-id="qe.add-group"`)
+asks for a name and adds a **pending** row (dimmed, outline dot, 0 members, no eye/isolate) that
+lives in the auto-assign store until the registry knows the name — the first assignment creates
+the `Group` components. A pending name is cleared on `model-loaded` and when the panel closes.
+The "Add to group (no kinematic)…" field in the Components section still exists and is
+unchanged.
+
+**Rename / Dissolve.** Pencil or double-click opens an inline editor (Enter/blur commits, Escape
+cancels, IME composition is ignored, a refusal keeps the field open with a toast). Rename
+rewrites `GroupName` on every member key and on the owning `Kinematic*` in ONE transaction,
+per key so a mixed prefixed/unprefixed group stays one group; a new name that would drop a
+key's prefix is refused before any write. Dissolve (trash, `ConfirmActionDialog`) removes the
+matching `Group` keys and blanks `Kinematic.GroupName`; it never deletes geometry. Both are one
+undo step; undo restores the registry and the kinematic link, not an eye state.
+
+**Live only — the rule.** Eye, Isolate and *Show all* in BOTH editor lists call
+`viewer.groups.setVisible / isolate / showAll` and bump the shared `group-view-store` tick; they
+never write `rv-group-visibility`. The persisted profile belongs to the HMI's **Display** panel,
+whose close handler skips `persistCurrentGroupVisibility` while `getActiveAssetContext()` is
+non-null (`closeGroupsOverlay`, `GroupsOverlay.tsx`). Quick Edit = live, Display panel =
+persisted.
+
+**The Auto Assign contract** (one mode, one target, for both sections):
+
+| Event | Target (store) | Mode (`autoAssign`) |
+|---|---|---|
+| Click a Kinematics row | `{ groupName, kinematicPath }` | unchanged |
+| Click a Groups row | `{ groupName, kinematicPath: first owning Kinematic or null }` | unchanged |
+| Add Kinematic / Add Group | the new group | **unchanged** — never switched on programmatically |
+| Toggle (either header, same state) | unchanged | user click |
+| Escape (no input focused, no dialog open) | unchanged | off |
+| Rename of the target | re-keyed to the new name | unchanged |
+| Dissolve of the target, `model-loaded`, panel close, asset switch | `null` | off |
+| 3D click / marquee, mode ON + target | `assignTarget()` routes: kinematic → `autoAssignToKinematic`, plain → `assignToGroup`; a click on a node that carries a `Kinematic*` re-targets; target itself / existing member = no-op | unchanged |
+| 3D click / marquee, mode OFF | nothing — `getArmedTarget()` is `null`, the marquee is a normal selection | unchanged |
+| Undo removes the target group from the registry | target stays; not in registry and not pending → no hide, no ghost, assign = no-op | unchanged |
+| Eye / Isolate on the armed row while ON; Show all | locked ("Turn off Auto Assign first") / Show all skips the armed group | unchanged |
+
+While the mode is ON and the target exists, the target group is hidden and the selection is
+ghosted in the group's accent; the `AutoAssignController` (`auto-assign-controller.ts`) owns
+that hide/restore imperatively (`apply()` is idempotent and re-runs on `groups-changed` and the
+view tick, `suspend(name)` / `resume(newName | null)` bracket a rename or dissolve), and restores
+onto the same `GroupInfo` instance it captured. The React bridge is `useAutoAssignArming()`,
+mounted once by the panel: it writes `enabled`, registers the ONE `object-clicked` listener,
+the Escape listener and the `model-loaded` disarm.
+
+**For plugin authors — store and controller API in three sentences.** The target lives in
+`kinematics/auto-assign-store.ts` as `{ groupName: string; kinematicPath: string | null }`:
+`setAutoAssignTarget(t | null)` publishes it, `getAutoAssignTarget()` reads it for display
+(armed row, ghost accent), `getArmedTarget()` returns it only while the mode is enabled and is
+the only accessor routing, hide and marquee may read; `addPending / removePending / isPending`
+manage the pending names. The singleton `autoAssignController` (`bind / setEnabled / disarm /
+suspend / resume / apply / busy`) is the sole writer of `enabled` and of the hide state — a list
+publishes a target, it never nulls it in an effect cleanup and never flips the mode. Group
+mutations go through `groups/group-ops.ts` (`assignToGroup`, `removeFromGroup`, `renameGroup`,
+`dissolveGroup`, `validateGroupName`, `groupNameCollides`, `assignTarget`), each ONE
+`withTransaction` that throws a `GroupOpError` BEFORE any write, and the same four operations
+are the commands `editor.groupAssign / groupRemove / groupRename / groupDissolve` behind the
+MCP verbs `web_editor_group_assign / _remove / _rename / _dissolve` (`webviewer.mcp.md`).
 
 ---
 
@@ -2284,7 +3145,6 @@ class MockHost {
 | `CameraEventsPlugin` | `camera-events` | [src/plugins/camera-events-plugin.ts](src/plugins/camera-events-plugin.ts) | Emits `camera-animation-done` |
 | `CameraStartposPlugin` | `camera-startpos` | [src/plugins/camera-startpos-plugin.tsx](src/plugins/camera-startpos-plugin.tsx) | Per-model start position presets — the canonical `core: true` + mode-scoped-UI case (see [doc-ui-visibility.md](doc-ui-visibility.md) §4) |
 | `RvExtrasEditorPlugin` | `rv-extras-editor` | [src/core/hmi/rv-extras-editor.tsx](src/core/hmi/rv-extras-editor.tsx) | Hierarchy browser + property inspector |
-| `AdaptiveNavPlugin` | `adaptive-nav` | [src/plugins/adaptive-nav-plugin.ts](src/plugins/adaptive-nav-plugin.ts) | Scene-size-aware navigation defaults |
 | `ConnectionSystemPlugin` | `connection-system` | [src/plugins/connection-system-plugin.ts](src/plugins/connection-system-plugin.ts) | Typed connection registry session (see §22) |
 | `KioskPlugin` | `kiosk` | [src/plugins/kiosk-plugin.tsx](src/plugins/kiosk-plugin.tsx) | Kiosk chrome + idle detection / tour |
 | `SignalBindPlugin` | `signal-bind` | [src/plugins/signal-bind/SignalBindPlugin.ts](src/plugins/signal-bind/SignalBindPlugin.ts) | Signal ↔ component binding popover and persistence |
@@ -2348,7 +3208,7 @@ Plugins are organized into three tiers:
 >
 > | Entry point | Tier | Reaches |
 > |---|---|---|
-> | `private-plugins.ts` | customer | every build that has the private folder. `main.ts` awaits `registerPrivatePlugins(viewer)`; the public build resolves it to the no-op stub in `src/private-stubs/`. |
+> | `private-plugins.ts` | customer | every build that has the private folder. `main.ts` starts `prefetchPrivateFeatures()` early (imports of the side-effect-free feature adapters, plan-598) and later awaits `registerPrivatePlugins(viewer, mods)`, which registers in the fixed manifest order; the public build resolves both to the no-op stub in `src/private-stubs/`. A feature whose module registers something at load time is marked `loadSideEffects: true` in `tier-manifest.json` and is never prefetched. |
 > | `internal-plugins.ts` | internal | realvirtual-internal builds only, behind a `__RV_INTERNAL__`-gated dynamic import (Omniverse render backend, physics provider, Features tab). |
 >
 > Both must finish registering before the workspace-mode registration in `main.ts`, because they
@@ -2747,6 +3607,49 @@ class VisualSettingsManager {
 
 Both managers receive a shared state interface from `RVViewer` and operate on it directly — no events or callbacks, just property access.
 
+### AgentEye (`viewer.agentEye`, plan-740)
+
+The MCP agent does **not** share the viewport camera. `viewer.agentEye` is a second, independent
+camera body: a pose that no user input ever changes, persisted per tab (`sessionStorage`, keyed by
+`deriveModelKey(modelUrl)` from `core/engine/rv-model-key.ts`), rendered offscreen and never
+through the visible frame.
+
+```typescript
+interface AgentPose { px, py, pz, tx, ty, tz, fov, aspect, projection }
+
+viewer.agentEye?.ensure();                 // spawn at the current viewport pose on first use
+viewer.agentEye?.setPose({ px, py, pz });  // partial patch; persists and fires onChange
+viewer.agentEye?.setLens({ fov, aspect, projection });   // clamped 5..120° / 0.2..5
+viewer.agentEye?.camera();                 // the private Perspective/Orthographic camera
+viewer.agentEye?.unproject(x, y);          // image fraction → world ray (the pick frame)
+```
+
+Three things a contributor has to know before touching it:
+
+- **`AGENT_EYE_LAYER = 5`** (`rv-group-registry.ts`) carries the "AI" frustum cone and is part of
+  `OVERLAY_LAYERS`, so `disableOverlayLayers()` strips it from every offscreen camera — the agent
+  cannot photograph its own cone, and neither can the thumbnail renderer or the object analyzer.
+  Only the two VIEWPORT cameras enable layer 5.
+- **`userData._agentEyeOverlay = true`** on the gizmo keeps it out of picking. The `RaycastManager`
+  filters through `_excludeFilters`, **not** through layer bits (doc-render-picking §2.4), so the
+  layer alone would leave the cone clickable.
+- **Plugin `agent-eye`** (`src/plugins/agent-eye-plugin.ts`) owns the lifecycle: it creates the
+  body and the cone, registers the double-click attach and the three auto-detach paths, exposes the
+  Settings ▸ Visual toggle, and owns the `EyeChannels` instance (one render target per body,
+  released on model change). It is a core plugin — the embed viewer loads no plugins, so it has no
+  cone and no `web_eye`.
+
+Attach is `CameraManager.startFollow(new AgentEyeFollowSource(eye))` with follow mode `'follow'`
+(so `controls.enabled` stays true and the first user drag detaches). `FollowSource` gained
+`onFollowStopped()` so the plugin can pull `attached` and the cone's visibility back in sync no
+matter which of the detach paths fired.
+
+Every MCP capture renders through `EyeChannels.renderChannels()` (`core/engine/rv-eye-channels.ts`),
+reached from the tool side by `renderAgentChannels()` in `rv-mcp-observe-tools.ts` — which also owns
+the single `serializeEyeCapture()` promise chain. Adding a new capture tool means going through
+those two, not through `captureFrameCanvas`: that one reads the visible drawing buffer and has
+exactly one legitimate consumer, `web_screenshot`.
+
 ---
 
 ## 16. Key Design Decisions
@@ -2776,9 +3679,12 @@ saved bytes and the CAD re-import loses the moved nodes silently. If your plugin
 or component restructures nodes at load time (`attach()`, `add()`, reparenting a
 subtree from `onSceneReady`), gate it on `preserveAuthoringHierarchy` and prefer
 computing a world transform over moving the node. Do **not** gate on
-`preserveHierarchy` — that flag is about mesh baking and pickability, and the
-embed viewer sets it while still needing structure work to run. See the invariant
-section in `doc-webviewer.md`.
+`preserveHierarchy` — that flag turns the BAKE off, which is a different question
+from "may this load restructure the authored tree"; only the editor sets it today
+(the embed viewer bakes since plan-754 D20). Structural work a runtime load needs
+belongs in an `onPreBake` hook, which runs on the throwaway graph and therefore
+cannot corrupt an authored document at all. See the invariant section in
+`doc-webviewer.md`.
 
 **Why two signal lookup tables (name + path)?**
 Signals need to be addressed by **name** for communication (plugin API, HMI, interfaces) and by **path** for GLB object references (ComponentRef). The name is the signal's identity (Signal.Name if set, otherwise node name); the path is its location in the scene hierarchy. Both resolve to the same underlying value.
@@ -3237,6 +4143,26 @@ In DES FastForward the runner normally skips per-frame animation and only "settl
 
 ## 23. Path Simulation — Agv as a Library-Component Example + Routing Hooks
 
+> **plan-558 — reusable motion engine.** Two pure engine modules carry the AGV
+> distance control and are reusable for any 1D mover:
+>
+> - [`rv-motion-profile.ts`](src/core/engine/rv-motion-profile.ts) — closed-form
+>   time-optimal profiles in **meters / seconds**: `planProfile(t0, x0, v0, limits, a, b, xEnd, { vEnd })`
+>   with piecewise-linear v² limits (`LimitPiece`), forward / backward pass,
+>   `positionAt` / `speedAt` / `timeAt`, `feasible: false` = emergency stop;
+>   `minSeparation` (exact time-domain gap check, cut at a branch point) and
+>   `earliestGapCrossing` (exact field entry / exit times). Throws `RangeError`
+>   on invalid input; the evaluators are allocation-free.
+> - [`rv-movement-authority.ts`](src/core/engine/rv-movement-authority.ts) — the
+>   trajectory-based moving block: per vehicle one versioned plan (route +
+>   profile), leader envelopes, zone claims keyed on odometer positions, the
+>   coalesced re-plan flush, scanner state machine and motion state
+>   (free / slowed / stopped). Kernel-neutral through the `MbHost` callbacks;
+>   `getDefaultMovementAuthority('des' | 'continuous')` (the continuous one owns
+>   the exact-time `MotionEventClock`). `RVPath.curvatureIntervals()` feeds the
+>   curve limits; `findUnzonedMerges()` reports merges without a common zone
+>   (Problems panel at load).
+
 [src/behaviors/Agv.ts](src/behaviors/Agv.ts) and [src/behaviors/OverheadConveyor.ts](src/behaviors/OverheadConveyor.ts) are the reference examples for a library component built on the path substrate: one `defineLibraryComponent(def)` call each (see [doc-behavior-modelling.md](doc-behavior-modelling.md) for the factory), riding `RVPath` / `RVPathNetwork` / `PathTraveler` ([src/core/engine/rv-path.ts](src/core/engine/rv-path.ts), [rv-path-network.ts](src/core/engine/rv-path-network.ts), [rv-path-traveler.ts](src/core/engine/rv-path-traveler.ts)) with raycast-free traffic (`SpacingController` headway + `ZoneRegistry` claims). The Agv shows the full pattern: schema defaults from rv_extras, the shared drive ramp for speed, signals with `self.isWired` live-override, a `continuous` block plus a purely declarative `des` block, and reset/teardown hooks that release every zone claim (a surviving claim would block a crossing permanently).
 
 **The component ships mechanics only — routing and dispatch are project logic.** Three id-based hooks cross to project code (only plain values, never engine objects):
@@ -3310,6 +4236,53 @@ Three rules are not negotiable:
   `() => ({...})` gives `useSyncExternalStore` a new identity on every read,
   which is an infinite render loop (React minified error #185).
 
+## Binary resources in a GLB (plan-498 pattern)
+
+Some components need bytes that are neither geometry nor texture — the first one is
+the `Fmu` component, whose `.fmu` package travels inside the GLB. The pattern it
+established is the one to reuse for the next such payload.
+
+- **Standard glTF, no custom chunk.** The payload is an ordinary `bufferView` in the
+  BIN chunk; the component's extras name it (`FmuEmbed.bufferView`, `byteLength`,
+  `sha256`) and the file lists all such views in
+  `asset.extras.realvirtual.fmuBufferViews`. No Base64 in extras, no bytes in
+  `userData`.
+- **One store, keyed by content.** `binaryResources`
+  ([rv-binary-resources.ts](src/core/engine/rv-binary-resources.ts)) maps
+  `sha256 → bytes` and reference-counts the documents that hold a payload
+  (`put` / `retain` / `releaseDocument`). A component looks its bytes up by SHA in
+  `init()`; it never reads them from the scene graph.
+- **Fed from the RAW GLB at every parse entry.** `GLTFLoader` drops bufferViews
+  nothing references, so the bytes must be taken before it parses. All three entries
+  — main load (`rv-scene-loader.ts`), placement cache (`rv-model-cache.ts`) and
+  subtree/compose (`rv-glb-parse.ts`) — call ONE wrapper,
+  `parseGlbCollectingResources(bytes, documentId, loader)`, which slices the wanted
+  views into the store and then parses. A GLB without the marker string costs one
+  byte scan, no second JSON parse. `tests/rv-binary-resources.test.ts` fails on any
+  new `parseAsync(` outside the wrapper (the two writers are named exceptions). A new
+  payload kind extends `collectFmuEmbeds` / `forEachFmuRecord` there instead of
+  adding a parse path.
+- **Written by the asset writer.** `exportAssetGlb`
+  ([rv-asset-glb-export.ts](src/core/editor/rv-asset-glb-export.ts)) appends one
+  bufferView per SHA from the store (`embedFmuPackages`) and prunes runtime children
+  (`userData._rvFmuSignal`) before the export. A payload missing from the store is
+  saved with `bufferView: -1` and a warning — never silently dropped.
+- **Heavy parsers are lazy editor chunks.** Reading `modelDescription.xml` needs a
+  zip and an XML parser (`fflate`, `fast-xml-parser`). They live in
+  [rv-fmu-model-description.ts](src/core/engine/rv-fmu-model-description.ts), which
+  only the editor path reaches via dynamic `import()` — only that one zip entry is
+  inflated, with size limits. The runtime reads the parsed result from the extras and
+  never loads the parser; `tests/bundle-splitting.test.ts` (T10/T11) keeps it out of
+  the entry chunk.
+- **Signal children with their own leaf name.** `addSignal(host, wireName, type,
+  store, registry, { at: host, leafName })`
+  ([rv-signal-construction.ts](src/core/engine/rv-signal-construction.ts)) creates
+  the child `<host>/Signals/<leafName>` while the wire name stays unique
+  (`<host>.<variable>`). Without `leafName` the leaf is named after the wire name.
+  Children created this way at load time are addressable like authored signals —
+  a `ComponentReference` to `<host>/Signals/<leaf>` in another component resolves to
+  the signal once the host component has registered it.
+
 ## Project backends
 
 A project's bytes live behind `ProjectBackend`, with three implementations:
@@ -3318,3 +4291,44 @@ System Access). Anything writing project data should go through the backend
 rather than reaching for the filesystem, so it works on all three — that is what
 lets a user on Firefox or Safari, where only the browser backend is writable,
 save their own assets at all.
+
+## Picking and cleanup
+
+Community extensions can use the public
+[RaycastManager](src/core/engine/rv-raycast-manager.ts) through
+`viewer.raycastManager` (which can be null). Register helper geometry with
+`addAuxRaycastTarget(mesh, owner)` so hits resolve to the intended model node.
+Remove it with `removeAuxRaycastTarget(mesh)` before removing or disposing the
+helper. Layer bits alone do not register auxiliary pick targets.
+
+Everything else pickable is baked geometry. The pick surface is
+`viewer.bakeRegistry.pickMeshes` — the chunk and keep meshes of every live
+instance, the main model included. Iterate that, never the scene
+graph: a per-node mesh to walk no longer exists. A hit is resolved back to a
+node by the registry (`resolveHit(mesh, ownerOrdinal)` — the owner ordinal travels
+on the intersection the backend pushed, as `rvOwner`), which the viewer's
+`PickBackend` already does for ordinary picks. A plain `THREE.Raycaster` over
+those meshes also works: an instance `.raycast` override answers from the same
+pick structure with the nearest surface.
+
+Two ownership rules follow, and both are load-bearing:
+
+- **Never `dispose()` a chunk geometry.** It is shared by every instance of the
+  asset. `disposeSubtree` / `disposeModelSubtree` skip geometries registered in
+  `chunkMetaOf` for exactly that reason, and the `BakedAsset` frees them itself
+  once its refcount reaches zero.
+- **Remove a placement through the registry**, with
+  `bakeRegistry.release(instance)` or `releaseByRoot(root)`. The registry fires
+  its release listeners before it detaches anything, which is how the highlight
+  manager drops `chunk-outline` / `chunk-overlay` proxies for that instance in
+  time. Detaching or disposing the meshes by hand skips that step.
+
+Highlights on a baked root go through those pooled wrapper proxies, which carry
+their own `drawRange` over the chunk geometry — never set `drawRange` on the
+chunk itself, it is shared. Dispose only geometry and materials your extension
+created, never the model's.
+
+Pair every registration with cleanup on model clear, user disable, relevant mode
+exit and final plugin disposal. Make cleanup idempotent and cancel asynchronous
+work so a late continuation cannot reinstall a removed overlay. See
+[Lifecycle](doc-lifecycle.md) and [Events](doc-events-and-hooks.md).

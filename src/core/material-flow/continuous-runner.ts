@@ -29,6 +29,7 @@
  * declared once instead of re-evaluated per model load.
  */
 
+import { simStageProbe } from '../engine/perf/rv-sim-stage-hooks';
 import type { RVTransportManager } from '../engine/rv-transport-manager';
 import type { BehaviorManager } from '../behaviors';
 import type { CoreSubsystems } from '../engine/rv-core-subsystems';
@@ -139,12 +140,25 @@ export class ContinuousRunner implements SimulationExecutor {
    * the old viewer-level `_physicsPluginActive` bypass.
    */
   tick(dt: number): void {
+    // plan-469 Phase 0d: dev-only stage attribution. `import.meta.env.DEV` is
+    // replaced with `false` in a production build, so the whole seam — including
+    // the import above — is eliminated and the production tick is byte-for-byte
+    // the four calls it always was.
+    const sh = import.meta.env.DEV ? simStageProbe.hooks : null;
+    if (sh) sh.enter('drives');
     this.core?.drives(dt);
+    if (sh) sh.leave('drives');
     if (this.transportGate?.() !== false) {
+      if (sh) sh.enter('transport');
       this.transport.update(dt);
+      if (sh) sh.leave('transport');
+      if (sh) sh.enter('behaviors');
       this.behaviors.tick(dt);
+      if (sh) sh.leave('behaviors');
     }
+    if (sh) sh.enter('visuals');
     this.core?.visuals(dt);
+    if (sh) sh.leave('visuals');
   }
 
   /**
@@ -163,6 +177,11 @@ export class ContinuousRunner implements SimulationExecutor {
    * down. The shared transport manager's `reset()` disposes every live MU and
    * zeroes the spawn/consume counters; the behaviour binds (and thus the scene)
    * stay intact, so the runner can immediately resume.
+   *
+   * Pre-placed MUs (plan-516) are restored to their authored pose and NOT
+   * re-activated here: a mode switch must leave them static. Only
+   * `RVViewer.resetSimulation()` and the switch back into continuous mode
+   * start them again.
    */
   clearMUs(): void {
     this.transport.reset();

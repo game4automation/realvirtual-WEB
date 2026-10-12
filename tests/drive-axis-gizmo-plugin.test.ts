@@ -23,7 +23,10 @@ const GIZMO_NAME = '__rvDriveAxisGizmo';
 
 interface World {
   plugin: DriveAxisGizmoPlugin;
-  viewer: { scene: Scene; registry: NodeRegistry; camera: PerspectiveCamera; showDriveAxisGizmo: boolean };
+  viewer: {
+    scene: Scene; registry: NodeRegistry; camera: PerspectiveCamera; showDriveAxisGizmo: boolean;
+    emit: (event: string, data?: unknown) => void;
+  };
   scene: Scene;
   registry: NodeRegistry;
   select: (paths: string[]) => void;
@@ -36,9 +39,13 @@ function createWorld(): World {
   const registry = new NodeRegistry();
   const camera = new PerspectiveCamera();
   camera.position.set(0, 2, 5);
+  let lastSnap: { selectedPaths: string[]; primaryPath: string | null } | null = null;
   const viewer = {
     scene, registry, camera,
     showDriveAxisGizmo: true,
+    // The plugin PULLS the selection on `editor-structure-changed` (same as
+    // onActivate) — mirror what the real SelectionManager would hand back.
+    selectionManager: { getSnapshot: () => lastSnap },
     on(event: string, cb: (d?: unknown) => void) {
       let set = listeners.get(event);
       if (!set) { set = new Set(); listeners.set(event, set); }
@@ -51,8 +58,10 @@ function createWorld(): World {
   };
   const plugin = new DriveAxisGizmoPlugin();
   plugin.init(viewer as never);
-  const select = (paths: string[]) =>
-    viewer.emit('selection-changed', { selectedPaths: paths, primaryPath: paths[paths.length - 1] ?? null });
+  const select = (paths: string[]) => {
+    lastSnap = { selectedPaths: paths, primaryPath: paths[paths.length - 1] ?? null };
+    viewer.emit('selection-changed', lastSnap);
+  };
   const render = () => { scene.updateMatrixWorld(true); plugin.onRender(); };
   return { plugin, viewer, scene, registry, select, render };
 }
@@ -392,6 +401,30 @@ describe('DriveAxisGizmoPlugin', () => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  it('a Drive added to the CURRENT selection shows its gizmo on editor-structure-changed (no reselect)', () => {
+    const w = createWorld();
+    // Select a drive-less node first — exactly the editor flow: pick the axis
+    // node, then add a Drive component to it.
+    const { node, path } = addNode(w, w.scene, 'Axis');
+    node.add(new Mesh(new BoxGeometry(0.2, 0.2, 0.2)));
+    w.select([path]);
+    expect(gizmos(w.scene)).toHaveLength(0);
+
+    const drive = new RVDrive(node);
+    drive.Direction = DriveDirection.LinearX;
+    drive.initDrive();
+    w.registry.register('Drive', path, drive);
+    // Nothing happens until the editor reports the structure change.
+    expect(gizmos(w.scene)).toHaveLength(0);
+    w.viewer.emit('editor-structure-changed', { source: 'asset-editor' });
+    expect(gizmos(w.scene)).toHaveLength(1);
+
+    // And the inverse (remove / undo): the gizmo goes away, still no reselect.
+    w.registry.unregisterComponent('Drive', path);
+    w.viewer.emit('editor-structure-changed', { source: 'asset-editor' });
+    expect(gizmos(w.scene)).toHaveLength(0);
   });
 
   it('dispose removes gizmos and unsubscribes from selection', () => {

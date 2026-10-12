@@ -2,24 +2,31 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { useState, useRef } from 'react';
-import { Box, Button, Checkbox } from '@mui/material';
+import { Box, Button, Switch } from '@mui/material';
 import { RestartAlt } from '@mui/icons-material';
 import { useViewer } from '../../../hooks/use-viewer';
 import { isSettingsLocked } from '../rv-app-config';
 import {
-  loadVisualSettings, saveVisualSettings, NAVIGATION_RANGES,
+  loadVisualSettings, saveVisualSettings, getDefaultVisualSettings, NAVIGATION_RANGES,
   type VisualSettings,
 } from '../visual-settings-store';
-import type { AdaptiveNavPlugin } from '../../../plugins/adaptive-nav-plugin';
-import { SettingsSection, FieldRow, SliderRow } from './settings-helpers';
+import { FieldRow, SettingsSection, SliderRow } from './settings-helpers';
 
 /**
  * Settings panel tab — "Mouse & Touch".
  *
  * Controls pointer / touch navigation sensitivity for the OrbitControls camera:
  * rotate, pan, zoom speed (mouse wheel + trackpad + touch pinch) and damping.
+ * The zoom speed also scales the wheel step toward the surface (plan-515
+ * NavigationController). "Zoom to mouse cursor" picks the mouse-wheel anchor:
+ * on (default) = the point under the cursor, off = the middle of the viewport;
+ * a trackpad or touch pinch always zooms under the fingers. "Orbit around point
+ * under cursor" picks the orbit / pan anchor: off (default) = orbit about the
+ * fixed focus point and pan in the plane through it (the classic feel), on =
+ * orbit about and pan by the surface point under the cursor.
  * Values persist to localStorage via visual-settings-store and can be overridden
- * via `settings.json` (key `visual.orbit*`).
+ * via `settings.json` (keys `visual.orbit*`, `visual.wheelZoomToCursor`,
+ * `visual.navigateAroundCursorPoint`).
  */
 export function MouseTab() {
   const viewer = useViewer();
@@ -28,14 +35,9 @@ export function MouseTab() {
   const [orbitPanSpeed, setOrbitPanSpeed] = useState<number>(settingsRef.current.orbitPanSpeed);
   const [orbitZoomSpeed, setOrbitZoomSpeed] = useState<number>(settingsRef.current.orbitZoomSpeed);
   const [orbitDampingFactor, setOrbitDampingFactor] = useState<number>(settingsRef.current.orbitDampingFactor);
-  const [adaptiveNav, setAdaptiveNav] = useState<boolean>(settingsRef.current.distanceAdaptiveNav ?? false);
+  const [wheelZoomToCursor, setWheelZoomToCursor] = useState<boolean>(settingsRef.current.wheelZoomToCursor);
+  const [navigateAroundCursorPoint, setNavigateAroundCursorPoint] = useState<boolean>(settingsRef.current.navigateAroundCursorPoint);
   const settingsLocked = isSettingsLocked();
-
-  /** Notify AdaptiveNavPlugin to re-read cached base speeds from the store. */
-  const notifyAdaptivePlugin = () => {
-    const plugin = viewer.getPlugin<AdaptiveNavPlugin>('adaptive-nav');
-    if (plugin) plugin.reloadSettings();
-  };
 
   const persist = (patch: Partial<VisualSettings>) => {
     Object.assign(settingsRef.current, patch);
@@ -50,17 +52,15 @@ export function MouseTab() {
   };
   const updateOrbitPanSpeed = (_: unknown, v: number | number[]) => {
     const val = v as number;
-    if (!adaptiveNav) viewer.setControlsConfig({ panSpeed: val });
+    viewer.setControlsConfig({ panSpeed: val });
     setOrbitPanSpeed(val);
     persist({ orbitPanSpeed: val });
-    if (adaptiveNav) notifyAdaptivePlugin();
   };
   const updateOrbitZoomSpeed = (_: unknown, v: number | number[]) => {
     const val = v as number;
-    if (!adaptiveNav) viewer.setControlsConfig({ zoomSpeed: val });
+    viewer.setControlsConfig({ zoomSpeed: val });
     setOrbitZoomSpeed(val);
     persist({ orbitZoomSpeed: val });
-    if (adaptiveNav) notifyAdaptivePlugin();
   };
   const updateOrbitDampingFactor = (_: unknown, v: number | number[]) => {
     const val = v as number;
@@ -68,34 +68,41 @@ export function MouseTab() {
     setOrbitDampingFactor(val);
     persist({ orbitDampingFactor: val });
   };
+  const updateWheelZoomToCursor = (_: unknown, checked: boolean) => {
+    viewer.setControlsConfig({ wheelZoomToCursor: checked });
+    setWheelZoomToCursor(checked);
+    persist({ wheelZoomToCursor: checked });
+  };
+  const updateNavigateAroundCursorPoint = (_: unknown, checked: boolean) => {
+    viewer.setControlsConfig({ navigateAroundCursorPoint: checked });
+    setNavigateAroundCursorPoint(checked);
+    persist({ navigateAroundCursorPoint: checked });
+  };
   const resetNavigation = () => {
     const defaults = {
       orbitRotateSpeed: 1.0,
       orbitPanSpeed: 1.0,
       orbitZoomSpeed: 1.0,
-      orbitDampingFactor: 0.08,
-      distanceAdaptiveNav: false as boolean | undefined,
+      // plan-515: the reset matches the store default (0.2), not the old 0.08.
+      orbitDampingFactor: getDefaultVisualSettings().orbitDampingFactor,
+      wheelZoomToCursor: getDefaultVisualSettings().wheelZoomToCursor,
+      navigateAroundCursorPoint: getDefaultVisualSettings().navigateAroundCursorPoint,
     };
-    if (!adaptiveNav) {
-      viewer.setControlsConfig({
-        rotateSpeed: defaults.orbitRotateSpeed,
-        panSpeed: defaults.orbitPanSpeed,
-        zoomSpeed: defaults.orbitZoomSpeed,
-        dampingFactor: defaults.orbitDampingFactor,
-      });
-    } else {
-      viewer.setControlsConfig({
-        rotateSpeed: defaults.orbitRotateSpeed,
-        dampingFactor: defaults.orbitDampingFactor,
-      });
-    }
+    viewer.setControlsConfig({
+      rotateSpeed: defaults.orbitRotateSpeed,
+      panSpeed: defaults.orbitPanSpeed,
+      zoomSpeed: defaults.orbitZoomSpeed,
+      dampingFactor: defaults.orbitDampingFactor,
+      wheelZoomToCursor: defaults.wheelZoomToCursor,
+      navigateAroundCursorPoint: defaults.navigateAroundCursorPoint,
+    });
     setOrbitRotateSpeed(defaults.orbitRotateSpeed);
     setOrbitPanSpeed(defaults.orbitPanSpeed);
     setOrbitZoomSpeed(defaults.orbitZoomSpeed);
     setOrbitDampingFactor(defaults.orbitDampingFactor);
-    setAdaptiveNav(false);
+    setWheelZoomToCursor(defaults.wheelZoomToCursor);
+    setNavigateAroundCursorPoint(defaults.navigateAroundCursorPoint);
     persist(defaults);
-    notifyAdaptivePlugin();
   };
 
   return (
@@ -146,6 +153,32 @@ export function MouseTab() {
           hint="applies to mouse wheel, trackpad, pinch"
         />
 
+        <FieldRow
+          label="Zoom to mouse cursor"
+          hint="On: the mouse wheel zooms toward the point under the cursor. Off: toward the middle of the view. Pinch always zooms under the fingers."
+        >
+          <Switch
+            size="small"
+            checked={wheelZoomToCursor}
+            onChange={updateWheelZoomToCursor}
+            disabled={settingsLocked}
+            inputProps={{ 'aria-label': 'Zoom to mouse cursor' }}
+          />
+        </FieldRow>
+
+        <FieldRow
+          label="Orbit around point under cursor"
+          hint="On: rotate around and pan by the surface point under the cursor. Off: rotate around the focus point."
+        >
+          <Switch
+            size="small"
+            checked={navigateAroundCursorPoint}
+            onChange={updateNavigateAroundCursorPoint}
+            disabled={settingsLocked}
+            inputProps={{ 'aria-label': 'Orbit around point under cursor' }}
+          />
+        </FieldRow>
+
         <SliderRow
           label="Inertia (Damping)"
           min={NAVIGATION_RANGES.dampingFactor.min}
@@ -156,25 +189,6 @@ export function MouseTab() {
           disabled={settingsLocked}
         />
 
-        <FieldRow label="Adaptive Nav" hint={adaptiveNav ? 'Slider values are used as base multipliers.' : undefined}>
-          <Checkbox
-            size="small"
-            checked={adaptiveNav}
-            disabled={settingsLocked}
-            onChange={(_, checked) => {
-              setAdaptiveNav(checked);
-              persist({ distanceAdaptiveNav: checked });
-              notifyAdaptivePlugin();
-              // When turning off, restore store base speeds to controls immediately
-              if (!checked) {
-                viewer.setControlsConfig({
-                  panSpeed: settingsRef.current.orbitPanSpeed,
-                  zoomSpeed: settingsRef.current.orbitZoomSpeed,
-                });
-              }
-            }}
-          />
-        </FieldRow>
       </SettingsSection>
     </Box>
   );

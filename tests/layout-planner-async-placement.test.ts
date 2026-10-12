@@ -13,7 +13,10 @@
  */
 import { describe, it, expect } from 'vitest';
 import { Box3, Sprite } from 'three';
-import type { LineSegments, Mesh, Object3D } from 'three';
+import type { BufferGeometry, LineSegments, Mesh, Object3D } from 'three';
+
+import { chunkMetaOf } from '../src/core/engine/rv-bake-chunk';
+import { isChunkMesh } from '../src/core/engine/rv-node-classification';
 
 import { serializeLayout } from '../src/plugins/layout-planner/rv-layout-store';
 import { CONFLICT_BLINK_HZ } from '../src/plugins/signal-bind/conflict-blink';
@@ -32,6 +35,21 @@ import {
   VIRTUAL_ENTRY,
   SPLAT_ENTRY,
 } from './_layout-planner-async-harness';
+
+/**
+ * Let a released decode run all the way through the bake. Since plan-756 1c
+ * (a9ea8247, 2026-09-21) `bake()` awaits its pick-structure builds, and the
+ * inline build slices on EVENT-LOOP turns (`scheduler.yield` / MessageChannel)
+ * — a microtask-only `flush()` returns before the swap. A fixed number of
+ * macrotask turns, not a wall-clock sleep, so a stalled load stays stalled.
+ */
+async function settle(turns = 25): Promise<void> {
+  await flush();
+  for (let i = 0; i < turns; i++) {
+    await new Promise<void>((r) => setTimeout(r, 0));
+    await flush();
+  }
+}
 
 /** The placeholder's wireframe box. */
 function findLine(root: Object3D): LineSegments {
@@ -111,7 +129,7 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(poseBefore.y).toBeGreaterThan(0.5);   // dropToSurface really fired
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     const rootAfter = internals(plugin)._objectMap.get(id)!;
     expect(rootAfter).toBe(rootBefore);                        // the SAME root
@@ -143,7 +161,7 @@ describe('plan-371 — async asset drag & placement', () => {
     act(plugin, id);
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     expect(internals(plugin)._objectMap.has(id)).toBe(false);
     expect(node.parent).toBeNull();
@@ -167,12 +185,20 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(viewer.transportManager.surfaces.length).toBe(0);
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
-    // FULL registration after the swap: the real subtree IS registered.
+    // FULL registration after the swap: the swapped root is registered and the
+    // real geometry arrived as the placement's baked chunk.
+    //
+    // plan-754 F13/D19: this used to read `getPathForNode(swapped.children[0])`.
+    // That child is the CHUNK mesh of the baked placement, and since the ONE
+    // init a chunk mesh is deliberately not registered — the same contract the
+    // main model always had ("their path is computed, not registry-backed",
+    // `web_node_tree`). The leaner `processExtras` traversal used to register it
+    // under a phantom path, which is what the old assertion was reading.
     const swapped = internals(plugin)._objectMap.get(id)!;
-    const mesh = swapped.children[0];
-    expect(viewer.registry.getPathForNode(mesh)).not.toBeNull();
+    expect(viewer.registry.getPathForNode(swapped)).not.toBeNull();
+    expect(swapped.children.some(c => isChunkMesh(c))).toBe(true);
   });
 
   // ── T6 ────────────────────────────────────────────────────────────────
@@ -190,7 +216,7 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(tracked.spriteTextures.length).toBeGreaterThan(0);
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     expect(tracked.lineGeometries.every(d => d.disposed)).toBe(true);
     expect(tracked.lineMaterials.every(d => d.disposed)).toBe(true);
@@ -198,9 +224,27 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(tracked.spriteTextures.every(d => d.disposed)).toBe(true);
     // ⛔ The three.js Sprite geometry is a module singleton.
     expect(tracked.sharedSpriteGeometry!.disposed).toBe(false);
-    // Clones share the master's BufferGeometry — disposing it would corrupt
-    // the cache and every other placement of the same asset.
-    expect(cache.masterGeometryDisposed(GLB_URL)).toBe(false);
+    // The shared resource every other placement of this asset draws from is
+    // the CHUNK geometry, and it is alive with its asset.
+    //
+    // CHANGED by plan-754 Phase 1b: this used to read
+    // `expect(cache.masterGeometryDisposed(GLB_URL)).toBe(false)` — the
+    // plan-753 contract "clones share the master's BufferGeometry". The
+    // destructive bake merges the master's source meshes into chunk geometry
+    // and frees the sources (§2.4 step 4), so the source box IS disposed now,
+    // by design; what must not be disposed moved one level.
+    const placed = internals(plugin)._objectMap.get(id)!;
+    const chunkGeometries: BufferGeometry[] = [];
+    placed.traverse((n) => {
+      const mesh = n as Mesh;
+      if (mesh.isMesh && mesh.geometry && chunkMetaOf.has(mesh.geometry)) chunkGeometries.push(mesh.geometry);
+    });
+    expect(chunkGeometries.length).toBeGreaterThan(0);
+    for (const g of chunkGeometries) {
+      expect(chunkMetaOf.get(g)!.asset.disposed).toBe(false);
+      expect(g.getAttribute('position').count).toBeGreaterThan(0);
+    }
+    expect(cache.masterGeometryDisposed(GLB_URL)).toBe(true);
   });
 
   // ── T7 ────────────────────────────────────────────────────────────────
@@ -217,7 +261,7 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(internals(plugin)._editPauseDepth).toBe(0);
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     expect(internals(plugin)._editPauseDepth).toBe(0);
   });
@@ -243,7 +287,7 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(viewer.registry.getNode(pathB)).toBe(b);
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     expect(internals(plugin)._objectMap.get(idA)!.userData._rvPendingPlaceholder).toBeUndefined();
     expect(internals(plugin)._objectMap.get(idB)!.userData._rvPendingPlaceholder).toBeUndefined();
@@ -323,7 +367,7 @@ describe('plan-371 — async asset drag & placement', () => {
 
     // A late arrival must neither throw nor resurrect anything.
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
     expect(internals(plugin)._objectMap.has(id)).toBe(false);
     expect(node.children.length).toBe(0);
   });
@@ -342,7 +386,7 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(internals(plugin)._pending.pendingIds.size).toBe(0);
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     // Still a placeholder — the stale result was discarded, not grafted on.
     expect(node.userData._rvPendingPlaceholder).toBe(true);
@@ -354,7 +398,7 @@ describe('plan-371 — async asset drag & placement', () => {
     cache.fail(GLB_URL, new Error('404'));
 
     const id = await dragAndDrop(plugin, GLB_ENTRY, [0, 0]);
-    await flush();
+    await settle();
 
     const node = internals(plugin)._objectMap.get(id)!;
     expect(internals(plugin)._pending.statusOf(id)).toBe('error');
@@ -382,7 +426,7 @@ describe('plan-371 — async asset drag & placement', () => {
     cache.recover(GLB_URL);
     cache.stall(GLB_URL);
     plugin.retryPendingPlacement(id);
-    await flush();
+    await settle();
 
     expect(internals(plugin)._pending.statusOf(id)).toBe('loading');
     // The decisive assertion for §2.10 Rule 1: the retry really re-entered the
@@ -396,7 +440,7 @@ describe('plan-371 — async asset drag & placement', () => {
 
     // ── Success ─────────────────────────────────────────────────────────
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     expect(internals(plugin)._pending.statusOf(id)).toBeUndefined();
     expect(internals(plugin)._objectMap.get(id)!.userData._rvPendingPlaceholder).toBeUndefined();
@@ -419,7 +463,7 @@ describe('plan-371 — async asset drag & placement', () => {
     expect(cache.decodeCount(GLB_URL)).toBe(1); // joined, not re-decoded
 
     await cache.resolve(GLB_URL);
-    await flush();
+    await settle();
 
     const root = internals(plugin)._objectMap.get(id)!;
     expect(root.userData._rvPendingPlaceholder).toBeUndefined();

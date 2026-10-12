@@ -28,7 +28,9 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
-import { Box3, Scene, Vector3 } from 'three';
+import { Box3, Raycaster, Scene, Vector3 } from 'three';
+import { RibbonManager } from '../src/core/engine/rv-ribbon-manager';
+import type { RVDrive } from '../src/core/engine/rv-drive';
 import { loadGLB, type LoadResult } from '../src/core/engine/rv-scene-loader';
 import { MM_TO_METERS } from '../src/core/engine/rv-constants';
 import type { RVRibbonPath } from '../src/core/engine/rv-ribbon-path';
@@ -46,6 +48,7 @@ const PENETRATION_TOLERANCE_MM = 0.1;
 
 let result: LoadResult | null = null;
 let paths: RVRibbonPath[] = [];
+const manager = new RibbonManager();
 
 beforeAll(async () => {
   // The suite below is `skipIf`-ed without the private sibling, but a top-level
@@ -57,7 +60,7 @@ beforeAll(async () => {
   const scene = new Scene();
   // preserveHierarchy: the merges would bake the roller nodes away, and this
   // test asks a question about the authored nodes.
-  result = await loadGLB(GLB_URL, scene, { data: bytes, preserveHierarchy: true });
+  result = await loadGLB(GLB_URL, scene, { data: bytes, preserveHierarchy: true, ribbonManager: manager });
   scene.updateMatrixWorld(true);
   paths = result.registry.getAll<RVRibbonPath>('RibbonPath').map((p) => p.instance);
   paths.sort((a, b) => (a.node.name < b.node.name ? -1 : 1));
@@ -207,5 +210,37 @@ describe.skipIf(!DEV_ASSETS)('DemoRibbonSlitter.glb', () => {
         ).toBeLessThanOrEqual(halfLenMm);
       }
     }
+  });
+
+  it('has a single visible cap surface per roller, without a competing cylinder cap', () => {
+    for (const roller of new Set(paths.flatMap((p) => [...p.rollers]))) {
+      if (!roller.node.visible) continue; // empty winding roll
+      roller.node.updateMatrixWorld(true);
+      const centre = roller.node.getWorldPosition(new Vector3());
+      const r = roller.radiusMm / 1000;
+      const ray = new Raycaster(centre.add(new Vector3(1, r * 0.3, r * 0.2)), new Vector3(-1, 0, 0));
+      const hits = ray.intersectObject(roller.node, true);
+      expect(hits.length, `${roller.node.name}: overlapping end faces`).toBe(1);
+    }
+  });
+
+  it('pulls forward with a negative nip rotation and moving Idler_02 end faces', () => {
+    const drives = result!.registry.getAll<RVDrive>('Drive').map((d) => d.instance);
+    const idler = paths[0].rollers.find((r) => r.node.name === 'Idler_02')!;
+    const face = idler.node.children.find((n) => n.name.startsWith('Faces'))!;
+    const before = face.getWorldQuaternion(idler.node.quaternion.clone());
+    for (let i = 0; i < 120; i++) {
+      for (const drive of drives) drive.update(1 / 60);
+      manager.update(1 / 60);
+    }
+    const nip = drives.find((d) => d.node.name === 'Nip')!;
+    expect(nip.currentPosition).toBeLessThan(0);
+    expect(nip.node.quaternion.x).not.toBe(0);
+    for (const path of paths) {
+      for (const section of path.sections) expect(section.speed).toBeGreaterThan(0);
+    }
+    expect(Math.abs(idler.angle)).toBeGreaterThan(1);
+    const after = face.getWorldQuaternion(before.clone());
+    expect(before.angleTo(after)).toBeGreaterThan(0.01);
   });
 });

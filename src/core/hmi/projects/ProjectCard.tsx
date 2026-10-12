@@ -23,7 +23,7 @@
 import { useState } from 'react';
 import { Box, Menu, MenuItem } from '@mui/material';
 import { useLongPress } from '../../../hooks/use-long-press';
-import { AssetCard } from '../../library/AssetCard';
+import { AssetCard, type AssetCardGlyph } from '../../library/AssetCard';
 import type { LibraryCatalogEntry } from '../../library/library-types';
 import { useOptionalViewer } from '../../../hooks/use-viewer';
 import {
@@ -65,10 +65,16 @@ export interface ProjectCardModel {
   thumbnailKey?: ThumbnailKeyParts;
   resolveThumbnail?: () => Promise<ResolvedThumbnailSource | null>;
   /**
-   * Stated glyph tile instead of a picture — a CONNECT configuration or
-   * knowledge card. Suppresses the thumbnail request: nothing to render.
+   * The PERSISTED preview of this document, tried before anything is
+   * rendered (plan-744 F5). Omit for a card with no document behind it.
    */
-  glyph?: 'connect' | 'knowledge';
+  resolveThumbnailSidecar?: () => Promise<ResolvedThumbnailSource | null>;
+  /**
+   * Stated glyph tile instead of a picture — a CONNECT configuration or
+   * knowledge card, or the `file:<ext>` tile of any other project file.
+   * Suppresses the thumbnail request: nothing to render.
+   */
+  glyph?: AssetCardGlyph;
 }
 
 /**
@@ -95,6 +101,7 @@ export function ProjectCard({ card, touchInput = false }: ProjectCardProps) {
     service: viewer?.thumbnails ?? null,
     keyParts: card.thumbnailKey ?? null,
     resolve: card.resolveThumbnail ?? null,
+    sidecar: card.resolveThumbnailSidecar ?? null,
     // A glyph card has nothing to render — never queue a request for it.
     enabled: !card.entry.thumbnailUrl && !card.glyph,
   });

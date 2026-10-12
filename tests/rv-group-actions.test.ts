@@ -85,9 +85,13 @@ describe('listGroupNamesForMenu', () => {
     const groups = new GroupRegistry();
     groups.register('UserGroup', new Object3D());
     groups.register('KinGroup', new Object3D());
-    groups.markAsKinematic('KinGroup');
-    expect(listGroupNamesForMenu(makeViewer({}, groups))).toEqual(['UserGroup']);
-    expect(listGroupNamesForMenu(makeViewer({}, null))).toEqual([]);
+    // The kinematic filter reads the SCENE, not `GroupRegistry.isKinematic`:
+    // that flag is stamped at load time and would miss a Kinematic added during
+    // this edit session (see `collectKinematicGroupNames`). So the link has to
+    // be authored on a node for the group to count as kinematic.
+    const axis = nodeWith({ Kinematic: { GroupName: 'KinGroup' } });
+    expect(listGroupNamesForMenu(makeViewer({ axis }, groups))).toEqual(['UserGroup']);
+    expect(listGroupNamesForMenu(makeViewer({ axis }, null))).toEqual([]);
   });
 });
 

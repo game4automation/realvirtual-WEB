@@ -95,8 +95,24 @@ export async function deriveMasterKey(password, fragmentSecret, salt, iterations
 
 // ─── Envelope ──────────────────────────────────────────────────────────────
 
-function buildHeaderBytes(flags, iterations, salt, chunkSize, chunkCount) {
-  const len = 4 + 1 + 1 + 4 + 1 + salt.length + 1 + HKDF_INFO.length + 4 + 4;
+/**
+ * The header's `hkdfInfo` field (plan-759 F6b). Key derivation ignores it —
+ * `deriveMasterKey` always uses the constant `HKDF_INFO`, so one key opens
+ * every file of a publish — but the field is part of the header hash and
+ * therefore of every chunk's AAD. A hosted deploy writes each file's `p/`-
+ * relative path here, which makes chunks of two files under the same key
+ * structurally non-interchangeable. `undefined` keeps the plan-267 constant
+ * (and the frozen golden vector). Max 255 bytes (one length byte).
+ */
+export function hkdfInfoBytes(info) {
+  if (info === undefined || info === null) return HKDF_INFO;
+  const bytes = typeof info === 'string' ? new TextEncoder().encode(info) : asBytes(info);
+  if (bytes.length > 255) throw new Error(`hkdfInfo must be at most 255 bytes, got ${bytes.length}`);
+  return bytes;
+}
+
+function buildHeaderBytes(flags, iterations, salt, chunkSize, chunkCount, info = HKDF_INFO) {
+  const len = 4 + 1 + 1 + 4 + 1 + salt.length + 1 + info.length + 4 + 4;
   const out = new Uint8Array(len);
   const dv = new DataView(out.buffer);
   let o = 0;
@@ -106,8 +122,8 @@ function buildHeaderBytes(flags, iterations, salt, chunkSize, chunkCount) {
   dv.setUint32(o, iterations, true); o += 4;
   out[o++] = salt.length;
   out.set(salt, o); o += salt.length;
-  out[o++] = HKDF_INFO.length;
-  out.set(HKDF_INFO, o); o += HKDF_INFO.length;
+  out[o++] = info.length;
+  out.set(info, o); o += info.length;
   dv.setUint32(o, chunkSize, true); o += 4;
   dv.setUint32(o, chunkCount, true); o += 4;
   return out;
@@ -170,7 +186,7 @@ export async function encryptToEnvelope(plain, key, opts = {}) {
   const chunkCount = chunked ? Math.max(1, Math.ceil(data.length / step)) : 1;
   const flags = chunked ? FLAG_CHUNKED : 0x00;
 
-  const header = buildHeaderBytes(flags, iterations, salt, chunkSize, chunkCount);
+  const header = buildHeaderBytes(flags, iterations, salt, chunkSize, chunkCount, hkdfInfoBytes(opts.hkdfInfo));
   const headerHash = new Uint8Array(await subtle.digest('SHA-256', header));
 
   const parts = [header];
@@ -229,4 +245,27 @@ export async function decryptGlb(data, password, fragmentSecret) {
   const header = await parseEnvelopeHeader(data);
   const key = await deriveMasterKey(password, fragmentSecret, header.salt, header.iterations);
   return decryptEnvelope(data, key);
+}
+
+// ─── Key probe (plan-759 F5) ───────────────────────────────────────────────
+
+/** Fixed plaintext of the key probe. The browser gate compares against it. */
+export const PROBE_PLAINTEXT = 'realvirtual-key-probe-v1';
+/** `hkdfInfo` of the probe envelope — never a file path, so a probe can never be mistaken for a document. */
+export const PROBE_INFO = 'probe';
+
+/**
+ * A tiny RVE1 envelope over {@link PROBE_PLAINTEXT}, encrypted with the SAME
+ * salt and iterations as every GLB of the publish. The boot gate derives the key
+ * once from this header and verifies it here, without downloading a model.
+ * Returned base64 (standard alphabet) for `settings.json`.
+ */
+export async function makeKeyProbe(password, fragmentSecret, { salt, iterations } = {}) {
+  if (!salt) throw new Error('makeKeyProbe needs the publish salt');
+  const env = await encryptGlb(new TextEncoder().encode(PROBE_PLAINTEXT), password, fragmentSecret, {
+    salt,
+    iterations,
+    hkdfInfo: PROBE_INFO,
+  });
+  return Buffer.from(env).toString('base64');
 }

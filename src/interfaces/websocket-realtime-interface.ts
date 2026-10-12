@@ -120,6 +120,9 @@ export function parseWsTarget(
 export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
   readonly id: string = 'websocket-realtime';
   readonly protocolName: string = 'WebSocket Realtime';
+  // CONNECT adds signals at runtime (new interface, PLC auto-map → Apply) and only
+  // broadcasts their values — re-read the list so viewer writes reach them too.
+  protected override rediscoverOnUnknownSignal = true;
 
   private _port: TransportPort | null = null;
   private _openResolve: (() => void) | null = null;
@@ -146,6 +149,8 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
   private _cookieAuthFailed = false;
 
   private _visibilityHandler: (() => void) | null = null;
+  /** The URL of the attempt in flight — becomes `connectedEndpoint` on open (plan-498). */
+  private _pendingEndpoint: string | null = null;
 
   // ── Protocol Implementation ──
 
@@ -160,6 +165,8 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
     // A configured token that is NOT in the URL means this attempt rides on the
     // session cookie — which is what a failure below has to fall back from.
     this._usedCookieAuth = !!settings.wsAuthToken && !url.includes('apikey=');
+    this._pendingEndpoint = url;
+    this.setConnectedEndpoint(null);
 
     const transportSettings: TransportConnectSettings = {
       url,
@@ -235,6 +242,12 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
     this._port.postMessage({ type: 'outgoing', signals });
   }
 
+  /** plan-563 F7: `init_values` — CONNECT takes each value only while the input is still unset. */
+  protected override sendInitValues(signals: Record<string, boolean | number>): void {
+    if (!this._port) return;
+    this._port.postMessage({ type: 'init_values', signals });
+  }
+
   // ── Transport (worker) message handling ──
 
   private handleTransportMessage(msg: TransportOutboundMessage): void {
@@ -275,11 +288,17 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
         break;
 
       case 'import_answer':
-        this.handleImportAnswer(msg.signals, msg.signalTypes);
+        this.handleImportAnswer(msg.signals, msg.signalTypes, msg.uninitialized);
         break;
 
       case 'import_error':
         this.handleImportError(msg.error);
+        break;
+
+      case 'catalog_changed':
+        // plan-563 F6/F8: the gateway's list changed (an interface apply added inputs that move
+        // no value). The shared discovery scheduler re-reads it and offers model values.
+        this.requestRediscovery('catalog');
         break;
 
       case 'model_changed':
@@ -300,6 +319,8 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
     const resolve = this._openResolve;
     this._openResolve = null;
     this._openReject = null;
+    // plan-498: the target this socket really reached, not the settings.
+    this.setConnectedEndpoint(this._pendingEndpoint);
     this.installVisibilityHandler();
     resolve?.();
   }
@@ -333,9 +354,13 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
   private handleImportAnswer(
     values: Record<string, unknown>,
     types: Record<string, string>,
+    uninitialized?: string[],
   ): void {
     if (!this._importResolve) return;
 
+    // plan-563 F5: names CONNECT has never received a value for. Their entry in `values` is only
+    // the type default — kept for discovery, flagged so the base class offers the model value.
+    const unset = new Set(uninitialized ?? []);
     const signals: SignalDescriptor[] = [];
 
     for (const name in values) {
@@ -353,7 +378,9 @@ export class WebSocketRealtimeInterface extends BaseIndustrialInterface {
         initialValue = defaultValueForType(type);
       }
 
-      signals.push({ name, type, direction, initialValue });
+      signals.push(unset.has(name)
+        ? { name, type, direction, initialValue, uninitialized: true }
+        : { name, type, direction, initialValue });
     }
 
     // Resolve the discovery promise — null out reject first to prevent

@@ -71,7 +71,7 @@ export function ServeSessionBadge() {
       data-ui-panel
       data-testid="serve-session-badge"
       role="status"
-      title={`Serving ${info.root}${info.branch ? `\nBranch: ${info.branch}` : ''}`}
+      title={`Serving ${info.root}\nMachine: ${info.host}${info.branch ? `\nBranch: ${info.branch}` : ''}`}
       sx={{
         position: 'fixed',
         top: 0,
@@ -120,6 +120,24 @@ export function ServeSessionBadge() {
       >
         {canonical ? '⚠ CANONICAL' : sessionLabel}
         {info.vitePort ? ` · :${info.vitePort}` : ''}
+      </Typography>
+      {/* The serving MACHINE. Unconditional, because the browser cannot tell
+          whether it is looking at its own computer: through a port forward a
+          remote dev server answers on the reader's own localhost. A condition
+          would need the client's host name, which no page can obtain. */}
+      <Typography
+        component="span"
+        sx={{
+          fontSize: 10.5,
+          fontWeight: 600,
+          lineHeight: 1.6,
+          color: '#fff',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          whiteSpace: 'nowrap',
+          flexShrink: 0,
+        }}
+      >
+        {`@${info.host}`}
       </Typography>
       {/* Clipped from the tail: the head of the path (worktree base vs the
           canonical checkout) is what actually tells them apart. */}

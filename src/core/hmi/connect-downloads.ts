@@ -37,6 +37,9 @@ export interface ConnectReleaseManifest {
   buildDate?: string;
   url: string;
   sha256?: string;
+  /** Set by `publish-release.mjs --allow-unsigned`: the exe carries no Authenticode signature yet,
+   *  so Windows SmartScreen warns on first start. The download buttons show a hint. */
+  unsigned?: boolean;
 }
 
 /** Resolved download affordance for one channel — url is always present, version enriches it. */
@@ -45,6 +48,8 @@ export interface ConnectChannelInfo {
   version: string | null;
   build: number | null;
   buildDate: string | null;
+  /** True when the manifest marks the build as not code-signed (SmartScreen will warn). */
+  unsigned?: boolean;
 }
 
 export interface ConnectDownloadInfo {
@@ -59,7 +64,7 @@ export interface ConnectDownloadInfo {
 
 function initialInfo(): ConnectDownloadInfo {
   return {
-    stable: { url: CONNECT_STABLE_DOWNLOAD_URL, version: null, build: null, buildDate: null },
+    stable: { url: CONNECT_STABLE_DOWNLOAD_URL, version: null, build: null, buildDate: null, unsigned: false },
     beta: null,
     loaded: false,
   };
@@ -79,6 +84,7 @@ function _channelFromManifest(m: ConnectReleaseManifest, fallbackUrl: string): C
     version: typeof m.version === 'string' && m.version ? m.version : null,
     build: typeof m.build === 'number' ? m.build : null,
     buildDate: typeof m.buildDate === 'string' && m.buildDate ? m.buildDate : null,
+    unsigned: m.unsigned === true,
   };
 }
 
@@ -116,7 +122,7 @@ export function ensureConnectDownloadsLoaded(): void {
     _info = {
       stable: stableManifest
         ? _channelFromManifest(stableManifest, CONNECT_STABLE_DOWNLOAD_URL)
-        : { url: CONNECT_STABLE_DOWNLOAD_URL, version: null, build: null, buildDate: null },
+        : { url: CONNECT_STABLE_DOWNLOAD_URL, version: null, build: null, buildDate: null, unsigned: false },
       beta: betaManifest && typeof betaManifest.url === 'string' && betaManifest.url
         ? _channelFromManifest(betaManifest, betaManifest.url)
         : null,

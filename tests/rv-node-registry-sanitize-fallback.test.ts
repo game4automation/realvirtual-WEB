@@ -121,6 +121,37 @@ describe('NodeRegistry stage 4 — sanitize-normalized fallback (plan-734)', () 
     expect(registry.sanitizedIndexBuildCount()).toBe(0);
   });
 
+  // plan-755 R11: a node the bake CREATED (partition object) was never an
+  // authored path. Its name is free text — `MC01.13` sanitizes to `MC0113` —
+  // so inside the stage-4 index it would collide with a real node and make the
+  // stage REFUSE the authored path. It stays out of that index and remains
+  // addressable by its real path through stages 1-3.
+  it('a synthetic node never takes part: it cannot make an authored path ambiguous', () => {
+    const root = new Object3D(); root.name = 'Scene';
+    const cell = child(root, 'Cell');
+    const authored = child(cell, 'MC0113');          // loader-sanitized spelling of `MC01.13`
+    const synthetic = child(cell, 'MC01.13');        // partition object, readable name
+    synthetic.userData._rvSynthetic = true;
+
+    for (const order of ['before', 'after'] as const) {
+      const registry = new NodeRegistry();
+      if (order === 'after') {
+        // Index built FIRST, synthetic registered incrementally afterwards.
+        registry.registerNode('Cell/MC0113', authored);
+        expect(registry.getNode('Cell/MC:0113')).toBe(authored);
+        registry.registerNode('Cell/MC01.13', synthetic);
+      } else {
+        registerAll(registry, root);
+      }
+      // Stage 4 for a differently-authored spelling still finds the REAL node …
+      expect(registry.getNode('Cell/MC:01[13]'), order).toBe(authored);
+      // … and the synthetic one resolves by its own exact path.
+      expect(registry.getNode('Cell/MC01.13'), order).toBe(synthetic);
+      expect(registry.getPathForNode(synthetic), order).toBe('Cell/MC01.13');
+      expect(warn).not.toHaveBeenCalled();
+    }
+  });
+
   it('a genuine miss stays a miss', () => {
     const root = new Object3D(); root.name = 'Scene';
     child(child(root, 'CellA'), 'Motor');

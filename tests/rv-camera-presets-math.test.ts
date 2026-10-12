@@ -28,6 +28,7 @@ import {
 } from '../src/plugins/mcp-bridge/rv-camera-presets-math';
 import { McpViewTools } from '../src/plugins/mcp-bridge/rv-mcp-view-tools';
 import { generateToolSchemas } from '../src/core/engine/rv-mcp-tools';
+import { AgentEye } from '../src/core/engine/rv-agent-eye';
 import type { RVViewer } from '../src/core/rv-viewer';
 
 const box = (min: [number, number, number], max: [number, number, number]): Box3 =>
@@ -140,18 +141,38 @@ describe('T5 — the measured fit replaces the fallback distance (D-A5)', () => 
 
 // ─── The tool ───────────────────────────────────────────────────────────
 
-/** A viewer whose camera is owned by `owner`. */
+/**
+ * A camera body for the stub viewers below.
+ *
+ * Since plan-740 every camera verb drives this instead of the viewport, so a
+ * stub without one answers `{ error: 'No agent eye' }` before it ever reaches
+ * the branch under test.
+ */
+function stubEye(): AgentEye {
+  return new AgentEye({
+    getViewportState: () => ({
+      position: [0, 0, 10], target: [0, 0, 0], fov: 50, projection: 'perspective',
+    }),
+    modelKey: null,
+  });
+}
+
+/** A viewer whose VIEWPORT camera is owned by `owner`. */
 function ownedViewer(owner: 'fpv' | 'follow' | 'xr'): RVViewer {
   return {
+    agentEye: stubEye(),
+    renderer: { domElement: { clientWidth: 1600, clientHeight: 1000 } },
     getPlugin: (id: string) => {
       if (id === 'fpv') return owner === 'fpv' ? { id, isActive: true } : { id, isActive: false };
       if (id === 'webxr') return owner === 'xr' ? { isPresenting: true } : { isPresenting: false };
       return undefined;
     },
     cameraFollowMode: owner === 'follow' ? 'sit-on' : 'off',
-    getCameraState: () => { throw new Error('the guard must refuse BEFORE reading the camera'); },
-    animateCameraTo: () => { throw new Error('the guard must refuse BEFORE moving the camera'); },
-    fitToNodes: () => { throw new Error('the guard must refuse BEFORE fitting'); },
+    // plan-740: the agent never touches the viewport camera any more, so any
+    // call to these would be the regression, not a late guard.
+    getCameraState: () => { throw new Error('the agent camera must not read the viewport'); },
+    animateCameraTo: () => { throw new Error('the agent camera must not animate the viewport'); },
+    fitToNodes: () => { throw new Error('the agent camera must not fit the viewport'); },
   } as unknown as RVViewer;
 }
 
@@ -183,21 +204,39 @@ describe('T5 — web_camera_view schema and guards', () => {
   it('refuses an unknown preset by listing the valid ones', async () => {
     const tools = new McpViewTools(() => ({
       getPlugin: () => undefined, cameraFollowMode: 'off',
+      agentEye: stubEye(),
+      renderer: { domElement: { clientWidth: 1600, clientHeight: 1000 } },
     } as unknown as RVViewer));
     const out = JSON.parse(await tools.webCameraView('bottom')) as { error: string };
     expect(out.error).toContain('bottom');
     expect(out.error).toContain('iso');
   });
 
-  it('refuses under FPV, follow and XR — and moves NOTHING (D-A2)', async () => {
+  /**
+   * plan-740 D-A7 replaces plan-705 D-A2 here.
+   *
+   * FPV, camera-follow and XR own the USER viewport. The agent has its own
+   * camera body now, so a preset or an orbit under any of them must SUCCEED —
+   * and, crucially, without touching the viewport: the stub throws from
+   * `getCameraState` / `animateCameraTo` / `fitToNodes`, so a leftover viewport
+   * path surfaces as an exception rather than a quiet pass. The refusal itself
+   * moved to `attach()` (asserted in mcp-camera-fly-tool.test.ts).
+   */
+  it('moves the AGENT camera under FPV, follow and XR — and the viewport NOT at all', async () => {
     for (const owner of ['fpv', 'follow', 'xr'] as const) {
-      // The stub throws from getCameraState/animateCameraTo/fitToNodes, so a
-      // guard that ran too late would surface as an exception, not a pass.
-      const tools = new McpViewTools(() => ownedViewer(owner));
-      const viewOut = JSON.parse(await tools.webCameraView('top')) as { blockedBy: string };
-      expect(viewOut.blockedBy, `web_camera_view under ${owner}`).toBe(owner);
-      const orbitOut = JSON.parse(await tools.webCameraOrbit(90, 0, 1)) as { blockedBy: string };
-      expect(orbitOut.blockedBy, `web_camera_orbit under ${owner}`).toBe(owner);
+      const viewer = ownedViewer(owner);
+      const eye = viewer.agentEye!;
+      const tools = new McpViewTools(() => viewer);
+
+      const viewOut = JSON.parse(await tools.webCameraView('top')) as Record<string, unknown>;
+      expect(viewOut.blockedBy, `web_camera_view under ${owner}`).toBeUndefined();
+      expect(viewOut.error, `web_camera_view under ${owner}`).toBeUndefined();
+      expect(eye.pose.py, `top view under ${owner} looks down`).toBeGreaterThan(eye.pose.ty);
+
+      const before = eye.pose;
+      const orbitOut = JSON.parse(await tools.webCameraOrbit(90, 0, 1)) as Record<string, unknown>;
+      expect(orbitOut.blockedBy, `web_camera_orbit under ${owner}`).toBeUndefined();
+      expect(eye.pose.px, `orbit under ${owner} moved the body`).not.toBe(before.px);
     }
   });
 
@@ -205,6 +244,8 @@ describe('T5 — web_camera_view schema and guards', () => {
     const tools = new McpViewTools(() => ({
       getPlugin: () => undefined,
       cameraFollowMode: 'off',
+      agentEye: stubEye(),
+      renderer: { domElement: { clientWidth: 1600, clientHeight: 1000 } },
       getCameraState: () => ({ position: new Vector3(0, 0, 10), target: new Vector3() }),
       selectionManager: { getSnapshot: () => ({ selectedPaths: [] }) },
     } as unknown as RVViewer));

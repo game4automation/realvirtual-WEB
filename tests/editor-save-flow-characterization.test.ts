@@ -21,8 +21,9 @@
  *
  *  1. a named document saves without asking anything, and "Save as…" is the
  *     only thing that prompts;
- *  2. a save writes **two** blobs — the GLB and the thumbnail beside it in
- *     `library/.thumbnails/` — and the thumbnail failing does not fail it;
+ *  2. a save writes **two** blobs — the GLB and its preview, keyed by the
+ *     document ID under `<project>/.thumbnails/` (plan-744 F5) — and the
+ *     thumbnail failing does not fail it;
  *  3. live-preview holders get to restore before the tree is cloned;
  *  4. after a successful save the document is re-based onto the identity it
  *     now has.
@@ -44,7 +45,12 @@ vi.mock('../src/core/project/project-store', () => ({
     getProject: () => ({ id: 'prj_characterisation' }),
   }),
 }));
-vi.mock('../src/core/engine/rv-local-filesystem', () => ({ isSupported: () => true }));
+// Keep every real export and override only isSupported: a hand-listed mock went stale the
+// moment the import graph reached getOrCreateSubfolder, and the whole file failed to import.
+vi.mock('../src/core/engine/rv-local-filesystem', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/core/engine/rv-local-filesystem')>()),
+  isSupported: () => true,
+}));
 vi.mock('../src/core/editor/rv-asset-glb-export', () => ({
   exportAssetGlb: async () => new TextEncoder().encode('GLB').buffer,
 }));
@@ -86,6 +92,7 @@ import { SharePlugin } from '../src/core/share/share-plugin';
 import hierarchyBrowserSource from '../src/core/hmi/rv-hierarchy-browser.tsx?raw';
 import type { AssetBase } from '../src/core/editor/rv-asset-document';
 import { libraryDocumentBase } from '../src/core/editor/active-asset-store';
+import { thumbnailSidecarPath } from '../src/core/library/library-types';
 
 /** Answer the next save dialog of `kind`; returns an unsubscribe. */
 function autoAnswer(kind: string, answer: unknown): () => void {
@@ -150,7 +157,11 @@ function context(name: string) {
       modelCache: { invalidate: (url: string) => { invalidated.push(url === 'blob:belt' ? 'Custom/Belt.glb' : url); } },
     }),
   };
-  return { ctx: { viewer, doc } as never, saved, refreshed, invalidated, emitted };
+  // `as never` is the escape hatch that lets this hand-built double stand in
+  // for the editor context without restating its type. It also erases the
+  // shape, so `doc` is handed back separately for the assertions that need to
+  // read the document the flow was given.
+  return { ctx: { viewer, doc } as never, doc, saved, refreshed, invalidated, emitted };
 }
 
 beforeEach(() => {
@@ -209,13 +220,20 @@ describe('editor save flow — the name prompt', () => {
 });
 
 describe('editor save flow — what reaches the project', () => {
-  it('writes the GLB and the thumbnail beside it', async () => {
-    const { ctx } = context('Belt');
+  it('writes the GLB and a preview keyed by the document ID', async () => {
+    const { ctx, doc } = context('Belt');
     await saveAssetAs(ctx, 'Belt');
+    // plan-744 F5: the preview no longer mirrors the asset's PATH under
+    // `library/.thumbnails/`. That convention lost the picture on every move
+    // or rename — the key WAS the location — and only existed for
+    // `library/**`, so a model or a scene had no persisted preview at all.
+    // The id is frozen at birth (plan-717), so the sidecar survives both.
+    const documentId = (doc.base as { documentId: string }).documentId;
     expect(writes).toEqual([
       'library/Custom/Belt.glb',
-      'library/.thumbnails/Custom/Belt.png',
+      thumbnailSidecarPath(documentId),
     ]);
+    expect(writes[1]!.startsWith('.thumbnails/')).toBe(true);
   });
 
   it('a missing thumbnail does not fail the save', async () => {

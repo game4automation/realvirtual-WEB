@@ -6,7 +6,9 @@
  *
  * Tests defaults, persistence, boundary values, clamping, NaN/null/string
  * fallback, partial migration from older localStorage payloads, and corrupt
- * JSON recovery for the 4 new orbit* fields in VisualSettings.
+ * JSON recovery for the 4 new orbit* fields in VisualSettings, plus the
+ * `wheelZoomToCursor` (default true) and `navigateAroundCursorPoint` (default
+ * false) booleans with settings.json override.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -14,6 +16,7 @@ import {
   loadVisualSettings,
   saveVisualSettings,
   NAVIGATION_RANGES,
+  getDefaultVisualSettings,
 } from '../src/core/hmi/visual-settings-store';
 import { setAppConfig } from '../src/core/rv-app-config';
 
@@ -146,4 +149,56 @@ describe('navigation-sensitivity settings — store', () => {
     expect(s.orbitZoomSpeed).toBe(NAVIGATION_RANGES.zoomSpeed.min);
     expect(s.orbitDampingFactor).toBe(NAVIGATION_RANGES.dampingFactor.max);
   });
+
+  // ─── wheelZoomToCursor + navigateAroundCursorPoint (decision 2026-09-29) ─
+  // wheelZoomToCursor: default TRUE (wheel at the cursor, the pre-515 feel);
+  // navigateAroundCursorPoint: default FALSE (orbit / pan about controls.target).
+  const BOOLS = [
+    { key: 'wheelZoomToCursor', def: true },
+    { key: 'navigateAroundCursorPoint', def: false },
+  ] as const;
+
+  it('wheelZoomToCursor defaults to true (wheel zooms to the cursor), navigateAroundCursorPoint to false', () => {
+    expect(loadVisualSettings().wheelZoomToCursor).toBe(true);
+    expect(getDefaultVisualSettings().wheelZoomToCursor).toBe(true);
+    expect(loadVisualSettings().navigateAroundCursorPoint).toBe(false);
+    expect(getDefaultVisualSettings().navigateAroundCursorPoint).toBe(false);
+  });
+
+  for (const { key, def } of BOOLS) {
+    it(`${key} persists and reloads`, () => {
+      const s = loadVisualSettings();
+      s[key] = !def;
+      saveVisualSettings(s);
+      expect(JSON.parse(localStorage.getItem('rv-visual-settings')!)[key]).toBe(!def);
+      expect(loadVisualSettings()[key]).toBe(!def);
+      s[key] = def;
+      saveVisualSettings(s);
+      expect(loadVisualSettings()[key]).toBe(def);
+    });
+
+    it(`${key}: non-boolean stored values fall back to the default (${def})`, () => {
+      for (const bad of [1, 'true', 'false', 0, null, {}]) {
+        localStorage.setItem('rv-visual-settings', JSON.stringify({ [key]: bad }));
+        expect(loadVisualSettings()[key], JSON.stringify(bad)).toBe(def);
+      }
+      // Missing in an older payload → default.
+      localStorage.setItem('rv-visual-settings', JSON.stringify({ orbitZoomSpeed: 2 }));
+      expect(loadVisualSettings()[key]).toBe(def);
+    });
+
+    it(`settings.json visual.${key} overrides the stored value; a non-boolean override is ignored`, () => {
+      const s = loadVisualSettings();
+      s[key] = false;
+      saveVisualSettings(s);
+      setAppConfig({ visual: { [key]: true } });
+      expect(loadVisualSettings()[key]).toBe(true);
+      setAppConfig({ visual: { [key]: 'yes' as unknown as boolean } });
+      expect(loadVisualSettings()[key]).toBe(false);
+      s[key] = true;
+      saveVisualSettings(s);
+      setAppConfig({ visual: { [key]: false } });
+      expect(loadVisualSettings()[key]).toBe(false);
+    });
+  }
 });

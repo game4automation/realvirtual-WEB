@@ -78,4 +78,42 @@ describe('Node crypto pipeline parity', () => {
     const b64 = nodeCrypto.bytesToBase64Url(bytes);
     expect(toHex(nodeCrypto.base64UrlToBytes(b64))).toBe(GOLDEN.fragmentHex);
   });
+
+  // plan-759 F6b: one salt per publish, the file's path in the header.
+  it('shares one salt across files while each header binds its own path', async () => {
+    const frag = nodeCrypto.generateFragmentSecret();
+    const salt = nodeCrypto.randomBytes(16);
+    const plain = new TextEncoder().encode('same plaintext in two files');
+    const a = await nodeCrypto.encryptGlb(plain, 'pw', frag, { salt, iterations: 1000, hkdfInfo: 'models/a.glb' });
+    const b = await nodeCrypto.encryptGlb(plain, 'pw', frag, { salt, iterations: 1000, hkdfInfo: 'cad/b.glb' });
+    const ha = await nodeCrypto.parseEnvelopeHeader(a);
+    const hb = await nodeCrypto.parseEnvelopeHeader(b);
+    expect(toHex(ha.salt)).toBe(toHex(salt));
+    expect(toHex(hb.salt)).toBe(toHex(salt));
+    expect(new TextDecoder().decode(ha.hkdfInfo)).toBe('models/a.glb');
+    expect(new TextDecoder().decode(hb.hkdfInfo)).toBe('cad/b.glb');
+    expect(new TextDecoder().decode(await nodeCrypto.decryptGlb(a, 'pw', frag))).toBe('same plaintext in two files');
+    expect(new TextDecoder().decode(await nodeCrypto.decryptGlb(b, 'pw', frag))).toBe('same plaintext in two files');
+    // b's header on a's body: the AAD (header hash) differs → GCM rejects.
+    const spliced = new Uint8Array(hb.headerLength + (a.length - ha.headerLength));
+    spliced.set(b.subarray(0, hb.headerLength), 0);
+    spliced.set(a.subarray(ha.headerLength), hb.headerLength);
+    await expect(nodeCrypto.decryptGlb(spliced, 'pw', frag)).rejects.toThrow();
+    // an info longer than one length byte is refused up front
+    await expect(nodeCrypto.encryptGlb(plain, 'pw', frag, { salt, iterations: 1000, hkdfInfo: 'x'.repeat(256) }))
+      .rejects.toThrow(/255/);
+  });
+
+  it('the key probe opens with the publish key and nothing else', async () => {
+    const frag = nodeCrypto.generateFragmentSecret();
+    const salt = nodeCrypto.randomBytes(16);
+    const probeB64 = await nodeCrypto.makeKeyProbe('pw', frag, { salt, iterations: 1000 });
+    const probe = new Uint8Array(Buffer.from(probeB64, 'base64'));
+    const header = await nodeCrypto.parseEnvelopeHeader(probe);
+    expect(toHex(header.salt)).toBe(toHex(salt));
+    expect(new TextDecoder().decode(header.hkdfInfo)).toBe(nodeCrypto.PROBE_INFO);
+    expect(new TextDecoder().decode(await nodeCrypto.decryptGlb(probe, 'pw', frag))).toBe(nodeCrypto.PROBE_PLAINTEXT);
+    await expect(nodeCrypto.decryptGlb(probe, 'wrong', frag)).rejects.toThrow();
+    await expect(nodeCrypto.decryptGlb(probe, 'pw', nodeCrypto.generateFragmentSecret())).rejects.toThrow();
+  });
 });

@@ -72,6 +72,11 @@ vi.mock('three', () => {
     scale = { set: vi.fn() };
     position = { x: 0, y: 0, z: 0, set(_x: number, _y: number, _z: number) { return this; } };
     material = new SpriteMaterial();
+    // Label contract (rv-label-sprite.ts) touches these on the avatar card.
+    layers = { set: vi.fn(), enable: vi.fn(), mask: 8 };
+    userData: Record<string, unknown> = {};
+    renderOrder = 0;
+    frustumCulled = true;
   }
   class Vector3 {
     x: number; y: number; z: number;
@@ -125,6 +130,9 @@ vi.mock('three', () => {
   class LineBasicMaterial { dispose = vi.fn(); }
 
   return {
+    // Constants the label factory (rv-label-sprite.ts) reads.
+    LinearFilter: 1006,
+    SRGBColorSpace: 'srgb',
     SphereGeometry,
     MeshStandardMaterial,
     Mesh,

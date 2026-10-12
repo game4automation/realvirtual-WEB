@@ -7,6 +7,16 @@
  * The facade intentionally excludes RVViewer, plugins, React/MUI, industrial
  * interfaces, editor tooling, post-processing, WebGPU and stats. It owns one
  * scene, renderer and fixed-step pipeline and is terminal after dispose().
+ *
+ * Navigation (plan-515 Phase 1b) is the main viewer's: the same
+ * `NavigationController` with the controller defaults (wheel zoom toward the
+ * surface under the cursor, orbit about controls.target, pan in the plane
+ * through it - `navigateAroundCursorPoint` stays off here -, trackpad orbit, dynamic near/far per frame), fed by this embed's OWN
+ * `RaycastManager` + `PickBackend` (rebuilt per load, surface picks only - no
+ * hover UI) and its OWN `SceneScale`. F / Shift+F frame the scene (the embed
+ * has no selection) through a `SelectionManager` on the embed's canvas as
+ * keyboard scope, so only the focused viewer on a page reacts. Perspective
+ * only - the embed offers no projection switch.
  */
 
 import {
@@ -15,6 +25,7 @@ import {
   Box3,
   Color,
   DirectionalLight,
+  type InstancedMesh,
   Material,
   Mesh,
   type Object3D,
@@ -32,6 +43,13 @@ import {
   loadGLB,
   type LoadResult,
 } from '../core/engine/rv-scene-loader';
+import { BakeRegistry } from '../core/engine/rv-bake-registry';
+import { preloadDracoDecoder } from '../core/engine/rv-glb-parse';
+import { buildInitContext, type InitContextBase, type InitSubsystems } from '../core/engine/rv-init-context';
+import { collectDeferredPlacements, type PlacementInstancer } from '../core/engine/rv-placement-instancer';
+import { createViewerPlacementInstancer, type PlacementHost } from '../core/engine/rv-placement-integrate';
+import { createUberMaterial, type RVUberMaterial } from '../core/engine/rv-uber-material';
+import type { RVLogicEngine } from '../core/engine/rv-logic-engine';
 import { SimulationLoop } from '../core/engine/rv-simulation-loop';
 import { CoreSubsystems } from '../core/engine/rv-core-subsystems';
 import { ContinuousRunner } from '../core/material-flow/continuous-runner';
@@ -39,6 +57,19 @@ import { CameraManager, type ViewerCameraState } from '../core/rv-camera-manager
 import type { SignalStore } from '../core/engine/rv-signal-store';
 import type { RVIKPath } from '../core/engine/rv-ik-path';
 import { configureOrbitControls } from '../core/engine/rv-orbit-controls-config';
+import { RaycastManager } from '../core/engine/rv-raycast-manager';
+import { PickBackend } from '../core/engine/rv-pick-backend';
+import type { RVHighlightManager } from '../core/engine/rv-highlight-manager';
+import { NavigationController } from '../core/engine/rv-navigation-controller';
+import { fitFloor } from '../core/engine/rv-navigation-math';
+import {
+  SceneScale,
+  SCENE_SCALE_INVALIDATING_EVENTS,
+  computeContentBoundsInto,
+  computeMovingBoundsInto,
+} from '../core/engine/rv-scene-scale';
+import { SelectionManager } from '../core/engine/rv-selection-manager';
+import type { ViewerHost } from '../core/engine/rv-viewer-host';
 import { resetEmbedEngineRegistries } from './rv-embed-registry-reset';
 import {
   RVEmbedDirector,
@@ -162,6 +193,24 @@ class RVEmbedSignals implements RVEmbedSignalsApi {
   }
 }
 
+/**
+ * Stateless no-op sinks of the embed's surface picker (plan-515 Phase 1b): the
+ * embed has no highlight system and no event bus, and its picker runs with
+ * hover disabled, so nothing ever reaches them. Module constants are safe to
+ * share between embeds - they hold no state.
+ */
+const NOOP_PICK_EMITTER = { emit: (): void => {} };
+const NOOP_HOVER_HIGHLIGHTER = {
+  highlight: (): void => {},
+  highlightInstancedMU: (): void => {},
+  clear: (): void => {},
+} as unknown as RVHighlightManager;
+const NOOP_SELECTION_HIGHLIGHTER = {
+  clearSelection: (): void => {},
+  highlightSelection: (): void => {},
+};
+const SCALE_EVENTS: ReadonlySet<string> = new Set(SCENE_SCALE_INVALIDATING_EVENTS);
+
 export class RVEmbedViewer {
   readonly scene = new Scene();
   renderer: WebGLRenderer;
@@ -171,6 +220,19 @@ export class RVEmbedViewer {
   readonly signals: RVEmbedSignalsApi;
   readonly camera: RVEmbedCameraApi;
   readonly director: RVEmbedDirectorApi;
+  /** Content bounds / scale of THIS embed (plan-515): near/far and zoom caps. */
+  readonly sceneScale: SceneScale;
+  /**
+   * Scale-adaptive wheel navigation - the main viewer's controller (plan-515
+   * Phase 1b). Null while the context is suspended and after dispose().
+   */
+  navController: NavigationController | null = null;
+  /**
+   * Surface picker of the current load (plan-515 Phase 1b): chunk pick
+   * structures of the bake + MU pools, hover disabled. Null without a model,
+   * while the context is suspended and after dispose().
+   */
+  raycastManager: RaycastManager | null = null;
 
   private readonly sceneCamera: PerspectiveCamera;
   private readonly cameraState: ViewerCameraState;
@@ -178,6 +240,33 @@ export class RVEmbedViewer {
   private readonly ownAbortController: AbortController | null;
   private readonly signalApi: RVEmbedSignals;
   private result: LoadResult | null = null;
+  /**
+   * plan-754 D20: the embed's own bake registry. One per viewer instance, and
+   * the only owner of its placement instances — the embed has no planner, no
+   * highlight system and no picking, so it needs the registry purely to place
+   * the bake's template and to release it again at teardown.
+   */
+  private readonly bakeRegistry = new BakeRegistry();
+  /**
+   * plan-757 F4: the embed's OWN init dependencies — the same `InitSubsystems`
+   * bag `RVViewer.initSubsystems()` fills, fed into the loader's one
+   * `buildInitContext`. The embed has no HMI shell, so it owns none of the
+   * viewer-shell managers (gizmos, lamps, outlines, scene buttons, chains,
+   * machining, collision): every entry stays unset and the components
+   * null-check, exactly as `CoreSubsystems` below is told with `null`s.
+   */
+  private readonly initSubsystems: InitSubsystems = {};
+  /**
+   * plan-757 Phase 2b (F8): the embed's placement instancer — the SAME engine
+   * instancer `RVViewer.placements` is, built over a {@link PlacementHost} the
+   * facade assembles from its own load result (no `RVViewer`, no Problems
+   * panel: `reportProblems: false`). A runtime load defers every reference
+   * (D7: nothing is grafted at runtime), so a model that references other
+   * assets is empty without this — every reference is a placement, here too.
+   */
+  private readonly placements: PlacementInstancer;
+  /** ONE uber material per embed session — the loader and the placement bake must share it (plan-752 S2). */
+  private uber: RVUberMaterial | null = null;
   private ikPaths: RVIKPath[] = [];
   private readonly core: CoreSubsystems;
   private runner: ContinuousRunner | null = null;
@@ -202,6 +291,11 @@ export class RVEmbedViewer {
   private readonly directorProjectionPoint = new Vector3();
   private readonly dragProjectionPoint = new Vector3();
   private readonly dragLocalPoint = new Vector3();
+  /** F / Shift+F on the canvas scope (plan-515 R3-2); the selection stays empty. */
+  private keyboard: SelectionManager | null = null;
+  /** Canvas-press focus listener (the canvas is the keyboard scope) and its canvas. */
+  private focusOnPress: (() => void) | null = null;
+  private focusCanvas: HTMLCanvasElement | null = null;
 
   constructor(options: RVEmbedOptions = {}) {
     this.dprCap = normalizeDprCap(options.dprCap);
@@ -276,21 +370,100 @@ export class RVEmbedViewer {
       markShadowsDirty: () => {},
     });
 
+    this.placements = createViewerPlacementInstancer(this.placementHost());
+
+    this.sceneScale = new SceneScale({
+      computeContentBounds: (out) => { computeContentBoundsInto(this.scene, out); },
+      computeMovingBounds: (out) => {
+        const r = this.result;
+        if (!r) return false;
+        return computeMovingBoundsInto(
+          r.drives, r.transportManager?.mus, (roots) => this.cameraManager.computeNodeBounds(roots), out,
+        );
+      },
+    });
+    this.wireInput();
+
     this.lifecycleSignal.addEventListener('abort', () => this.dispose(), { once: true });
+  }
+
+  /**
+   * The {@link PlacementHost} of this facade (plan-757 F8): every field reads
+   * the CURRENT load result, so a placement that lands after `loadModel`
+   * resolved joins the drives, signals and logic of the model it belongs to.
+   * The embed runs everything as trusted (`allowUntrustedLogic: true`, as the
+   * loader is told), keeps no problems store and has no render-mode swap.
+   */
+  private placementHost(): PlacementHost {
+    const viewer = this;
+    // Drives of a placement are PUSHED here; without a model there is nothing
+    // to push into and the throwaway keeps the host total.
+    const noDrives: LoadResult['drives'] = [];
+    return {
+      get scene() { return viewer.scene; },
+      get registry() { return viewer.result?.registry ?? null; },
+      get signalStore() { return viewer.result?.signalStore ?? null; },
+      get transportManager() { return viewer.result?.transportManager ?? null; },
+      get drives() { return viewer.result?.drives ?? noDrives; },
+      get logicEngine(): RVLogicEngine | null { return viewer.result?.logicEngine ?? null; },
+      set logicEngine(engine: RVLogicEngine | null) { if (viewer.result) viewer.result.logicEngine = engine; },
+      groups: null,
+      get bakeRegistry() { return viewer.bakeRegistry; },
+      get placementUberMaterial() { return viewer.uber; },
+      isWebGPU: false,
+      logicRunState: 'active',
+      registerDeferredLogic: () => { /* the embed runs trusted: nothing is ever deferred */ },
+      initContext: (): InitContextBase | null => {
+        const r = viewer.result;
+        if (!r) return null;
+        return buildInitContext({
+          registry: r.registry, signalStore: r.signalStore, transportManager: r.transportManager,
+          scene: viewer.scene, ...viewer.initSubsystems,
+        });
+      },
+      allowUntrustedLogic: true,
+      // The loop renders every frame while it runs; a placement landing on a
+      // stopped loop (manual `step()` diagnostics) is drawn once right away.
+      markRenderDirty: () => { if (!viewer.loopRunning) viewer.renderOnce(); },
+      // No event bus - the content events only invalidate the scene scale
+      // (plan-515: a placement that lands changes the bounds).
+      emit: (event: string) => { if (SCALE_EVENTS.has(event)) viewer.sceneScale.invalidate(); },
+      reportProblems: false,
+    };
   }
 
   /** Load or replace a GLB through the production component pipeline. */
   async loadModel(url: string, data?: ArrayBuffer): Promise<LoadResult> {
     this.assertUsable();
+    // plan-598 F4: the decoder downloads in parallel with the GLB. The embed
+    // entry set its module-relative decoder path at import time, so the path is
+    // final here; starting it per load (idempotent) instead of at import keeps an
+    // embed that never becomes visible from fetching anything.
+    preloadDracoDecoder();
     const generation = ++this.loadGeneration;
     this.clearModel();
     resetEmbedEngineRegistries();
+    this.uber ??= createUberMaterial(false);
 
+    // plan-754 D20: the embed runs the FULL pipeline like the main viewer —
+    // load → prepare → bake → drop → place → init. `preserveHierarchy: true` is
+    // gone: it is a mesh-bake flag, and the embed is a simulating production
+    // runtime with no authoring, no per-part picking and no hierarchy panel, so
+    // there was never anything for the individual source meshes to serve. The
+    // only entry left without a bake is the asset editor, which authors the
+    // tree. The bake needs a `BakeRegistry` — one per viewer, released with the
+    // model.
     const result = await loadGLB(url, this.scene, {
+      ...this.initSubsystems,
       data,
-      preserveHierarchy: true,
+      bakeRegistry: this.bakeRegistry,
+      sharedUber: this.uber,
       allowUntrustedLogic: true,
       loadKinematicsSidecar: false,
+      // plan-757 Phase 2b (F8): a reference is a placement here as well — the
+      // loader leaves every reference node empty and `this.placements` fills
+      // them in below, through the same recipe the main viewer uses.
+      deferPlacements: true,
       shouldAbort: () => (
         this.disposed
         || this.lifecycleSignal.aborted
@@ -311,10 +484,40 @@ export class RVEmbedViewer {
       this.core,
     );
     this.signalApi.attach(result.signalStore);
+    // plan-515 Phase 1b: the surface picker of this load (the main viewer
+    // builds its RaycastManager + PickBackend per load, too). The backend reads
+    // the bake registry live, so the placements below pick without a rebuild.
+    this.installPicker();
+    // The document's references become placements: queued, sealed (one settle
+    // per load) and AWAITED — `loadModel` resolves with the scene complete, the
+    // embed's scene-ready contract in one line. A superseding load aborts the
+    // queue through `clearModel` → `placements.clearDocument()`.
+    this.placements.setDocumentKey(this.placements.keyOf({ catalogId: '', glbUrl: url }));
+    this.placements.materializeDeferred(collectDeferredPlacements(result.root));
+    this.placements.sealLoad();
+    await this.placements.whenMaterialized();
+    if (this.disposed || this.lifecycleSignal.aborted || generation !== this.loadGeneration) {
+      throw new DOMException('RVEmbedViewer load aborted', 'AbortError');
+    }
+    this.sceneScale.invalidate();
     this.fitCamera();
     this.renderOnce();
     this.runNamedDirector();
     return result;
+  }
+
+  /** Live placement state — `viewer.placements` of the main viewer, for diagnostics/tests. */
+  get placementInstancer(): PlacementInstancer {
+    return this.placements;
+  }
+
+  /**
+   * The embed's keyboard scope (plan-515 R3-2): its canvas — focusable,
+   * focused on a press. F / Shift+F / Escape act only for key events that pass
+   * through it.
+   */
+  get keyboardScope(): HTMLElement {
+    return this.renderer.domElement;
   }
 
   /** Raw loaded store for diagnostics/tests. Public consumers use signals. */
@@ -341,6 +544,24 @@ export class RVEmbedViewer {
   /** Snap an active director tween and stop choreography before user control. */
   takeOver(): void {
     this.directorController.takeover();
+  }
+
+  /**
+   * Frame the whole scene content - F and Shift+F in the embed (it has no
+   * selection, so F without a selection = the scene, plan-515 R2-4). Same
+   * bounds walk as the main viewer (`computeContentBoundsInto`, placements
+   * included) and the same 1 mm framing floor (F2); the view direction is kept,
+   * the distance comes from the embed's own aspect-exact fit.
+   */
+  frameSceneContent(animate = true): void {
+    if (this.disposed || this.contextSuspended) return;
+    const box = computeContentBoundsInto(this.scene, new Box3());
+    if (box.isEmpty()) return;
+    const size = box.getSize(new Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const floored = fitFloor(maxDim);
+    if (floored > maxDim) box.expandByScalar((floored - maxDim) / 2);
+    this.applyCameraBounds(box, 1.08, animate ? 600 : 0);
   }
 
   /**
@@ -503,6 +724,7 @@ export class RVEmbedViewer {
     this.suspendedPauseReasons.clear();
     for (const reason of this.loop.pauseReasons) this.suspendedPauseReasons.add(reason);
     this.stopLoop();
+    this.unwireInput();
     this.controls.dispose();
     this.renderer.dispose();
     this.renderer.forceContextLoss();
@@ -521,6 +743,9 @@ export class RVEmbedViewer {
     this.loop = this.createLoop();
     for (const reason of this.suspendedPauseReasons) this.loop.setPaused(reason, true);
     this.contextSuspended = false;
+    // plan-515 Phase 1b: controller, keyboard scope and picker on the NEW
+    // canvas / controls (the old ones were released in suspendContext).
+    this.wireInput();
     this.renderOnce();
     const firstFrameMs = performance.now() - startedAt;
     this.loop.setPaused('offscreen', false);
@@ -539,6 +764,7 @@ export class RVEmbedViewer {
     this.director.stop();
     this.stopLoop();
     this.cameraManager.cancelCameraAnimation();
+    this.unwireInput();
     this.controls.dispose();
     if (!this.contextSuspended) {
       this.renderer.dispose();
@@ -547,6 +773,103 @@ export class RVEmbedViewer {
     this.clearModel();
     this.scene.clear();
     resetEmbedEngineRegistries();
+  }
+
+  /**
+   * plan-515 Phase 1b: attach navigation to the CURRENT canvas and controls -
+   * the controller (capture-phase wheel / pointer-down on the canvas, which is
+   * also the keyboard scope: focusable, focused on a press), the F handler
+   * and, with a model loaded, the surface picker. Mirrored by
+   * {@link unwireInput}; runs at construction and after every resumeContext().
+   */
+  private wireInput(): void {
+    this.unwireInput();
+    const canvas = this.renderer.domElement;
+    if (!canvas.hasAttribute('tabindex')) canvas.tabIndex = 0;
+    if (!canvas.style.outline) canvas.style.outline = 'none';
+    const focus = (): void => {
+      try { canvas.focus({ preventScroll: true }); } catch { /* detached */ }
+    };
+    canvas.addEventListener('pointerdown', focus);
+    this.focusOnPress = focus;
+    this.focusCanvas = canvas;
+
+    this.navController = new NavigationController({
+      canvas,
+      captureTarget: canvas,
+      getCamera: () => this.sceneCamera,
+      controls: this.controls,
+      getPicker: () => this.raycastManager,
+      camera: this.cameraManager,
+      getSceneScale: () => this.sceneScale.get(),
+      // The loop renders every frame while it runs (and render() ticks this).
+      markDirty: () => {},
+    });
+
+    const keyboard = new SelectionManager();
+    keyboard.init(this.keyboardHost(canvas));
+    this.keyboard = keyboard;
+
+    if (this.result) this.installPicker();
+  }
+
+  /** Release everything {@link wireInput} attached (idempotent). */
+  private unwireInput(): void {
+    this.navController?.dispose();
+    this.navController = null;
+    this.keyboard?.dispose();
+    this.keyboard = null;
+    this.raycastManager?.dispose();
+    this.raycastManager = null;
+    if (this.focusCanvas && this.focusOnPress) {
+      this.focusCanvas.removeEventListener('pointerdown', this.focusOnPress);
+    }
+    this.focusCanvas = null;
+    this.focusOnPress = null;
+  }
+
+  /**
+   * The minimal {@link ViewerHost} the embed's F handler needs: the canvas as
+   * NON-primary keyboard scope (keys outside it never reach this embed), no
+   * selection, F / Shift+F = frame the scene - only while the user may
+   * navigate (`controls.enabled`: an rv-embed element before takeover ignores it).
+   */
+  private keyboardHost(canvas: HTMLCanvasElement): ViewerHost {
+    const viewer = this;
+    return {
+      on: () => () => {},
+      emit: () => {},
+      registry: null,
+      highlighter: NOOP_SELECTION_HIGHLIGHTER,
+      keyboardScope: canvas,
+      keyboardScopeIsPrimary: false,
+      frameSceneContent: (animate?: boolean) => {
+        if (viewer.controls.enabled) viewer.frameSceneContent(animate);
+      },
+    } as unknown as ViewerHost;
+  }
+
+  /**
+   * (Re)build the surface picker for the current load on the current canvas.
+   * Every load of the embed bakes (it never authors), so the chunk
+   * `PickBackend` is the model's only pick geometry - the main viewer's
+   * instance pick index serves unbaked authoring loads only.
+   */
+  private installPicker(): void {
+    this.raycastManager?.dispose();
+    this.raycastManager = null;
+    const result = this.result;
+    if (!result || this.contextSuspended || this.disposed) return;
+    const picker = new RaycastManager(
+      this.renderer, () => this.sceneCamera, this.scene,
+      result.registry, NOOP_HOVER_HIGHLIGHTER, NOOP_PICK_EMITTER,
+    );
+    // No hover UI in the embed: navigation picks only (`raycastSurface` does
+    // not look at the hover switch).
+    picker.setEnabled(false);
+    picker.addBackend(new PickBackend(this.bakeRegistry));
+    picker.setInstancedMeshes(collectMuPools(this.scene));
+    this.raycastManager = picker;
   }
 
   private createLoop(): SimulationLoop {
@@ -624,6 +947,12 @@ export class RVEmbedViewer {
     } else if (force) {
       this.renderAccumulator = 0;
     }
+    // plan-515: moving-content bounds while the simulation runs (throttled,
+    // grow-only), then the accumulated wheel (one pick per frame) + dynamic
+    // near/far - before controls.update(), exactly as in the main viewer.
+    const nowMs = performance.now();
+    this.sceneScale.tick(nowMs, this.loopRunning && !this.loop.isPaused && this.result !== null);
+    this.navController?.tick(nowMs);
     this.controls.update();
     this.cameraManager.tickCameraAnimation(frameTime);
     this.renderer.render(this.scene, this.sceneCamera);
@@ -831,12 +1160,29 @@ export class RVEmbedViewer {
     this.signalApi?.attach(null);
     this.runner = null;
     this.ikPaths = [];
+    this.raycastManager?.dispose();
+    this.raycastManager = null;
+    this.sceneScale?.invalidate();
+    // Placement bakes are document-scoped: abandon the queue, release the
+    // instances (nested first — `releaseSubtree`), retire the bakes — BEFORE
+    // the load result's own teardown frees the tree they hang in.
+    this.placements?.clearDocument();
     this.result = null;
     if (!current) return;
     this.disposeLoadResult(current);
   }
 
   private disposeLoadResult(loadResult: LoadResult): void {
+    // plan-754 D20: the bake instance goes first — releasing it takes the chunk
+    // meshes out of the tree, and retiring the asset at refcount 0 frees the
+    // chunk geometries, which `disposeObjectResources` below must not race.
+    if (loadResult.bakeInstance) {
+      try { this.bakeRegistry.release(loadResult.bakeInstance); } catch { /* continue teardown */ }
+    }
+    if (loadResult.bakedAsset) {
+      loadResult.bakedAsset.retired = true;
+      if (loadResult.bakedAsset.instances === 0) loadResult.bakedAsset.dispose();
+    }
     try { loadResult.playback?.stop(); } catch { /* continue teardown */ }
     try { loadResult.logicEngine?.reset(); } catch { /* continue teardown */ }
     try { loadResult.transportManager.reset(); } catch { /* continue teardown */ }
@@ -860,6 +1206,15 @@ function normalizeDprCap(value: number | undefined): number {
 
 function normalizeDimension(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) && (value as number) > 0 ? Math.round(value as number) : fallback;
+}
+
+/** The MU pool meshes (the main viewer's `_collectInstancedMeshes`). */
+function collectMuPools(root: Object3D): InstancedMesh[] {
+  const pools: InstancedMesh[] = [];
+  root.traverse((node) => {
+    if (node.userData?._muPool && (node as InstancedMesh).isInstancedMesh) pools.push(node as InstancedMesh);
+  });
+  return pools;
 }
 
 function finiteDelta(value: number): number {

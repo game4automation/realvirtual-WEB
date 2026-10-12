@@ -137,6 +137,11 @@ export class ArcSegment implements IPathSegment {
     this.length = this.radius * Math.abs(this.sweepRad); // == 2πR·|deg|/360
   }
 
+  /** Arc radius in meters (plan-558 — the curve speed limit v ≤ √(aLat·R)). */
+  get radiusM(): number {
+    return this.radius;
+  }
+
   getPosition(t01: number, out: Vector3 = new Vector3()): Vector3 {
     const a = this.startRad + this.sweepRad * clamp01(t01);
     return out
@@ -171,6 +176,11 @@ export interface RVPathOptions {
   zoneCapacity?: number | null;
 }
 
+/** One curvature interval of a path (meters; `radiusM = Infinity` = straight). */
+export interface PathCurvatureInterval { s0: number; s1: number; radiusM: number }
+
+let geometryCounter = 0;
+
 /**
  * One connected route: an ordered segment chain, arc-length addressed via
  * prefix sums. Graph edges (`successors` / `predecessors`) are resolved by
@@ -191,6 +201,13 @@ export class RVPath {
   readonly predecessors: RVPath[] = [];
   /** Total length in meters (Σ segment.length), cached. */
   readonly length: number;
+
+  /**
+   * Process-unique geometry id (plan-558 R2-6): every constructed path gets a
+   * fresh one, and a live edit constructs a fresh path — so caches derived from
+   * the geometry (curvature, branch clearance) key on it instead of the id.
+   */
+  readonly geometryId: number = ++geometryCounter;
 
   /** prefix[i] = arc length at the START of segment i. */
   private readonly prefix: Float64Array;
@@ -241,6 +258,31 @@ export class RVPath {
     const t = seg.length > 0 ? (m - this.prefix[lo]) / seg.length : 0;
     return { i: lo, t: clamp01(t) };
   }
+
+  /**
+   * Curvature intervals of this path (plan-558 — curve speed limits): one
+   * entry per segment, `{ s0, s1, radiusM }` in meters, contiguous over
+   * [0, length]. Straight segments report `radiusM = Infinity`; zero-length
+   * segments are skipped. Cached per instance — an `RVPath` is immutable and a
+   * live edit (`RVPathComponent.reapplyConfig`) REPLACES the object, which is
+   * the invalidation (see {@link geometryId}).
+   */
+  curvatureIntervals(): readonly PathCurvatureInterval[] {
+    if (this._curv) return this._curv;
+    const out: PathCurvatureInterval[] = [];
+    for (let i = 0; i < this.segments.length; i++) {
+      const seg = this.segments[i];
+      if (seg.length <= 0) continue;
+      out.push({
+        s0: this.prefix[i],
+        s1: this.prefix[i] + seg.length,
+        radiusM: seg instanceof ArcSegment ? seg.radiusM : Infinity,
+      });
+    }
+    this._curv = out;
+    return out;
+  }
+  private _curv: PathCurvatureInterval[] | null = null;
 
   /** World position at an ABSOLUTE arc length in meters (constant speed). */
   getAbsPosition(meters: number, out: Vector3 = new Vector3()): Vector3 {
@@ -593,10 +635,9 @@ registerComponent({
   type: 'Path',
   schema: RVPathComponent.schema,
   capabilities: {
-    hierarchyVisible: true,
-    inspectorVisible: true,
-    filterLabel: 'Paths',
-    badgeColor: '#26a69a',
+    // Carries the MUs that follow it — its own chunk once baked (plan-753 §2.3).
+    bake: 'chunk',
+    ui: { filter: 'Paths', category: 'transport', badge: '#26a69a' },
     // Authorable in the asset editor / via MCP: a fresh Path starts from the
     // schema defaults (empty segment list) and is edited through the generic
     // json fields (segments/successors) — no dedicated path tool needed.

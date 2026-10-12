@@ -17,7 +17,7 @@ import { DRAG_THRESHOLD_PX } from '../../core/engine/rv-constants';
 import { pointerToNDC } from '../../core/engine/rv-pointer-utils';
 import { type LibraryCatalogEntry, type LayoutStore } from './rv-layout-store';
 import type { FloorGizmo } from './floor-gizmo';
-import { findLayoutAncestor, isLockedLayoutInstance, isMuSelectable } from './layout-predicates';
+import { findLayoutAncestor, isLockedLayoutInstance, isMuSelectable, isSimSelectable } from './layout-predicates';
 import type { BoxSelectController } from './box-select-controller';
 import type { BboxSnapController } from './bbox-snap';
 
@@ -175,7 +175,7 @@ export class CanvasInteractionManager {
       // this, a zero-size marquee on pointer-up could clear the MU selection.
       // Hover already ran via the global RaycastManager this frame.
       const hovered = viewer.raycastManager?.hoveredNode;
-      if (hovered && isMuSelectable(hovered)) return;
+      if (hovered && (isMuSelectable(hovered) || isSimSelectable(hovered))) return;
 
       // Nothing hit → empty canvas → start marquee.
       this.deps.boxSelect.start(e);

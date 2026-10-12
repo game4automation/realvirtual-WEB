@@ -280,15 +280,19 @@ describe('MCP — web_document_list is THE one list', () => {
     const fake = installFakeDocumentProject({ documents: manifestRows() });
     try {
       const out = JSON.parse(await new McpProjectTools(() => undefined).webDocumentList()) as {
-        documents: { id: string; name: string; path: string; section: string }[];
+        documents: { id: string; name: string; path: string; folder: string; section?: string }[];
         builtins: unknown[];
       };
-      // Section order is storage order, not identity: since the terminology
+      // Folder order is storage order, not identity: since the terminology
       // rework the rows are sorted by path, and asset = document = model.
       expect([...out.documents.map(d => d.id)].sort())
         .toEqual(['doc_base', 'doc_line', 'doc_part']);
-      expect([...out.documents.map(d => d.section)].sort())
+      // `folder` is the first path segment and the ONLY field that says where
+      // a row lives; the deprecated `section` alias that carried the identical
+      // value is gone (plan-744 F9).
+      expect([...out.documents.map(d => d.folder)].sort())
         .toEqual(['library', 'models', 'scenes']);
+      expect(out.documents.every(d => d.section === undefined)).toBe(true);
       // Every row carries the path, so an agent can build a reference without
       // a second call.
       expect(out.documents.every(d => typeof d.path === 'string' && d.path !== '')).toBe(true);
@@ -319,8 +323,9 @@ describe('MCP — web_document_list is THE one list', () => {
     try {
       const out = JSON.parse(
         await new McpProjectTools(() => undefined).webDocumentOpen('Part'),
-      ) as { opened: boolean; kind: string; id: string; section: string };
-      expect(out).toMatchObject({ opened: true, kind: 'document', id: 'doc_part', section: 'library' });
+      ) as { opened: boolean; kind: string; id: string; folder: string; section?: string };
+      expect(out).toMatchObject({ opened: true, kind: 'document', id: 'doc_part', folder: 'library' });
+      expect(out.section).toBeUndefined();
       expect(h.calls).toContainEqual({ verb: 'openDocument', arg: 'doc_part' });
     } finally { fake.restore(); }
   });

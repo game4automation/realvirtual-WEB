@@ -17,6 +17,7 @@
 import { useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
 import {
   Box,
+  Link,
   Typography,
   Button,
   TextField,
@@ -560,6 +561,29 @@ function HistorianSettingsSection() {
   );
 }
 
+// ── Third-party notices ────────────────────────────────────────────────────
+
+/**
+ * "Open-source licenses" of the connected gateway (plan-544 F7): CONNECT serves its embedded
+ * THIRD-PARTY-NOTICES.txt on GET /third-party-notices.
+ */
+export function ConnectLicensesLink({ serverUrl }: { serverUrl: string }) {
+  const href = `${serverUrl.replace(/\/+$/, '')}/third-party-notices`;
+  return (
+    <Link
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      underline="hover"
+      title="Third-party software notices of this CONNECT gateway"
+      data-testid="connect-open-source-licenses"
+      sx={{ fontSize: 10, color: 'rgba(255,255,255,0.55)', '&:hover': { color: 'rgba(255,255,255,0.8)' } }}
+    >
+      Open-source licenses ↗
+    </Link>
+  );
+}
+
 // ── Window ─────────────────────────────────────────────────────────────────
 
 export interface ConnectOptionsWindowProps {
@@ -612,6 +636,8 @@ export function ConnectOptionsWindow({
             <ProfileSection onSwitched={onProfileSwitched} initialProfile={initialProfile} />
             <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
             <HistorianSettingsSection />
+            <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)' }} />
+            <ConnectLicensesLink serverUrl={snap.serverUrl} />
           </>
         ) : (
           <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', lineHeight: 1.5 }}>

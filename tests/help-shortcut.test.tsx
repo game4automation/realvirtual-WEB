@@ -23,6 +23,7 @@ import { RVViewerProvider } from '../src/hooks/use-viewer';
 import { setAppConfig } from '../src/core/rv-app-config';
 import { activateContext, deactivateContext, useUIVisible } from '../src/core/hmi/ui-context-store';
 import { useHelpShortcut } from '../src/core/hmi/help-context';
+import { modeManagerDouble } from './fixtures/mode-manager-double';
 
 vi.mock('../src/hooks/use-mobile-layout', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/hooks/use-mobile-layout')>(),
@@ -63,7 +64,7 @@ function createViewer() {
   return {
     leftPanelManager: new LeftPanelManager(),
     uiRegistry: new UIPluginRegistry(),
-    modes: { activeMode: null, subscribe: () => () => undefined, getSnapshot: () => 0 },
+    modes: modeManagerDouble(),
     applyVisualSettings: vi.fn(),
     clearModel: vi.fn(),
     renderBackend: 'three',
@@ -184,7 +185,7 @@ describe('App wiring (source-level)', () => {
 
   it('lets the CONNECT embed shell offer help', () => {
     expect(appSource).toContain(
-      "const CONNECT_EMBED_ACTIVITY_BAR_ALLOWLIST = ['about', 'models', 'plugin:connect', 'help'] as const;",
+      "const CONNECT_EMBED_ACTIVITY_BAR_ALLOWLIST = ['about', 'models', 'plugin:connect', 'problems', 'help'] as const;",
     );
   });
 });

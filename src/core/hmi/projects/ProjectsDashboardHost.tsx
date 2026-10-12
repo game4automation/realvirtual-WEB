@@ -20,13 +20,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { Alert, Badge, Box, Button, Chip, Collapse, Divider, IconButton, InputAdornment, ListItemText, Menu, MenuItem, Snackbar, TextField, Tooltip, Typography } from '@mui/material';
+import { Alert, Badge, Box, Button, Chip, Collapse, Dialog, DialogContent, DialogTitle, Divider, IconButton, InputAdornment, LinearProgress, ListItemText, Menu, MenuItem, Snackbar, TextField, Tooltip, Typography } from '@mui/material';
 import { SectionHeader } from '../shared-components';
 import {
   Add, ChevronRight, CreateNewFolderOutlined, DeleteOutline, FilterList,
   MoreHoriz, MoreVert, NoteAddOutlined, Refresh, Search, SettingsEthernet,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from '../../library/library-types';
+import { fileGlyphOf } from '../../library/AssetCard';
 import { debug } from '../../engine/rv-debug'; // TEMP open-perf instrumentation
 import {
   getLibrarySourcesSnapshot,
@@ -36,8 +37,17 @@ import {
 import { getProjectStore } from '../../project/project-store';
 import { projectAssetUrl } from '../../project/rv-project-asset-source';
 import { DEMO_PROJECT_ID, DEMO_PROJECT_NAME } from '../../project/backends/bundled-backend';
-import { readRecentProjects, forgetRecentProject } from '../../project/rv-project-recent';
-import { CreateHereDialog, FromScenesDialog, NewProjectDialog, ProjectRenameDialog, type CreateHereRequest, type FromScenesRequest, type ProjectRenameRequest } from '../../project/ProjectCreateDialogs';
+import { WORKSPACE_DEFAULT_PROJECT_HINT } from '../../project/rv-workspace-default';
+import {
+  isSameLinkedFolder,
+  listLinkedProjects,
+  recordLinkedProject,
+  relinkProject,
+  unlinkProject,
+  type LinkedProjectEntry,
+} from '../../project/rv-project-linked';
+import { FromScenesDialog, ProjectRenameDialog, type FromScenesRequest, type ProjectRenameRequest } from '../../project/ProjectCreateDialogs';
+import { NewProjectDialog } from './NewProjectDialog';
 import { createProjectFromScenes } from '../../project/rv-project-create';
 import { writeManifest } from '../../project/rv-project-storage';
 import {
@@ -47,19 +57,65 @@ import {
   withProjectFolders,
   type RvDocumentEntry,
 } from '../../project/rv-project-types';
+import { probeAddTarget } from '../../project/rv-project-add';
+// The rules of Add / Open / Locate / Drop live in their own module for the same
+// reason `dashboard-documents` does: this file cannot be rendered by a test, so
+// a rule kept inside it is a rule with no test.
 import {
-  adoptWorkspace,
-  getWorkspaceHandle,
-  getWorkspaceMeta,
-  probeOpenFolder,
-  scanStoredWorkspace,
-} from '../../project/rv-project-workspace';
-import { detectOpenTarget, projectStartDocument, resolveResumeTarget } from '../../project/rv-project-open';
-import { findStartDocument } from '../../project/rv-project-documents';
-import { readRememberedSession, rememberSession } from '../../project/rv-project-resume-store';
-import { pickFolderForKey, type FolderPick } from '../../engine/rv-local-filesystem';
+  collectDropHandles,
+  firstDirectoryHandle,
+  isInternalDrag,
+  linkChildProjects,
+  resolveLinkedOpen,
+  summariseParentAdd,
+  verdictForAdd,
+} from './linked-project-verbs';
+import { seedProjectFromScan } from '../../project/rv-project-scan';
+import { getAddJobSnapshot, startAddScan } from '../../project/rv-project-add-job';
+import { readManifest } from '../../project/rv-project-storage';
+import { detectOpenTarget, projectStartDocument } from '../../project/rv-project-open';
+import { rememberSession } from '../../project/rv-project-resume-store';
+import {
+  clearRecents,
+  forgetRecent,
+  withOpenIntentMode,
+} from '../../project/rv-project-recents-store';
+import type { RecentDocumentEntry } from '../../project/rv-project-recents';
+import { useRecentDocuments } from '../../../hooks/use-recent-documents';
+import { isRecentDocumentsShortcut } from '../recent-documents-shortcut';
+import { getRecentDocumentsHoverOpened, getRecentDocumentsOpen, subscribeRecentDocumentsOpen, setRecentDocumentsOpen, toggleRecentDocumentsOpen } from './projects-dashboard-store';
+import { RecentDocumentsPopover } from './RecentDocumentsPopover';
+import {
+  isOpeningRecent, openProjectDocument, openRecentEntry,
+  type OpenChainBaseDeps, type OpenRecentResult,
+} from './open-recent-entry';
+import { documentModeKey, effectiveOpenMode, handoffParkMode, type DocumentModeRecord } from '../../project/rv-document-mode';
+import {
+  loadDocumentModes, readDocumentMode, subscribeDocumentModes,
+} from '../../project/rv-document-mode-store';
+import { forgetProjectTraces } from './forget-project-traces';
+import {
+  forgetModelIndexEntry, loadModelIndex, subscribeModelIndex,
+} from '../../project/rv-model-index-store';
+import { indexBundledProject } from '../../project/rv-model-index-writer';
+import { modelIndexKey, type ModelIndexSnapshot } from '../../project/rv-model-index';
+import {
+  MAX_SEARCH_RESULTS as MAX_MODEL_SEARCH_RESULTS,
+  buildModelSearchIndex, capModelSearch, searchModelIndex, unindexedLinkedCount, visibleSnapshots,
+  type ModelSearchGroup, type ModelSearchHit, type ModelSearchProject,
+} from '../../project/rv-model-search';
+import { ModelSearchResults } from './ModelSearchResults';
+import { openProjectById } from './open-project-by-id';
+import {
+  getFolderHandle,
+  getHandle,
+  pickFolderForKey,
+  projectHandleKey,
+  putHandle,
+  type FolderPick,
+} from '../../engine/rv-local-filesystem';
 import { exportProject, importProject, RVPROJECT_EXTENSION } from '../../project/rv-project-transport';
-import type { WorkspaceProjectEntry } from '../../project/rv-project-workspace';
+import type { LinkedRowState } from './ProjectsList';
 import { useMode } from '../../../hooks/use-mode';
 import { getAppConfig } from '../rv-app-config';
 import { useStartupModalRegistration } from '../startup-modal-coordinator';
@@ -90,6 +146,7 @@ import {
 } from '../../editor/active-asset-store';
 import { NO_PROJECT } from '../../thumbnails';
 import type { ThumbnailKeyParts } from '../../thumbnails/thumbnail-key';
+import { documentThumbnailVersion } from '../../thumbnails/thumbnail-key';
 import { AddLibraryDialog } from '../../library/AddLibraryDialog';
 import { getLibraryStore } from '../../library/library-store-singleton';
 import {
@@ -104,7 +161,7 @@ import { SceneNameDialog } from './SceneNameDialog';
 import { AssetPromptDialog } from './AssetPromptDialog';
 import { ProjectsDashboard } from './ProjectsDashboard';
 import { ProjectsList, type ProjectListRow } from './ProjectsList';
-import { ProjectTree } from './ProjectTree';
+import { ProjectTree, PROJECT_TREE_DRAG_TYPE } from './ProjectTree';
 import {
   buildDashboardTree,
   catalogRootId,
@@ -114,6 +171,7 @@ import {
 } from '../../project/rv-project-tree-sources';
 import {
   buildProjectTree,
+  canMoveInTree,
   canRenameInTree,
   findTreeNode,
   folderContents,
@@ -136,7 +194,11 @@ import {
   isConnectConfigPath, isKnowledgeFilePath, readDocumentRef,
   stripConnectConfigSuffix, stripKnowledgeFileSuffix,
 } from '../../project/rv-project-refs';
-import { CONNECT_CONFIG_DRAG_TYPE, KNOWLEDGE_FILE_DRAG_TYPE } from './connect-config-dnd';
+import {
+  CONNECT_CONFIG_DRAG_TYPE,
+  KNOWLEDGE_FILE_DRAG_TYPE,
+  SCRIPT_FILE_DRAG_TYPE,
+} from './connect-config-dnd';
 import { setDragChip } from './drag-chip';
 import { reportDocumentIdCollisions } from '../problems-store';
 import { selectionPointsIntoGroup, type SelectedAssetRef } from './assets-library-groups';
@@ -164,14 +226,23 @@ import {
 import {
   documentChipOptions,
   documentTagOptions,
+  matchesDocumentChip,
   matchesDocumentFilter,
+  matchesDocumentTag,
   matchesSearchTerm,
   type ClassifiedRow,
   type DocumentFilterState,
 } from './document-filter';
+import {
+  buildProjectSearchIndex, capSearchResult, filterSearchGroups, isDocumentHit,
+  searchDocumentRows, searchProjectIndex,
+} from '../../project/rv-project-tree-search';
+import { ProjectSearchResults } from './ProjectSearchResults';
+import { projectsScreenActive, useDashboardSearchShortcut } from './dashboard-search-shortcut';
 import { DocumentFilterBar } from './DocumentFilterBar';
 import { DocumentHeroSection } from './DocumentHeroSection';
 import { ClassificationEditor } from './ClassificationEditor';
+import { DocumentInfoEditor } from './DocumentInfoEditor';
 // plan-716 §2.7 / F8 — the dashboard's readers of THE one list. They live in
 // their own module because this file cannot be rendered by a test.
 import {
@@ -180,8 +251,10 @@ import {
   documentRoleBadge,
   documentsUsingRef,
   documentTypeBadge,
+  formatDocumentSize,
   newDocumentFolderFor,
   newDocumentNameFor,
+  type DocumentStatEntry,
   type RefUsage,
 } from './dashboard-documents';
 // plan-446: the two CONNECT bridges of the project browser — "Show in Explorer"
@@ -195,7 +268,9 @@ import {
 } from '../connect-store';
 import { ConnectOptionsWindow } from '../ConnectOptionsWindow';
 import type { DocumentClassification } from '../../project/rv-document-classification';
+import type { DocumentInfo } from '../../project/rv-document-info';
 import type { TieredDocumentEntry } from '../../project/rv-project-tiers';
+import { sceneUrlToDocumentUrl } from '../../project/rv-doc-alias';
 
 /** Display name for a manifest asset that carries no explicit `label`. */
 function baseNameOf(path: string): string {
@@ -316,7 +391,13 @@ export interface WorkingSceneOpenModes {
   activeMode: string | null;
   list(): readonly { id: string }[];
   setMode(id: string): void;
-  requestMode(id: string): unknown;
+  /**
+   * `token` is the workspace switch lock of the caller that owns this open
+   * (plan-478 R3-2). Absent for an ordinary double-click, which owns nothing;
+   * present when the recents chain holds the lock and this handoff is the
+   * re-entry it is allowed to make.
+   */
+  requestMode(id: string, token?: symbol): unknown;
 }
 
 /**
@@ -349,27 +430,165 @@ export interface WorkingSceneOpenModes {
  * `SceneStore.openDocument` funnel writes it itself, with alias tolerance this
  * call site never had.
  */
-export async function openDocumentAsWorkingScene(
+/**
+ * Which mode the handoff parks in while the load runs.
+ *
+ * Exported because a caller that must clear the exit guards BEFORE the handoff
+ * runs (the recents chain, plan-478) has to name the mode the handoff will
+ * depart to — and two spellings of "the first non-editor mode" is how the
+ * guard check and the actual departure start to disagree.
+ */
+export function handoffExitTarget(modes: { list(): readonly { id: string }[] }): string {
+  // The one spelling lives beside the chain's guard rule (plan-513).
+  return handoffParkMode(modes);
+}
+
+/** What the handoff needs of the scene store. */
+export interface WorkingSceneStore {
+  openScene(id: string, opts?: { modeDecidedByCaller?: boolean }): Promise<void>;
+}
+
+/**
+ * Handoffs run ONE AT A TIME (plan-478 R3-2).
+ *
+ * Two overlapping handoffs interleave three shared things — the mode manager,
+ * the scene store's single workspace, and the recents ring's intent scope — and
+ * the second one to START is routinely the first to FINISH (a small document
+ * loads while a large one is still decoding). Serialising them is cheaper than
+ * making each of those three safe against interleaving, and it is what the
+ * user already believes is happening: a double-click means "open this instead",
+ * never "open both".
+ *
+ * A failed handoff must not poison the queue, so the tail is the SETTLED
+ * promise; the caller still gets the rejection through `run`.
+ */
+let handoffQueue: Promise<unknown> = Promise.resolve();
+
+/**
+ * `targetMode` (plan-513) is the mode the open chain has DECIDED this open ends
+ * in, with its exit guards already asked. Absent, the handoff behaves exactly
+ * as it always has. Resolves `false` only when the editor refused its re-entry
+ * at the end of an editor → editor open; every other outcome is `true`.
+ */
+export function openDocumentAsWorkingScene(
   viewer: { modes: WorkingSceneOpenModes },
-  sceneStore: { openScene(id: string): Promise<void> },
+  sceneStore: WorkingSceneStore,
   documents: readonly TieredDocumentEntry[],
   id: string,
-): Promise<void> {
+  switchToken?: symbol,
+  targetMode?: string,
+): Promise<boolean> {
+  const run = handoffQueue.then(
+    () => runHandoff(viewer, sceneStore, documents, id, switchToken, targetMode),
+    () => runHandoff(viewer, sceneStore, documents, id, switchToken, targetMode),
+  );
+  handoffQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function runHandoff(
+  viewer: { modes: WorkingSceneOpenModes },
+  sceneStore: WorkingSceneStore,
+  documents: readonly TieredDocumentEntry[],
+  id: string,
+  switchToken?: symbol,
+  targetMode?: string,
+): Promise<boolean> {
+  if (targetMode !== undefined) {
+    return runDecidedHandoff(viewer.modes, sceneStore, documents, id, targetMode, switchToken);
+  }
   const modes = viewer.modes;
   const wasEditor = modes.activeMode === 'editor';
-  if (wasEditor) {
-    const ids = modes.list().map((m) => m.id);
-    modes.setMode(ids.find((mid) => mid !== 'editor') ?? 'hmi');
-  }
-  await sceneStore.openScene(id);
-  const sceneRow = documentById(documents, id);
-  if (sceneRow) setOpenDocumentBase(sceneDocumentBase(id, sceneRow.name));
-  if (wasEditor) {
-    if (sceneRow) {
-      setPendingAssetOpen(documentBase(id, sceneRow.name, sceneRow.path));
+  // The whole leave/load/re-enter dance is ONE open with ONE intended mode
+  // (plan-478 F1b). Inside the scope the recents ring records the mode this
+  // open ends in rather than the transitional one it passes through, and the
+  // `mode-changed` retagging is inert — without that, the `setMode` two lines
+  // down would stamp the transitional mode onto the document being LEFT, which
+  // is still the ring's head until the new one is recorded (SOL R2 F4).
+  await withOpenIntentMode(wasEditor ? 'editor' : null, async () => {
+    if (wasEditor) modes.setMode(handoffExitTarget(modes));
+    await sceneStore.openScene(id);
+    const sceneRow = documentById(documents, id);
+    if (sceneRow) setOpenDocumentBase(sceneDocumentBase(id, sceneRow.name));
+    if (wasEditor) {
+      if (sceneRow) {
+        setPendingAssetOpen(documentBase(id, sceneRow.name, sceneRow.path));
+      }
+      // AWAITED, not fired and forgotten (plan-478 R3-3). The re-entry runs the
+      // editor's own activation — `_resolveOpenPlan`, which may raise the
+      // conflicting-draft dialog — and a caller that continued past it would
+      // set its target mode while this switch was still deciding, letting the
+      // later-landing `requestMode` win and leaving the workspace in `editor`
+      // when the recent asked for something else. It stays INSIDE the intent
+      // scope, so the resulting `mode-changed` retags nothing: the ring's head
+      // is already this document with `editor` recorded from the intent.
+      await modes.requestMode('editor', switchToken);
     }
-    void modes.requestMode('editor');
-  }
+  });
+  return true;
+}
+
+/**
+ * The handoff with a DECIDED target (plan-513 F7): the chain asked the exit
+ * guards for exactly this transition, so nothing here asks again — except the
+ * editor's own re-entry in case c, which is the editor's activation, not a
+ * guard question.
+ *
+ * All four cases run inside `withOpenIntentMode(target)`: the recording takes
+ * the target, and the `mode-changed` trackers stay inert while the workspace
+ * passes through anything else. The load is `modeDecidedByCaller`, so the row's
+ * declared mode is not applied a second time.
+ *
+ *  a. editor → X: leave straight INTO X, then load. No park mode.
+ *  b. X → editor: load, publish the identity, set the pending asset, THEN
+ *     activate the editor — its activation resolves what it shows from the
+ *     pending open, so the order is the contract (plan-513 risk "Editor ohne
+ *     geladenes Asset").
+ *  c. editor → editor: the path as it always was — park, load, pending,
+ *     `requestMode('editor')` with the chain's token. Its `false` travels back
+ *     so the chain can answer `vetoed-after-open`.
+ *  d. X → Y (neither the editor): load, then switch if Y differs.
+ */
+async function runDecidedHandoff(
+  modes: WorkingSceneOpenModes,
+  sceneStore: WorkingSceneStore,
+  documents: readonly TieredDocumentEntry[],
+  id: string,
+  target: string,
+  switchToken?: symbol,
+): Promise<boolean> {
+  const wasEditor = modes.activeMode === 'editor';
+  const sceneRow = documentById(documents, id);
+  const publishIdentity = () => {
+    if (sceneRow) setOpenDocumentBase(sceneDocumentBase(id, sceneRow.name));
+  };
+  const pendAsset = () => {
+    if (sceneRow) setPendingAssetOpen(documentBase(id, sceneRow.name, sceneRow.path));
+  };
+  return withOpenIntentMode(target, async () => {
+    if (wasEditor && target === 'editor') {                       // (c)
+      modes.setMode(handoffExitTarget(modes));
+      await sceneStore.openScene(id, { modeDecidedByCaller: true });
+      publishIdentity();
+      pendAsset();
+      return (await modes.requestMode('editor', switchToken)) !== false;
+    }
+    if (wasEditor) {                                              // (a)
+      modes.setMode(target);
+      await sceneStore.openScene(id, { modeDecidedByCaller: true });
+      publishIdentity();
+      return true;
+    }
+    await sceneStore.openScene(id, { modeDecidedByCaller: true });
+    publishIdentity();
+    if (target === 'editor') {                                    // (b)
+      pendAsset();
+      modes.setMode('editor');
+    } else if (modes.activeMode !== target) {                     // (d)
+      modes.setMode(target);
+    }
+    return true;
+  });
 }
 
 export function ProjectsDashboardHost() {
@@ -403,34 +622,74 @@ export function ProjectsDashboardHost() {
   // `revealSupported` again after a refusal cleared it.
   const connectSnap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
 
-  const [workspaceProjects, setWorkspaceProjects] = useState<WorkspaceProjectEntry[]>([]);
-  const [recent, setRecent] = useState(() => readRecentProjects());
-  // The display record, not the handle: it is written synchronously by
-  // `pickWorkspace` and is all the empty state needs to decide which screen to
-  // be. Probing the real handle would mean an async permission check before the
-  // first paint, and a flash of "no workspace" for a user who has one.
-  const [workspaceMeta, setWorkspaceMeta] = useState(() => getWorkspaceMeta());
+  /**
+   * The linked projects — this browser's whole project list (plan-743 F1).
+   *
+   * Held as state rather than derived, because reading it is async (the
+   * localStorage rows are intersected with the IndexedDB handle keys) and every
+   * verb that changes it — Add, New, Locate, Remove, and an ordinary open —
+   * has to publish the new list itself.
+   */
+  const [linked, setLinked] = useState<LinkedProjectEntry[]>([]);
+  /**
+   * Per-row openability, collected AFTER the first paint.
+   *
+   * ONE `setState` for the whole map, never one per row: the probe is N async
+   * round-trips, and a `setState` inside each would repaint the list N times
+   * while the user is trying to read it.
+   */
+  const [rowStates, setRowStates] = useState<Map<string, LinkedRowState>>(() => new Map());
 
-  // Workspace discovery touches the disk, so it runs when the OVERVIEW is
-  // actually on screen, not on every dashboard open: the two screens are two
-  // windows onto two listings (workspace → projects, project → its documents),
-  // and each scan belongs to the screen that shows its result. Going back to
-  // the overview re-runs the scan, which is also what keeps the list fresh
-  // after a stay inside a project. The one exception is the FIRST open of a
-  // session: it scans whichever screen it lands on, because the project screen
-  // keeps one piece of workspace knowledge — the "Copy to… / Move to…"
-  // transfer targets — and those entries hide entirely when the list is empty.
-  const workspaceScannedRef = useRef(false);
+  /** Correct ONE row's state after a click told us more than the probe could. */
+  const setRowState = useCallback((id: string, state: LinkedRowState) => {
+    setRowStates(prev => {
+      if (prev.get(id) === state) return prev;   // identity is the render signal
+      const next = new Map(prev);
+      next.set(id, state);
+      return next;
+    });
+  }, []);
+
+  const refreshLinked = useCallback(async (): Promise<LinkedProjectEntry[]> => {
+    let rows: LinkedProjectEntry[] = [];
+    try {
+      rows = await listLinkedProjects();
+    } catch {
+      rows = [];
+    }
+    setLinked(rows);
+    return rows;
+  }, []);
+
+  // Listing is cheap and asks for nothing: no disk read, no permission. It can
+  // therefore run on every dashboard open rather than on a "scanned once"
+  // latch, which is what kept the old workspace list stale after a change made
+  // in another tab.
   useEffect(() => {
     if (!dash.open) return;
-    if (dash.view !== 'projects' && workspaceScannedRef.current) return;
-    workspaceScannedRef.current = true;
     let alive = true;
-    void scanStoredWorkspace()
-      .then(result => { if (alive) setWorkspaceProjects(result?.projects ?? []); })
-      .catch(() => { if (alive) setWorkspaceProjects([]); });
-    setRecent(readRecentProjects());
-    setWorkspaceMeta(getWorkspaceMeta());
+    void (async () => {
+      const rows = await listLinkedProjects().catch(() => [] as LinkedProjectEntry[]);
+      if (!alive) return;
+      setLinked(rows);
+
+      // The permission probe comes second, and only `queryPermission` — the
+      // list must be readable before any of this resolves, and a `prompt` here
+      // would raise a browser dialog the user never asked for.
+      const states = new Map<string, LinkedRowState>();
+      await Promise.all(rows.map(async (row) => {
+        try {
+          const handle = await getHandle(projectHandleKey(row.id));
+          if (!handle) { states.set(row.id, 'missing'); return; }
+          const perm = await handle.queryPermission({ mode: 'readwrite' });
+          states.set(row.id, perm === 'granted' ? 'ready' : 'needs-grant');
+        } catch {
+          // A stale handle throws here; the click will tell the two apart.
+          states.set(row.id, 'needs-grant');
+        }
+      }));
+      if (alive) setRowStates(states);
+    })();
     return () => { alive = false; };
   }, [dash.open, dash.view]);
 
@@ -445,15 +704,6 @@ export function ProjectsDashboardHost() {
   // coordinator so it cannot stack on top of the welcome screen.
   useStartupModalRegistration('projects', dash.open);
   const autoOpenedRef = useRef(false);
-  /**
-   * "The next project that opens was opened deliberately — resume into it."
-   *
-   * Set BEFORE the open, not after: the store publishes synchronously, so a flag
-   * set afterwards would arrive one render too late and the resume would never
-   * fire. It is a ref rather than state because flipping it must not itself
-   * cause a render.
-   */
-  const pendingResumeRef = useRef(false);
   useEffect(() => {
     if (autoOpenedRef.current) return;
     autoOpenedRef.current = true;
@@ -484,104 +734,69 @@ export function ProjectsDashboardHost() {
     }
   }, [modeLocked, store]);
 
-  // A recent entry that is also a workspace subfolder would appear twice; the
-  // workspace listing wins because it is the live, on-disk truth.
-  const workspaceNames = useMemo(
-    () => new Set(workspaceProjects.map(p => p.name)),
-    [workspaceProjects],
-  );
-  const recentOutside = useMemo(
-    () => recent.filter(r => !workspaceNames.has(r.name)),
-    [recent, workspaceNames],
-  );
-
   /**
-   * The rows of the list screen: the open project, then the local projects —
-   * workspace entries and recents from elsewhere, interleaved and ordered by
-   * when they were last opened. All are projects to the user, so they share
-   * one list rather than headed groups — the origin only decides whether the
-   * row can be forgotten.
+   * The rows of the list screen: the bundled demo, then the linked projects in
+   * their own order, then the open project if it is neither.
    *
-   * The recency ordering is deliberately SILENT (user decision 2026-09-07):
-   * there is no badge, no timestamp and no "Recent" heading, only position.
-   * A project that was never opened has no `lastOpenedAt` and sorts last,
-   * which is the honest place for it.
+   * The linked list is ALREADY sorted (last opened first, then last linked), so
+   * this memo does not re-sort it: the ordering is a property of the list, and
+   * deriving it a second time here is how the two would eventually disagree.
+   * The ordering is deliberately SILENT (user decision 2026-09-07): no badge,
+   * no timestamp, no "Recent" heading, only position.
    *
-   * The open project leads the list even when it belongs to neither source.
-   *
-   * `DemoRealvirtual` — the shipped demo project — is listed with the workspace
-   * entries whether or not it is open, because a deploy serves it over HTTP and
-   * `discoverWorkspaceProjects()` can never find it there.
-   *
-   * Unless the workspace *is* the folder it lives in: whoever points the picker
-   * at `projects/` gets `demo-realvirtual` discovered like any other folder, and
-   * then the synthetic row is the same project a second time. On-disk truth
-   * wins, same rule the recents list follows above.
+   * `DemoRealvirtual` — the shipped demo project — is listed whether or not it
+   * is open, because a deploy serves it over HTTP and no folder listing could
+   * ever find it there. Unless the user has LINKED the demo folder itself: then
+   * the same project would be two rows, and the bundled one wins (plan-743 F12,
+   * the same rule the store's collision guard applies).
    */
   const projectRows = useMemo<ProjectListRow[]>(() => {
-    const term = dash.search.trim().toLowerCase();
-    const match = (name: string) => !term || name.toLowerCase().includes(term);
-    const onDisk = [...workspaceProjects, ...recentOutside]
-      .some(p => p.id === DEMO_PROJECT_ID || p.name === DEMO_PROJECT_NAME);
-    // `readRecentProjects()` is newest-first and carries `lastOpenedAt`, so the
-    // ordering costs one lookup table and no new state. ISO-8601 sorts
-    // lexicographically in chronological order, which is why this compares the
-    // strings rather than parsing dates.
-    const openedAt = new Map(recent.map(r => [r.id, r.lastOpenedAt]));
-    const localRows: ProjectListRow[] = [
-      ...workspaceProjects
-        .filter(p => match(p.name))
-        .map(p => ({
-          id: p.id,
-          name: p.name,
-          caption: p.folderName,
-          origin: 'workspace' as const,
-          canManage: true,
-          hint: 'local' as const,
-        })),
-      ...recentOutside
-        .filter(r => match(r.name))
-        .map(r => ({
-          id: r.id,
-          name: r.name,
-          caption: r.folderName,
-          origin: 'recent' as const,
-          hint: 'local' as const,
-        })),
-    ].sort((a, b) => (openedAt.get(b.id) ?? '').localeCompare(openedAt.get(a.id) ?? ''));
+    // Unfiltered (plan-509 SOL R2 F3): a term typed on this screen searches
+    // MODELS, the cards give way to the hit list while it is there, and this
+    // list is also where the hit groups take their order and names from.
+    const bundledIds = new Set<string>([DEMO_PROJECT_ID]);
+    const bundledRows: ProjectListRow[] = [{
+      id: DEMO_PROJECT_ID,
+      name: DEMO_PROJECT_NAME,
+      caption: 'realvirtual demo scenes & library',
+      hint: 'bundled' as const,
+    }];
 
-    const rows: ProjectListRow[] = [
-      ...(!onDisk && match(DEMO_PROJECT_NAME)
-        ? [{
-            id: DEMO_PROJECT_ID,
-            name: DEMO_PROJECT_NAME,
-            caption: 'realvirtual demo scenes & library',
-            origin: 'workspace' as const,
-            hint: 'bundled' as const,
-          }]
-        : []),
-      ...localRows,
-    ];
+    const linkedRows: ProjectListRow[] = linked
+      .filter(l => !bundledIds.has(l.id) && l.name !== DEMO_PROJECT_NAME)
+      .map(l => ({
+        id: l.id,
+        name: l.name,
+        caption: l.folderName,
+        hint: 'local' as const,
+        state: rowStates.get(l.id) ?? 'ready',
+        canManage: true,
+        canUnlink: true,
+      }));
+
+    const rows: ProjectListRow[] = [...bundledRows, ...linkedRows];
 
     const open = project.project;
-    if (open && match(open.name) && !rows.some(r => r.id === open.id)) {
-      rows.unshift({
+    if (open && !rows.some(r => r.id === open.id)) {
+      // The browser project has no folder and no link, so it can neither be
+      // removed nor renamed — it goes LAST (user decision: it is a fallback,
+      // not a recent).
+      rows.push({
         id: open.id,
         name: open.name,
-        caption: project.folderName ?? `${project.backendKind ?? 'open'} project`,
-        // Not 'recent': there is no recents entry to forget, so the row must
-        // not offer a remove button that would do nothing.
-        origin: 'workspace',
+        caption: project.backendKind === 'browser'
+          ? WORKSPACE_DEFAULT_PROJECT_HINT
+          : project.folderName ?? `${project.backendKind ?? 'open'} project`,
         // The open project is the one row whose backend is known exactly, so
-        // its hint is read rather than assumed. 'browser' is My Workspace and
-        // says so: it lives in this browser's storage, not in a folder.
+        // its hint is read rather than assumed. 'browser' is the implicit
+        // project and says so: it lives in this browser's storage.
         hint: project.backendKind === 'bundled' ? 'bundled'
           : project.backendKind === 'browser' ? 'browser'
           : 'local',
       });
     }
     return rows;
-  }, [workspaceProjects, recentOutside, recent, dash.search,
+  }, [linked, rowStates,
       project.project, project.folderName, project.backendKind]);
 
   const projectLibraries = useMemo(
@@ -600,12 +815,14 @@ export function ProjectsDashboardHost() {
   // plan-370 dirty guard lives (§3.4). Calling it here rather than
   // reimplementing a guard is the whole point: one prompt, one rule.
   const [busy, setBusy] = useState(false);
+  const operationRef = useRef(false);
+  const [operationLabel, setOperationLabel] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   // One confirm for every destructive verb — see DestructiveConfirmDialog.
   const [confirmReq, setConfirmReq] = useState<DestructiveConfirmRequest | null>(null);
-  const [createHere, setCreateHere] = useState<(CreateHereRequest & { dir: FileSystemDirectoryHandle }) | null>(null);
   const [fromScenes, setFromScenes] = useState<FromScenesRequest | null>(null);
-  const [newProjectName, setNewProjectName] = useState<string | null>(null);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
 
   /**
    * Show the folder picker and, when no folder comes back, say why.
@@ -631,13 +848,23 @@ export function ProjectsDashboardHost() {
 
   /** Run a verb, surfacing failures instead of swallowing them. */
   const runVerb = useCallback(async (label: string, fn: () => Promise<unknown>) => {
+    if (operationRef.current) return;
+    operationRef.current = true;
+    setSuccessMessage(null);
+    setMessage(null);
+    setOperationLabel(label.replace(/^Rename/, 'Renaming').replace(/^Delete/, 'Deleting'));
     setBusy(true);
+    const tVerb = performance.now();   // TEMP verb-timing
     try {
       await fn();
+      console.warn(`[verb-timing] "${label}" total ${Math.round(performance.now() - tVerb)} ms`);
+      if (/^(Rename|Delete)/.test(label)) setSuccessMessage(`${label} completed.`);
     } catch (e) {
       setMessage(e instanceof Error ? e.message : `${label} failed: ${String(e)}`);
     } finally {
       setBusy(false);
+      setOperationLabel(null);
+      operationRef.current = false;
     }
   }, []);
 
@@ -650,106 +877,254 @@ export function ProjectsDashboardHost() {
    * one click before the scenes they came for. Opening a scene or a model still
    * closes — those are the actions that actually change what is on screen.
    */
-  const handleOpenProject = useCallback((id: string) => {
-    if (busy) return;
-    const ws = workspaceProjects.find(p => p.id === id);
+  const openProject = useCallback(async (id: string) => {
+    const isLinked = linked.some(l => l.id === id);
     // "Already open" is only true when it is the same THING, not merely the
     // same id. DemoRealvirtual exists twice under one id — as the read-only
-    // HTTP fallback and as a folder in the workspace — so while the HTTP one
-    // is open, clicking the folder row must still open the folder. Treating
-    // it as navigation is what left the project permanently read-only.
-    if (id === project.project?.id && (!ws || project.backendKind === 'folder')) {
+    // HTTP fallback and as a linked folder — so while the HTTP one is open,
+    // clicking the folder row must still open the folder. Treating it as
+    // navigation is what left the project permanently read-only.
+    if (id === project.project?.id && (!isLinked || project.backendKind === 'folder')) {
       setProjectsView('project');      // genuinely already open — pure navigation
       return;
     }
-    void runVerb('Open project', async () => {
-      pendingResumeRef.current = true;
-      try {
-        // The folder wins whenever there is one: it is writable, and the HTTP
-        // project is the fallback for a deploy that has no folder at all.
-        const ok = ws
-          ? await store.openProjectFolder(ws.dir)
-          : id === DEMO_PROJECT_ID
-            ? await store.openDemoProject()
-            : await store.openRecentProject(id);
-        if (!ok) setMessage('That project could not be opened.');
-        else setProjectsView('project');
-      } finally {
-        // A failed open must not leave the flag armed for the next one.
-        if (!store.getProject()) pendingResumeRef.current = false;
-      }
-    });
-  }, [busy, project.project?.id, project.backendKind, workspaceProjects, runVerb, store]);
+
+    // The verb itself lives in `open-project-by-id.ts` since plan-478 Phase 3:
+    // the recents chain must be able to AWAIT an open and to know WHY one did
+    // not happen, and two spellings of "open this project" is how the two
+    // would start to differ. What stays here is the host's reaction to the
+    // answer — the view, the row state, the message.
+    //
+    // The "already open" question is answered ABOVE, with this file's own rule
+    // (the id is not enough — DemoRealvirtual exists twice), so the verb is
+    // told there is nothing open and simply performs the open.
+    //
+    // Opening a project shows the PROJECT — its folders and documents — and
+    // nothing else. Until 2026-09-25 this click also armed a "resume" effect
+    // that resolved a document (URL `?scene=`, the remembered pair, the
+    // manifest's `activeSceneId`, `defaultModel`) and loaded it, closing the
+    // dashboard behind the user's back whenever one of those happened to name
+    // a document of the clicked project. Resuming into a document is the
+    // BOOT's job (`main.ts`, reload and kiosk); a click on a folder is a
+    // request to look inside it. A document opens when a document is clicked.
+    const r = await openProjectById(
+      { projectId: id, backend: !isLinked && id === DEMO_PROJECT_ID ? 'bundled' : 'folder' },
+      {
+        currentProject: () => null,
+        isLinked: () => isLinked,
+        resolveLinkedOpen,
+        store,
+        afterLinkedOpen: refreshLinked,
+        onRowState: setRowState,
+      },
+    );
+    if (r === 'opened' || r === 'already-open') {
+      setProjectsView('project');
+      return;
+    }
+    // `denied` / `missing` already said what they are, as a row state.
+    if (r !== 'denied' && r !== 'missing') {
+      setMessage('That project could not be opened.');
+    }
+  }, [project.project?.id, project.backendKind, linked, store,
+      setRowState, refreshLinked]);
+
+  const handleOpenProject = useCallback((id: string) => {
+    void runVerb('Open project', () => openProject(id));
+  }, [runVerb, openProject]);
 
   /**
-   * **One "Open…"** (plan-703 §2.6.3, decision 1).
+   * **Add** — link a folder the user already has (plan-743 F2).
    *
-   * There used to be two buttons — "Open folder…" and "Switch workspace" — and
-   * the user had to know which of our two internal concepts their folder was.
-   * Now there is one picker and one directory listing, and the listing answers
-   * the question: a folder with its own `project.json` is a project (even when
-   * it also holds child projects — decision 2), a folder holding child projects
-   * is a workspace, and a folder that is neither is an offer to create one.
+   * One picker, one directory listing, and the listing answers which of three
+   * shapes it is. The user is never asked to classify their own folder:
    *
-   * The detection is `detectOpenTarget`, the listing is `probeOpenFolder`, and
-   * neither of them is here — this function is only the dispatch.
+   *  - **project** — link it and open it;
+   *  - **parent** — link every child project and write NOTHING to the folder
+   *    itself (the replacement for migrating an old workspace root);
+   *  - **plain** — offer to make it a project by scanning it for GLBs.
+   *
+   * Shared by the Add button, the drop handler and Locate, because all three
+   * arrive at the same place: a directory handle of unknown shape.
    */
-  const handleOpen = useCallback(() => {
-    void runVerb('Open', async () => {
-      // Picked under the project key rather than the workspace one: a folder we
-      // have not classified yet must not become "the workspace" just by being
-      // looked at. `adoptWorkspace` below is what promotes it, once we know.
-      const dir = await pickFolder('rv-project-pick');
-      if (!dir) return;                // cancelled, or already explained by pickFolder
-      const target = detectOpenTarget(await probeOpenFolder(dir));
+  const addProjectFolder = useCallback(async (dir: FileSystemDirectoryHandle) => {
+    // Reentrancy guard: a second Add while a scan runs would either queue
+    // invisibly or replace the job the user is watching. Neither is honest.
+    if (getAddJobSnapshot().status === 'running') {
+      setMessage('A folder is still being scanned — cancel it or wait for it to finish.');
+      return;
+    }
+    const verdict = await verdictForAdd(dir, linked);
 
-      if (target.kind === 'project') {
-        pendingResumeRef.current = true;
+    if (verdict.kind === 'project') {
+      const manifest = verdict.manifest;
+      if (verdict.probe.manifestBroken || !manifest) {
+        setMessage(`"${dir.name}" holds a project.json that could not be read.`);
+        return;
+      }
+      if (verdict.duplicateOfOtherFolder) {
+        const keep = window.confirm(
+          `This folder is a copy of project "${manifest.name}", which is already linked. `
+          + 'Replace the link?');
+        if (!keep) return;
+      }
+      const ok = await store.openProjectFolder(dir);
+      if (!ok) {
+        setMessage('That project could not be opened.');
+        return;
+      }
+      await refreshLinked();
+      setRowState(manifest.id, 'ready');
+      setProjectsView('project');
+      return;
+    }
+
+    if (verdict.kind === 'parent') {
+      const added = await linkChildProjects(dir, verdict.childProjects, linked);
+      await refreshLinked();
+      setProjectsView('projects');
+      setMessage(summariseParentAdd(added));
+      return;
+    }
+
+    // Plain: the folder may be full of GLBs, it just holds no manifest. The
+    // scan runs in the module-level job store, so closing the dashboard does
+    // not cancel it.
+    startAddScan(dir, (outcome) => {
+      if (outcome.kind !== 'success' || !outcome.result) {
+        if (outcome.kind === 'error' && outcome.error) setMessage(outcome.error);
+        return;                          // cancelled: nothing written, nothing said
+      }
+      const result = outcome.result;
+      void runVerb('Add project', async () => {
+        await seedProjectFromScan(dir, dir.name || 'New project', result);
+        // Nested projects become their own rows — the same thing the `parent`
+        // branch does, reached from the other direction.
+        const added = await linkChildProjects(
+          dir, result.nestedProjectDirs.map(n => n.relPath), linked,
+          result.nestedProjectDirs.map(n => n.dir));
         const ok = await store.openProjectFolder(dir);
+        await refreshLinked();
         if (!ok) {
-          pendingResumeRef.current = false;
-          setMessage('That project could not be opened.');
+          setMessage('The project was created but could not be opened.');
           return;
         }
         setProjectsView('project');
-        if (target.childProjects.length > 0) {
-          // Decision 2: the children are a HINT, never a second interpretation.
-          setMessage(`Opened "${dir.name}". It also contains `
-            + `${target.childProjects.length} project folder(s).`);
-        }
+        if (added.linked > 0) setMessage(summariseParentAdd(added));
+      });
+    });
+  }, [runVerb, store, linked, refreshLinked, setRowState]);
+
+  // Only entry points acquire the operation guard. Composed steps are awaited
+  // inside the same operation so Add and Locate cannot suppress their own work.
+  const handleAdd = useCallback((dir: FileSystemDirectoryHandle) => {
+    void runVerb('Add project', () => addProjectFolder(dir));
+  }, [runVerb, addProjectFolder]);
+
+  /** Add via the button: pick a folder first, then classify it. */
+  const handleAddPick = useCallback(() => {
+    void runVerb('Add project', async () => {
+      const dir = await pickFolder('rv-project-pick');
+      if (!dir) return;                // cancelled, or already explained by pickFolder
+      await addProjectFolder(dir);
+    });
+  }, [runVerb, pickFolder, addProjectFolder]);
+
+  /**
+   * **Locate…** — the row's folder moved, point it at the new place (F6).
+   *
+   * The one place a handle is replaced WITHOUT a confirm — but only when the
+   * folder found still carries the same project id. The old folder is gone by
+   * definition (that is why the row said "Folder not found"), so there is no
+   * other folder for the row to lose. A different id is a different project and
+   * goes through the ordinary Add, after the user has said so.
+   */
+  const handleLocate = useCallback((id: string) => {
+    const entry = linked.find(l => l.id === id);
+    void runVerb('Locate project', async () => {
+      const dir = await pickFolder('rv-project-pick');
+      if (!dir) return;
+      const probe = await probeAddTarget(dir);
+      if (!probe.hasManifest || probe.manifestBroken) {
+        setMessage(`"${dir.name}" does not hold a readable project.json.`);
         return;
       }
-
-      if (target.kind === 'workspace') {
-        await adoptWorkspace(dir);
-        const result = await scanStoredWorkspace();
-        setWorkspaceProjects(result?.projects ?? []);
-        setWorkspaceMeta(getWorkspaceMeta());
-        setProjectsView('projects');
+      const manifest = (await readManifest(dir))?.project;
+      if (!manifest) {
+        setMessage(`"${dir.name}" does not hold a readable project.json.`);
         return;
       }
-
-      // Neither: offer to make one here rather than reporting an error for a
-      // folder the user deliberately chose.
-      setCreateHere({ dir, name: dir.name || 'New Project' });
+      if (manifest.id === id) {
+        await relinkProject(id, dir);
+        await refreshLinked();
+        setRowState(id, 'ready');
+        await openProject(id);
+        return;
+      }
+      const replace = window.confirm(
+        `This folder holds project "${manifest.name}". `
+        + `Replace the list entry for "${entry?.name ?? id}"?`);
+      if (!replace) return;
+      await unlinkProject(id);
+      // The replaced entry's traces go with it, like Remove's (plan-509 F7):
+      // its recents and its folder model-index snapshot describe a project
+      // that is no longer on the list.
+      await forgetProjectTraces(id);
+      await refreshLinked();
+      await addProjectFolder(dir);
     });
-  }, [runVerb, store, pickFolder]);
+  }, [linked, runVerb, pickFolder, refreshLinked, setRowState, openProject, addProjectFolder]);
 
-  /** Create a project in the folder the single "Open…" found empty. */
-  const submitCreateHere = useCallback(() => {
-    const request = createHere;
-    setCreateHere(null);
-    if (!request) return;
-    const name = request.name.trim();
-    if (!name) return;
-    void runVerb('New project', async () => {
-      const result = await createProjectFromScenes(request.dir, name, []);
-      if (!result.ok) throw new Error(result.message);
-      const ok = await store.openProjectFolder(request.dir);
-      if (!ok) throw new Error('The project was created but could not be opened.');
-      setProjectsView('project');
+  /**
+   * **Remove from list** — forget the row and the handle, touch no file (F7).
+   *
+   * Both halves, or the orphan fallback in `listLinkedProjects` would put the
+   * project straight back under "Untitled project" and the verb would look
+   * broken.
+   */
+  const handleRemove = useCallback((id: string) => {
+    void runVerb('Remove project', async () => {
+      await unlinkProject(id);
+      // Its recents go with it (plan-478 F10). A row pointing at a project the
+      // user just unlinked can only ever answer "that project could not be
+      // opened", and a list that keeps offering it reads as the verb not
+      // having worked. The same holds for its model-index snapshot (plan-509
+      // F7) — `forgetProjectTraces` is the one list of what goes.
+      await forgetProjectTraces(id);
+      await refreshLinked();
+      setRowStates(prev => {
+        if (!prev.has(id)) return prev;
+        const next = new Map(prev);
+        next.delete(id);
+        return next;
+      });
     });
-  }, [createHere, runVerb, store]);
+  }, [runVerb, refreshLinked]);
+
+  /**
+   * Drop an OS folder on the dashboard — the same thing as Add (F10).
+   *
+   * `getAsFileSystemHandle()` is called for every item SYNCHRONOUSLY inside the
+   * drop handler and awaited only afterwards: the DataTransfer items are
+   * neutered once the event tick ends, and an `await` before the calls makes
+   * every one of them answer `null`.
+   */
+  const handleDashboardDrop = useCallback((e: React.DragEvent) => {
+    // The dashboard already carries internal drags (CONNECT configs, knowledge
+    // files). They own the drop; only an OS drag reaches Add.
+    const types = Array.from(e.dataTransfer?.types ?? []);
+    if (isInternalDrag(types, [
+      CONNECT_CONFIG_DRAG_TYPE, KNOWLEDGE_FILE_DRAG_TYPE, SCRIPT_FILE_DRAG_TYPE,
+    ])) return;
+
+    const pending = collectDropHandles(Array.from(e.dataTransfer?.items ?? []));
+    if (pending.length === 0) return;
+    e.preventDefault();
+    void (async () => {
+      const dir = await firstDirectoryHandle(pending);
+      if (dir) handleAdd(dir);
+    })();
+  }, [handleAdd]);
 
   /**
    * Export the open folder project as a single .rvproject (Phase 16).
@@ -792,17 +1167,26 @@ export function ProjectsDashboardHost() {
         input.click();
       });
       if (!file) return;                 // cancelled — not an error
-      // Unpacked into a folder the user picks now — and that folder becomes the
-      // workspace, which is where the import will be listed again next time.
+      // Unpacked into a folder the user picks now, and LINKED straight after:
+      // an import that did not appear in the list would have to be found with
+      // Add on the very next visit.
       const dir = await pickFolder('rv-project-pick');
       if (!dir) return;
-      await adoptWorkspace(dir);
       const result = await importProject(file, dir);
       if (result.kind !== 'imported') throw new Error(
         'message' in result ? result.message : 'Import failed.');
+      await putHandle(dir, projectHandleKey(result.project.id));
+      recordLinkedProject({
+        id: result.project.id,
+        name: result.project.name,
+        slug: result.project.canonicalName || canonicalNameOf(result.project.name),
+        folderName: dir.name,
+        opened: false,
+      });
+      await refreshLinked();
       setMessage(`Imported "${result.project.name}" (${result.entryCount} files).`);
     });
-  }, [runVerb, pickFolder]);
+  }, [runVerb, pickFolder, refreshLinked]);
 
   /**
    * Every document of the open project by path — the lookup the asset verbs need.
@@ -842,9 +1226,13 @@ export function ProjectsDashboardHost() {
    * no rescan touches.
    */
   const refreshListings = useCallback(async () => {
+    const t0 = performance.now();   // TEMP verb-timing
     await store.rescanDocuments();
+    const t1 = performance.now();
     await listLibrarySources()
       .find(s => s.providerId === PROJECT_LIBRARY_PROVIDER_ID)?.source.refresh?.();
+    console.warn(`[verb-timing] refreshListings: rescan ${Math.round(t1 - t0)} ms, `
+      + `library refresh ${Math.round(performance.now() - t1)} ms`);
   }, [store]);
 
   /** Run an asset op, surfacing its typed failure rather than swallowing it. */
@@ -952,16 +1340,16 @@ export function ProjectsDashboardHost() {
   /**
    * Where a document can be sent.
    *
-   * Workspace projects only, and never the one that is open: a target needs a
+   * Linked projects only, and never the one that is open: a target needs a
    * folder handle (its `project.json` is updated under compare-and-swap) and a
    * transfer into the source itself is Duplicate, which already exists. A
    * read-only project is absent rather than disabled — see the dialog.
    */
   const transferTargets = useMemo<TransferTargetOption[]>(
-    () => workspaceProjects
-      .filter(ws => ws.id !== project.project?.id)
-      .map(ws => ({ id: ws.id, label: ws.name, hint: ws.folderName })),
-    [workspaceProjects, project.project?.id],
+    () => linked
+      .filter(l => l.id !== project.project?.id)
+      .map(l => ({ id: l.id, label: l.name, hint: l.folderName })),
+    [linked, project.project?.id],
   );
 
   /**
@@ -976,14 +1364,19 @@ export function ProjectsDashboardHost() {
    */
   const runTransfer = useCallback((req: TransferRequest, targetId: string) => {
     setTransferReq(null);
-    const ws = workspaceProjects.find(p => p.id === targetId);
+    const target = linked.find(l => l.id === targetId);
     const doc = documentByPath.get(req.documentPath);
     const label = req.mode === 'move' ? 'Move document' : 'Copy document';
     void runVerb(label, async () => {
-      if (!ws) throw new Error('That project is no longer in the workspace.');
+      if (!target) throw new Error('That project is no longer in the list.');
       if (!doc) throw new Error('That document is no longer part of this project.');
       const backend = store.getBackend();
       if (!backend?.writable) throw new Error('This project is read-only.');
+      // The target's own handle, prompted if the grant lapsed: writing into a
+      // project that is not open is exactly the case a stale grant breaks, and
+      // this call still sits inside the user's menu gesture.
+      const targetDir = await getFolderHandle(projectHandleKey(targetId), { prompt: true });
+      if (!targetDir) throw new Error(`"${target.name}" is not accessible — open it once first.`);
 
       const result = await withTransferSession(
         {
@@ -994,16 +1387,15 @@ export function ProjectsDashboardHost() {
             isActiveProject: true,
           },
           target: {
-            label: ws.name,
-            // A fresh backend rather than `ws.backend`: discovery constructs
-            // those read-only and inert, and `setWritable` on a shared instance
-            // would leave the workspace listing holding a writable handle long
-            // after the transfer.
-            backend: new FolderBackend(ws.dir, {
+            label: target.name,
+            // A backend built for THIS transfer and discarded with it: nothing
+            // else holds a writable handle on the target, so the session cannot
+            // leak write access past its own `finally`.
+            backend: new FolderBackend(targetDir, {
               writable: true,
-              id: `transfer:${ws.id}`,
+              id: `transfer:${target.id}`,
             }),
-            dir: ws.dir,
+            dir: targetDir,
           },
         },
         session => req.mode === 'move'
@@ -1015,7 +1407,7 @@ export function ProjectsDashboardHost() {
       if (result.warning) {
         setMessage(result.warning);
       } else {
-        setMessage(`"${doc.name}" ${req.mode === 'move' ? 'moved' : 'copied'} to "${ws.name}".`);
+        setMessage(`"${doc.name}" ${req.mode === 'move' ? 'moved' : 'copied'} to "${target.name}".`);
       }
       // A move took bytes out of THIS project's library, so the source listing
       // is stale until it is re-read — the same refresh every asset op does.
@@ -1025,7 +1417,7 @@ export function ProjectsDashboardHost() {
         setProjectsSelection({ kind: 'none' });
       }
     });
-  }, [workspaceProjects, documentByPath, runVerb, store, project.project?.name]);
+  }, [linked, documentByPath, runVerb, store, project.project?.name]);
 
   /**
    * "Copy to…" / "Move to…" for one document, or nothing.
@@ -1168,15 +1560,15 @@ export function ProjectsDashboardHost() {
     void runVerb('Close project', () => store.requestCloseProject());
   }, [runVerb, store]);
 
-  // ── Project rename / delete (workspace rows only) ─────────────────────
-  // Both act on the folder the workspace scan found. Recents and the bundled
-  // demo have no workspace folder, so neither verb is offered for them.
+  // ── Project rename / delete (linked rows only) ────────────────────────
+  // Rename writes the linked folder's own manifest. The bundled demo and the
+  // browser project have no folder, so neither verb is offered for them.
   const [renameProjectReq, setRenameProjectReq] = useState<ProjectRenameRequest | null>(null);
 
   const handleRenameProject = useCallback((id: string) => {
-    const ws = workspaceProjects.find(p => p.id === id);
-    if (ws) setRenameProjectReq({ id, name: ws.name });
-  }, [workspaceProjects]);
+    const row = linked.find(l => l.id === id);
+    if (row) setRenameProjectReq({ id, name: row.name });
+  }, [linked]);
 
   const submitRenameProject = useCallback(() => {
     if (!renameProjectReq) return;
@@ -1184,24 +1576,35 @@ export function ProjectsDashboardHost() {
     const trimmed = name.trim();
     setRenameProjectReq(null);
     if (!trimmed) return;
-    const ws = workspaceProjects.find(p => p.id === id);
-    if (!ws) return;
     void runVerb('Rename project', async () => {
-      await writeManifest(ws.dir, { ...ws.manifest, name: trimmed });
-      const scan = await scanStoredWorkspace({ prompt: false });
-      setWorkspaceProjects(scan.projects);
+      // No prompt: the user is renaming a row they are looking at, and the
+      // grant is normally alive. When it is not, saying so beats a dialog
+      // raised from inside a submit handler that no longer counts as a gesture.
+      const dir = await getFolderHandle(projectHandleKey(id), { prompt: false });
+      if (!dir) throw new Error('That project folder is not accessible — open it once first.');
+      const manifest = (await readManifest(dir))?.project;
+      if (!manifest) throw new Error('That project folder has no readable project.json.');
+      await writeManifest(dir, { ...manifest, name: trimmed });
+      recordLinkedProject({
+        id,
+        name: trimmed,
+        slug: manifest.canonicalName || canonicalNameOf(trimmed),
+        folderName: dir.name,
+        opened: false,
+      });
+      await refreshLinked();
       // The open project shows its name in the header; re-open it so the
       // rename is visible immediately. The store's own dirty guard applies.
       if (project.project?.id === id && project.backendKind === 'folder') {
-        await store.openProjectFolder(ws.dir);
+        await store.openProjectFolder(dir);
       }
     });
-  }, [renameProjectReq, workspaceProjects, runVerb,
+  }, [renameProjectReq, runVerb, refreshLinked,
       project.project?.id, project.backendKind, store]);
 
   const handleDeleteProject = useCallback((id: string) => {
-    const ws = workspaceProjects.find(p => p.id === id);
-    if (!ws) return;
+    const row = linked.find(l => l.id === id);
+    if (!row) return;
     // Deleting the folder under the open project would leave the store
     // writing into nowhere — closing first is the user's explicit step.
     if (project.project?.id === id) {
@@ -1210,23 +1613,30 @@ export function ProjectsDashboardHost() {
     }
     setConfirmReq({
       title: 'Delete project',
-      message: `Delete the project "${ws.name}" and its folder "${ws.folderName}"? This cannot be undone.`,
+      message: `Delete the project "${row.name}" and its folder "${row.folderName}"? This cannot be undone.`,
       confirmLabel: 'Delete project',
       onConfirm: () => {
         void runVerb('Delete project', async () => {
-          const root = await getWorkspaceHandle();
-          if (!root) throw new Error('The workspace folder is not accessible.');
-          await root.removeEntry(ws.folderName, { recursive: true });
-          // A recents entry pointing at the deleted folder would be a row
-          // that can only ever fail to open.
-          forgetRecentProject(id);
-          setRecent(readRecentProjects());
-          const scan = await scanStoredWorkspace({ prompt: false });
-          setWorkspaceProjects(scan.projects);
+          // Deleting a project needs its PARENT, which a per-project handle
+          // does not give us — the linked model deliberately knows a project's
+          // folder and nothing above it. So the folder's own contents go, the
+          // manifest included, and the row is unlinked; the (now empty) folder
+          // is the user's to remove.
+          const dir = await getFolderHandle(projectHandleKey(id), { prompt: true });
+          if (!dir) throw new Error('That project folder is not accessible.');
+          for await (const name of dir.keys()) {
+            await dir.removeEntry(name, { recursive: true });
+          }
+          await unlinkProject(id);
+          // Same rule as Remove (F10), and more absolute: the folder itself is
+          // gone, so every recent of it — and every model the index still
+          // lists for it — is unopenable by construction.
+          await forgetProjectTraces(id);
+          await refreshLinked();
         });
       },
     });
-  }, [workspaceProjects, project.project?.id, runVerb]);
+  }, [linked, project.project?.id, runVerb, refreshLinked]);
 
   // ── Scene actions (§3.6) ──────────────────────────────────────────────
   // The dashboard is the only scene browser after Phase 13, so it must carry
@@ -1253,6 +1663,188 @@ export function ProjectsDashboardHost() {
    */
   const openSeqRef = useRef(0);
 
+  // ── Recent documents (plan-478) ───────────────────────────────────────
+  //
+  // The activity-bar flyout and keyboard Quick Open share the same store and
+  // opening chain, owned here alongside the project and scene dependencies.
+  //
+  // Under a kiosk lock none of it exists: no section, no listener, no popover
+  // (F5). The recording side is gated separately, in the store itself, so a
+  // locked deployment writes nothing even when its documents are opened by
+  // `?doc=` or MCP.
+  const recents = useRecentDocuments();
+  const quickOpen = useSyncExternalStore(subscribeRecentDocumentsOpen, getRecentDocumentsOpen);
+  /**
+   * Mirrors `isOpeningRecent()` into React.
+   *
+   * The chain's in-flight flag is module-level on purpose (it must outlive this
+   * host's unmount when the target mode is `viewer`), and a module variable
+   * cannot make React repaint. This is the one-way mirror that disables the
+   * rows while it runs — never the source of truth, which stays the module.
+   */
+  const [recentBusy, setRecentBusy] = useState(false);
+
+  /**
+   * The dirty-scene question, as an awaitable (plan-478 R3-1).
+   *
+   * The same dialog `trySwitch` raises, reached through the same
+   * `pendingSwitch` slot so there can never be two unsaved-changes prompts with
+   * two different answers. The difference is only in the shape: `trySwitch`
+   * takes a continuation, a chain needs a boolean — so Discard/Save resolve
+   * `true` through the pending action, and Cancel resolves `false` through this
+   * ref, which the dialog's `onCancel` settles.
+   */
+  const dirtyGuardRef = useRef<((ok: boolean) => void) | null>(null);
+  const confirmDiscardDirtyScene = useCallback((): Promise<boolean> => {
+    if (!sceneSnap?.dirty) return Promise.resolve(true);
+    return new Promise<boolean>(resolve => {
+      dirtyGuardRef.current = resolve;
+      setPendingSwitch(() => async () => {
+        dirtyGuardRef.current = null;
+        resolve(true);
+      });
+    });
+  }, [sceneSnap?.dirty]);
+
+  /**
+   * The chain's dependencies, built in ONE place for both of its callers — a
+   * recent and a model-search hit (plan-509) — so the two can never drift
+   * apart. Only how a gone document is forgotten differs, and that is the
+   * caller's to add.
+   */
+  const openChainDeps = useCallback((): OpenChainBaseDeps => ({
+    modes: viewer.modes,
+    currentProject: () => {
+      const p = store.getSnapshot();
+      return p.project ? { id: p.project.id, backend: p.backendKind } : null;
+    },
+    isLinked: (id) => linked.some(l => l.id === id),
+    resolveLinkedOpen,
+    store: {
+      openDemoProject: () => store.openDemoProject(),
+      openWorkspaceProject: () => store.openWorkspaceProject(),
+      openRecentProject: (id) => store.openRecentProject(id),
+      openProjectFolder: (dir) => store.openProjectFolder(dir),
+    },
+    afterLinkedOpen: refreshLinked,
+    onRowState: setRowState,
+    isDemoProject: () => store.getSnapshot().project?.kind === 'demo',
+    // The STORE's list, not the React snapshot: after step 2 the snapshot
+    // is a frame behind and still describes the previous project.
+    documents: () => store.getSnapshot().documents,
+    openDocument: (id, token, targetMode) =>
+      openDocumentAsWorkingScene(viewer, sceneStore!, store.getSnapshot().documents, id, token, targetMode),
+    confirmDiscardDirtyScene,
+    notify: setMessage,
+  }), [viewer, store, linked, refreshLinked, setRowState, sceneStore,
+      confirmDiscardDirtyScene]);
+
+  /**
+   * Run one chain open with the busy mirror and the shared result reporting.
+   *
+   * Not `runVerb`: its `busy` ends with the callback, which says nothing
+   * about whether the document has finished loading, and this chain is
+   * awaited to the end on purpose. Errors still surface — the chain answers
+   * rather than throwing, and a throw would be a bug, not a user outcome.
+   */
+  const runOpenChain = useCallback((run: () => Promise<OpenRecentResult>) => {
+    if (isOpeningRecent()) return;
+    setRecentBusy(true);
+    void (async () => {
+      try {
+        const result = await run();
+        if (result === 'opened') {
+          closeProjectsDashboard();
+        } else if (result === 'project-denied') {
+          setMessage('Access to that project folder was not granted.');
+        } else if (result === 'project-missing') {
+          setMessage('That project folder could not be found.');
+        }
+        // `busy`, `vetoed`, `vetoed-after-open`, `dirty-cancelled`,
+        // `project-cancelled` and `document-missing` are silent here: each is
+        // either the user's own answer to a prompt they just saw, or already
+        // reported by the chain.
+      } finally {
+        setRecentBusy(false);
+      }
+    })();
+  }, []);
+
+  const openRecent = useCallback((entry: RecentDocumentEntry) => {
+    // The mode comes from `rv-document-modes`, not from the ring (plan-513):
+    // the entry's own `mode` is history, and it drifts across tabs.
+    runOpenChain(async () => {
+      const lastMode = await readDocumentMode(entry.backend, entry.projectId, entry.documentId);
+      return openRecentEntry(entry, { ...openChainDeps(), forgetRecent }, { lastMode });
+    });
+  }, [runOpenChain, openChainDeps]);
+
+  /**
+   * Enter / double-click on a model-search hit (plan-509 F6): the project
+   * through the normal open path — a folder-access prompt included — then the
+   * model. A model the project no longer has is reported by the chain and
+   * dropped from the index; the project stays open.
+   */
+  const openModelHit = useCallback((hit: ModelSearchHit) => {
+    const { entry } = hit;
+    runOpenChain(async () => {
+      const lastMode = await readDocumentMode(entry.backend, entry.projectId, entry.doc.id);
+      return openProjectDocument({
+        projectId: entry.projectId,
+        backend: entry.backend,
+        documentId: entry.doc.id,
+        projectName: entry.projectName,
+        ...(lastMode ? { lastMode } : {}),
+        // Display only — the chain decides on the LIVE row (plan-513 SOL R2 F2).
+        ...(entry.doc.mode ? { indexedDeclaredMode: entry.doc.mode } : {}),
+      }, {
+        ...openChainDeps(),
+        forget: (pid, did) => { void forgetModelIndexEntry(entry.backend, pid, did); },
+      });
+    });
+  }, [runOpenChain, openChainDeps]);
+
+  /** `viewer.modes.descriptor(id)?.label`, for the mode chip. */
+  const recentModeLabel = useCallback(
+    (mode: string) => viewer.modes.descriptor(mode)?.label,
+    [viewer],
+  );
+
+  // ── The documents' last modes (plan-513) ──────────────────────────────
+  //
+  // ONE map for every chip on this screen, loaded once and again on every
+  // change in this tab or another — never an IndexedDB read per row. A click
+  // reads its own entry fresh (`readDocumentMode`); the chip and the click
+  // then agree through `effectiveOpenMode`, the one rule both use.
+  const [documentModes, setDocumentModes] = useState<Map<string, DocumentModeRecord>>(() => new Map());
+  useEffect(() => {
+    let alive = true;
+    const reload = () => {
+      void loadDocumentModes().then((m) => { if (alive) setDocumentModes(m); });
+    };
+    const off = subscribeDocumentModes(reload);
+    reload();
+    return () => { alive = false; off(); };
+  }, []);
+  /** The mode a click on this document row opens it in, or null (no chip). */
+  const openModeOf = useCallback((
+    backend: RecentDocumentEntry['backend'],
+    projectId: string,
+    documentId: string,
+    declaredMode: string | null | undefined,
+    isDemo: boolean,
+  ): string | null => effectiveOpenMode({
+    lastMode: documentModes.get(documentModeKey(backend, projectId, documentId))?.mode ?? null,
+    declaredMode,
+    isDemo,
+    has: (m) => viewer.modes.has(m),
+  }), [documentModes, viewer]);
+
+  /**
+   * Open a document of the OPEN project as the working scene — a card, the
+   * detail pane's Open, a row of the project search (plan-513: through the
+   * chain, below it because it uses the chain's deps).
+   */
   const openScene = useCallback((id: string) => {
     if (!sceneStore) return;
     // Opening the document that is ALREADY open means one thing: the dashboard
@@ -1263,6 +1855,46 @@ export function ProjectsDashboardHost() {
     // conservative side of plan-711 risk 8.
     if (sameDocumentBase(getOpenDocumentBase(), documentBase(id, ''))) {
       closeProjectsDashboard();
+      return;
+    }
+    // plan-513 F8 — a card (or a tree / search row of the open project) is the
+    // same deliberate open as a recent: through the chain, same-project
+    // branch, so the target mode is decided once and the chain's own dirty
+    // guard is the ONE unsaved-changes dialog (not `trySwitch` as well).
+    const snap = store.getSnapshot();
+    if (snap.project && snap.backendKind) {
+      const projectId = snap.project.id;
+      const backend = snap.backendKind;
+      const name = snap.documents.find(d => d.id === id)?.name ?? '…';
+      runOpenChain(async () => {
+        const lastMode = await readDocumentMode(backend, projectId, id);
+        const base = openChainDeps();
+        return openProjectDocument({
+          projectId, backend, documentId: id,
+          projectName: snap.project?.name ?? projectId,
+          ...(lastMode ? { lastMode } : {}),
+        }, {
+          ...base,
+          // Open IN PLACE, as before: the hero band announces the target and
+          // shows the load's progress from the moment the LOAD starts — after
+          // the chain's questions, so a cancelled dialog never flashes it.
+          openDocument: async (docId, token, targetMode) => {
+            const seq = ++openSeqRef.current;
+            beginProjectsOpening(name);
+            try {
+              return await base.openDocument(docId, token, targetMode);
+            } finally {
+              if (openSeqRef.current === seq) {
+                endProjectsOpening();
+                closeProjectsDashboard();
+              }
+            }
+          },
+          // A card has no list of its own to forget from; the chain's notice
+          // is the whole answer.
+          forget: () => {},
+        });
+      });
       return;
     }
     trySwitch(async () => {
@@ -1283,7 +1915,26 @@ export function ProjectsDashboardHost() {
         }
       }
     });
-  }, [sceneStore, trySwitch, project.documents, viewer]);
+  }, [sceneStore, trySwitch, project.documents, viewer, store, runOpenChain, openChainDeps]);
+
+  // The Quick-Open key. Registered on the window, capture phase OFF: a plain
+  // bubble listener is enough because the predicate refuses every editable
+  // target itself. Not mounted under a kiosk lock, and not under `mode:viewer`
+  // — this whole host is unmounted there (`HMIShell.tsx`), which is the
+  // cheapest possible way to honour "not reachable in the viewer".
+  useEffect(() => {
+    if (modeLocked) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!isRecentDocumentsShortcut(e)) return;
+      // Chrome maps Ctrl+Shift+F to nothing, but a page-level default (and
+      // Firefox's quick-find on some builds) is cheaper to prevent than to
+      // debug in the field.
+      e.preventDefault();
+      toggleRecentDocumentsOpen();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [modeLocked]);
 
   /**
    * Create a project in the workspace, give it a scene, and open it.
@@ -1303,22 +1954,17 @@ export function ProjectsDashboardHost() {
    * The document is created only after the project is OPEN: `createDocument`
    * writes through the project store, which needs the folder backend active.
    */
-  const handleCreateProject = useCallback(() => {
-    const name = (newProjectName ?? '').trim();
+  const handleCreateProject = useCallback((parent: FileSystemDirectoryHandle, name: string) => {
+    setNewProjectOpen(false);
     if (!name) return;
-    setNewProjectName(null);
     void runVerb('New project', async () => {
-      const root = await getWorkspaceHandle();
-      if (!root) throw new Error('No workspace folder is open — pick one first.');
-      const dir = await root.getDirectoryHandle(canonicalNameOf(name), { create: true });
+      const dir = await parent.getDirectoryHandle(canonicalNameOf(name), { create: true });
       const result = await createProjectFromScenes(dir, name, []);
       if (!result.ok) throw new Error(result.message);
-      const scan = await scanStoredWorkspace({ prompt: false });
-      setWorkspaceProjects(scan.projects);
-      setWorkspaceMeta(getWorkspaceMeta());
 
       const opened = await store.openProjectFolder(dir);
       if (!opened) throw new Error('The project was created but could not be opened.');
+      await refreshLinked();
       setProjectsView('project');
 
       // In the project ROOT ('' — a real target since the folder rule was
@@ -1333,7 +1979,7 @@ export function ProjectsDashboardHost() {
       // `openProjectFolder` above already ran its own guard over it.
       if (sceneStore) await sceneStore.openScene(created.documentId);
     });
-  }, [newProjectName, runVerb, store, sceneStore]);
+  }, [runVerb, store, sceneStore, refreshLinked]);
 
   /**
    * Open a base GLB.
@@ -1738,33 +2384,46 @@ export function ProjectsDashboardHost() {
   /** The knowledge twin (`*.knowledge.md`) — same listing, same rules. */
   const [knowledgeFiles, setKnowledgeFiles] = useState<string[]>([]);
   /**
+   * The project's own scripts (`plugins/**​/*.ts|tsx`) — the third bindable
+   * listing (plan-479 Phase 1). Same walk, classified by folder AND ending.
+   */
+  const [projectScripts, setProjectScripts] = useState<string[]>([]);
+  /**
    * Everything else the project folder holds — the inert rows of the full view
    * (plan-445 F1/F2).
    */
   const [plainFiles, setPlainFiles] = useState<string[]>([]);
+  const [diskFolders, setDiskFolders] = useState<string[]>([]);
   /** Bumped by a write that changes the folder without changing a document. */
   const [listingBump, setListingBump] = useState(0);
   useEffect(() => {
     const backend = store.getBackend();
     if (!dash.open || !backend) {
-      setConnectConfigs([]); setKnowledgeFiles([]); setPlainFiles([]);
+      setConnectConfigs([]); setKnowledgeFiles([]); setProjectScripts([]); setPlainFiles([]);
+      setDiskFolders([]);
       return;
     }
     let alive = true;
     // ONE walk for all three lists (plan-445 §5.1): the two per-ending walks
     // that used to stand here were two full traversals of the project folder
     // per dashboard open, and the full view would have made it three.
-    void listProjectFiles(backend).then(listing => {
+    void Promise.all([
+      listProjectFiles(backend),
+      backend.listFolders?.().catch(() => []) ?? Promise.resolve([]),
+    ]).then(([listing, folders]) => {
       if (!alive) return;
       setConnectConfigs(listing.configs);
       setKnowledgeFiles(listing.knowledge);
+      setProjectScripts(listing.scripts);
       setPlainFiles(listing.plainFiles);
+      setDiskFolders(folders);
     });
     return () => { alive = false; };
   }, [dash.open, store, project.project?.id, project.documents, listingBump]);
 
   /**
-   * Per-document mtimes — the content VERSION of every card preview.
+   * Per-document stats — the content VERSION of every card preview, and the
+   * on-disk size the detail pane shows.
    *
    * The thumbnail cache is persistent and keyed by identity; without a
    * version segment the first render ever made was served forever, saves
@@ -1772,8 +2431,14 @@ export function ProjectsDashboardHost() {
    * exactly when the bytes do. Re-statted on every dashboard open and
    * whenever a save lands (`document-saved`), so the very next card render
    * misses the old cache entry and draws the new bytes.
+   *
+   * The size rides along in the same map because it comes out of the same
+   * `statDocuments()` call — a second stat pass for the pane would walk the
+   * whole folder again for a number the first pass already had. A backend
+   * that cannot size a body reports 0, which is kept OUT of the map so the
+   * pane omits the row rather than printing a GLB as empty.
    */
-  const [docStats, setDocStats] = useState<ReadonlyMap<string, number>>(new Map());
+  const [docStats, setDocStats] = useState<ReadonlyMap<string, DocumentStatEntry>>(new Map());
   const [statsBump, setStatsBump] = useState(0);
   useEffect(
     () => viewer.on('document-saved', () => setStatsBump(t => t + 1)),
@@ -1786,8 +2451,10 @@ export function ProjectsDashboardHost() {
     void backend.statDocuments()
       .then(stats => {
         if (!alive) return;
-        setDocStats(new Map(stats.flatMap(s =>
-          typeof s.mtime === 'number' ? [[s.path, s.mtime] as const] : [])));
+        setDocStats(new Map(stats.map(s => [s.path, {
+          ...(typeof s.mtime === 'number' ? { mtime: s.mtime } : {}),
+          ...(typeof s.size === 'number' && s.size > 0 ? { size: s.size } : {}),
+        }] as const)));
       })
       .catch(() => { if (alive) setDocStats(new Map()); });
     return () => { alive = false; };
@@ -1826,13 +2493,14 @@ export function ProjectsDashboardHost() {
           attachments,
           configs: connectConfigs,
           knowledge: knowledgeFiles,
+          scripts: projectScripts,
           plainFiles,
-          folders: readProjectFolders(project.project),
+          folders: [...new Set([...readProjectFolders(project.project), ...diskFolders])],
         }
       : null,
     catalogs: treeCatalogs,
   }), [project.project, project.writable, project.documents, attachments,
-      connectConfigs, knowledgeFiles, plainFiles, treeCatalogs]);
+      connectConfigs, knowledgeFiles, projectScripts, plainFiles, diskFolders, treeCatalogs]);
 
   const treeRoots = useMemo(() => buildProjectTree(tree.roots), [tree.roots]);
 
@@ -1922,6 +2590,7 @@ export function ProjectsDashboardHost() {
     if (ref.kind === 'attachment') return;             // nothing opens a PDF here
     if (ref.kind === 'connectConfig') return;          // a config is inspected, not opened
     if (ref.kind === 'knowledgeFile') return;          // knowledge too — the pane describes it
+    if (ref.kind === 'scriptFile') return;             // a script is bound, not opened
     if (ref.kind === 'plainFile') return;              // inert (plan-445 F2) — no verb at all
     if (ref.kind === 'catalogAsset') {
       const source = sources.find(
@@ -1987,7 +2656,9 @@ export function ProjectsDashboardHost() {
   const handleNewDocument = useCallback(() => {
     const folder = newDocumentFolderFor(project.project?.id, selectedFolderPath);
     void runVerb('New document', async () => {
+      const tCreate = performance.now();   // TEMP verb-timing
       const created = await createDocument(store, newDocumentNameFor(folder), { folder });
+      console.warn(`[verb-timing] createDocument ${Math.round(performance.now() - tCreate)} ms`);
       // Two listings have to learn about the newborn before it can be shown:
       // the document scan (tree rows + folder cards) and the project-library
       // catalog (thumbnails, drag-into-scene). The row itself is already in the
@@ -2035,6 +2706,109 @@ export function ProjectsDashboardHost() {
     [folderRows, dash.search, dash.chip],
   );
 
+  // ── The project search (plan-507) ─────────────────────────────────────
+  // Glue only: every rule lives in `rv-project-tree-search` and
+  // `ProjectSearchResults`, which tests can reach and this host they cannot.
+  /** The search field — the `/` / Ctrl+K target and the anchor after a folder hit. */
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  /** A typed term swaps the folder's cards for the flat, recursive hit list. */
+  const searchMode = dash.search.trim() !== '';
+  const searchIndex = useMemo(() => buildProjectSearchIndex(treeRoots), [treeRoots]);
+  const searchGroups = useMemo(
+    () => searchProjectIndex(searchIndex, dash.search), [searchIndex, dash.search]);
+  const classificationOfNode = useCallback((node: ProjectTreeNode) => {
+    const ref = tree.refs.get(node.path!);
+    return ref?.kind === 'document' ? documentByPath.get(ref.path)?.classification : undefined;
+  }, [tree.refs, documentByPath]);
+  // Counted over the hits BEFORE the chip, like the folder chips.
+  const searchChips = useMemo(
+    () => documentChipOptions(searchDocumentRows(searchGroups, classificationOfNode), dash.chip),
+    [searchGroups, classificationOfNode, dash.chip],
+  );
+  // Chip and tag only — never `matchesDocumentFilter`, whose substring term
+  // would throw token hits like `line demo` → `demo-line.glb` out again.
+  const searchResult = useMemo(() => capSearchResult(filterSearchGroups(searchGroups,
+    hit => !isDocumentHit(hit)
+      || (matchesDocumentChip(classificationOfNode(hit.entry.node), dash.chip)
+        && matchesDocumentTag(classificationOfNode(hit.entry.node), dash.tag)))),
+  [searchGroups, classificationOfNode, dash.chip, dash.tag]);
+  /** Enter / double-click on a hit: a folder is navigated to, anything else opens. */
+  const handleSearchActivate = useCallback((node: ProjectTreeNode) => {
+    if (node.kind === 'folder') {
+      setProjectsSelection({ kind: 'folder', rootId: node.rootId, relPath: node.relPath });
+      setProjectsSearch('');
+      // The list — and the focused row — unmount with the term; the field is
+      // the stable place for the focus to land.
+      searchInputRef.current?.focus();
+      return;
+    }
+    handleTreeActivate(node);
+  }, [handleTreeActivate]);
+  // `/` and Ctrl/Cmd+K reach this field, not the scene search, while the
+  // dashboard shows a project. Called here, above the pre-open early return.
+  useDashboardSearchShortcut(searchInputRef,
+    dash.open && dash.view === 'project' && project.project !== null);
+
+  // ── The model search of the Projects screen (plan-509) ────────────────
+  // Glue only: the index lives in `rv-model-index*`, the search in
+  // `rv-model-search`, the list in `ModelSearchResults` — which tests can
+  // reach and this host they cannot.
+  const onProjectsScreen = projectsScreenActive(dash, project.project !== null);
+  /** The Projects screen's field — its own `/` / Ctrl+K target. */
+  const projectsSearchInputRef = useRef<HTMLInputElement | null>(null);
+  useDashboardSearchShortcut(projectsSearchInputRef, onProjectsScreen);
+  const [modelSnapshots, setModelSnapshots] = useState<ModelIndexSnapshot[]>([]);
+  // Loaded when the screen shows, and again on every change in this tab or
+  // another. The bundled demo is indexed from its HTTP manifest first, so it
+  // is searchable without ever having been opened (F2). Nothing here asks
+  // for a permission (F8).
+  useEffect(() => {
+    if (!onProjectsScreen) return;
+    let alive = true;
+    const reload = () => {
+      void loadModelIndex().then(({ snapshots }) => { if (alive) setModelSnapshots(snapshots); });
+    };
+    const off = subscribeModelIndex(reload);
+    reload();
+    void indexBundledProject(store.getBundledBackend());
+    return () => { alive = false; off(); };
+  }, [onProjectsScreen, store]);
+  /** The screen's rows as search groups — same order, current names. */
+  const modelSearchProjects = useMemo<ModelSearchProject[]>(() => projectRows.map(r => ({
+    key: modelIndexKey(r.hint === 'bundled' ? 'bundled' : r.hint === 'browser' ? 'browser' : 'folder', r.id),
+    name: r.name,
+  })), [projectRows]);
+  const linkedIds = useMemo(() => linked.map(l => l.id), [linked]);
+  const modelSearchIndex = useMemo(
+    () => buildModelSearchIndex(visibleSnapshots(modelSnapshots, linkedIds), modelSearchProjects),
+    [modelSnapshots, linkedIds, modelSearchProjects]);
+  const modelSearchResult = useMemo(
+    () => capModelSearch(searchModelIndex(modelSearchIndex, dash.search, MAX_MODEL_SEARCH_RESULTS)),
+    [modelSearchIndex, dash.search]);
+  const modelSearchUnindexed = useMemo(
+    () => unindexedLinkedCount(modelSnapshots, linkedIds), [modelSnapshots, linkedIds]);
+  const modelSearchStateOf = useCallback((group: ModelSearchGroup) =>
+    (group.backend === 'folder' ? rowStates.get(group.projectId) : undefined), [rowStates]);
+  /** A hit's chip: its last mode, else the INDEXED declared mode (display only). */
+  const modelSearchModeOf = useCallback((hit: ModelSearchHit) =>
+    openModeOf(hit.entry.backend, hit.entry.projectId, hit.entry.doc.id, hit.entry.doc.mode, false),
+  [openModeOf]);
+  /**
+   * A recent's chip (plan-513): its last mode from the store — the ring's own
+   * `mode` is history — else the declared mode, from the live row when the
+   * project is open and from the model index when it is not (unknown there
+   * until the Projects screen has loaded the index: then only a last mode).
+   */
+  const recentModeOf = useCallback((entry: RecentDocumentEntry) => {
+    const open = project.project?.id === entry.projectId && project.backendKind === entry.backend;
+    const declared = open
+      ? project.documents.find(d => d.id === entry.documentId)?.mode
+      : modelSnapshots.find(s => s.backend === entry.backend && s.projectId === entry.projectId)
+        ?.docs.find(d => d.id === entry.documentId)?.mode;
+    return openModeOf(entry.backend, entry.projectId, entry.documentId, declared,
+      open && project.project?.kind === 'demo');
+  }, [openModeOf, project.project, project.backendKind, project.documents, modelSnapshots]);
+
   /** Announce a card drag to the tree, which owns every drop. */
   const [cardDragPath, setCardDragPath] = useState<string | null>(null);
 
@@ -2072,7 +2846,11 @@ export function ProjectsDashboardHost() {
         // nothing.
         const isConnectConfig = ref?.kind === 'connectConfig';
         const isKnowledgeFile = ref?.kind === 'knowledgeFile';
-        const isRefFile = isConnectConfig || isKnowledgeFile;
+        // plan-479: the third draggable reference source. Same treatment as
+        // the two above — a stated tile, no Open verb, a drag that carries a
+        // reference payload — because a script is bound, never opened here.
+        const isScriptFile = ref?.kind === 'scriptFile';
+        const isRefFile = isConnectConfig || isKnowledgeFile || isScriptFile;
         // Defence line 1 of three (plan-445 §2.4): an inert row gets an EMPTY
         // verb set, so the card shows no menu at all rather than a menu whose
         // every entry refuses.
@@ -2113,6 +2891,7 @@ export function ProjectsDashboardHost() {
         // through the backend and is keyed in a namespace of its own — its
         // path is unique within the project, which is all the key needs.
         const backend = store.getBackend();
+        const docVersion = documentThumbnailVersion(docStats.get(node.relPath), doc);
         const thumbnailKey: ThumbnailKeyParts | undefined = ref?.kind === 'catalogAsset'
           ? {
             projectId: project.project?.id ?? NO_PROJECT,
@@ -2126,12 +2905,11 @@ export function ProjectsDashboardHost() {
               providerId: 'project-document',
               sourceId: node.rootId,
               assetId: path,
-              // The content version (file mtime): a saved document gets a NEW
-              // key, so the persistent cache misses and re-renders instead of
-              // serving the pre-save picture forever.
-              ...(docStats.get(node.relPath) !== undefined
-                ? { version: String(docStats.get(node.relPath)) }
-                : {}),
+              // The content version (file mtime, else the manifest's sha256 /
+              // mtimeMs for a backend without stats): a changed document gets
+              // a NEW key, so the persistent cache misses and re-renders
+              // instead of serving the old picture forever.
+              ...(docVersion !== undefined ? { version: docVersion } : {}),
             }
             : undefined;
         const resolveThumbnail = ref?.kind === 'catalogAsset'
@@ -2145,13 +2923,36 @@ export function ProjectsDashboardHost() {
           : node.kind === 'document' && backend
             ? async () => backend.readDocumentUrl(node.relPath)
             : undefined;
+        // The PERSISTED preview, keyed by document id (plan-744 F5) — tried
+        // before the GLB is decoded and rendered. Only a real document has
+        // one; a catalog asset's picture comes from its own source.
+        const resolveThumbnailSidecar = doc?.id && backend && ref?.kind !== 'catalogAsset'
+          ? async () => {
+            const { resolveDocumentThumbnail } = await import(
+              '../../library/resolve-document-thumbnail');
+            const found = await resolveDocumentThumbnail(backend, doc);
+            return found ? { url: found.url, release: found.release } : null;
+          }
+          : undefined;
         return {
           key: path,
           entry,
           thumbnailKey,
           resolveThumbnail,
+          resolveThumbnailSidecar,
           ...(isConnectConfig ? { glyph: 'connect' as const } : {}),
           ...(isKnowledgeFile ? { glyph: 'knowledge' as const } : {}),
+          // Every other plain file of the folder — PDF, slides, video, … —
+          // gets the same-coloured tile with its extension as the label, so
+          // the grid never shows a blank square for a file it knows the name
+          // of (user decision 2026-09-10).
+          // `scriptFile` is in this branch deliberately (plan-479 R14): it used
+          // to BE a `plainFile`, and the `file:ts` tile is the icon 15 existing
+          // project files already show. Reclassifying them must not blank them.
+          ...(ref?.kind === 'plainFile' || ref?.kind === 'attachment'
+            || ref?.kind === 'scriptFile'
+            ? { glyph: fileGlyphOf(path) }
+            : {}),
           // The document's own tier is the whole answer since plan-737. The
           // `isBundled` half beside it described a built-in-demo ROW, and there
           // are no such rows any more.
@@ -2160,6 +2961,17 @@ export function ProjectsDashboardHost() {
           onSelect: () => handleTreeSelect(node),
           onOpen: () => handleTreeActivate(node),
           menuActions,
+          // plan-506 F6: the hover tooltip reads the manifest row's cache —
+          // never the GLB — so a sweep over the grid costs no file access.
+          documentInfo: doc?.documentInfo ?? null,
+          classification: doc?.classification ?? null,
+          // plan-513 F10 — the mode a double-click opens it in. Only a real
+          // document of the open project opens as a scene; everything else
+          // (catalog asset, attachment, plain file) shows no chip.
+          openMode: doc?.id && ref?.kind !== 'catalogAsset' && project.project && project.backendKind
+            ? openModeOf(project.backendKind, project.project.id, doc.id, doc.mode,
+              project.project.kind === 'demo')
+            : null,
           // A config/knowledge card is draggable even when its FILE may not
           // move (a reserved-folder row): the drag then carries only the
           // reference payload for the hero card's Unity-style assignment,
@@ -2180,6 +2992,9 @@ export function ProjectsDashboardHost() {
             if (isKnowledgeFile) {
               e.dataTransfer.setData(KNOWLEDGE_FILE_DRAG_TYPE, node.relPath);
             }
+            if (isScriptFile) {
+              e.dataTransfer.setData(SCRIPT_FILE_DRAG_TYPE, node.relPath);
+            }
             if (node.writable) {
               setCardDragPath(path);
               e.dataTransfer.effectAllowed = isRefFile ? 'all' : 'move';
@@ -2191,7 +3006,8 @@ export function ProjectsDashboardHost() {
         };
       }),
     [folderRows, documentFilter, sources, selectedTreePath, project.project?.id,
-      store, docStats, handleTreeSelect, handleTreeActivate, treeRoots],
+      store, docStats, handleTreeSelect, handleTreeActivate, treeRoots,
+      openModeOf, project.project, project.backendKind],
   );
 
   /**
@@ -2203,31 +3019,39 @@ export function ProjectsDashboardHost() {
    * — the same thing clicking the folder's tree row does — so the grid and
    * the tree stay one navigation model, not two.
    */
-  const subfolderTiles = useMemo<FolderTileModel[]>(
-    () => subfoldersInView
-      .filter(node => matchesSearchTerm(node.name, dash.search))
-      .map(node => {
-        const path = node.path!;
-        const menuActions: ProjectCardMenuAction[] = node.inert === true
-          ? []
-          : [{ key: 'open', label: 'Open', onClick: () => handleTreeSelect(node) }];
-        if (isRenamableInTree(treeRoots, path) && node.rootId === project.project?.id) {
-          menuActions.push({
-            key: 'rename',
-            label: 'Rename…',
-            onClick: () => setAssetDialog({ kind: 'renameNode', relPath: path, value: node.name }),
-          });
-        }
-        return {
-          key: path,
-          name: node.name,
-          holdsSomething: node.hasContent ?? node.children.length > 0,
-          onOpen: () => handleTreeSelect(node),
-          menuActions,
-        };
-      }),
-    [subfoldersInView, dash.search, treeRoots, project.project?.id, handleTreeSelect],
-  );
+  const canDeleteEmptyFolder = useCallback((node: ProjectTreeNode) =>
+    node.kind === 'folder' && node.rootId === project.project?.id
+    && project.writable && node.writable && !node.inert && node.children.length === 0
+    && (!!store.getBackend()?.deleteEmptyFolder || !diskFolders.includes(node.relPath)),
+  [project.project?.id, project.writable, store, diskFolders]);
+
+  const handleDeleteEmptyFolder = useCallback((node: ProjectTreeNode) => {
+    if (!canDeleteEmptyFolder(node)) return;
+    const backend = store.getBackend();
+    const projectId = project.project?.id;
+    setConfirmReq({
+      title: 'Delete empty folder',
+      message: `Delete the empty folder "${node.name}"?`,
+      confirmLabel: 'Delete folder',
+      onConfirm: () => {
+        void runVerb('Delete folder', async () => {
+          if (store.getBackend() !== backend || store.getProject()?.id !== projectId) {
+            throw new Error('The project changed. Select the folder again.');
+          }
+          await backend?.deleteEmptyFolder?.(node.relPath);
+          await store.applyManifestDelta(current => withProjectFolders(current,
+            readProjectFolders(current).filter(path => path !== node.relPath)));
+          setDiskFolders(current => current.filter(path => path !== node.relPath));
+          setProjectsSelection({ kind: 'none' });
+          await refreshListings();
+          setListingBump(value => value + 1);
+        });
+      },
+    });
+  }, [canDeleteEmptyFolder, store, project.project?.id, runVerb, refreshListings]);
+
+  // `subfolderTiles` itself is built below `handleTreeMove`, which its drop
+  // target needs and which is declared later in this component.
 
   /**
    * The attached libraries as root-level tiles (plan-458 F3).
@@ -2323,6 +3147,7 @@ export function ProjectsDashboardHost() {
       // document paths, and an EMPTY folder has none — without this a renamed
       // empty folder snapped back to its old name on the next rebuild, and a
       // moved one reappeared at its old place.
+      let leftBehind: string | null = null;
       if (node.kind === 'folder') {
         const from = node.relPath;
         await store.applyManifestDelta((current) => {
@@ -2330,6 +3155,22 @@ export function ProjectsDashboardHost() {
             p === from ? to : (p.startsWith(`${from}/`) ? to + p.slice(from.length) : p));
           return withProjectFolders(current, remapped);
         });
+        // The bytes moved FILE BY FILE, and on a disk backend that leaves the
+        // directory itself standing under its old name — empty, but listed by
+        // `listFolders` and present in the explorer (field finding 2026-09-25:
+        // "renamed in the UI, not on disk"). Drop it now that it is empty. A
+        // directory that is NOT empty holds files the tree never listed, and
+        // those are not ours to delete: leave it and say so.
+        const backend = store.getBackend();
+        if (backend?.deleteEmptyFolder) {
+          try {
+            await backend.deleteEmptyFolder(from);
+          } catch {
+            leftBehind = from;
+          }
+        }
+        setDiskFolders(current => current.filter(p => p !== from && !p.startsWith(`${from}/`)));
+        setListingBump(value => value + 1);
       }
       // The document scan AND the provider listing both re-read, or the tree
       // row, the card and the pane keep the old name until the next open.
@@ -2341,7 +3182,9 @@ export function ProjectsDashboardHost() {
       // its own rename inline; this is the same adoption for the tree route.
       sceneStore?.adoptDocumentRename();
       onDone?.(to);
-      if (outcome.docsIndexRows > 0) {
+      if (leftBehind) {
+        setMessage(`Moved, but the old folder "${leftBehind}" still holds files this project does not list — it was left in place.`);
+      } else if (outcome.docsIndexRows > 0) {
         setMessage(`Moved, and repointed ${outcome.docsIndexRows} document link(s).`);
       }
     });
@@ -2522,6 +3365,9 @@ export function ProjectsDashboardHost() {
         run: () => setAssetDialog({ kind: 'renameNode', relPath: node.path!, value: node.name }),
       });
     }
+    if (canDeleteEmptyFolder(node)) verbs.push({
+      key: 'delete', label: 'Delete folder', run: () => handleDeleteEmptyFolder(node),
+    });
     if (revealAvailable && ownProject && !node.inert) {
       verbs.push({
         key: 'reveal',
@@ -2531,7 +3377,7 @@ export function ProjectsDashboardHost() {
     }
     return verbs;
   }, [treeMenu, treeRoots, project.project?.id, project.writable, handleNewFolder,
-    revealAvailable, handleRevealInExplorer]);
+    revealAvailable, handleRevealInExplorer, canDeleteEmptyFolder, handleDeleteEmptyFolder]);
 
   const handleTreeMove = useCallback(
     (node: ProjectTreeNode, to: string) => runTreeEdit('Move', node, to),
@@ -2540,6 +3386,63 @@ export function ProjectsDashboardHost() {
   const handleTreeRename = useCallback(
     (node: ProjectTreeNode, to: string) => runTreeEdit('Rename', node, to),
     [runTreeEdit],
+  );
+
+  /**
+   * The subfolder tiles of the folder in view (docblock above
+   * `canDeleteEmptyFolder`). Built here because every tile is also a DROP
+   * TARGET (customer feedback 2026-09-30): a card dropped onto a folder tile
+   * moves into that folder, through the same `canMoveInTree` verdict and the
+   * same `handleTreeMove` a drop onto the folder's tree row takes. Two drag
+   * sources reach it — a card (`cardDragPath`) and a tree row (its path in
+   * the tree's own drag type, readable only on drop).
+   */
+  const subfolderTiles = useMemo<FolderTileModel[]>(
+    () => subfoldersInView
+      .filter(node => matchesSearchTerm(node.name, dash.search))
+      .map(node => {
+        const path = node.path!;
+        const menuActions: ProjectCardMenuAction[] = node.inert === true
+          ? []
+          : [{ key: 'open', label: 'Open', onClick: () => handleTreeSelect(node) }];
+        if (isRenamableInTree(treeRoots, path) && node.rootId === project.project?.id) {
+          menuActions.push({
+            key: 'rename',
+            label: 'Rename…',
+            onClick: () => setAssetDialog({ kind: 'renameNode', relPath: path, value: node.name }),
+          });
+        }
+        if (canDeleteEmptyFolder(node)) menuActions.push({
+          key: 'delete', label: 'Delete folder', destructive: true,
+          onClick: () => handleDeleteEmptyFolder(node),
+        });
+        return {
+          key: path,
+          name: node.name,
+          holdsSomething: node.hasContent ?? node.children.length > 0,
+          onOpen: () => handleTreeSelect(node),
+          menuActions,
+          acceptsDrop: (e: React.DragEvent) => {
+            if (cardDragPath) return canMoveInTree(treeRoots, cardDragPath, path).ok;
+            // A tree-row drag: only its TYPE is readable during drag-over, so
+            // the verdict waits for the drop.
+            return Array.from(e.dataTransfer?.types ?? []).includes(PROJECT_TREE_DRAG_TYPE);
+          },
+          onDrop: (e: React.DragEvent) => {
+            let source = cardDragPath;
+            if (!source) {
+              try { source = e.dataTransfer.getData(PROJECT_TREE_DRAG_TYPE) || null; } catch { source = null; }
+            }
+            if (!source) return;
+            const verdict = canMoveInTree(treeRoots, source, path);
+            if (!verdict.ok) return;
+            const moved = findTreeNode(treeRoots, source);
+            if (moved) handleTreeMove(moved, verdict.to);
+          },
+        };
+      }),
+    [subfoldersInView, dash.search, treeRoots, project.project?.id, handleTreeSelect,
+      canDeleteEmptyFolder, handleDeleteEmptyFolder, cardDragPath, handleTreeMove],
   );
 
   /**
@@ -2648,65 +3551,15 @@ export function ProjectsDashboardHost() {
     reportDocumentIdCollisions(findLocalIdCollisions(project.project));
   }, [project.project]);
 
-  // ── The resume rule (plan-703 §2.6.3, decisions 3 and 24; F15) ────────
-  /**
-   * What to show once a project the user just opened has loaded.
-   *
-   * The order is `resolveResumeTarget`'s, not this file's: URL beats the
-   * remembered pair beats `defaultModel`, and a kiosk (`modeLocked`) takes
-   * `defaultModel` whatever the other two say. All this effect adds is the two
-   * things the rule cannot know — whether the named asset is actually in this
-   * project, and how to open it.
-   *
-   * Armed only by an explicit open (`pendingResumeRef`). A project that becomes
-   * open some other way — a restore on reload, a plugin — is left alone: the
-   * resume is an answer to "the user just opened this", not to "a project
-   * exists".
-   */
-  useEffect(() => {
-    if (!pendingResumeRef.current) return;
-    const projectId = project.project?.id;
-    if (!projectId) return;
-    pendingResumeRef.current = false;
-
-    const target = resolveResumeTarget({
-      search: window.location.search,
-      remembered: readRememberedSession(projectId),
-      // What the project itself last had open. Without it a switch into a
-      // project this browser has never opened has nothing to resume and lands
-      // on the deployer's `defaultModel` — a document out of another project.
-      projectActive: project.project?.activeSceneId ?? null,
-      // plan-721 §2.4: the PROJECT's own start document beats the global
-      // `settings.json` one, and the rule is identical at BOTH call sites of
-      // `resolveResumeTarget` — this one and the boot in `main.ts`. On an
-      // appliance the dashboard is unreachable under the kiosk lock, but the
-      // lock is a config flag a commissioning session can drop, and a rule
-      // that held in only one of the two places would be a rule that depends
-      // on how the project was opened.
-      defaultModel: projectStartDocument(project.project) ?? getAppConfig().defaultModel,
-      modeLocked,
-      // Same rule at both call sites: a demo deployment always resumes into
-      // its start document, never into the visitor's last session.
-      demoProject: project.project?.kind === 'demo',
-    });
-    if (!target.asset) return;
-
-    // Addressed by path or by id: a URL names a path, a remembered pair may
-    // hold either, and refusing one of the two would make the rule depend on
-    // which spelling happened to be stored. The rule itself lives in
-    // `findStartDocument` (plan-726 F12) — this is one of THREE call sites that
-    // had it inline, and three copies is how three answers start to differ.
-    const doc = findStartDocument(project.documents, target.asset);
-    if (!doc) return;
-
-    // The mode is restored ONLY from the remembered pair — `resolveResumeTarget`
-    // is what guarantees that; a URL and a `defaultModel` both come back with
-    // `mode: null`, so this line cannot relocate anybody by accident.
-    if (target.mode) void viewer.modes.requestMode(target.mode);
-    // Same rule as the tree: a document is a document, wherever it sits.
-    openScene(doc.id);
-  }, [project.project?.id, project.project?.activeSceneId, project.documents,
-      modeLocked, viewer, openScene, openModel]);
+  // ── No resume on a project click (decision 2026-09-25) ────────────────
+  //
+  // plan-703 §2.6.3 (decisions 3 and 24) had an effect here that, once a
+  // project the user had just opened was loaded, resolved a document through
+  // `resolveResumeTarget` and opened it — closing the dashboard. The user's
+  // ruling replaces it: a click on a project folder shows the folder, always;
+  // a document loads only when a document is clicked. The resolver and its
+  // order still govern the BOOT (`main.ts`: reload, kiosk, demo), where there
+  // is no dashboard to show and something has to be on screen.
 
   // ── The hero band (plan-709 F3, project screen only) ──────────────────
   /**
@@ -2816,6 +3669,43 @@ export function ProjectsDashboardHost() {
     );
   }, [documentTags, busy, project.writable, changeClassification]);
 
+  // ── Document description (plan-506 §2.7) ──────────────────────────────
+  /**
+   * The description block of the selected document, stacked under the
+   * classification in the same `extra` slot.
+   *
+   * Same visibility rule as {@link classificationFor}: editable only for a
+   * document this project owns in a writable project. The commit goes to the
+   * store DIRECTLY, not through `runVerb` — `runVerb` drops a second call while
+   * one runs and reports no outcome, and a blur-committed text field produces
+   * exactly such overlapping calls (R1-1). The write is bound to the project
+   * that is open NOW (`expectProjectId`), so a draft flushed after the user
+   * switched projects is refused instead of landing in the new one (R2-5).
+   */
+  const projectId = project.project?.id ?? null;
+  const documentInfoFor = useCallback((row: DocumentRow | undefined) => {
+    const doc = row?.doc;
+    if (!doc || !projectId) return null;
+    const editable = doc.tier !== 'bundled' && project.writable;
+    return (
+      <DocumentInfoEditor
+        projectId={projectId}
+        documentId={doc.id}
+        info={doc.documentInfo ?? null}
+        busy={busy}
+        onCommit={editable
+          ? (next: DocumentInfo | null) => store.setDocumentInfo(doc.id, next, { expectProjectId: projectId })
+          : undefined}
+      />
+    );
+  }, [projectId, busy, project.writable, store]);
+
+  /** Classification and description, stacked — the one `extra` slot of the pane. */
+  const documentExtraFor = useCallback((row: DocumentRow | undefined) => {
+    if (!row) return null;
+    return <>{classificationFor(row)}{documentInfoFor(row)}</>;
+  }, [classificationFor, documentInfoFor]);
+
   // ── Markdown preview + editor (plan-445 F7) ───────────────────────────
   /**
    * Which `.md` file the detail pane is showing, and its text.
@@ -2895,6 +3785,10 @@ export function ProjectsDashboardHost() {
       const bundled = scene.tier === 'bundled';
       const fields: DetailField[] = [];
       if (scene.modifiedAt) fields.push({ label: 'Modified', value: scene.modifiedAt });
+      // The GLB's size on disk, from the same stat pass that versions the
+      // thumbnails. Absent (not "0 B") when the backend cannot size a body.
+      const size = formatDocumentSize(docStats.get(scene.path)?.size);
+      if (size) fields.push({ label: 'Size', value: size });
       if (project.project?.name) fields.push({ label: 'Project', value: project.project.name });
       // The document's CONNECT binding (`documents[].connectRef`, plan-718 §3).
       // Shown whenever set — and marked when the file it names is not in the
@@ -2903,6 +3797,17 @@ export function ProjectsDashboardHost() {
       fields.push(...refFields(scene, connectConfigs, knowledgeFiles));
       const actions: DetailAction[] = [
         { key: 'open', label: 'Open', primary: true, onClick: () => openScene(scene.id) },
+        // Same document in a fresh tab: the `?doc=<id>` deep link is the one
+        // open verb, and the new tab restores the active project on its own
+        // (`restoreLastProject`, no prompt). Every other parameter of the
+        // current URL travels along, as the address-bar normalisation keeps it.
+        {
+          key: 'open-tab',
+          label: 'Open in new tab',
+          onClick: () => {
+            window.open(sceneUrlToDocumentUrl(window.location.href, scene.id), '_blank', 'noopener,noreferrer');
+          },
+        },
       ];
       // A bundled scene is offered a duplicate rather than five greyed-out
       // buttons — telling the user the way forward beats disabling (§3.6).
@@ -2941,7 +3846,7 @@ export function ProjectsDashboardHost() {
         thumbnailUrl: scene.thumbnail ?? null,
         fields,
         actions,
-        extra: classificationFor(row),
+        extra: documentExtraFor(row),
         // The title edits in place — the same commit the Rename action makes.
         ...(bundled || !sceneStore ? {} : {
           onRename: (name: string) => { renameDocumentRow(scene.id, name); },
@@ -2990,7 +3895,7 @@ export function ProjectsDashboardHost() {
           },
           ...(readOnly ? [] : transferActionsFor(documentByPath.get(sel.path))),
         ] as DetailAction[],
-        extra: classificationFor(row),
+        extra: documentExtraFor(row),
         // Inline title rename runs the SAME gate and write path as F2 on the
         // tree row — one rule, however the rename is reached. The selection
         // follows to the new path on success, so the pane keeps describing
@@ -3131,16 +4036,12 @@ export function ProjectsDashboardHost() {
     return { title: null };
   }, [dash.selection, project, sources, store, runVerb, connectConfigs, knowledgeFiles,
       openScene, duplicateScene, deleteScene, buildAssetActions, openModel,
-      project.models, documentRows, classificationFor,
+      project.models, documentRows, documentExtraFor,
       transferActionsFor, documentByPath, sourceOfRoot, treeRoots, catalogRoots,
       handleRefreshLibrary, handleRemoveLibrary,
       sceneStore, selectedTreePath, runTreeEdit, renameLibraryAsset, renameDocumentRow,
-      tree.refs, markdownPane]);
+      tree.refs, markdownPane, docStats]);
 
-  const handleForget = useCallback((id: string) => {
-    forgetRecentProject(id);
-    setRecent(readRecentProjects());
-  }, []);
 
   /**
    * Refresh/Remove on a library ROOT row, right-hand (they replaced the
@@ -3203,38 +4104,79 @@ export function ProjectsDashboardHost() {
    */
   const everOpenedRef = useRef(false);
   if (dash.open) everOpenedRef.current = true;
-  if (!everOpenedRef.current) return null;
+
+  /**
+   * Quick Open (plan-478 F4) — the ONE thing this host renders even before the
+   * dashboard has ever been opened.
+   *
+   * The shortcut is reachable from the viewport, so the popover cannot live
+   * behind the "mounted once, then kept" gate below: a fresh session's first
+   * `Ctrl/Cmd+Shift+F` would set the flag and paint nothing. It is rendered
+   * once — here on the pre-open path, and through `sharedChrome` on both
+   * screens afterwards — never twice, or the two copies would fight over the
+   * focus each of them returns. Never under a kiosk lock (F5).
+   */
+  const quickOpenPopover = modeLocked ? null : (
+    <RecentDocumentsPopover
+      open={quickOpen}
+      autoFocus={!getRecentDocumentsHoverOpened()}
+      entries={recents}
+      rowStates={rowStates}
+      modeLabel={recentModeLabel}
+      modeOf={recentModeOf}
+      busy={recentBusy}
+      onOpen={openRecent}
+      onClose={() => setRecentDocumentsOpen(false)}
+      onForget={(e) => forgetRecent(e.projectId, e.documentId)}
+      onClear={clearRecents}
+    />
+  );
+
+  if (!everOpenedRef.current) return quickOpenPopover;
 
   const onProjectScreen = dash.view === 'project' && project.project !== null;
 
+  /**
+   * The way OUT of unsaved work, on both screens.
+   * `Save as…` existed only inside the switch-confirmation dialog, which
+   * meant the offer appeared solely when the user was already leaving —
+   * and a TRANSIENT workspace (a shared link, an Example) could not be
+   * saved at all without first trying to navigate away from it. Someone
+   * who opens a shared demo, binds their signals and wants to keep the
+   * result had no verb to reach for. The dialog still calls the same
+   * `setNameDialog`; this is the missing free-standing entry point.
+   *
+   * It is the ONE visible element of the shared chrome and therefore lives
+   * apart from it: `sharedChrome` is dropped into the dashboard body, a flex
+   * row, and a button rendered there becomes a stretched flex item — a
+   * full-height orange column reading "Save as…" beside the project list.
+   * Title actions are where it belongs on both screens.
+   */
+  const saveAsButton = sceneSnap?.dirty ? (
+    <Tooltip title={sceneSnap.transient
+      ? 'This scene came from a link and is not stored anywhere yet — saving keeps it under My scenes.'
+      : 'Save the current edits under a new name.'}
+    >
+      <Button
+        size="small"
+        color="warning"
+        variant={sceneSnap.transient ? 'contained' : 'outlined'}
+        onClick={() => setNameDialog({ kind: 'saveAs', name: sceneSnap?.draft?.name ?? '' })}
+        sx={{ fontSize: 11, textTransform: 'none', whiteSpace: 'nowrap' }}
+      >
+        {sceneSnap.transient ? 'Save to my scenes…' : 'Save as…'}
+      </Button>
+    </Tooltip>
+  ) : null;
+
   // Dialogs and the snackbar ride along on both screens: a verb started on one
   // can surface its failure after the user has navigated to the other.
+  // Nothing in here paints inline — see `saveAsButton` for the one verb that does.
   const sharedChrome = (
     <>
-      {/* The way OUT of unsaved work, on both screens.
-          `Save as…` existed only inside the switch-confirmation dialog, which
-          meant the offer appeared solely when the user was already leaving —
-          and a TRANSIENT workspace (a shared link, an Example) could not be
-          saved at all without first trying to navigate away from it. Someone
-          who opens a shared demo, binds their signals and wants to keep the
-          result had no verb to reach for. The dialog still calls the same
-          `setNameDialog`; this is the missing free-standing entry point. */}
-      {sceneSnap?.dirty && (
-        <Tooltip title={sceneSnap.transient
-          ? 'This scene came from a link and is not stored anywhere yet — saving keeps it under My scenes.'
-          : 'Save the current edits under a new name.'}
-        >
-          <Button
-            size="small"
-            color="warning"
-            variant={sceneSnap.transient ? 'contained' : 'outlined'}
-            onClick={() => setNameDialog({ kind: 'saveAs', name: sceneSnap?.draft?.name ?? '' })}
-            sx={{ fontSize: 11, textTransform: 'none', whiteSpace: 'nowrap' }}
-          >
-            {sceneSnap.transient ? 'Save to my scenes…' : 'Save as…'}
-          </Button>
-        </Tooltip>
-      )}
+      {/* Quick Open rides in the shared chrome because the shortcut works on
+          BOTH dashboard screens — see where it is built, above the gate. */}
+      {quickOpenPopover}
       {/* Attaching a library is a viewer-level verb, so it rides in the shared
           chrome. The Asset-Manager tab inside it appears only when the private
           extension supplied a cloud store. */}
@@ -3251,19 +4193,13 @@ export function ProjectsDashboardHost() {
             })
           : undefined}
       />
-      {/* The third answer of the single "Open…": the folder is neither a
-          project nor a workspace, so it is offered as a place to make one. */}
-      <CreateHereDialog
-        request={createHere}
-        onChange={setCreateHere}
-        onConfirm={submitCreateHere}
-      />
+      {/* "Create a project here?" is gone with the workspace: a plain folder
+          picked through Add becomes a project by being SCANNED, and naming one
+          from scratch is what New is for. */}
       <NewProjectDialog
-        open={newProjectName !== null}
-        name={newProjectName ?? ''}
-        onChange={setNewProjectName}
-        onClose={() => setNewProjectName(null)}
-        onConfirm={handleCreateProject}
+        open={newProjectOpen}
+        onClose={() => setNewProjectOpen(false)}
+        onCreate={handleCreateProject}
       />
       <FromScenesDialog
         request={fromScenes}
@@ -3356,8 +4292,34 @@ export function ProjectsDashboardHost() {
           setPendingSwitch(null);
           if (next) void next();
         }}
-        onCancel={() => setPendingSwitch(null)}
+        onCancel={() => {
+          setPendingSwitch(null);
+          // A chain waiting on this answer gets it (plan-478 R3-1). Null for
+          // every `trySwitch` caller, which simply drops its continuation —
+          // that is what "cancel" has always meant on this path.
+          const reject = dirtyGuardRef.current;
+          dirtyGuardRef.current = null;
+          reject?.(false);
+        }}
       />
+      <Dialog open={operationLabel !== null} disableEscapeKeyDown maxWidth="xs" fullWidth
+        onKeyDown={e => e.stopPropagation()}
+        aria-labelledby="project-operation-title" aria-describedby="project-operation-description">
+        <DialogTitle id="project-operation-title">{operationLabel}…</DialogTitle>
+        <DialogContent>
+          <Typography id="project-operation-description" sx={{ mb: 2 }}>
+            Please wait while the project is updated.
+          </Typography>
+          <LinearProgress aria-label={operationLabel ?? 'Updating project'} />
+        </DialogContent>
+      </Dialog>
+      <Snackbar open={successMessage !== null} autoHideDuration={4000}
+        onClose={() => setSuccessMessage(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}>
+        <Alert severity="success" onClose={() => setSuccessMessage(null)} sx={{ fontSize: 12 }}>
+          {successMessage}
+        </Alert>
+      </Snackbar>
       <Snackbar
         open={message !== null}
         autoHideDuration={8000}
@@ -3436,7 +4398,7 @@ export function ProjectsDashboardHost() {
         showSearch={false}
         titleActions={
           <>
-            {sharedChrome}
+            {saveAsButton}
             <Tooltip title="Project actions">
               <IconButton
                 size="small"
@@ -3756,10 +4718,12 @@ export function ProjectsDashboardHost() {
 
             <TextField
               size="small"
-              placeholder="Search this folder…"
+              placeholder="Search this project…"
               value={dash.search}
               onChange={(e) => setProjectsSearch(e.target.value)}
+              inputRef={searchInputRef}
               slotProps={{
+                htmlInput: { 'aria-label': 'Search this project' },
                 input: {
                   startAdornment: (
                     <InputAdornment position="start" sx={{ mr: 0.5 }}>
@@ -3858,7 +4822,7 @@ export function ProjectsDashboardHost() {
               }}
             >
               <DocumentFilterBar
-                chips={folderChips}
+                chips={searchMode ? searchChips : folderChips}
                 chip={dash.chip}
                 onChipChange={setProjectsChip}
                 tags={documentTags}
@@ -3867,8 +4831,19 @@ export function ProjectsDashboardHost() {
               />
             </Box>
           </Collapse>
+          {searchMode ? (
+          <ProjectSearchResults
+            result={searchResult}
+            selectedPath={selectedTreePath}
+            compactLayout={compactLayout}
+            touchInput={touchInput}
+            onSelect={handleTreeSelect}
+            onActivate={handleSearchActivate}
+          />
+          ) : (
           <ProjectFolderContents
             cards={folderCards}
+            modeLabel={recentModeLabel}
             folders={subfolderTiles}
             tileGroups={libraryTiles.length > 0
               ? [{ key: 'libraries', label: 'Libraries', tiles: libraryTiles }]
@@ -3893,6 +4868,7 @@ export function ProjectsDashboardHost() {
               </Button>
             )}
           />
+          )}
           {/* The folder's verbs where the folder is. Anchored to the pointer,
               same as the tree menu, and disabled entries stay VISIBLE so a
               read-only project still teaches what the screen can do. */}
@@ -3959,69 +4935,82 @@ export function ProjectsDashboardHost() {
             />
           )
           : <ProjectsDetailPane {...detail} />}
+        {/* Dialogs and the snackbar — nothing here paints inline, so the
+            body row is a safe place for them. */}
+        {sharedChrome}
       </ProjectsDashboard>
     );
   }
 
   // ── Screen one: which project ─────────────────────────────────────────
-  // Search is offered only once there is a list worth filtering; on the empty
-  // state it would be a control that can only ever return nothing.
-  const hasWorkspace = workspaceMeta !== null || workspaceProjects.length > 0;
   // The kiosk gate is a statement about the DEPLOYMENT, not about the model
   // that happens to be open. A project plugin may lock the mode — Mauser and
   // Toray both do, to make their model a single-purpose 3D-HMI — while the very
-  // same build sits in a dev workspace next to a dozen other projects. Reading
-  // `modeLocked` alone told that developer "This deployment opens a single
-  // fixed project" and took the list away. So the screen closes only when the
-  // lock is backed by there being nothing else to offer: no workspace, and at
-  // most the one project the box was given (plan-721 §2.13).
-  const kioskSingleProject = modeLocked && !hasWorkspace && projectRows.length <= 1;
+  // same build sits next to a dozen other linked projects. Reading `modeLocked`
+  // alone told that developer "This deployment opens a single fixed project"
+  // and took the list away. So the screen closes only when the lock is backed
+  // by there being nothing else to offer: no linked projects, and at most the
+  // one project the box was given (plan-721 §2.13).
+  const kioskSingleProject = modeLocked && linked.length === 0 && projectRows.length <= 1;
   return (
     <ProjectsDashboard
       title="Projects"
-      showSearch={projectRows.length > 0}
-      headerActions={
-        <>
-          {/* ONE "Open…" (decision 1). It used to be two — "Open folder…" and
-              "Switch workspace" — which made the user classify their own
-              folder before they were allowed to open it. */}
-          {!kioskSingleProject && (
-            <Button
-              size="small"
-              variant="outlined"
-              onClick={handleOpen}
-              sx={{ fontSize: 11, textTransform: 'none', whiteSpace: 'nowrap' }}
-            >
-              Open…
-            </Button>
-          )}
-          {hasWorkspace && !kioskSingleProject && (
-            <Button
-              size="small"
-              variant="contained"
-              onClick={() => setNewProjectName('New Project')}
-              sx={{ fontSize: 11, textTransform: 'none', whiteSpace: 'nowrap' }}
-            >
-              New project
-            </Button>
-          )}
-          {sharedChrome}
-        </>
-      }
+      // The search bar is back on the project-picking screen (plan-509), and
+      // the 2026-09-08 reason for removing it does not apply to what it does
+      // now: it no longer filters the handful of project rows, it searches the
+      // MODELS of every project — linked, bundled, locked — from the persisted
+      // model index. Add and New stay in the Projects section's own header.
+      showSearch
+      // "documents", not "models": the dashboard's labels say document
+      // (plan-413; guarded by projects-dashboard-tree.test.tsx).
+      searchPlaceholder="Search documents…"
+      searchInputRef={projectsSearchInputRef}
+      headerActions={null}
+      // The one way out of unsaved work sits in the title row, not in the
+      // body: the body is a flex row, and a button dropped in there was the
+      // full-height "Save as…" column beside the project list.
+      titleActions={saveAsButton}
     >
-      <ProjectsList
-        hasWorkspace={hasWorkspace}
-        workspaceName={workspaceMeta?.folderName ?? null}
-        rows={projectRows}
-        activeProjectId={project.project?.id ?? null}
-        modeLocked={kioskSingleProject}
-        onOpenProject={handleOpenProject}
-        onOpenWorkspace={handleOpen}
-        onOpenFolder={handleOpen}
-        onForgetProject={handleForget}
-        onRenameProject={handleRenameProject}
-        onDeleteProject={handleDeleteProject}
-      />
+      {/* Dialogs and the snackbar only — nothing in here paints inline. */}
+      {sharedChrome}
+      {/* Drop is armed on the SCREEN, not on the list: a folder dragged
+          anywhere over the dashboard means the same thing, and a drop zone the
+          user has to aim at is a drop zone they miss. */}
+      <Box
+        onDragOver={(e) => { e.preventDefault(); }}
+        onDrop={handleDashboardDrop}
+        sx={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}
+      >
+        {dash.search.trim() !== ''
+          ? (
+            // A typed term swaps the cards for the model hits (F4).
+            <ModelSearchResults
+              result={modelSearchResult}
+              stateOf={modelSearchStateOf}
+              unindexedCount={modelSearchUnindexed}
+              busy={recentBusy}
+              compactLayout={compactLayout}
+              touchInput={touchInput}
+              modeOf={modelSearchModeOf}
+              modeLabel={recentModeLabel}
+              onActivate={openModelHit}
+            />
+          )
+          : (
+            <ProjectsList
+              rows={projectRows}
+              activeProjectId={project.project?.id ?? null}
+              modeLocked={kioskSingleProject}
+              onOpenProject={handleOpenProject}
+              onAdd={handleAddPick}
+              onNew={() => setNewProjectOpen(true)}
+              onLocate={handleLocate}
+              onRemove={handleRemove}
+              onRenameProject={handleRenameProject}
+              onDeleteProject={handleDeleteProject}
+            />
+          )}
+      </Box>
     </ProjectsDashboard>
   );
 }

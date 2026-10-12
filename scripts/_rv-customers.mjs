@@ -10,8 +10,8 @@
  * `delivery/<key>.json`: a delivery *recipe* that happened to be the closest
  * thing to a customer record. It said nothing about who works there, what kind
  * of relationship it is, what the hub grants them, or whether the customer even
- * has a git delivery — and it carried the licence key and the inference
- * credentials as literal values, in a file that is committed.
+ * has a git delivery — and it carried the inference credentials as literal
+ * values, in a file that is committed.
  *
  * `customers/<slug>.json` is the record. It is a *superset* of the delivery
  * config and replaces it; two files per customer would be exactly the state
@@ -37,20 +37,32 @@
  * has a diagnosis preset for every project" — is true of `wmyb` today and must
  * not stop a delivery; it is a finding for the doctor, not a load failure.
  *
- * ## Secret values never live here
+ * ## One customer, one file
  *
- * `connectLicenseKey`, `requestyApiKey` and `requestyBaseUrl` resolve through
- * {@link resolveCustomerSecrets}: environment first, then the gitignored
- * `customers/<slug>.secrets.json`, then a clear error naming the expected path
- * and the SOPS counterpart. A credential-shaped *value* found inside the
- * register itself is an error, not a warning (§2.3).
+ * Everything a delivery needs is IN the entry (2026-09-13): the CONNECT licence
+ * as `licensing.connect.key`, the Requesty pair as `inference`. Both used to sit
+ * in a gitignored `customers/<slug>.secrets.json` — the licence additionally in
+ * a SOPS copy in the knowledge base that no code ever read. Three places for one
+ * string, synchronised by hand and in practice regularly out of sync: a customer
+ * was onboarded with no key anywhere, and the doctor could only say something
+ * was missing, not where it had gone.
+ *
+ * Neither value is a secret FROM the customer: we issue the licence and hand it
+ * over, and `bundle-rag` embeds the Requesty credentials into their delivered
+ * `project-config.json` regardless. What the sidecar bought was not protection
+ * but a second mechanism.
+ *
+ * The scan for credential-shaped values in the register therefore still runs —
+ * `licensing.connect.key` and `inference.requestyApiKey` are two exact exempt
+ * paths, so an unexpected token or password anywhere else is still a hard error
+ * (§2.3).
  */
 
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { readJson } from './_rv-fs-utils.mjs';
-import { knownProjectKeys, looksLikeSecretValue } from './_rv-guards.mjs';
+import { knownProjectKeys, looksLikeSecretValue, CONNECT_LICENSE_KEY_PATTERN } from './_rv-guards.mjs';
 // Deliberate module cycle: `_workspace-lib.mjs` imports this file to read the
 // register, and this file imports the tier resolver from there so the
 // `restrictedFeatures` invariant is judged by the SAME rules the delivery uses
@@ -94,19 +106,24 @@ export const SHARED_REPO = 'realvirtual-commercial';
 //! Strict allowlists — an unknown field is a typo that would otherwise be silently ignored.
 const CUSTOMER_KEYS = new Set([
   'schemaVersion', 'customer', 'displayName', 'kind', 'support', 'status',
-  'forgejo', 'contacts', 'licensing', 'delivery', 'billing', 'secretsRef',
+  'forgejo', 'contacts', 'licensing', 'delivery', 'billing', 'inference', 'hosted',
 ]);
+//! plan-759 D6/D6b: the hosted-link secrets live IN the entry, like the licence.
+//! `fragment` is link material (the `#k=` half of the key, base64url, 32 bytes),
+//! `password` the half the customer types. Both are exempt from the register's
+//! secret-value refusal for exactly these two paths and nothing else.
+const HOSTED_KEYS = new Set(['fragment', 'password']);
 const FORGEJO_KEYS = new Set(['org', 'repo', 'team', 'permission']);
 const CONTACT_KEYS = new Set(['login', 'email', 'fullName', 'role', 'status']);
 const LICENSING_KEYS = new Set(['connect']);
-const LICENSING_CONNECT_KEYS = new Set(['issuer', 'keyRef', 'seats', 'activatedFingerprints']);
+const LICENSING_CONNECT_KEYS = new Set(['issuer', 'key', 'seats', 'activatedFingerprints']);
 const DELIVERY_KEYS = new Set([
   'channel', 'tier', 'restrictedFeatures', 'projects', 'connectChannel', 'mirror',
 ]);
 const BILLING_KEYS = new Set(['billomatCustomer']);
+const INFERENCE_KEYS = new Set(['requestyApiKey', 'requestyBaseUrl']);
 
-//! The three values a secrets file may carry. `keyRef` must name one of them.
-export const CUSTOMER_SECRET_KEYS = Object.freeze(['connectLicenseKey', 'requestyApiKey', 'requestyBaseUrl']);
+
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const PROJECT_KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
@@ -114,14 +131,6 @@ const PROJECT_KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 //! Absolute path of one register entry.
 export function customerRegistryPath(privateRoot, slug) {
   return join(privateRoot, 'customers', `${slug}.json`);
-}
-
-//! Default location of the gitignored secrets file belonging to one customer.
-export function customerSecretsPath(privateRoot, customer) {
-  const ref = typeof customer?.secretsRef === 'string' && customer.secretsRef
-    ? customer.secretsRef
-    : `customers/${customer.customer}.secrets.json`;
-  return join(privateRoot, ...ref.split('/'));
 }
 
 /**
@@ -390,9 +399,26 @@ export function assertCustomerInvariants(customer, context = {}) {
           if (typeof connect.issuer !== 'string' || !connect.issuer.trim()) {
             fail('licensing.connect.issuer is required (the register assigns, it does not issue).');
           }
-          if (!CUSTOMER_SECRET_KEYS.includes(connect.keyRef)) {
-            fail(`licensing.connect.keyRef must be one of ${CUSTOMER_SECRET_KEYS.join(', ')} — `
-              + 'it names a field in the secrets file, never a value.');
+          // The licence key is a VALUE here (2026-09-13). It used to be a
+          // `keyRef` naming a field in a gitignored sidecar, with an encrypted
+          // counterpart in the knowledge base — three places for one string,
+          // kept in sync by hand, and regularly out of sync. The key is issued
+          // by us, carries no access to anything but the customer's own CONNECT
+          // and travels to them anyway, so the register is where it belongs.
+          // OPTIONAL on purpose: a customer between onboarding and the portal
+          // issuing their licence declares `connect` with no `key` yet. That is a
+          // finding for the doctor (resolveCustomerSecrets throws), not an
+          // unreadable file — making it required would break `list`, `doctor`
+          // and every delivery for exactly the customer who needs attention.
+          if (connect.key !== undefined
+              && (typeof connect.key !== 'string' || !CONNECT_LICENSE_KEY_PATTERN.test(connect.key.trim()))) {
+            fail('licensing.connect.key must look like a CONNECT licence key (LIC-XXXX-XXXX-XXXX); '
+              + 'leave it out entirely while the licence is not issued yet.');
+          }
+          // Same placeholder refusal the delivery already makes: a customer
+          // delivered 'LIC-XXXX-XXXX-XXXX' looks licensed and activates nothing.
+          else if (typeof connect.key === 'string' && /placeholder|example|dummy|xxxx/i.test(connect.key)) {
+            fail(`licensing.connect.key looks like a placeholder; write the customer's real key.`);
           }
           for (const key of ['seats', 'activatedFingerprints']) {
             if (connect[key] !== undefined && (!Number.isInteger(connect[key]) || connect[key] < 0)) {
@@ -404,7 +430,7 @@ export function assertCustomerInvariants(customer, context = {}) {
     }
   }
 
-  // ── billing / secretsRef ──────────────────────────────────────────────
+  // ── billing ────────────────────────────────────────────────────────
   if (customer.billing !== undefined) {
     if (!isPlainObject(customer.billing)) {
       fail('"billing" must be a JSON object.');
@@ -416,20 +442,64 @@ export function assertCustomerInvariants(customer, context = {}) {
       }
     }
   }
-  if (customer.secretsRef !== undefined) {
-    if (typeof customer.secretsRef !== 'string' || !customer.secretsRef.startsWith('customers/')
-        || customer.secretsRef.includes('..') || customer.secretsRef.includes('\\')) {
-      fail('"secretsRef" must be a POSIX path under "customers/".');
-    } else if (typeof slug === 'string' && customer.secretsRef !== `customers/${slug}.secrets.json`) {
-      fail(`"secretsRef" must be "customers/${slug}.secrets.json" so the .gitignore rule covers it.`);
+  // ── inference (the Requesty pair) ─────────────────────────
+  //
+  // In the entry since 2026-09-13, for the same reason as the licence: these
+  // values are embedded into the customer's delivered project-config.json by
+  // bundle-rag anyway, so a gitignored sidecar protected them from nobody while
+  // costing a whole second mechanism. REQUESTY_API_KEY / REQUESTY_BASE_URL still
+  // win at run time — that is a one-off override, not a storage location.
+  // ── hosted (plan-759) ─────────────────────────────────────────────────
+  if (customer.hosted !== undefined) {
+    if (!isPlainObject(customer.hosted)) {
+      fail('"hosted" must be a JSON object.');
+    } else {
+      for (const key of unknownKeys(customer.hosted, HOSTED_KEYS)) fail(`hosted contains unknown field "${key}".`);
+      if (customer.hosted.password !== undefined
+          && (typeof customer.hosted.password !== 'string' || customer.hosted.password.length < 8)) {
+        fail('hosted.password must be a string of at least 8 characters when present.');
+      }
+      if (customer.hosted.fragment !== undefined
+          && (typeof customer.hosted.fragment !== 'string' || !isHostedFragment(customer.hosted.fragment))) {
+        fail('hosted.fragment must be the base64url of 32 bytes (43 characters, no padding) when present.');
+      }
     }
   }
 
-  // ── no secret VALUES anywhere in the register (§2.3) ───────────────────
+  if (customer.inference !== undefined) {
+    if (!isPlainObject(customer.inference)) {
+      fail('"inference" must be a JSON object.');
+    } else {
+      for (const key of unknownKeys(customer.inference, INFERENCE_KEYS)) {
+        fail(`inference contains unknown field "${key}".`);
+      }
+      if (customer.inference.requestyApiKey !== undefined
+          && (typeof customer.inference.requestyApiKey !== 'string' || !customer.inference.requestyApiKey.trim())) {
+        fail('inference.requestyApiKey must be a non-empty string when present.');
+      }
+      if (customer.inference.requestyBaseUrl !== undefined
+          && (typeof customer.inference.requestyBaseUrl !== 'string'
+            || !/^https:[/][/]/i.test(customer.inference.requestyBaseUrl))) {
+        fail('inference.requestyBaseUrl must be an https:// URL when present.');
+      }
+    }
+  }
+
+  // ── no secret VALUES anywhere in the register, except these two ────────
+  //
+  // The licence and the Requesty key are the credential-shaped values the entry
+  // is allowed to hold (2026-09-13); both reach the customer through the
+  // delivery anyway. Everything else — tokens, passwords, another vendor's key —
+  // is still a hard error, so the exemption is a list of exact paths rather
+  // than a relaxed pattern.
+  // plan-759 D6b adds the two hosted-link halves; nothing else is exempt.
+  const CREDENTIAL_PATHS = new Set(['licensing.connect.key', 'inference.requestyApiKey', 'hosted.password', 'hosted.fragment']);
   for (const [path, value] of flattenStrings(customer)) {
+    if (CREDENTIAL_PATHS.has(path)) continue;
     if (looksLikeSecretValue(value)) {
-      fail(`${path} holds a credential-shaped value. Licence and API keys belong in `
-        + `customers/${typeof slug === 'string' ? slug : '<slug>'}.secrets.json, referenced by licensing.connect.keyRef.`);
+      fail(`${path} holds a credential-shaped value. Only the CONNECT licence `
+        + '(licensing.connect.key), the Requesty key (inference.requestyApiKey) and the hosted-link '
+        + 'pair (hosted.password, hosted.fragment) belong in the register; anything else has no place in it at all.');
     }
   }
 
@@ -553,44 +623,96 @@ export function customerRemoteUrl(customer, hubBaseUrl = DEFAULT_HUB_URL) {
 }
 
 /**
- * Resolves the customer's secret values: environment → secrets file → error.
+ * Resolves the values a delivery needs, all of them out of the register entry.
  *
- * The environment layer is deliberately only the two Requesty variables that
- * already worked that way. No `CONNECT_LICENSE_KEY_<SLUG>` convention is
- * invented here: a per-customer environment variable is a second place a
- * licence key can live, which is the problem, not the fix.
+ * There is no file layer any more (2026-09-13). The licence and the Requesty
+ * pair both live in `customers/<slug>.json`; the gitignored sidecar that used to
+ * hold them protected nothing a delivery does not hand the customer anyway, and
+ * a second storage location is a second thing to keep in sync.
+ *
+ * The environment still wins for the Requesty pair: `REQUESTY_API_KEY` /
+ * `REQUESTY_BASE_URL` are the one-off run against another gateway, which worked
+ * before the register existed and keeps working. No `CONNECT_LICENSE_KEY_<SLUG>`
+ * convention was invented to match — a per-customer environment variable would be
+ * a second place a licence can live, which is the problem, not the fix.
  *
  * `options.requireLicenseKey` (default `true`) is what a caller sets to `false`
  * when the run does not SHIP the key: a shared-repo delivery writes no
  * `connectLicensePrefill` (plan-434 §2.7), so a missing value cannot break it.
- * The default keeps the management view — the doctor — reporting "declared but
- * no value resolves", because the licence itself is still owed to the customer.
+ * The default keeps the management view — the doctor — reporting the licence as
+ * owed, because it still is.
  */
 export function resolveCustomerSecrets(privateRoot, customer, options = {}) {
   const env = options.env ?? process.env;
-  const path = customerSecretsPath(privateRoot, customer);
-  let file = null;
-  if (existsSync(path)) {
-    file = readJson(path, `customers/${customer.customer}.secrets.json`);
-    if (!isPlainObject(file)) throw new Error(`${path} must be a JSON object.`);
-    const unknown = unknownKeys(file, new Set(CUSTOMER_SECRET_KEYS));
-    if (unknown.length > 0) {
-      throw new Error(`${path} contains unknown field "${unknown[0]}"; allowed: ${CUSTOMER_SECRET_KEYS.join(', ')}.`);
-    }
-  }
   const fromEnv = (name) => (typeof env[name] === 'string' && env[name].trim() ? env[name].trim() : undefined);
-  const keyRef = customer.licensing?.connect?.keyRef;
+  const trimmed = (value) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
   const secrets = {
-    connectLicenseKey: keyRef ? file?.[keyRef] : file?.connectLicenseKey,
-    requestyApiKey: fromEnv('REQUESTY_API_KEY') ?? file?.requestyApiKey,
-    requestyBaseUrl: fromEnv('REQUESTY_BASE_URL') ?? file?.requestyBaseUrl,
-    path,
+    connectLicenseKey: trimmed(customer.licensing?.connect?.key),
+    requestyApiKey: fromEnv('REQUESTY_API_KEY') ?? trimmed(customer.inference?.requestyApiKey),
+    requestyBaseUrl: fromEnv('REQUESTY_BASE_URL') ?? trimmed(customer.inference?.requestyBaseUrl),
+    path: customerRegistryPath(privateRoot, customer.customer),
   };
   if (customer.licensing?.connect && !secrets.connectLicenseKey && options.requireLicenseKey !== false) {
-    throw new Error(`Customer "${customer.customer}" declares a CONNECT licence but no value resolves for `
-      + `"${keyRef}". Expected it in ${path} (gitignored). The encrypted counterpart lives in the private `
-      + 'knowledge-base secrets store (secrets/delivery/<slug>.secrets.json, SOPS-encrypted) — decrypt it '
-      + 'with SOPS and write the file.');
+    throw new Error(`Customer "${customer.customer}" declares a CONNECT licence but carries no `
+      + `"licensing.connect.key" in ${secrets.path}. Issue the key in the portal and write it there.`);
   }
   return secrets;
+}
+
+// ─── Hosted link (plan-759) ─────────────────────────────────────────────
+
+//! True for the base64url form of exactly 32 bytes (the `#k=` fragment secret).
+export function isHostedFragment(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+/**
+ * The two halves of a hosted deploy's key, with the environment winning over
+ * the register (the same rule `resolveCustomerSecrets` applies to Requesty).
+ * `customer` may be null (a project no register entry claims): then only the
+ * environment can arm encryption. `source` says where the password came from.
+ *
+ *   { password: string|null, fragment: string|null, source: 'env'|'register'|null }
+ */
+export function resolveHostedSecrets(customer, env = process.env) {
+  const fromEnv = (name) => (typeof env?.[name] === 'string' && env[name].trim() ? env[name].trim() : null);
+  const trimmed = (value) => (typeof value === 'string' && value.trim() ? value.trim() : null);
+  const envPassword = fromEnv('RV_DEPLOY_PASSWORD');
+  const envFragment = fromEnv('RV_DEPLOY_FRAGMENT');
+  const regPassword = trimmed(customer?.hosted?.password);
+  const regFragment = trimmed(customer?.hosted?.fragment);
+  const password = envPassword ?? regPassword;
+  const fragment = envFragment ?? regFragment;
+  if (fragment !== null && !isHostedFragment(fragment)) {
+    throw new Error('The hosted fragment must be the base64url of 32 bytes (43 characters).');
+  }
+  return {
+    password,
+    fragment,
+    source: password === null ? null : (envPassword !== null ? 'env' : 'register'),
+  };
+}
+
+/**
+ * Writes a freshly minted fragment into `customers/<slug>.json` (`hosted.fragment`)
+ * so the next publish keeps the link the customer already has (D6). Refuses to
+ * overwrite an existing fragment: rotating one is an explicit edit, never a
+ * side effect of a publish.
+ */
+export function recordHostedFragment(privateRoot, slug, fragment) {
+  if (!isHostedFragment(fragment)) throw new Error('recordHostedFragment: not a fragment.');
+  const path = customerRegistryPath(privateRoot, slug);
+  const customer = readJson(path, `customers/${slug}.json`);
+  if (typeof customer.hosted?.fragment === 'string' && customer.hosted.fragment.trim()) {
+    throw new Error(`customers/${slug}.json already carries hosted.fragment; rotate it by hand, not by publishing.`);
+  }
+  customer.hosted = { ...(isPlainObject(customer.hosted) ? customer.hosted : {}), fragment };
+  writeFileSync(path, JSON.stringify(customer, null, 2) + '\n');
+  return customer;
+}
+
+//! A register entry with `hosted.password` replaced for display (`/customers show`, doctor).
+export function redactHostedSecrets(customer) {
+  if (!isPlainObject(customer?.hosted) || customer.hosted.password === undefined) return customer;
+  return { ...customer, hosted: { ...customer.hosted, password: '••••••••' } };
 }

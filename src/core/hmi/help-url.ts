@@ -10,7 +10,7 @@
  * and the `window.open()` call makes popup blockers swallow the tab. Everything
  * this module and `deriveHelpTopic()` do is therefore pure and synchronous.
  *
- * NOT the same as `DOC_BASE_URL` in tooltip/MetadataTooltipContent.tsx
+ * NOT the same as `DOC_BASE_URL` in tooltip/metadata-link-resolver.ts
  * (`https://doc.realvirtual.io/`). That constant resolves relative links out of
  * Unity `RuntimeMetadata` — customer content, different domain, different
  * lifecycle. Touching it would break customer tooltips; it stays as it is.
@@ -55,6 +55,25 @@ export function buildHelpUrl(topic: HelpTopic, baseUrl?: string | null): string 
   const page = slug ? `${base}${slug}/` : base;
   const anchor = topic.anchor ? topic.anchor.replace(/^#+/, '') : '';
   return anchor ? `${page}#${anchor}` : page;
+}
+
+/**
+ * True when `url` may be opened from AUTHORED content (plan-529 `WebLabel.Url`):
+ * a string that parses as an ABSOLUTE `http:`/`https:` URL. `new URL('javascript:…')`
+ * parses fine, so the protocol allow-list is the actual guard; relative,
+ * `data:`, `file:`, `javascript:` and malformed values are rejected.
+ */
+export function isSafeExternalUrl(url: unknown): url is string {
+  if (typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === 'http:' || parsed.protocol === 'https:';
 }
 
 /**

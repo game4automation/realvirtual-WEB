@@ -79,7 +79,9 @@ export function SharedGlbInfoCardHost() {
   const onDownload = useCallback(() => {
     const { payload, info } = getSharedGlbSnapshot();
     if (!payload || !info) return;
-    downloadSharedGlb(payload, info.name);
+    // An encrypted share hands out its envelope, never the plaintext (plan-560);
+    // the file name says so.
+    downloadSharedGlb(payload, info.encrypted ? `${info.name.replace(/\.rve$/i, '')}.rve.glb` : info.name);
   }, []);
 
   const onOpenInApp = useCallback(async () => {
@@ -106,6 +108,10 @@ export function SharedGlbInfoCardHost() {
 
   if (!snap.info && !snap.error && !snap.loading) return null;
 
+  // plan-560: both follow-up actions fetch `info.url` again WITHOUT the key and
+  // would load ciphertext, so an encrypted share does not offer them at all.
+  const followUps = Boolean(snap.info && !snap.info.encrypted);
+
   return (
     <SharedGlbInfoCard
       info={snap.info}
@@ -115,11 +121,11 @@ export function SharedGlbInfoCardHost() {
       // downloads off (F14): an inert button invites a support question about
       // why it does nothing.
       onDownload={snap.info && snap.payload && snap.info.downloadAllowed ? onDownload : undefined}
-      onOpenInApp={snap.info ? () => void onOpenInApp() : undefined}
-      onAddToLibrary={snap.info ? onAddToLibrary : undefined}
+      onOpenInApp={followUps ? () => void onOpenInApp() : undefined}
+      onAddToLibrary={followUps ? onAddToLibrary : undefined}
       // `bookmarks` is read only to make this component re-render when the
       // list changes; the value itself is a revision counter.
-      bookmarked={snap.info ? hasSharedAssetBookmark(snap.info.url) && bookmarks >= 0 : false}
+      bookmarked={snap.info && followUps ? hasSharedAssetBookmark(snap.info.url) && bookmarks >= 0 : false}
       onDismiss={clearSharedGlb}
     />
   );

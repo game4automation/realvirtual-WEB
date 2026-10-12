@@ -98,6 +98,42 @@ export async function buildKinematicParentGLB(): Promise<ArrayBuffer> {
 }
 
 /**
+ * `buildKinematicParentGLB` with a mesh under the axis — what a BAKED runtime
+ * load needs: a document that draws nothing never runs the recipe (and with it
+ * the `Kinematic` hook), so the mesh-less fixture can only prove the authoring
+ * side. `Slide` is a plain mesh; it merges into Kine's mover chunk.
+ */
+export async function buildKinematicParentWithMeshGLB(): Promise<ArrayBuffer> {
+  const src = new Scene();
+
+  const cadRoot = new Object3D();
+  cadRoot.name = 'CadRoot';
+  cadRoot.position.set(-2, 0, 0.5);
+
+  const kin = new Object3D();
+  kin.name = 'Kine';
+  kin.position.set(0.25, 1.5, -0.75);
+  kin.userData = {
+    realvirtual: {
+      Kinematic: { KinematicParentEnable: true, Parent: 'Mount' },
+      Drive: { Direction: 'LinearX', StartPosition: 0 },
+    },
+  };
+  const slide = box('Slide');
+  slide.position.set(0.5, 0, 0);
+  kin.add(slide);
+  cadRoot.add(kin);
+
+  const mount = new Object3D();
+  mount.name = 'Mount';
+  mount.position.set(3, 0.25, 0);
+
+  src.add(cadRoot);
+  src.add(mount);
+  return toGlb(src);
+}
+
+/**
  * Nested axes: `Outer` carries a Drive, `Inner` carries only a `Kinematic`
  * extra (no Drive of its own — the Delta-robot passive-link case).
  *

@@ -1,5 +1,9 @@
 # Events & Hooks — Developer Reference
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 Overview of all extension points where custom logic can hook into realvirtual WEB.
 For plugin basics see [doc-extending-webviewer.md](doc-extending-webviewer.md), for the render/sim loop see [doc-lifecycle.md](doc-lifecycle.md).
 
@@ -44,6 +48,7 @@ viewer.use(myPlugin);
 | `init(viewer, context?)` | When the plugin is registered via `viewer.use(plugin)` (before any model load) | Initialize plugin state, store the viewer reference, establish connections |
 | `onModelLoaded(result, viewer)` | After GLB load, before the `'model-loaded'` event. Also called retroactively for plugins registered after a model is already loaded — **except** when the plugin is disabled or declares `modes` and none is active; then the call is parked and replayed on the mode transition that enables it. | Find components, initialize custom managers |
 | `onModelCleared(viewer)` | At the start of `clearModel()`, **before** state reset | Clear own caches |
+| `bakeClaims()` | Before every model bake, to collect nodes the plugin needs at runtime that carry no component of their own. Return `{ path, role }` entries: `'merge'` keeps the node addressable by path with its mesh merged into the enclosing chunk, `'chunk'` makes it a chunk boundary that can be moved or hidden as a unit. A path that does not resolve appears in the bake removal report instead of throwing, so one plugin may serve several models. | Keep a node the plugin addresses by path from being pruned away by the destructive bake |
 | `onConnectionStateChanged(state, viewer)` | When `viewer.setConnectionState(...)` changes | Pause/resume polling |
 | `onFixedUpdatePre(dt)` | 60 Hz, **before** drive physics & transport | Drive targets, ErraticDriver, replay, CAM |
 | `onFixedUpdatePost(dt)` | 60 Hz, **after** drive physics & transport | DriveRecorder, SensorMonitor, KPIs |
@@ -51,7 +56,11 @@ viewer.use(myPlugin);
 | `onModeActivate(mode, viewer)` | When entering a workspace mode this plugin participates in | Install mode-specific scene overlays, interaction handlers, raycast filters, gizmos |
 | `onModeDeactivate(mode, viewer)` | When leaving such a mode, before the plugin is disabled (scene/model still valid). `mode` is `null` only in unusual boot edge cases. | Tear down everything created in onModeActivate |
 | `onRenderBackendChanged(backend, viewer)` | When the active 3D render backend changes (plan-256), e.g. `'three'` → `'omniverse'` | Tear down open gizmos / drag handlers — Three interaction is meaningless under a non-Three backend |
+| `onDeactivate(viewer)` | User disables the plugin; synchronous, cancels plugin-owned work | Release overlays, subscriptions and timers; model cleanup remains in `onModelCleared` |
+| `onActivate(viewer)` | User enables the plugin after any missed model load; before mode activation | Restore what `onDeactivate` released |
 | `dispose()` | Viewer is destroyed | Clean up listeners / DOM |
+
+User toggles are distinct from mode changes and model teardown. See [Lifecycle §8.1](doc-lifecycle.md#81-the-user-toggle--ondeactivate--onactivate-plan-435) for fallback behavior and cancellation. A missed `onModelLoaded` can precede `onActivate`; cleanup must be idempotent.
 
 ### Plugin Properties
 
@@ -61,7 +70,7 @@ viewer.use(myPlugin);
 | `order` | Sort order in pre/post/render lists (default `100`) |
 | `handlesTransport` | When `true`: kinematic transport manager is skipped |
 | `core` | When `true`: plugin always runs even in selective mode |
-| `modes` | Workspace modes this plugin participates in. `undefined` (default) = the plugin is shared and active in every mode. When set (e.g. `['planner']` or `['des','hmi']`) the plugin and its UI slots are active only while one of those modes is active. |
+| `modes` | Workspace modes this plugin participates in. `undefined` (default) = the plugin is shared and active in every mode. When set, non-core runtime participation and UI slots are limited to those modes. With `core: true`, runtime remains active in every mode; UI is still mode-gated. See [UI visibility](doc-ui-visibility.md). |
 | `slots` | Array of `UISlotEntry` — automatic registration in HMI slots |
 
 ---
@@ -87,92 +96,98 @@ viewer.once('model-loaded', ({ result }) => { /* fires once only */ });
 
 ### Event Catalog
 
-#### Model / Scene Lifecycle
-| Event | Payload | Who fires |
-|---|---|---|
-| `model-loaded` | `{ result: LoadResult }` | `RVViewer.loadModel()` |
-| `model-cleared` | `void` | `RVViewer.clearModel()` |
-| `scene-loaded` | `{ scene: RvScene }` | `RVViewer.loadScene()` — after GLB + overlay + placements |
+The table below is generated from `ViewerEvents`. Regenerate it with
+`npm run docs:generate`; `npm run docs:check` rejects drift. Payload type names
+refer to imports in [rv-viewer-events.ts](src/core/rv-viewer-events.ts).
+A declared event is not a promise that every edition emits it: DES run events,
+for example, require the commercial DES runtime.
 
-#### Component Lifecycle (generic)
+Use `model-loaded` for geometry/HMI state. Executable model logic must wait for
+`model-logic-activated`, which respects the signature gate; `signature-state-changed`
+reports changes to that gate. `raycast-ready` means the asynchronous three-mesh-bvh
+trees (collision, transport, instance pick) are ready — a baked model's own pick
+structure exists before the scene is shown — not that the first interaction must
+wait. `document-saved` invalidates cached
+bytes after a successful write, independent of the document's folder.
 
-All components — drives, sensors, MUs, and plugin-owned types — report runtime state changes via a **single** generic event. New component types do not need to extend `ViewerEvents`.
-
+<!-- BEGIN GENERATED VIEWER EVENTS -->
 | Event | Payload |
 |---|---|
-| `component-event` | `{ componentType: string; kind: string; path: string; payload?: unknown }` |
-
-Known combinations:
-
-| `componentType` | `kind` | `payload` | Who fires |
-|---|---|---|---|
-| `sensor` | `changed` | `{ occupied: boolean }` | [sensor-monitor-plugin.ts](src/plugins/sensor-monitor-plugin.ts) |
-| `mu` | `spawned` | `{ totalSpawned: number }` | [transport-stats-plugin.ts](src/plugins/transport-stats-plugin.ts) |
-| `mu` | `consumed` | `{ totalConsumed: number }` | [transport-stats-plugin.ts](src/plugins/transport-stats-plugin.ts) |
-| `drive` | `at-target` | `{ position: number }` | Declared as a known kind in [rv-viewer-events.ts](src/core/rv-viewer-events.ts); no core emitter today — subscribe defensively |
-
-Plugins can emit arbitrary `componentType` / `kind` combinations without modifying the core.
-
-#### HMI Panel States for Drives / Nodes / Sensors
-
-| Event | Payload |
-|---|---|
-| `drive-chart-toggle` | `{ open: boolean }` |
-| `drive-filter` | `{ filter: string; filteredDrives: RVDrive[] }` |
-| `sensor-chart-toggle` | `{ open: boolean }` |
-| `node-filter` | `{ filter; filteredNodes; tooMany: boolean }` |
-
-#### Interfaces (PLC connectivity)
-| Event | Payload |
-|---|---|
-| `interface-connected` | `{ interfaceId; type }` |
-| `interface-disconnected` | `{ interfaceId; reason? }` |
-| `interface-error` | `{ interfaceId; error }` |
-| `interface-data` | `{ interfaceId; signals: Record<string, unknown> }` |
-| `connection-state-changed` | `{ state: 'Connected' \| 'Disconnected'; previous }` |
-
-#### Generic Raycast & Selection Events
-| Event | Payload |
-|---|---|
+| `model-loaded` | `{ result: LoadResult; }` |
+| `placements-materialized` | `PlacementsSettledInfo` |
+| `placements-state-changed` | `{ state: PlacementsState; }` |
+| `model-logic-activated` | `{ result: LoadResult; }` |
+| `signature-state-changed` | `{ signatureState: SignatureState; logicRunState: 'active' \| 'gated' \| 'activating'; }` |
+| `model-provenance-changed` | `{ provenance: ModelProvenance; }` |
+| `document-saved` | `{ documentId: string; relPath: string; }` |
+| `model-cleared` | `void` |
+| `raycast-ready` | `void` |
+| `node-visibility-changed` | `void` |
+| `models-changed` | `{ models: Array<{ url: string; label: string; }>; }` |
+| `scene-loaded` | `{ scene: RvScene; }` |
+| `drive-chart-toggle` | `{ open: boolean; }` |
+| `drive-filter` | `{ filter: string; filteredDrives: RVDrive[]; }` |
+| `drives-changed` | `{ drives: readonly RVDrive[]; added: RVDrive \| null; removed: RVDrive \| null; }` |
+| `component-construction-failed` | `{ nodePath: string; componentType: string; reason: string; }` |
+| `node-filter` | `{ filter: string; filteredNodes: NodeSearchResult[]; tooMany: boolean; }` |
+| `sensor-chart-toggle` | `{ open: boolean; }` |
+| `groups-overlay-toggle` | `{ open: boolean; }` |
+| `exclusive-hover-mode` | `{ mode: HoverableType \| null; }` |
+| `connection-state-changed` | `{ state: 'Connected' \| 'Disconnected'; previous: 'Connected' \| 'Disconnected'; }` |
+| `renderer-context-lost` | `void` |
+| `renderer-context-restored` | `void` |
+| `render-mode-changed` | `{ mode: RenderMode; }` |
+| `component-event` | `{ componentType: string; kind: string; path: string; payload?: unknown; }` |
+| `interface-connected` | `{ interfaceId: string; type: string; }` |
+| `interface-disconnected` | `{ interfaceId: string; reason?: string; }` |
+| `interface-error` | `{ interfaceId: string; error: string; }` |
+| `interface-data` | `{ interfaceId: string; signals: Record<string, unknown>; }` |
+| `interface-signals-synced` | `{ interfaceId: string; }` |
+| `signal-binding-applied` | `{ targetId: string; componentPath: string; slot: string; signalName: string; sourceKind: 'connect' \| 'internal'; }` |
 | `object-hover` | `ObjectHoverData \| null` |
 | `object-unhover` | `ObjectUnhoverData` |
-| `object-click` | `ObjectClickData` (declared, see `object-clicked`) |
-| `object-clicked` | `{ path: string; node: Object3D; hitPoint?: [number, number, number] }` |
-| `object-focus` | `{ path: string; node: Object3D; openInspector?: boolean }` — `openInspector === false` (F shortcut) frames the camera only |
-| `object-blur` | `void` — previous focus pin was cleared (`clearFocus()`) |
+| `object-click` | `ObjectClickData` |
+| `camera-animation-done` | `{ targetPath?: string; }` |
+| `object-clicked` | `{ path: string; node: Object3D; hitPoint?: [ number, number, number ]; }` |
 | `selection-changed` | `SelectionSnapshot` |
-| `context-menu-request` | `{ pos: {x,y}; path; node }` |
-| `camera-animation-done` | `{ targetPath? }` |
-
-#### UI Panels & Overlays
-| Event | Payload |
-|---|---|
-| `panel-opened` / `panel-closed` | `{ panelId: string }` |
-| `groups-overlay-toggle` | `{ open: boolean }` |
-| `exclusive-hover-mode` | `{ mode: HoverableType \| null }` |
-| `safety-door:show-all` | `{ show: boolean }` |
-
-#### Simulation Pause
-| Event | Payload |
-|---|---|
-| `simulation-pause-changed` | `{ paused; reasons: readonly string[]; reason: string }` |
-
-> Fired **only** on the idle ↔ paused transition, not when additional reasons are added.
-
-#### XR / VR / AR
-| Event | Payload |
-|---|---|
-| `xr-session-start` / `xr-session-end` | `void` |
-| `xr-hit-test` | `{ position: Float32Array; matrix: Float32Array }` |
-| `xr-controller-select` | `{ hand: 'left' \| 'right'; position: {x,y,z} }` |
-
-#### Miscellaneous
-| Event | Payload |
-|---|---|
-| `fpv-enter` / `fpv-exit` | `void` |
+| `object-focus` | `{ path: string; node: Object3D; openInspector?: boolean; }` |
+| `object-blur` | `void` |
+| `panel-opened` | `{ panelId: string; }` |
+| `panel-closed` | `{ panelId: string; }` |
+| `diagnose-request` | `{ nodePath: string; errorCode?: number; errorActive?: boolean; docFilter?: string; errorId?: string; label?: string; autoOpen?: boolean; docHints?: string[]; machineContext?: string; source?: string; }` |
+| `safety-door:show-all` | `{ show: boolean; }` |
+| `xr-session-start` | `void` |
+| `xr-session-end` | `void` |
+| `xr-hit-test` | `{ position: Float32Array; matrix: Float32Array; }` |
+| `xr-controller-select` | `{ hand: 'left' \| 'right'; position: { x: number; y: number; z: number; }; }` |
+| `fpv-enter` | `void` |
+| `fpv-exit` | `void` |
+| `camera-mode-changed` | `{ mode: 'follow' \| 'siton' \| null; }` |
 | `multiuser-changed` | `MultiuserSnapshot` |
 | `mcp-bridge-changed` | `McpBridgeSnapshot` |
-| `layout-transform-update` | `{ path; position; rotation; scale?; visible? }` |
+| `mcp-bridge-log` | `McpServerLogLine[]` |
+| `context-menu-request` | `{ pos: { x: number; y: number; }; path: string; node: Object3D; }` |
+| `layout-transform-update` | `{ path: string; position: [ number, number, number ]; rotation: [ number, number, number ]; scale?: [ number, number, number ]; visible?: boolean; }` |
+| `layout-drag-start` | `{ node: Object3D; altKey?: boolean; }` |
+| `layout-drag-tick` | `{ node: Object3D; }` |
+| `layout-drag-end` | `{ node: Object3D; }` |
+| `mode-changing` | `{ from: ModeId \| null; to: ModeId; }` |
+| `mode-changed` | `{ from: ModeId \| null; to: ModeId; }` |
+| `plugins-changed` | `{ kind: 'registered' \| 'enabled' \| 'disabled' \| 'removed' \| 'user-disabled' \| 'user-enabled'; id: string; }` |
+| `component-reloaded` | `{ nodePath: string; }` |
+| `component-error` | `{ nodePath: string; code?: string; message?: string; cleared?: boolean; }` |
+| `editor-structure-changed` | `{ source: 'asset-editor'; }` |
+| `component-field-changed` | `{ nodePath: string; componentType: string; fieldName: string; }` |
+| `groups-changed` | `{ source: 'editor'; }` |
+| `asset-editor-pre-export` | `{ source: 'save-flow' \| 'test-session'; }` |
+| `runtime-attach-changed` | `{ attached: boolean; }` |
+| `simulation-pause-changed` | `{ paused: boolean; reasons: readonly string[]; reason: string; }` |
+| `simulation-reset` | `void` |
+| `simulation-start` | `void` |
+| `simulation-resetstat` | `void` |
+| `simulation-run-started` | `{ runId: string; seed: number; }` |
+| `simulation-run-ending` | `{ runId: string; seed: number; simTime: number; status: 'completed' \| 'aborted'; reason: 'reset' \| 'duration-reached' \| 'manual'; }` |
+<!-- END GENERATED VIEWER EVENTS -->
 
 ### Emitting Custom Events
 

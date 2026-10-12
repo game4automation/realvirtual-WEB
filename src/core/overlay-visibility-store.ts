@@ -34,29 +34,40 @@
 export type OverlayCategory =
   | 'tooltips'    // 3D tooltip system (Drive/MU/Pipe/Tank/Sensor)
   | 'gizmos'      // drive-axis (rotation ring), drive-gizmo tint, IK path
+  | 'colliders'   // authoring BoxCollider boxes (sensors, sinks, physics zones)
   | 'status'      // error/safety-door badges, sensor states, status panels
   | 'signals'     // 3D signal dots + DOM signal chips
   | 'highlights'  // hover/selection highlight, outline
   | 'markers'     // source markers, snap markers
-  | 'connections'; // typed-connection cables (plan-259 link-line gizmos)
+  | 'connections' // typed-connection cables (plan-259 link-line gizmos)
+  | 'ribbon-preview' // editor-only ribbon definition overlays
+  | 'labels'      // authored WebLabel text, Billboard + Plate (plan-529)
+  | 'safety-fields'; // AGV scanner warning / protective fields (plan-558) — default OFF
 
 export interface OverlayCategoryMeta {
   id: OverlayCategory;
   label: string;
+  /** Hidden until the user shows it once (persisted as `shown`). */
+  defaultHidden?: boolean;
 }
 
 /** Fixed catalog — order = display order in the panel. */
 export const OVERLAY_CATEGORIES: readonly OverlayCategoryMeta[] = [
   { id: 'tooltips', label: 'Tooltips' },
   { id: 'gizmos', label: 'Gizmos' },
+  { id: 'colliders', label: 'Colliders' },
   { id: 'status', label: 'Status & Alarms' },
   { id: 'signals', label: 'Signal chips' },
   { id: 'highlights', label: 'Highlights' },
   { id: 'markers', label: 'Markers' },
   { id: 'connections', label: 'Connections' },
+  { id: 'ribbon-preview', label: 'Ribbon preview' },
+  { id: 'labels', label: 'Labels' },
+  { id: 'safety-fields', label: 'Safety fields', defaultHidden: true },
 ];
 
 const VALID_IDS = new Set<OverlayCategory>(OVERLAY_CATEGORIES.map((c) => c.id));
+const DEFAULT_HIDDEN: readonly OverlayCategory[] = OVERLAY_CATEGORIES.filter((c) => c.defaultHidden).map((c) => c.id);
 
 export interface OverlayVisibilityState {
   /** Categories the user has hidden. Persisted. Unknown/new categories are
@@ -98,17 +109,43 @@ let version = 0;
 let snapshot: OverlayVisibilityState = buildSnapshot();
 const listeners = new Set<() => void>();
 
-function loadHidden(): OverlayCategory[] {
+/**
+ * Default-hidden categories the user has explicitly SHOWN (persisted as
+ * `shown`). Pure & exported for tests. Unknown ids and categories that are not
+ * default-hidden are dropped.
+ */
+export function parseStoredShown(raw: string | null): OverlayCategory[] {
+  if (!raw) return [];
   try {
-    return parseStoredHidden(localStorage.getItem(STORAGE_KEY));
+    const parsed = JSON.parse(raw) as { shown?: unknown };
+    if (!Array.isArray(parsed.shown)) return [];
+    return parsed.shown.filter((id): id is OverlayCategory =>
+      typeof id === 'string' && DEFAULT_HIDDEN.includes(id as OverlayCategory));
   } catch {
     return [];
   }
 }
 
+/** The hidden set from a stored blob: explicit hides + default-hidden categories never shown. */
+export function resolveStoredHidden(raw: string | null): OverlayCategory[] {
+  const out = parseStoredHidden(raw);
+  const shown = parseStoredShown(raw);
+  for (const id of DEFAULT_HIDDEN) if (!shown.includes(id) && !out.includes(id)) out.push(id);
+  return out;
+}
+
+function loadHidden(): OverlayCategory[] {
+  try {
+    return resolveStoredHidden(localStorage.getItem(STORAGE_KEY));
+  } catch {
+    return [...DEFAULT_HIDDEN];
+  }
+}
+
 function persist(): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hidden: [...hidden] }));
+    const shown = DEFAULT_HIDDEN.filter((id) => !hidden.has(id));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ hidden: [...hidden], shown }));
   } catch {
     /* ignore quota / unavailable */
   }

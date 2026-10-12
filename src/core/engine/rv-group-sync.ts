@@ -22,6 +22,9 @@ import { GroupRegistry } from './rv-group-registry';
 /** Matches Group component keys in userData.realvirtual: Group, Group_1, … */
 export const GROUP_KEY_RE = /^Group(_\d+)?$/;
 
+/** Matches Kinematic component keys in userData.realvirtual: Kinematic, Kinematic_1, … */
+const KINEMATIC_KEY_RE = /^Kinematic(_\d+)?$/;
+
 /** Minimal viewer surface needed for group syncing (test-friendly). */
 export interface GroupSyncHost {
   groups: GroupRegistry | null;
@@ -52,6 +55,38 @@ export function resolveGroupName(
     if (prefixNode) return prefixNode.name + groupName;
   }
   return groupName;
+}
+
+/**
+ * Resolved names of every group a `Kinematic*` component in the LIVE scene
+ * references (plan-760 F1 / F14).
+ *
+ * Reads userData, not `GroupRegistry.isKinematic`: that flag is stamped at
+ * load time only, so it misses a Kinematic created this session and goes
+ * stale after a group rename. `GroupName` + `GroupNamePrefix` are resolved
+ * through {@link resolveGroupName}, so a prefixed Kinematic yields the same
+ * key its member Group components register under. Disabled components
+ * (`_enabled === false`) and empty names are skipped.
+ */
+export function collectKinematicGroupNamesLive(
+  root: Object3D | null,
+  registry: GroupSyncHost['registry'],
+): Set<string> {
+  const names = new Set<string>();
+  if (!root) return names;
+  root.traverse((node) => {
+    const rv = (node.userData as Record<string, unknown> | undefined)?.['realvirtual'] as
+      Record<string, unknown> | undefined;
+    if (!rv) return;
+    for (const key of Object.keys(rv)) {
+      if (!KINEMATIC_KEY_RE.test(key)) continue;
+      const data = rv[key];
+      if (!data || typeof data !== 'object') continue;
+      const name = resolveGroupName(data as Record<string, unknown>, registry);
+      if (name) names.add(name);
+    }
+  });
+  return names;
 }
 
 /**

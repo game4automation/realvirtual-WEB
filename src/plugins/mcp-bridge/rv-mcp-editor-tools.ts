@@ -38,14 +38,13 @@ import type { ActiveAssetContext } from '../../core/editor/active-asset-store';
 // plan-713 F10 — the descend chain rides on the core view seam, not on the
 // private plugin's RvDocumentStack (see `_breadcrumbFields`).
 import { getActiveDocumentView } from '../../core/editor/active-document-view';
-import { libraryDocumentBase } from '../../core/editor/active-asset-store';
+import { documentBase, libraryDocumentBase } from '../../core/editor/active-asset-store';
+import { resolveEditorOpenDocument } from './rv-mcp-editor-open-resolve';
 import { ERR_DOCUMENT_LOCKED } from '../../core/editor/rv-asset-document';
 import type { AssetBase } from '../../core/editor/rv-asset-document';
 // Type-only: the module itself is dynamically imported inside the mechanism
 // tools so the asset-editor chunk stays lazy (see the module header).
-import type {
-  DensityPresetId, JointKind, MechanismDocumentLike, MechanismOpPlan,
-} from '@rv-private/plugins/asset-editor/mechanism/mechanism-authoring';
+import type { MechanismOpPlan } from '@rv-private/plugins/asset-editor/mechanism/mechanism-authoring';
 import type { MechanismUiBridge } from '../../core/engine/rv-kinematic-registry';
 import type { DownsampledSeries } from '@rv-private/plugins/asset-editor/mechanism/mechanism-force-downsample';
 import {
@@ -56,43 +55,68 @@ import {
   unsupportedMeshShapeReason,
   type SeparateMode,
 } from '../../core/editor/rv-mesh-separator';
+// plan-589: the command id, bound by constant (same convention as the group verbs).
+import {
+  SIGNAL_RENAME_COMMAND,
+  SIGNAL_RENAME_RECHECK_COMMAND,
+  SIGNAL_RENAME_REPAIR_COMMAND,
+  SIGNALS_CREATE_FROM_INTERFACE_COMMAND,
+} from '../../core/hmi/problems-store';
 import { requireEditor, isGuardError } from './rv-mcp-editor-guard';
 import { parsePathsParam } from './rv-object-analyzer-math';
-import { captureFrameCanvas, canvasToRvImage, compositeMontage } from './rv-frame-capture';
+import { canvasToRvImage, compositeMontage } from './rv-frame-capture';
+// plan-740 P3.5: the verify montage is rendered through the AGENT camera on the
+// shared capture chain — the drive still moves for real, only the picture of it
+// stopped being whatever the human's canvas happened to show.
+import {
+  guardAgentCapture, renderAgentChannels, serializeEyeCapture,
+} from './rv-mcp-observe-tools';
 import { arrayBufferOf } from '../../core/project/rv-scene-record';
 import { buildMeshUniverse } from './rv-mcp-view-tools';
 import {
-  computeIdenticalPaths,
-  computeSameMaterialPaths,
-  computeInvertPaths,
-  expandToUniverseMeshes,
-} from '@rv-private/plugins/asset-editor/select-actions';
+  ensureEditorCommandsRegistered,
+  ASSIGN_TO_KINEMATIC_BINDING,
+  GROUP_ASSIGN_COMMAND,
+  GROUP_DISSOLVE_COMMAND,
+  GROUP_REMOVE_COMMAND,
+  GROUP_RENAME_COMMAND,
+  ERR_TEST_RUN_ACTIVE,
+  MODEL_ROOT_LOCKED,
+  PIVOT_BINDING,
+  SHORTCUT_BINDING,
+  normalizeShortcutKeys,
+} from '../../core/hmi/editor-command-descriptors';
+import {
+  ensureMechanismCommandsRegistered,
+  mechanismForcesJson,
+  MECHANISM_UNAVAILABLE,
+} from '../../core/hmi/mechanism-command-descriptors';
+import { commandRegistry } from '../../core/hmi/rv-command-registry';
+import {
+  bindStandalone,
+  commandErrorJson,
+  dispatchBoundCommand,
+  type McpCallContext,
+} from '../../core/hmi/rv-command-context';
 
 const r3 = (n: number): number => +n.toFixed(3);
 
-/** Refusal shown for every structural verb aimed at the GLB root (plan-715 F4). */
-const MODEL_ROOT_LOCKED =
-  'The model root is locked: it cannot be renamed, transformed, hidden, deleted or reparented '
-  + '(its name is the first segment of every node path and its pose is the asset origin). '
-  + 'Edit its components/metadata instead, or target a child node.';
+// MODEL_ROOT_LOCKED lives with the command descriptors since plan-499 (one text
+// for the command refusal and the remaining direct tools).
 
 /** Kinematic component keys in rv_extras, tolerant of the `_N` dedup suffix. */
 const KINEMATIC_KEY_RE = /^Kinematic(_\d+)?$/;
 const DRIVE_KEY_RE = /^Drive(_\d+)?$/;
-/** Rigid-body MECHANISM container keys — the ancestor walk of `_mechCommit`. */
+/** KinematicMechanism container keys (the plan-729/501 tools check the mechanism node). */
 const MECHANISM_KEY_RE = /^KinematicMechanism(_\d+)?$/;
+/** plan-729 — MechanismPath / MechanismTarget keys, tolerant of the `_N` suffix. */
+const MECHANISM_PATH_KEY_RE = /^MechanismPath(_\d+)?$/;
+const MECHANISM_TARGET_KEY_RE = /^MechanismTarget(_\d+)?$/;
+/** plan-501 — MechanismTrajectory keys, tolerant of the `_N` suffix. */
+const MECHANISM_TRAJECTORY_KEY_RE = /^MechanismTrajectory(_\d+)?$/;
 
-/**
- * The one refusal every mechanism tool gives without the private bundle.
- *
- * It names the ALTERNATIVE, not just the absence: an agent that reads only
- * "not available" retries the same call three times before giving up, whereas
- * the axis-group system is right there and is what most single-axis authoring
- * actually wants.
- */
-const MECHANISM_UNAVAILABLE =
-  'Rigid-body mechanisms are not available in this build (private bundle missing). '
-  + 'Axis-group kinematics are available via web_editor_create_kinematic.';
+// MECHANISM_UNAVAILABLE lives with the mechanism command descriptors since plan-504
+// (one text for the command refusals and the remaining direct mechanism tools).
 
 /**
  * Narrow the `_requireMechanismBridge` union. Deliberately NOT `isGuardError`:
@@ -143,9 +167,7 @@ function testRunGuard(ctx: ActiveAssetContext): { error: string; code: string } 
   if (ctx.doc.lockOwner?.kind !== 'test-run') return null;
   return {
     code: ERR_DOCUMENT_LOCKED,
-    error: 'A test run is active (in-place test session): edits made now are rolled back '
-      + 'together with the test scene when the run stops, so they would be lost silently. '
-      + 'Stop the test run first, then repeat the edit.',
+    error: ERR_TEST_RUN_ACTIVE,
   };
 }
 
@@ -204,38 +226,14 @@ interface EditorMods {
   cadProvider: typeof import('../../core/editor/rv-cad-provider');
 }
 
-/**
- * One entry of the snap-candidate cache behind `web_editor_mechanism_snap_list`.
- *
- * The alternative — handing the full candidate geometry back and taking it in
- * again on the commit — would ask the agent to reproduce a position and a normal
- * vector without a rounding error, which is the exact failure class snapping
- * exists to remove. Precedent in house: `web_layout_snap_list` →
- * `web_layout_snap_attach`.
- */
-interface CachedSnapCandidate {
-  id: string;
-  kind: string;
-  label: string;
-  nodePath: string;
-  worldPosition: Vector3;
-  worldNormal: Vector3;
-  radius?: number;
-  inner?: boolean;
-  recommended: boolean;
-}
+// plan-499: eager descriptors — the bridge resolves label/button from them before a call.
+ensureEditorCommandsRegistered();
+// plan-504: the mechanism descriptors too — a first call (even in the community
+// build, where it answers ERR_EDITOR_UNAVAILABLE) never meets "Unknown command".
+ensureMechanismCommandsRegistered();
 
 export class McpEditorTools {
   constructor(private readonly getViewer: () => RVViewer | undefined) {}
-
-  /**
-   * The candidate set of the LAST `snap_list`, addressed by `snap0..snapN`.
-   *
-   * A new listing invalidates the previous one on purpose: two live sets would
-   * make `snap3` ambiguous, and an id that silently means yesterday's bore is a
-   * wrong anchor with no error attached.
-   */
-  private _snapCache: CachedSnapCandidate[] = [];
 
   private get viewer(): RVViewer | undefined {
     return this.getViewer();
@@ -264,6 +262,25 @@ export class McpEditorTools {
   /** requireEditor + JSON error shortcut. */
   private _ctx(): ActiveAssetContext | { error: string } {
     return requireEditor(this.viewer);
+  }
+
+  /**
+   * plan-499: THE one dispatch of a bound body. The bridge hands the call
+   * context in (resolved once, before the choreography); a direct call — tests,
+   * internal callers — binds the same way here from the method's decorator.
+   */
+  private _dispatch<R = Record<string, unknown>>(
+    ctx: McpCallContext | undefined, methodKey: string, wire: Record<string, unknown>,
+  ): ReturnType<typeof dispatchBoundCommand<R>> {
+    return dispatchBoundCommand<R>(ctx ?? bindStandalone(this, methodKey, wire, this.viewer), this.viewer);
+  }
+
+  /** Serialise a dispatch: `{error, ...details}` on refusal, else the shaped value. */
+  private _json<R>(
+    r: Awaited<ReturnType<typeof dispatchBoundCommand<R>>>,
+    shape: (v: R) => Record<string, unknown> = (v) => v as unknown as Record<string, unknown>,
+  ): string {
+    return JSON.stringify(r.ok ? shape(r.value) : commandErrorJson(r));
   }
 
   /** Handle unsaved changes per the ifDirty policy. Returns an error string or null. */
@@ -340,6 +357,9 @@ export class McpEditorTools {
       opCount: snap.opCount,
       selectionCount: v?.selectionManager.getSnapshot().selectedPaths.length ?? 0,
       nodeCount,
+      // The wireframe VIEW toggle (Shift+Z): true = screenshots show lines, not
+      // surfaces. A view state — it never changes the document.
+      wireframe: v?.wireframe ?? false,
       // plan-713 F10 — the descend chain, from the ONE core seam both writers
       // publish into. A depth of 1 is the root document, not "no stack".
       ...this._breadcrumbFields(),
@@ -445,10 +465,10 @@ export class McpEditorTools {
 
   // ═══ Lifecycle ════════════════════════════════════════════════════════
 
-  @McpTool('Open the ASSET EDITOR with a document: source=new (creates a NEW document in the open project and opens it) or source=library with relPath (e.g. "Custom/MyAsset.glb", relative to <workfolder>/library/). source=empty is a deprecated alias of source=new. When the editor is already open with unsaved changes, ifDirty decides: fail (default) | save (needs a saved name) | discard. Editing happens through the web_editor_* tools; finish with web_editor_save.', { readOnly: false, timeoutMs: 120_000 })
+  @McpTool('Open the ASSET EDITOR with a document: source=new (creates a NEW document in the open project and opens it) or source=library with relPath naming an EXISTING document of the open project — a library-relative path ("Custom/MyAsset.glb"), a project-relative path ("sidecutter.glb", "models/A.glb", also as "project:<path>"), a document id or a document name from web_document_list. A relPath that matches no document is refused at once with the available names instead of waiting for a load that cannot happen. When the editor is already open with unsaved changes, ifDirty decides: fail (default) | save (needs a saved name) | discard. Editing happens through the web_editor_* tools; finish with web_editor_save.', { readOnly: false, timeoutMs: 120_000 })
   async webEditorOpen(
     @McpParam('source', 'new | library. ("empty" is a deprecated alias of "new".)') source: string,
-    @McpParam('relPath', 'Library-relative GLB path (source=library), e.g. "Custom/MyAsset.glb".', 'string', false) relPath: string,
+    @McpParam('relPath', 'Document to open (source=library): library-relative path ("Custom/MyAsset.glb"), project-relative path ("sidecutter.glb", "project:models/A.glb"), document id or name from web_document_list.', 'string', false) relPath: string,
     @McpParam('ifDirty', 'fail | save | discard — what to do with unsaved changes (default fail).', 'string', false) ifDirty: string,
   ): Promise<string> {
     const v = this.viewer;
@@ -478,7 +498,32 @@ export class McpEditorTools {
       if (typeof created === 'string') return JSON.stringify({ error: created });
       pending = created;
     } else {
-      pending = libraryDocumentBase(relPath.trim());
+      // Open the ROW the dashboard would open, not a path guessed under
+      // `library/`: a document at the project root (the normal place since
+      // plan-744) has no `library/` twin, and the editor's load of that
+      // non-existent path fails silently — the tool then polled for an active
+      // document until its own timeout (2026-09-22). Resolving against the
+      // project's one document list finds the file wherever it is, and a miss
+      // is answered now, in words, with the names that would have matched.
+      const [{ getProjectStore }, documents] = await Promise.all([
+        import('../../core/project/project-store'),
+        import('../../core/project/rv-project-documents'),
+      ]);
+      const rows = documents.documentsOf(getProjectStore().getProject());
+      const row = resolveEditorOpenDocument(relPath, rows);
+      if (row) {
+        pending = documentBase(row.id, row.name || row.path, row.path);
+      } else if (rows.length === 0) {
+        // No project listing to consult (bundled / no project open): the
+        // library-relative form is the only address there is — keep it.
+        pending = libraryDocumentBase(relPath.trim());
+      } else {
+        return JSON.stringify({
+          error: `No document of the open project matches "${relPath.trim()}".`,
+          availableDocuments: rows.map((d) => ({ name: d.name, path: d.path, id: d.id })),
+          hint: 'Pass a path from web_document_list (project-relative, e.g. "sidecutter.glb" or "library/Custom/A.glb"), a document id or a name.',
+        });
+      }
     }
 
     let prevDocId: string | undefined;
@@ -556,7 +601,7 @@ export class McpEditorTools {
     return this._statusJson();
   }
 
-  @McpTool('Locate the KNOWLEDGE FOLDER for the open asset inside the OPEN PROJECT — the durable home for notes, a part catalogue and saved views across sessions. Returns the project name/kind, whether it is writable, the asset\'s library-relative path when it has one, and knowledgeRelPath ("knowledge/<AssetName>"). Every path here is PROJECT-relative, which is all the other tools need: web_editor_import_glb / web_editor_import_cad read them, web_render / web_screenshot_annotated write them via savePath. absolutePath is ALWAYS null — the browser exposes no filesystem path, and a browser project (OPFS) has none; put files in through the app, not the OS file manager.', { readOnly: true })
+  @McpTool('Locate the KNOWLEDGE FOLDER for the open asset inside the OPEN PROJECT — the durable home for notes, a part catalogue and saved views across sessions. Returns the project name/kind, whether it is writable, the asset\'s library-relative path when it has one, and knowledgeRelPath ("knowledge/<AssetName>"). Every path here is PROJECT-relative, which is all the other tools need: web_editor_import_glb / web_editor_import_cad read them, web_eye, web_view_sweep and web_view_ortho write them via savePath. absolutePath is ALWAYS null — the browser exposes no filesystem path, and a browser project (OPFS) has none; put files in through the app, not the OS file manager.', { readOnly: true })
   async webEditorProjectInfo(): Promise<string> {
     const ctx = this._ctx();
     if (isGuardError(ctx)) return JSON.stringify(ctx);
@@ -620,10 +665,13 @@ export class McpEditorTools {
     // a filesystem surface on an interface that deliberately has none (see the
     // header of project-backend.ts). The union of what it DOES list is the
     // honest answer, and `statDocuments()` supplies the size/mtime the rows lack.
-    const [documents, models, library, stats] = await Promise.all([
+    //
+    // Two calls, not four (plan-744 F1): `listModels()` and `listLibrary()`
+    // were folder-shaped slices of `listDocuments()` — one non-recursive, one
+    // recursive — so the union they contributed to was a union of the same
+    // rows at two different depths. `listDocuments()` walks the whole tree.
+    const [documents, stats] = await Promise.all([
       backend.listDocuments().catch(() => []),
-      backend.listModels().catch(() => []),
-      backend.listLibrary().catch(() => []),
       backend.statDocuments().catch(() => []),
     ]);
     const statByPath = new Map(stats.map(s => [s.path, s]));
@@ -633,8 +681,6 @@ export class McpEditorTools {
       modified: string | null;
       /** First path segment, `''` at the project root — where the file IS. */
       folder: string;
-      /** @deprecated plan-736 — carries the identical value as `folder`. */
-      section: string;
       documentId: string | null;
     }
     const byPath = new Map<string, FileRow>();
@@ -647,23 +693,21 @@ export class McpEditorTools {
       // F7). It used to be a `section` argument each caller passed by hand —
       // `'models'` here, `'library'` there, the row's stored field for a
       // document — which is how a listing could disagree with the tree it was
-      // listing, and how a root-level file ended up filed as `null`. `section`
-      // stays as a deprecated alias with the identical value, so an agent
-      // prompt written against the old field keeps working for one release.
-      const folder = path.includes('/') ? path.slice(0, path.indexOf('/')) : '';
+      // listing, and how a root-level file ended up filed as `null`. The
+      // deprecated `section` alias that outlived that argument is gone too
+      // (plan-744 F9); it only ever repeated `folder`.
       byPath.set(path, {
         path, name,
         sizeBytes: sizeBytes ?? stat?.size ?? null,
         modified: modified ?? (stat?.mtime ? new Date(stat.mtime).toISOString() : null),
-        folder, section: folder, documentId,
+        folder: path.includes('/') ? path.slice(0, path.indexOf('/')) : '',
+        documentId,
       });
     };
     for (const d of documents) {
       put(d.path, d.name, d.id, d.sizeBytes ?? null, d.modifiedAt ?? null);
     }
     const fileStem = listing.glbStem;
-    for (const m of models) put(m.path, m.label || fileStem(m.path), m.id ?? null, m.sizeBytes ?? null, null);
-    for (const l of library) put(l.path, l.label || fileStem(l.path), l.id ?? null, l.sizeBytes ?? null, null);
     for (const s of stats) put(s.path, fileStem(s.path), null, s.size, s.mtime ? new Date(s.mtime).toISOString() : null);
 
     const rows = [...byPath.values()]
@@ -683,33 +727,24 @@ export class McpEditorTools {
     });
   }
 
-  @McpTool('Undo the last N editor operations (default 1).', { readOnly: false })
+  @McpTool('Undo the last N editor operations (default 1).', { readOnly: false, command: 'editor.undo' })
   async webEditorUndo(
     @McpParam('count', 'Number of undo steps (default 1).', 'integer', false) count: number,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const n = Math.max(1, Math.round(count || 1));
-    let done = 0;
-    for (let i = 0; i < n && ctx.doc.getSnapshot().canUndo; i++) { await ctx.doc.undo(); done++; }
-    const snap = ctx.doc.getSnapshot();
-    return JSON.stringify({ undone: done, canUndo: snap.canUndo, canRedo: snap.canRedo });
+    // plan-499: a view of editor.undo — the same command Ctrl+Z and the toolbar dispatch.
+    return this._json(await this._dispatch(ctx, 'webEditorUndo', { count }));
   }
 
-  @McpTool('Redo the last N undone editor operations (default 1).', { readOnly: false })
+  @McpTool('Redo the last N undone editor operations (default 1).', { readOnly: false, command: 'editor.redo' })
   async webEditorRedo(
     @McpParam('count', 'Number of redo steps (default 1).', 'integer', false) count: number,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const n = Math.max(1, Math.round(count || 1));
-    let done = 0;
-    for (let i = 0; i < n && ctx.doc.getSnapshot().canRedo; i++) { await ctx.doc.redo(); done++; }
-    const snap = ctx.doc.getSnapshot();
-    return JSON.stringify({ redone: done, canUndo: snap.canUndo, canRedo: snap.canRedo });
+    return this._json(await this._dispatch(ctx, 'webEditorRedo', { count }));
   }
 
-  @McpTool('Save the asset as GLB into <workfolder>/library/Custom/. The document saves under its current name whatever it is (an "Untitled" name is a name like any other); the same name overwrites the existing file. Needs a configured work folder (File System Access). Reports saveVerb — save (in place), save-into-project (this write COPIES the document into the project and changes its identity) or blocked with a reason.', { readOnly: false, timeoutMs: 60_000 })
+  @McpTool('Save the asset as GLB into the open project — its own folder when it has one, the project ROOT when it has none (plan-744: `library/Custom` is no longer a fallback). The document saves under its current name whatever it is (an "Untitled" name is a name like any other); the same name overwrites the existing file. Needs a configured work folder (File System Access). Reports saveVerb — save (in place), save-into-project (this write COPIES the document into the project and changes its identity) or blocked with a reason.', { readOnly: false, timeoutMs: 60_000 })
   async webEditorSave(
     @McpParam('name', 'Asset name (default: current document name).', 'string', false) name: string,
   ): Promise<string> {
@@ -827,128 +862,73 @@ export class McpEditorTools {
     return JSON.stringify({ ok: true, path, position: next.position.map(r3) });
   }
 
-  @McpTool('Zero the LOCAL position of the given nodes (Quick Edit "Zero Local"). One undo unit.', { readOnly: false })
+  @McpTool('Zero the LOCAL position of the given nodes (Quick Edit "Zero Local"). One undo unit.', { readOnly: false, command: 'editor.zeroPosition' })
   async webEditorZeroPosition(
     @McpParam('paths', 'Node paths, comma/newline-separated.') paths: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    const list = parsePathsParam(paths);
-    await mods.transform.zeroLocalPosition(ctx.viewer, ctx.doc, list);
-    return JSON.stringify({ ok: true, count: list.length });
+    return this._json(await this._dispatch(ctx, 'webEditorZeroPosition', { paths }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Rotate a node ±90° around a LOCAL axis (Quick Edit rotate buttons). axis = x|y|z, sign = 1|-1.', { readOnly: false })
+  @McpTool('Rotate a node ±90° around a LOCAL axis (Quick Edit rotate buttons). axis = x|y|z, sign = 1|-1.', { readOnly: false, command: 'editor.rotate90' })
   async webEditorRotate90(
     @McpParam('path', 'Node path.') path: string,
     @McpParam('axis', 'x | y | z.') axis: string,
     @McpParam('sign', '1 or -1 (default 1).', 'integer', false) sign: number,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const a = (axis || '').toLowerCase();
-    if (!['x', 'y', 'z'].includes(a)) return JSON.stringify({ error: 'axis must be x|y|z' });
-    const mods = await this._load();
-    mods.transform.rotate90(ctx.viewer, ctx.doc, path, a as 'x' | 'y' | 'z', sign === -1 ? -1 : 1);
-    await ctx.doc.whenIdle();
-    return JSON.stringify({ ok: true, path, axis: a, sign: sign === -1 ? -1 : 1 });
+    return this._json(await this._dispatch(ctx, 'webEditorRotate90', { path, axis, sign }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Drop a node so its bounding box rests on the ground (Y = 0). Quick Edit "To Ground".', { readOnly: false })
+  @McpTool('Drop a node so its bounding box rests on the ground (Y = 0). Quick Edit "To Ground".', { readOnly: false, command: 'editor.toGround' })
   async webEditorToGround(
     @McpParam('path', 'Node path.') path: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    mods.transform.toGround(ctx.viewer, ctx.doc, path);
-    await ctx.doc.whenIdle();
-    return JSON.stringify({ ok: true, path });
+    // plan-499: the tool body is a VIEW of the command — exactly one dispatch,
+    // the same enabled() reason the Quick Edit button shows as tooltip.
+    return this._json(await this._dispatch(ctx, 'webEditorToGround', { path }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Move a node\'s PIVOT without moving geometry (children compensated, one undo unit). mode: bottom (pivot to bounds bottom-center) | object_center (to targetPath\'s precise vertex center — THE tool for placing a rotation axis on a specific part) | group_center (kinematic axis to its group\'s center) | align_y_up (rotate so local +Y is world up).', { readOnly: false })
+  @McpTool('Move a node\'s PIVOT without moving geometry (children compensated, one undo unit). mode: bottom (pivot to bounds bottom-center) | object_center (to targetPath\'s precise vertex center — THE tool for placing a rotation axis on a specific part) | group_center (kinematic axis to its group\'s center) | align_y_up (rotate so local +Y is world up).', { readOnly: false, command: PIVOT_BINDING })
   async webEditorPivot(
     @McpParam('path', 'Node path whose pivot moves.') path: string,
     @McpParam('mode', 'bottom | object_center | group_center | align_y_up.') mode: string,
     @McpParam('targetPath', 'Target node (required for object_center).', 'string', false) targetPath: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    const m = (mode || '').toLowerCase();
-    if (m === 'bottom') await mods.transform.pivotToBottom(ctx.viewer, ctx.doc, path);
-    else if (m === 'group_center') await mods.transform.centerKinematicToGroup(ctx.viewer, ctx.doc, path);
-    else if (m === 'align_y_up') await mods.transform.alignYUp(ctx.viewer, ctx.doc, path);
-    else if (m === 'object_center') {
-      if (!targetPath) return JSON.stringify({ error: 'object_center needs targetPath' });
-      await mods.transform.pivotToObjectCenter(ctx.viewer, ctx.doc, path, targetPath);
-    } else {
+    // plan-499: a multiplexer — `mode` picks the command via PIVOT_BINDING (one branch per mode).
+    const r = await this._dispatch<Record<string, unknown>>(ctx, 'webEditorPivot', { path, mode, targetPath });
+    if (!r.ok && r.kind === 'unbound' && !r.reason) {
       return JSON.stringify({ error: 'mode must be bottom | object_center | group_center | align_y_up' });
     }
-    const node = ctx.viewer.registry?.getNode(path);
-    const wp = node ? node.getWorldPosition(new Vector3()) : null;
-    return JSON.stringify({ ok: true, path, mode: m, pivotWorld: wp ? [r3(wp.x), r3(wp.y), r3(wp.z)] : null });
+    return this._json(r, (v) => ({ ok: true, path: v['path'], mode: (mode || '').toLowerCase(), pivotWorld: v['pivotWorld'] }));
   }
 
-  @McpTool('Rename a node (undoable).', { readOnly: false })
+  @McpTool('Rename a node (undoable).', { readOnly: false, command: 'editor.rename' })
   async webEditorRename(
     @McpParam('path', 'Node path.') path: string,
     @McpParam('name', 'New name.') name: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (isModelRoot(node, ctx.viewer.currentModelRoot)) return JSON.stringify({ error: MODEL_ROOT_LOCKED });
-    const trimmed = (name || '').trim();
-    if (!trimmed) return JSON.stringify({ error: 'Empty name' });
-    ctx.doc.renameNode(path, trimmed, node.name);
-    await ctx.doc.whenIdle();
-    const idx = path.lastIndexOf('/');
-    return JSON.stringify({ ok: true, path: idx < 0 ? trimmed : path.slice(0, idx + 1) + trimmed });
+    return this._json(await this._dispatch(ctx, 'webEditorRename', { path, name }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Delete nodes (descendants of other given paths are pruned automatically; one undo unit).', { readOnly: false })
+  @McpTool('Delete nodes (descendants of other given paths are pruned automatically; one undo unit).', { readOnly: false, command: 'editor.delete' })
   async webEditorDelete(
     @McpParam('paths', 'Node paths, comma/newline-separated.') paths: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    const candidates = parsePathsParam(paths).filter((p) => {
-      const node = ctx.viewer.registry?.getNode(p);
-      return !!node && !!node.parent && !isModelRoot(node, ctx.viewer.currentModelRoot);
-    });
-    const pruned = mods.del.pruneDescendantPaths(candidates);
-    if (pruned.length === 0) return JSON.stringify({ error: 'No deletable nodes among the given paths' });
-    await ctx.doc.deleteNodes(pruned);
-    return JSON.stringify({ ok: true, deleted: pruned.length });
+    return this._json(await this._dispatch(ctx, 'webEditorDelete', { paths }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Show or hide nodes (authored visibility — saved with the asset, undoable).', { readOnly: false })
+  @McpTool('Show or hide nodes (authored visibility — saved with the asset, undoable).', { readOnly: false, command: 'editor.setVisible' })
   async webEditorSetVisible(
     @McpParam('paths', 'Node paths, comma/newline-separated.') paths: string,
     @McpParam('visible', 'true to show, false to hide.', 'boolean') visible: boolean,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const list = parsePathsParam(paths);
-    let changed = 0;
-    for (const p of list) {
-      const node = ctx.viewer.registry?.getNode(p);
-      if (!node) continue;
-      // The model root stays visible (plan-715 F4). Reported rather than
-      // silently skipped so a single-path call gets a real answer.
-      if (isModelRoot(node, ctx.viewer.currentModelRoot)) {
-        if (list.length === 1) return JSON.stringify({ error: MODEL_ROOT_LOCKED });
-        continue;
-      }
-      ctx.doc.setNodeVisible(p, visible !== false);
-      changed++;
-    }
-    await ctx.doc.whenIdle();
-    return JSON.stringify({ ok: true, changed, visible: visible !== false });
+    return this._json(await this._dispatch(ctx, 'webEditorSetVisible', { paths, visible }), (v) => ({ ok: true, ...v }));
   }
 
   @McpTool('SEPARATE meshes into child parts (undoable, same op as the context menu "Separate ▸"): islands = connected loose parts, groups = one part per material group. Each source mesh is replaced by a same-named Group carrying the parts (children "<name>_part<N>"). Omit paths to separate the CURRENT selection.', { readOnly: false, timeoutMs: 120_000 })
@@ -1019,168 +999,86 @@ export class McpEditorTools {
 
   // ═══ Structure / components / kinematics ══════════════════════════════
 
-  @McpTool('Create an empty node (under parentPath, or at the asset root when omitted). Returns the new path.', { readOnly: false })
+  @McpTool('Create an empty node (under parentPath, or at the asset root when omitted). Returns the new path.', { readOnly: false, command: 'editor.createEmpty' })
   async webEditorCreateEmpty(
     @McpParam('parentPath', 'Parent node path (omit for asset root).', 'string', false) parentPath: string,
     @McpParam('name', 'Node name (default "Empty").', 'string', false) name: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const newPath = await ctx.doc.createEmptyNode(parentPath?.trim() || null, name?.trim() || 'Empty');
-    return JSON.stringify({ ok: true, path: newPath });
+    return this._json(await this._dispatch(ctx, 'webEditorCreateEmpty', { parentPath, name }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Move nodes under a new parent, preserving world poses (undoable). newParentPath omitted = asset root.', { readOnly: false })
+  @McpTool('Move nodes under a new parent, preserving world poses (undoable). newParentPath omitted = asset root.', { readOnly: false, command: 'editor.reparent' })
   async webEditorReparent(
     @McpParam('paths', 'Node paths to move, comma/newline-separated.') paths: string,
     @McpParam('newParentPath', 'Target parent path (omit for asset root).', 'string', false) newParentPath: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const moved = await ctx.doc.reparentNodes(parsePathsParam(paths), newParentPath?.trim() || null);
-    return JSON.stringify({ ok: true, moved });
+    return this._json(await this._dispatch(ctx, 'webEditorReparent', { paths, newParentPath }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Add a component to a node (Quick Edit "Components" section): Drive, Kinematic, Sensor, TransportSurface, Source, Sink, Grip, drive behaviors, signals, LogicSteps… Starts from schema defaults; optional propsJson overrides fields (e.g. {"Direction":"RotationY"}). Returns the concrete component key. Undoable.', { readOnly: false })
+  @McpTool('Add a component to a node (Quick Edit "Components" section): Drive, Kinematic, Sensor, TransportSurface, Source, Sink, Grip, BoxCollider, WebPhysicsZone, drive behaviors, signals, LogicSteps… Starts from schema defaults; optional propsJson overrides fields (e.g. {"Direction":"RotationY"}). BoxCollider: one per node, metres; on a mesh it goes onto a new child "Collider" (returned path). WebPhysicsZone adds a missing 1 m BoxCollider and turns physics on for the model. Returns the concrete component key. Undoable.', { readOnly: false, command: 'editor.addComponent' })
   async webEditorAddComponent(
     @McpParam('path', 'Node path.') path: string,
     @McpParam('type', 'Component base type (e.g. Drive).') type: string,
     @McpParam('propsJson', 'Optional JSON object of field overrides.', 'string', false) propsJson: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const testRun = testRunGuard(ctx);
-    if (testRun) return JSON.stringify(testRun);
-    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
-    const authorable = getTypesWithCapability('authorable');
-    if (authorable.length > 0 && !authorable.includes(type)) {
-      return JSON.stringify({ error: `Unknown component type "${type}"`, availableTypes: authorable });
-    }
-    let overrides: Record<string, unknown> = {};
-    if (propsJson) {
-      try {
-        const parsed = JSON.parse(propsJson);
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error();
-        overrides = parsed as Record<string, unknown>;
-      } catch {
-        return JSON.stringify({ error: 'propsJson must be a JSON object string' });
-      }
-    }
-    const fields = { ...getSchemaDefaults(type), ...overrides };
-    if (type === 'Drive' && fields['Direction'] === undefined) fields['Direction'] = 'LinearX';
-    const key = ctx.doc.addComponent(path, type, fields);
-    await ctx.doc.whenIdle();
-    return JSON.stringify({ ok: true, path, component: key, fields });
+    return this._json(await this._dispatch(ctx, 'webEditorAddComponent', { path, type, propsJson }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Remove a component from a node by its concrete key (e.g. "Drive" or "Drive_1" — see web_component_get_all). Undoable.', { readOnly: false })
+  @McpTool('Remove a component from a node by its concrete key (e.g. "Drive" or "Drive_1" — see web_component_get_all). Undoable.', { readOnly: false, command: 'editor.removeComponent' })
   async webEditorRemoveComponent(
     @McpParam('path', 'Node path.') path: string,
     @McpParam('componentType', 'Concrete component key.') componentType: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const testRun = testRunGuard(ctx);
-    if (testRun) return JSON.stringify(testRun);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (!(componentType in rvOf(node))) {
-      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
-    }
-    ctx.doc.removeComponent(path, componentType);
-    await ctx.doc.whenIdle();
-    return JSON.stringify({ ok: true, path, removed: componentType });
+    return this._json(await this._dispatch(ctx, 'webEditorRemoveComponent', { path, componentType }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Set one field of a component on a node (undoable, live in the panels). valueJson is parsed as JSON (numbers/booleans/strings/objects; bare strings work too). VERIFIED: ok is returned only after the value has been read back from the live scene — a dropped or refused op returns an error instead.', { readOnly: false })
+  @McpTool('Set one field of a component on a node (undoable, live in the panels). valueJson is parsed as JSON (numbers/booleans/strings/objects; bare strings work too). VERIFIED: ok is returned only after the value has been read back from the live scene — a dropped or refused op returns an error instead.', { readOnly: false, command: 'editor.setField' })
   async webEditorSetField(
     @McpParam('path', 'Node path.') path: string,
     @McpParam('componentType', 'Concrete component key (e.g. Drive).') componentType: string,
     @McpParam('fieldName', 'Field name (e.g. TargetSpeed).') fieldName: string,
     @McpParam('valueJson', 'New value as JSON (e.g. 500, true, "RotationY").') valueJson: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    const comp = rvOf(node)[componentType] as Record<string, unknown> | undefined;
-    if (!comp || typeof comp !== 'object') {
-      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
-    }
-    const testRun = testRunGuard(ctx);
-    if (testRun) return JSON.stringify(testRun);
-    let value: unknown;
-    try { value = JSON.parse(valueJson); }
-    catch { value = valueJson; } // bare string
-    const prev = comp[fieldName];
-    // AWAITED, not detached: the detached path swallows an executor refusal
-    // outside a transaction, and this tool used to answer "ok" for an op that
-    // never landed (Bug #9 — fields silently reverting in the saved GLB).
-    try {
-      await ctx.doc.setFieldAwaited(path, componentType, fieldName, value, prev);
-    } catch (e) {
-      return JSON.stringify({
-        error: `setField failed: ${e instanceof Error ? e.message : String(e)}`,
-        path, componentType, fieldName,
-      });
-    }
-    // Read-back verification. A resolve alone is not proof: an op queued during
-    // a base swap is dropped inside the queue without an error, and a scene
-    // swap (editor re-activation, test-session restore) can replace the node
-    // between guard and write. What the export will serialize is the node's
-    // userData — so that is what "landed" means.
-    const nodeAfter = ctx.viewer.registry?.getNode(path);
-    const stored = nodeAfter
-      ? (rvOf(nodeAfter)[componentType] as Record<string, unknown> | undefined)?.[fieldName]
-      : undefined;
-    if (!fieldValuesEqual(stored, value)) {
-      return JSON.stringify({
-        error: `setField did not land: "${componentType}.${fieldName}" on ${path} still holds `
-          + `${JSON.stringify(stored ?? null)} after the op. The op was dropped or the scene changed `
-          + 'underneath (base swap, editor re-activation, test-session restore) — '
-          + 'check web_editor_status and retry.',
-        path, componentType, fieldName, value, stored: stored ?? null,
-      });
-    }
-    // Live-instance value for the agent (saves the manual web_component_get):
-    // may legitimately differ from `value` for componentRef fields, which the
-    // instance holds in RESOLVED form.
-    const instance = ctx.viewer.registry?.getByPath(componentType, path) as Record<string, unknown> | null;
-    const liveRaw = instance && fieldName in instance ? instance[fieldName] : undefined;
-    const live = (liveRaw === null || ['number', 'string', 'boolean'].includes(typeof liveRaw))
-      ? liveRaw : undefined;
-    return JSON.stringify({
-      ok: true, path, componentType, fieldName, value, prev: prev ?? null,
-      ...(live !== undefined ? { live } : {}),
-    });
+    // VERIFIED inside the command: ok only after the value was read back from the
+    // live scene; a dropped or refused op comes back as {error, ...details}.
+    return this._json(
+      await this._dispatch(ctx, 'webEditorSetField', { path, componentType, fieldName, valueJson }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
-  // ── Rigid-body mechanisms (plan-404) ──────────────────────────────────
+  // ── Rigid-body mechanisms (plan-404, plan-504) ────────────────────────
   //
   // These orchestrate COMPOSITES of the existing generic ops (addComponent /
   // setField / unsetField) through `runMechanismPlan` — the op union and
   // its dispatchers are untouched by design (plan-404 §2.6). `_validate` and
   // `_jog` are TRANSIENT: they create no ops and no undo entries.
   //
+  // plan-504: eleven of the write tools are VIEWS of the `mechanism.*`
+  // commands (open descriptors: `mechanism-command-descriptors.ts`, private
+  // implementations: `mechanism/mechanism-commands.ts`) — the same rule the
+  // Mechanism section's buttons show as tooltip, one dispatch, the afterglow on
+  // the row that was addressed. `web_editor_mechanism_set_anchor` stays a direct
+  // tool (millimetre field input — no button to be a view of).
+  //
   // NOTE the naming: "mechanism" is the RIGID-BODY joint-graph system, not the
   // older `Kinematic` axis-group system that `web_editor_kinematize` /
   // `web_editor_create_kinematic` below drive. The two are never mixed.
 
-  @McpTool('Add a rigid-body MECHANISM (KinematicMechanism) to a node — the container that solves a joint graph with loop closure and free bodies. Add joints afterwards with web_editor_mechanism_add_joint. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  @McpTool('Add a rigid-body MECHANISM (KinematicMechanism) to a node — the container that solves a joint graph with loop closure and free bodies. Add joints afterwards with web_editor_mechanism_add_joint. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false, command: 'mechanism.create' })
   async webEditorMechanismCreate(
     @McpParam('path', 'Node the mechanism component is added to.') path: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
-    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-    await this._mechCommit(ctx, bridge, path, m.planCreateMechanism(path));
-    return JSON.stringify({ ok: true, path, component: 'KinematicMechanism' });
+    return this._json(await this._dispatch(ctx, 'webEditorMechanismCreate', { path }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Add a KinematicJoint to a mechanism. jointType = Revolute|Prismatic|Spherical|Universal. bodyBPath is required; OMIT bodyAPath to anchor the joint against WORLD/static space (the authored world-anchor form — an absent Body A, never an empty string). anchors are in millimetres in the respective body local frame; axisA is Body-A-local. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false })
+  @McpTool('Add a KinematicJoint to a mechanism. jointType = Revolute|Prismatic|Spherical|Universal. bodyBPath is required; OMIT bodyAPath to anchor the joint against WORLD/static space (the authored world-anchor form — an absent Body A, never an empty string). anchors are in millimetres in the respective body local frame; axisA is Body-A-local. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false, command: 'mechanism.addJoint' })
   async webEditorMechanismAddJoint(
     @McpParam('path', 'Node the joint component is added to (a child of the mechanism node).') path: string,
     @McpParam('jointType', 'Revolute | Prismatic | Spherical | Universal.') jointType: string,
@@ -1189,39 +1087,11 @@ export class McpEditorTools {
     @McpParam('anchorAJson', 'Anchor A as JSON {x,y,z} in mm (Body-A-local).', 'string', false) anchorAJson: string,
     @McpParam('anchorBJson', 'Anchor B as JSON {x,y,z} in mm (Body-B-local).', 'string', false) anchorBJson: string,
     @McpParam('axisAJson', 'Axis A as JSON {x,y,z} (Body-A-local).', 'string', false) axisAJson: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-    const kinds = m.JOINT_KINDS as readonly string[];
-    if (!kinds.includes(jointType)) {
-      return JSON.stringify({ error: `Unknown jointType "${jointType}"`, availableTypes: kinds });
-    }
-    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (!ctx.viewer.registry?.getNode(bodyBPath)) return JSON.stringify({ error: `Body B node not found: ${bodyBPath}` });
-    const bodyA = bodyAPath?.trim() || null;
-    if (bodyA && !ctx.viewer.registry?.getNode(bodyA)) {
-      return JSON.stringify({ error: `Body A node not found: ${bodyA}. Omit bodyAPath for a world anchor.` });
-    }
-    const vec = (json: string): { x: number; y: number; z: number } | undefined => {
-      if (!json) return undefined;
-      try {
-        const p = JSON.parse(json) as { x?: number; y?: number; z?: number };
-        return { x: Number(p.x ?? 0), y: Number(p.y ?? 0), z: Number(p.z ?? 0) };
-      } catch { return undefined; }
-    };
-    await this._mechCommit(ctx, bridge, path, m.planAddJoint({
-      nodePath: path,
-      jointType: jointType as JointKind,
-      bodyAPath: bodyA,
-      bodyBPath,
-      anchorA: vec(anchorAJson),
-      anchorB: vec(anchorBJson),
-      axisA: vec(axisAJson),
-    }));
-    return JSON.stringify({ ok: true, path, jointType, bodyA: bodyA ?? 'world', bodyB: bodyBPath });
+    return this._json(await this._dispatch(ctx, 'webEditorMechanismAddJoint', {
+      path, jointType, bodyBPath, bodyAPath, anchorAJson, anchorBJson, axisAJson,
+    }), (v) => ({ ok: true, ...v }));
   }
 
   @McpTool('Set a joint\'s anchor point(s), in millimetres, in the respective body local frame. Pass either or both. Both writes land in ONE composite, so an anchor snap is a single undo step. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false })
@@ -1255,32 +1125,17 @@ export class McpEditorTools {
     return JSON.stringify({ ok: true, path, componentType, anchorA: anchorA ?? null, anchorB: anchorB ?? null });
   }
 
-  @McpTool('Assign the Drive that actively controls a joint, or clear it. OMIT drivePath to make the joint PASSIVE again (the reference key is removed, which is the authored "no drive" form). NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  @McpTool('Assign the Drive that actively controls a joint, or clear it. OMIT drivePath to make the joint PASSIVE again (the reference key is removed, which is the authored "no drive" form). NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false, command: 'mechanism.assignDrive' })
   async webEditorMechanismAssignDrive(
     @McpParam('path', 'Node path of the joint.') path: string,
     @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint).') componentType: string,
     @McpParam('drivePath', 'Node path carrying the Drive. Omit to clear.', 'string', false) drivePath: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (!(componentType in rvOf(node))) {
-      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
-    }
-    const target = drivePath?.trim() || null;
-    if (target) {
-      const driveNode = ctx.viewer.registry?.getNode(target);
-      if (!driveNode) return JSON.stringify({ error: `Drive node not found: ${target}` });
-      if (!Object.keys(rvOf(driveNode)).some((k) => DRIVE_KEY_RE.test(k))) {
-        return JSON.stringify({ error: `Node "${target}" carries no Drive component` });
-      }
-    }
-    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-    await this._mechCommit(ctx, bridge, path, m.planAssignDrive(path, componentType, target));
-    return JSON.stringify({ ok: true, path, componentType, drive: target });
+    return this._json(
+      await this._dispatch(ctx, 'webEditorMechanismAssignDrive', { path, componentType, drivePath }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
   @McpTool('Validate a rigid-body mechanism: structured findings (MissingBodyB, SameBodyAAndB, UnresolvedBody, AnchorsApart, MissingSecondaryAxis, IdleSpinRod, NegativeDof, DriveAxisMismatch, DriveTypeMismatch) plus topology metrics. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). TRANSIENT — creates no ops and no undo entry.', { readOnly: true })
@@ -1304,41 +1159,17 @@ export class McpEditorTools {
     });
   }
 
-  @McpTool('Jog one driven joint to an absolute value (degrees for Revolute, millimetres for Prismatic) and run ONE solve, reporting the REAL convergence and residual. TRANSIENT — writes a live drive value only, creates no ops and no undo entry. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false })
+  @McpTool('Jog one driven joint to an absolute value (degrees for Revolute, millimetres for Prismatic) and run ONE solve, reporting the REAL convergence and residual. TRANSIENT — writes a live drive value only, creates no ops and no undo entry. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false, command: 'mechanism.jog' })
   async webEditorMechanismJog(
     @McpParam('path', 'Node path of the joint to jog.') path: string,
     @McpParam('value', 'Absolute joint value (deg or mm).', 'number') value: number,
     @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint_2) when several joints sit on one node. Omit for one-joint-per-node authoring.', 'string', false) componentType: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const result = bridge.jog(path, Number(value), componentType?.trim() || undefined);
-    if (!result) {
-      return JSON.stringify({ error: `Joint "${path}"${componentType ? ` (${componentType})` : ''} not found, not driven, or its mechanism cannot solve` });
-    }
-    return JSON.stringify({ ok: true, path, ...(componentType ? { componentType } : {}), value: Number(value), ...result });
-  }
-
-  /** Adapter: the AssetDocument slice the mechanism plans need. */
-  private _mechDoc(ctx: ActiveAssetContext): MechanismDocumentLike {
-    return {
-      withTransaction: (label, fn) => ctx.doc.withTransaction(label, fn),
-      addComponent: (nodePath, baseType, fields) => ctx.doc.addComponent(nodePath, baseType, fields),
-      setField: (nodePath, componentType, fieldName, v, prev) =>
-        ctx.doc.setField(nodePath, componentType, fieldName, v, prev),
-      unsetField: (nodePath, componentType, fieldName, prev) =>
-        ctx.doc.unsetField(nodePath, componentType, fieldName, prev),
-    };
-  }
-
-  /** Adapter: read a field's current value for the inverse half of an op. */
-  private _mechReadField(ctx: ActiveAssetContext) {
-    return (nodePath: string, componentType: string, fieldName: string): unknown => {
-      const node = ctx.viewer.registry?.getNode(nodePath);
-      if (!node) return undefined;
-      const comp = rvOf(node)[componentType] as Record<string, unknown> | undefined;
-      return comp?.[fieldName];
-    };
+    return this._json(
+      await this._dispatch(ctx, 'webEditorMechanismJog', { path, value, componentType }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
   /**
@@ -1359,66 +1190,23 @@ export class McpEditorTools {
     return getMechanismUiBridge() ?? { error: MECHANISM_UNAVAILABLE };
   }
 
-  /**
-   * Which mechanism(s) a write on `targetPath` invalidates — THREE stages, in
-   * this order (plan-706, Review F3):
-   *
-   *  1. **Ancestor walk.** The first self-or-ancestor carrying a
-   *     `KinematicMechanism` key. This is the normal case for everything the
-   *     authoring flow produces: joints are placed on children of the mechanism
-   *     node, and an imported assembly's links hang under it too.
-   *  2. **`bridge.list()` search.** A mechanism that already references the
-   *     node as a joint or a link. Catches the legitimate case of a body OUTSIDE
-   *     the mechanism subtree, linked only by a `ComponentReference`.
-   *  3. **Everything.** Expensive, never wrong.
-   *
-   * Stage 1 comes FIRST because stage 2 structurally misses the commonest new
-   * write: `planAddBody` only puts a `MechanismBody` on a node, and until some
-   * joint references that node it appears in no `links[]` — so `add_body` and
-   * `set_mass` would have fallen through to "rebuild everything" every time,
-   * making the last-resort branch the normal path.
-   */
-  private _mechanismPathsFor(
-    ctx: ActiveAssetContext, bridge: MechanismUiBridge, targetPath: string,
-  ): string[] {
-    const registry = ctx.viewer.registry;
-    for (let node = registry?.getNode(targetPath) ?? null; node; node = node.parent) {
-      if (!Object.keys(rvOf(node)).some((k) => MECHANISM_KEY_RE.test(k))) continue;
-      const path = registry?.getPathForNode(node) ?? NodeRegistry.computeNodePath(node);
-      if (path) return [path];
-    }
-    const all = bridge.list();
-    const referencing = all.filter((m) =>
-      m.nodePath === targetPath
-      || m.joints.some((j) => j.nodePath === targetPath)
-      || m.links.some((l) => l.nodePath === targetPath));
-    return (referencing.length > 0 ? referencing : all).map((m) => m.nodePath);
-  }
 
   /**
-   * Run an authoring composite AND make the solver see it (plan-706 F2).
-   *
-   * The panel has always done both — `runMechanismPlan` then
-   * `bridge.rebuild(mechanismPath)` (`MechanismSection.tsx`, the `commit`
-   * callbacks) — while the MCP tools did only the first half, so an anchor set
-   * by an agent took effect the next time a human happened to touch the panel.
-   * Every writing mechanism tool goes through here, which is what makes the
-   * following `validate`/`inspect` read the topology that was just written.
-   *
-   * The rebuild runs strictly AFTER `withTransaction` resolves: rebuilding a
-   * half-applied composite would hand the solver a joint whose body is not
-   * assigned yet.
+   * Run an authoring composite AND make the solver see it (plan-706 F2) — for
+   * the one mechanism write tool that is not a command view
+   * (`web_editor_mechanism_set_anchor`). The commands use the SAME function
+   * (`commitMechanismPlan`: one transaction, `whenIdle`, then the rebuild of
+   * every mechanism the write invalidates), so a direct tool and a button
+   * cannot leave the solver in different states.
    */
   private async _mechCommit(
     ctx: ActiveAssetContext, bridge: MechanismUiBridge, targetPath: string, plan: MechanismOpPlan,
   ): Promise<void> {
-    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-    await m.runMechanismPlan(this._mechDoc(ctx), plan, this._mechReadField(ctx));
-    await ctx.doc.whenIdle();
-    for (const path of this._mechanismPathsFor(ctx, bridge, targetPath)) bridge.rebuild(path);
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-commands');
+    await m.commitMechanismPlan(ctx.doc, ctx.viewer, targetPath, plan, bridge);
   }
 
-  @McpTool('Read a rigid-body MECHANISM in full: joints (type, bodies, drive, current value, limits, world origin and axis, joggable), links with their mass properties (hasBody, massKg, massSource, massWarning), findings, and convergence (converged, residualError, dof, loopCount). Omit path to read every mechanism; use include to keep the answer small. This is the READ half of the authoring cycle — call it before and after every edit. NOTE: this is the joint-graph mechanism system, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
+  @McpTool('Read a rigid-body MECHANISM in full: joints (type, bodies, drive, current value, limits, world origin and axis, joggable), links with their mass properties (hasBody, massKg, comLocalMm = centre of mass (link frame, mm), massSource, massWarning), findings and convergence (converged, residualError, dof, loopCount). Each mechanism also carries cog, its CENTRE OF GRAVITY in the current pose: cogWorldMm (world mm, null when nothing contributed), totalMassKg, contributingLinks of totalLinks, skippedLinks with reasons, estimated, ambiguousOwnership, contributions — recomputed per call from the live pose, marker-independent. Omit path to read every mechanism; include keeps the answer small. NOTE: this is the joint-graph mechanism system, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
   async webEditorMechanismInspect(
     @McpParam('path', 'Node path of one mechanism. Omit to read all.', 'string', false) path: string,
     @McpParam('include', 'Comma-separated subset of joints,links,findings (default all three).', 'string', false) include: string,
@@ -1456,33 +1244,334 @@ export class McpEditorTools {
         // no way to know they are the same thing.
         ...(want('joints') ? { joints: m.joints } : {}),
         ...(want('links') ? { links: m.links } : {}),
+        // Unconditional, and NOT behind `include`: the centre of gravity is one small object,
+        // it is the headline answer to "how heavy is this and where does it sit", and an agent
+        // that narrowed `include` to keep the joint list out of its context would otherwise lose
+        // it silently. `null` travels as `null` — never as an invented origin (plan-472).
+        cog: m.cog ?? null,
         ...(want('findings') ? { findings: m.findings } : {}),
       })),
     });
   }
 
-  /** Resolve a cached snap id, or the actionable refusal (R6). */
-  private _snapCandidate(
-    ctx: ActiveAssetContext, candidateId: string,
-  ): CachedSnapCandidate | { error: string; availableIds?: string[] } {
-    const id = (candidateId || '').trim();
-    const found = this._snapCache.find((c) => c.id === id);
-    if (!found) {
-      return {
-        error: `Unknown candidateId "${id}" — call web_editor_mechanism_snap_list first`,
-        availableIds: this._snapCache.map((c) => c.id),
-      };
-    }
-    // The model may have been rebuilt between the listing and the commit; a
-    // candidate pointing at geometry that no longer exists must refuse rather
-    // than write a plausible-looking anchor into a stale frame.
-    if (!ctx.viewer.registry?.getNode(found.nodePath)) {
-      return { error: `Node "${found.nodePath}" no longer exists — call web_editor_mechanism_snap_list again` };
-    }
-    return found;
+  // ── Mechanism paths (plan-729) ───────────────────────────────────────────
+  //
+  // Cartesian paths for a mechanism: MechanismTarget waypoints (the node's
+  // world position IS the waypoint) sequenced by a MechanismPath, LIN or PTP per
+  // waypoint. Composites of the generic ops like every other mechanism edit.
+  // No mechanism rebuild after these writes: a path or a waypoint changes no
+  // joint topology, and the path re-reads its list on every start.
+
+  /** Run a path/target composite (no topology rebuild — see block note). */
+  private async _pathCommit(ctx: ActiveAssetContext, plan: MechanismOpPlan): Promise<void> {
+    // The ONE commit path since plan-504 (one transaction, then whenIdle); bridge
+    // `null` = no solver rebuild, see the block note above.
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-commands');
+    await m.commitMechanismPlan(ctx.doc, ctx.viewer, '', plan, null);
   }
 
-  @McpTool('List the SNAP CANDIDATES under a canvas point (x,y as 0..1 fractions) so an anchor or a joint axis can be set on real geometry instead of guessed millimetres: bore axes, circle centres, edge/face centres and vertices, each with a stable id, a world position and a world normal. Exactly one is recommended — what a click would take. Aim the camera first (web_camera_focus, web_view_pick), then pass the ids to web_editor_mechanism_set_anchor_snap or _set_axis. Ids live until the next call. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: true })
+  /** The MechanismPath key on a node plus its current waypoint list, or a refusal. */
+  private _pathOn(
+    ctx: ActiveAssetContext, path: string,
+  ): { key: string; waypoints: string[] } | { error: string; components?: string[] } {
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return { error: `Node not found: ${path}` };
+    const rv = rvOf(node);
+    const key = Object.keys(rv).find((k) => MECHANISM_PATH_KEY_RE.test(k));
+    if (!key) {
+      return {
+        error: `"${path}" carries no MechanismPath — create one with web_editor_mechanism_path_create`,
+        components: Object.keys(rv),
+      };
+    }
+    const raw = (rv[key] as Record<string, unknown> | undefined)?.['Path'];
+    const waypoints: string[] = [];
+    if (Array.isArray(raw)) {
+      for (const e of raw) {
+        const p = e && typeof e === 'object' ? (e as Record<string, unknown>)['path'] : undefined;
+        if (typeof p === 'string') waypoints.push(p);
+      }
+    }
+    return { key, waypoints };
+  }
+
+  /** The current waypoint list of the path on `path` ([] when there is none). */
+  private _waypointsOf(ctx: ActiveAssetContext, path: string): string[] {
+    const on = this._pathOn(ctx, path);
+    return 'error' in on ? [] : on.waypoints;
+  }
+
+  @McpTool('Make a node a MechanismTarget: a path waypoint whose node WORLD POSITION is the target (move the node to move it). interpolation = Linear | PointToPoint. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismAddTarget(
+    @McpParam('path', 'Node that becomes the waypoint (its world position is the target).') path: string,
+    @McpParam('interpolation', 'Linear | PointToPoint (default Linear).', 'string', false) interpolation: string,
+    @McpParam('speedToTarget', 'Optional override: mm/s (Linear) or speed factor (PointToPoint).', 'number', false) speedToTarget: number,
+    @McpParam('waitForSeconds', 'Dwell time after arrival in seconds (default 0).', 'number', false) waitForSeconds: number,
+    @McpParam('mechanismPath', 'Optional KinematicMechanism node the waypoint belongs to.', 'string', false) mechanismPath: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const node = ctx.viewer.registry?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (Object.keys(rvOf(node)).some((k) => MECHANISM_TARGET_KEY_RE.test(k))) {
+      return JSON.stringify({ error: `"${path}" already carries a MechanismTarget` });
+    }
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    const interp = (interpolation || 'Linear').trim();
+    const kinds = m.WAYPOINT_INTERPOLATIONS as readonly string[];
+    if (!kinds.includes(interp)) {
+      return JSON.stringify({ error: `Unknown interpolation "${interpolation}"`, availableInterpolations: kinds });
+    }
+    const mech = mechanismPath?.trim() || null;
+    if (mech && !ctx.viewer.registry?.getNode(mech)) {
+      return JSON.stringify({ error: `Mechanism node not found: ${mech}` });
+    }
+    const speed = Number(speedToTarget);
+    const wait = Number(waitForSeconds);
+    await this._pathCommit(ctx, m.planCreateTarget(path, {
+      interpolation: interp as 'Linear' | 'PointToPoint',
+      speedToTarget: Number.isFinite(speed) && speed > 0 ? speed : undefined,
+      waitForSeconds: Number.isFinite(wait) && wait > 0 ? wait : 0,
+      mechanismPath: mech,
+    }));
+    return JSON.stringify({ ok: true, path, component: 'MechanismTarget', interpolation: interp });
+  }
+
+  @McpTool('Create a MechanismPath: the mechanism it drives, the TargetLink whose origin follows the path (a Delta: the platform) and optional ordered waypoints. Stops hard on an unreachable waypoint. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismPathCreate(
+    @McpParam('path', 'Node the MechanismPath component is added to.') path: string,
+    @McpParam('mechanismPath', 'Node carrying the KinematicMechanism.') mechanismPath: string,
+    @McpParam('targetLinkPath', 'The mechanism link whose origin follows the path.') targetLinkPath: string,
+    @McpParam('waypointPaths', 'Comma-separated MechanismTarget node paths, in order.', 'string', false) waypointPaths: string,
+    @McpParam('loopPath', 'Restart after the last waypoint (default false).', 'boolean', false) loopPath: boolean,
+    @McpParam('linearSpeed', 'LIN speed in mm/s (default 500).', 'number', false) linearSpeed: number,
+    @McpParam('linearAcceleration', 'LIN acceleration in mm/s² (default 1000).', 'number', false) linearAcceleration: number,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const reg = ctx.viewer.registry;
+    const node = reg?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    if (Object.keys(rvOf(node)).some((k) => MECHANISM_PATH_KEY_RE.test(k))) {
+      return JSON.stringify({ error: `"${path}" already carries a MechanismPath` });
+    }
+    const mechNode = reg?.getNode(mechanismPath);
+    if (!mechNode || !Object.keys(rvOf(mechNode)).some((k) => MECHANISM_KEY_RE.test(k))) {
+      return JSON.stringify({
+        error: `"${mechanismPath}" is not a KinematicMechanism node`,
+        availableMechanisms: bridge.list().map((mm) => mm.nodePath),
+      });
+    }
+    if (!reg?.getNode(targetLinkPath)) return JSON.stringify({ error: `Target link node not found: ${targetLinkPath}` });
+    const waypoints = parsePathsParam(waypointPaths);
+    for (const w of waypoints) {
+      const wn = reg?.getNode(w);
+      if (!wn || !Object.keys(rvOf(wn)).some((k) => MECHANISM_TARGET_KEY_RE.test(k))) {
+        return JSON.stringify({ error: `"${w}" is not a MechanismTarget — add one with web_editor_mechanism_add_target` });
+      }
+    }
+    const lin = Number(linearSpeed);
+    const acc = Number(linearAcceleration);
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await this._pathCommit(ctx, m.planCreatePath(path, mechanismPath, targetLinkPath, {
+      waypoints,
+      loopPath: loopPath === true,
+      linearSpeedToTarget: Number.isFinite(lin) && lin > 0 ? lin : undefined,
+      linearAcceleration: Number.isFinite(acc) && acc > 0 ? acc : undefined,
+    }));
+    return JSON.stringify({ ok: true, path, component: 'MechanismPath', mechanism: mechanismPath, targetLink: targetLinkPath, waypoints });
+  }
+
+  @McpTool('Insert a MechanismTarget into a mechanism path waypoint list, at index or appended. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismPathAddWaypoint(
+    @McpParam('path', 'Node carrying the MechanismPath.') path: string,
+    @McpParam('waypointPath', 'Node carrying the MechanismTarget.') waypointPath: string,
+    @McpParam('index', 'Insert position (0-based). Omit to append.', 'integer', false) index: number,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const on = this._pathOn(ctx, path);
+    if ('error' in on) return JSON.stringify(on);
+    const wn = ctx.viewer.registry?.getNode(waypointPath);
+    if (!wn || !Object.keys(rvOf(wn)).some((k) => MECHANISM_TARGET_KEY_RE.test(k))) {
+      return JSON.stringify({ error: `"${waypointPath}" is not a MechanismTarget — add one with web_editor_mechanism_add_target` });
+    }
+    const at = Number.isInteger(Number(index)) && index !== undefined && index !== null ? Number(index) : undefined;
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    const plan = m.planAddWaypoint(path, on.waypoints, waypointPath, at, on.key);
+    await this._pathCommit(ctx, plan);
+    return JSON.stringify({ ok: true, path, waypoints: this._waypointsOf(ctx, path) });
+  }
+
+  @McpTool('Remove the waypoint at index from a mechanism path list; the node stays. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismPathRemoveWaypoint(
+    @McpParam('path', 'Node carrying the MechanismPath.') path: string,
+    @McpParam('index', 'Waypoint position to remove (0-based).', 'integer') index: number,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const on = this._pathOn(ctx, path);
+    if ('error' in on) return JSON.stringify(on);
+    const i = Number(index);
+    if (!Number.isInteger(i) || i < 0 || i >= on.waypoints.length) {
+      return JSON.stringify({ error: `index ${index} out of range`, waypoints: on.waypoints });
+    }
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await this._pathCommit(ctx, m.planRemoveWaypoint(path, on.waypoints, i, on.key));
+    return JSON.stringify({ ok: true, path, removed: on.waypoints[i], waypoints: this._waypointsOf(ctx, path) });
+  }
+
+  @McpTool('Move one waypoint of a mechanism path from index from to index to. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismPathMoveWaypoint(
+    @McpParam('path', 'Node carrying the MechanismPath.') path: string,
+    @McpParam('from', 'Current waypoint position (0-based).', 'integer') from: number,
+    @McpParam('to', 'New waypoint position (0-based).', 'integer') to: number,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const on = this._pathOn(ctx, path);
+    if ('error' in on) return JSON.stringify(on);
+    const f = Number(from);
+    const t = Number(to);
+    const n = on.waypoints.length;
+    if (!Number.isInteger(f) || !Number.isInteger(t) || f < 0 || f >= n || t < 0 || t >= n) {
+      return JSON.stringify({ error: `from/to out of range (0..${n - 1})`, waypoints: on.waypoints });
+    }
+    if (f === t) return JSON.stringify({ ok: true, path, unchanged: true, waypoints: on.waypoints });
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    await this._pathCommit(ctx, m.planReorderWaypoints(path, on.waypoints, f, t, on.key));
+    return JSON.stringify({ ok: true, path, waypoints: this._waypointsOf(ctx, path) });
+  }
+
+  @McpTool('Read mechanism paths: waypoints (interpolation, dwell, world mm) and runtime status incl. lastError (why a path stopped). Omit path to read all. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
+  async webEditorMechanismPathInspect(
+    @McpParam('path', 'Node carrying one MechanismPath. Omit to read all.', 'string', false) path: string,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const all = bridge.listPaths?.() ?? [];
+    const target = path?.trim();
+    const paths = target ? all.filter((p) => p.nodePath === target) : all;
+    if (target && paths.length === 0) {
+      return JSON.stringify({ error: `No MechanismPath at "${target}"`, availablePaths: all.map((p) => p.nodePath) });
+    }
+    return JSON.stringify({ ok: true, paths });
+  }
+
+  // ── Drive sizing from a sampled trajectory (plan-501) ─────────────────────
+  //
+  // A MechanismTrajectory is one sizing case: sampled TCP path + payload. Import writes the
+  // samples (undoable composite, validated by the component on every path); run / inspect /
+  // export are transient bridge calls — the run lives in the bridge, so the panel sees it too.
+
+  @McpTool('Import a sampled TCP path CSV (time;X;Y;Z in mm) into a MechanismTrajectory for drive sizing; creates the trajectory when mechanismPath and targetLinkPath are given. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  async webEditorMechanismTrajectoryImport(
+    @McpParam('path', 'Node carrying (or receiving) the MechanismTrajectory.') path: string,
+    @McpParam('csv', 'CSV text with a header (time, X, Y, Z; velocity/acceleration columns are ignored).', 'string', false) csv: string,
+    @McpParam('relPath', 'Project-relative CSV file instead of csv text.', 'string', false) relPath: string,
+    @McpParam('mechanismPath', 'KinematicMechanism node — only when creating the trajectory.', 'string', false) mechanismPath: string,
+    @McpParam('targetLinkPath', 'Mechanism link carrying the TCP — only when creating.', 'string', false) targetLinkPath: string,
+    @McpParam('name', 'Name of the sizing case (prefix of the axis files).', 'string', false) name: string,
+  ): Promise<string> {
+    const ctx = this._ctx();
+    if (isGuardError(ctx)) return JSON.stringify(ctx);
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    if (!bridge.parseTrajectoryCsv) return JSON.stringify({ error: 'This build has no drive-sizing trajectories' });
+    const reg = ctx.viewer.registry;
+    const node = reg?.getNode(path);
+    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
+    let text = csv ?? '';
+    if (!text.trim() && relPath?.trim()) {
+      const read = await this._readProjectFile(relPath);
+      if ('error' in read) return JSON.stringify(read);
+      text = new TextDecoder().decode(read.bytes);
+    }
+    if (!text.trim()) return JSON.stringify({ error: 'Pass csv text or a project-relative relPath' });
+    const parsed = bridge.parseTrajectoryCsv(text);
+    if (!parsed.ok) return JSON.stringify({ error: `CSV refused: ${parsed.error}` });
+    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
+    const key = Object.keys(rvOf(node)).find((k) => MECHANISM_TRAJECTORY_KEY_RE.test(k));
+    if (key) {
+      await this._pathCommit(ctx, m.planSetTrajectorySamples(path, parsed.samples, parsed.intervalMs, key));
+    } else {
+      const mech = mechanismPath?.trim();
+      const link = targetLinkPath?.trim();
+      if (!mech || !link) {
+        return JSON.stringify({ error: `"${path}" carries no MechanismTrajectory — pass mechanismPath and targetLinkPath to create one` });
+      }
+      const mechNode = reg?.getNode(mech);
+      if (!mechNode || !Object.keys(rvOf(mechNode)).some((k) => MECHANISM_KEY_RE.test(k))) {
+        return JSON.stringify({ error: `"${mech}" is not a KinematicMechanism node`, availableMechanisms: bridge.list().map((mm) => mm.nodePath) });
+      }
+      if (!reg?.getNode(link)) return JSON.stringify({ error: `Target link node not found: ${link}` });
+      await this._pathCommit(ctx, m.planCreateTrajectory(path, mech, link, {
+        name: name?.trim() || undefined,
+        samples: parsed.samples,
+        sampleIntervalMs: parsed.intervalMs,
+      }));
+    }
+    const view = (bridge.listTrajectories?.() ?? []).find((t) => t.nodePath === path) ?? null;
+    return JSON.stringify({
+      ok: true, path, sampleCount: parsed.sampleCount, intervalMs: parsed.intervalMs,
+      warnings: parsed.warnings, findings: view?.findings ?? [],
+    });
+  }
+
+  @McpTool('Run the offline drive sizing of a MechanismTrajectory: inverse solve, forward solve and inverse dynamics per sample in its own raster; returns peak and RMS torque per axis. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Changes no document.', { readOnly: false, timeoutMs: 600_000 })
+  async webEditorMechanismTrajectoryRun(
+    @McpParam('path', 'Node carrying the MechanismTrajectory.') path: string,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    if (!bridge.runTrajectory) return JSON.stringify({ error: 'This build has no drive-sizing trajectories' });
+    const res = await bridge.runTrajectory(path?.trim() ?? '');
+    if ('error' in res) {
+      return JSON.stringify({ ...res, availableTrajectories: (bridge.listTrajectories?.() ?? []).map((t) => t.nodePath) });
+    }
+    return JSON.stringify({ ok: res.run?.state === 'done', trajectory: res });
+  }
+
+  @McpTool('Read MechanismTrajectories: configuration, findings, last sizing run and, for one path, the run series downsampled to at most maxPoints. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
+  async webEditorMechanismTrajectoryInspect(
+    @McpParam('path', 'Node carrying one MechanismTrajectory. Omit to read all.', 'string', false) path: string,
+    @McpParam('maxPoints', 'Series points per axis (default 200, at most 200).', 'integer', false) maxPoints: number,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    const all = bridge.listTrajectories?.() ?? [];
+    const target = path?.trim();
+    if (!target) return JSON.stringify({ ok: true, trajectories: all });
+    const one = all.find((t) => t.nodePath === target);
+    if (!one) return JSON.stringify({ error: `No MechanismTrajectory at "${target}"`, availableTrajectories: all.map((t) => t.nodePath) });
+    const n = Number(maxPoints);
+    const cap = Number.isFinite(n) && n > 1 ? Math.min(200, Math.floor(n)) : 200;
+    return JSON.stringify({ ok: true, trajectory: one, series: bridge.trajectorySeries?.(target, cap) ?? null });
+  }
+
+  @McpTool('Export the last sizing run of a MechanismTrajectory as SERVOsoft axis texts (Tab, decimal comma, CRLF), one per driven axis; refuses a stale, incomplete or failed run. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
+  async webEditorMechanismTrajectoryExport(
+    @McpParam('path', 'Node carrying the MechanismTrajectory.') path: string,
+  ): Promise<string> {
+    const bridge = await this._requireMechanismBridge();
+    if (isMechError(bridge)) return JSON.stringify(bridge);
+    if (!bridge.exportTrajectory) return JSON.stringify({ error: 'This build has no drive-sizing trajectories' });
+    const res = bridge.exportTrajectory(path?.trim() ?? '');
+    if (!res.ok) return JSON.stringify({ error: 'Export refused', findings: res.findings });
+    return JSON.stringify({ ok: true, files: res.files });
+  }
+
+  @McpTool('List the SNAP CANDIDATES under a canvas point (x,y as 0..1 fractions) so an anchor or a joint axis can be set on real geometry instead of guessed millimetres: bore axes, circle centres, edge/face centres and vertices, each with a stable id, a world position and a world normal. Exactly one is recommended — what a click would take. Aim the camera first (web_camera_focus), then pass the ids to web_editor_mechanism_set_anchor_snap or _set_axis. Ids ("snap<gen>-<i>") live until the next call and belong to this document. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: true })
   async webEditorMechanismSnapList(
     @McpParam('x', 'Horizontal position, fraction 0..1 of canvas width.', 'number') x: number,
     @McpParam('y', 'Vertical position, fraction 0..1 of canvas height.', 'number') y: number,
@@ -1509,13 +1598,20 @@ export class McpEditorTools {
     const result = querySnapCandidates(
       v, rect.left + fx * rect.width, rect.top + fy * rect.height, { maxCandidates: cap },
     );
+    // plan-504: the listing lives with the snap module (shared with the
+    // `mechanism.setAnchorSnap` / `mechanism.setAxis` commands). Ids carry the
+    // listing generation and are bound to this document — `snap<gen>-<i>`.
+    const snapCache = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-commands');
     if (!result) {
-      this._snapCache = [];
+      snapCache.clearSnapListing();
       return JSON.stringify({ ok: true, hit: false, candidates: [], hint: 'Nothing under that point — reframe with web_camera_focus and try again' });
     }
 
-    this._snapCache = result.candidates.map((c, i) => ({
-      id: `snap${i}`,
+    const documentKey = commandRegistry.captureContext(v).handle?.documentKey ?? null;
+    const listed: {
+      id: string; kind: string; label: string; nodePath: string; worldPosition: Vector3; worldNormal: Vector3;
+      radius?: number; inner?: boolean; recommended: boolean;
+    }[] = snapCache.recordSnapListing(documentKey, result.candidates.map((c) => ({
       kind: c.kind,
       label: c.label,
       nodePath: result.nodePath,
@@ -1524,12 +1620,12 @@ export class McpEditorTools {
       radius: c.radius,
       inner: c.inner,
       recommended: c.recommended,
-    }));
+    })));
     return JSON.stringify({
       ok: true,
       hit: true,
       hitPath: result.nodePath,
-      candidates: this._snapCache.map((c) => ({
+      candidates: listed.map((c) => ({
         id: c.id,
         kind: c.kind,
         label: c.label,
@@ -1543,59 +1639,23 @@ export class McpEditorTools {
     });
   }
 
-  @McpTool('Set a joint anchor from a snap candidate listed by web_editor_mechanism_snap_list — the geometrically exact alternative to typing millimetres into web_editor_mechanism_set_anchor. Writes AnchorA or AnchorB in the body-local frame and, unless assignBody=false, assigns the picked part as that side\'s body — ONE composite, one undo step. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  @McpTool('Set a joint anchor from a snap candidate listed by web_editor_mechanism_snap_list — the geometrically exact alternative to typing millimetres into web_editor_mechanism_set_anchor. Pass exactly ONE source: candidateId, or pickJson (a picked point, what the panel\'s Anchor A/B pick sends). Writes AnchorA or AnchorB in the body-local frame and, unless assignBody=false, assigns the picked part as that side\'s body — ONE composite, one undo step. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false, command: 'mechanism.setAnchorSnap' })
   async webEditorMechanismSetAnchorSnap(
     @McpParam('path', 'Node path of the joint.') path: string,
     @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint or KinematicJoint_1).') componentType: string,
     @McpParam('side', 'A | B — which side of the joint the point belongs to.') side: string,
-    @McpParam('candidateId', 'Id from web_editor_mechanism_snap_list, e.g. "snap0".') candidateId: string,
+    @McpParam('candidateId', 'Id from the LATEST web_editor_mechanism_snap_list, e.g. "snap3-0". Omit when passing pickJson.', 'string', false) candidateId: string,
     @McpParam('assignBody', 'Also assign the picked node as this side\'s body (default true).', 'boolean', false) assignBody: boolean,
+    @McpParam('pickJson', 'Instead of candidateId: {"nodePath":..,"worldPosition":[x,y,z],"worldNormal":[x,y,z]} in world space.', 'string', false) pickJson: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const which = (side || '').trim().toUpperCase();
-    if (which !== 'A' && which !== 'B') return JSON.stringify({ error: 'side must be "A" or "B"' });
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (!(componentType in rvOf(node))) {
-      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
-    }
-    const candidate = this._snapCandidate(ctx, candidateId);
-    if ('error' in candidate) return JSON.stringify(candidate);
-
-    const takeBody = assignBody !== false;
-    const joint = bridge.list().flatMap((m) => m.joints).find((j) => j.nodePath === path);
-    // Whose frame the anchor is expressed in: the newly picked body when we are
-    // assigning it, otherwise the body that side ALREADY carries. Getting this
-    // wrong writes a numerically fine anchor into the wrong frame — the silent
-    // failure planPickAnchor's one-composite rule exists to prevent.
-    const framePath = takeBody
-      ? candidate.nodePath
-      : (which === 'A' ? joint?.bodyAPath ?? null : joint?.bodyBPath ?? null);
-    const bodyNode = framePath ? ctx.viewer.registry?.getNode(framePath) ?? null : null;
-
-    const [{ planPickAnchor }, { worldPointToAnchorField }] = await Promise.all([
-      import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring'),
-      import('@rv-private/plugins/asset-editor/mechanism/mechanism-frames'),
-    ]);
-    const anchor = worldPointToAnchorField(candidate.worldPosition, bodyNode);
-    await this._mechCommit(ctx, bridge, path, planPickAnchor({
-      jointPath: path,
-      componentType,
-      side: which,
-      anchor,
-      bodyPath: takeBody ? candidate.nodePath : undefined,
-    }));
-    return JSON.stringify({
-      ok: true, path, componentType, side: which,
-      candidate: { id: candidate.id, kind: candidate.kind, label: candidate.label },
-      anchor, body: takeBody ? candidate.nodePath : framePath,
-    });
+    return this._json(
+      await this._dispatch(ctx, 'webEditorMechanismSetAnchorSnap', { path, componentType, side, candidateId, assignBody, pickJson }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
-  @McpTool('Set a joint\'s axis (AxisA, body-A-local) either from a snap candidate — a bore\'s normal IS its axis, so candidateId is the accurate route — or from an explicit world vector. Optionally set SecondaryAxisB for a Universal joint, and snapToPrincipal to magnet a nearly-axis-aligned direction onto X/Y/Z. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false })
+  @McpTool('Set a joint\'s axis (AxisA, body-A-local) either from a snap candidate — a bore\'s normal IS its axis, so candidateId is the accurate route — or from an explicit world vector. Optionally set SecondaryAxisB for a Universal joint, and snapToPrincipal to magnet a nearly-axis-aligned direction onto X/Y/Z. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false, command: 'mechanism.setAxis' })
   async webEditorMechanismSetAxis(
     @McpParam('path', 'Node path of the joint.') path: string,
     @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint).') componentType: string,
@@ -1603,243 +1663,67 @@ export class McpEditorTools {
     @McpParam('axisWorldJson', 'Axis as JSON {x,y,z} in WORLD space, when no candidateId is given.', 'string', false) axisWorldJson: string,
     @McpParam('secondaryAxisWorldJson', 'Universal joints only: second axis as JSON {x,y,z} in WORLD space.', 'string', false) secondaryAxisWorldJson: string,
     @McpParam('snapToPrincipal', 'Magnet the axis onto the nearest world X/Y/Z when within 5° (default false).', 'boolean', false) snapToPrincipal: boolean,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (!(componentType in rvOf(node))) {
-      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
-    }
-    const joints = bridge.list().flatMap((m) => m.joints);
-    const joint = joints.find((j) => j.nodePath === path);
-    if (!joint) {
-      return JSON.stringify({
-        error: `No solved joint at "${path}" — the axis frame depends on its type and Body A`,
-        availableJointPaths: joints.map((j) => j.nodePath),
-      });
-    }
-
-    const parseVec = (json: string): Vector3 | null => {
-      if (!json?.trim()) return null;
-      try {
-        const p = JSON.parse(json) as { x?: number; y?: number; z?: number };
-        const v = new Vector3(Number(p.x ?? 0), Number(p.y ?? 0), Number(p.z ?? 0));
-        return v.lengthSq() > 0 ? v : null;
-      } catch { return null; }
-    };
-
-    let axisWorld: Vector3 | null = null;
-    let from = 'vector';
-    if (candidateId?.trim()) {
-      const candidate = this._snapCandidate(ctx, candidateId);
-      if ('error' in candidate) return JSON.stringify(candidate);
-      axisWorld = candidate.worldNormal.clone();
-      from = `${candidate.id} (${candidate.kind})`;
-    } else {
-      axisWorld = parseVec(axisWorldJson);
-    }
-    if (!axisWorld) {
-      return JSON.stringify({ error: 'Pass candidateId, or axisWorldJson as {"x":..,"y":..,"z":..} with non-zero length' });
-    }
-
-    const frames = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-frames');
-    const { planSetAxis } = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-    if (snapToPrincipal === true) axisWorld = frames.snapAxisToPrincipal(axisWorld);
-    const isTranslation = frames.axisIsTranslation(joint.jointType);
-    const bodyA = joint.bodyAPath ? ctx.viewer.registry?.getNode(joint.bodyAPath) ?? null : null;
-    const axis = frames.worldDirectionToAxisField(axisWorld, bodyA, isTranslation);
-
-    const secondaryWorld = parseVec(secondaryAxisWorldJson);
-    let secondary: ReturnType<typeof frames.worldDirectionToAxisField> | undefined;
-    if (secondaryWorld) {
-      if (joint.jointType !== 'Universal') {
-        return JSON.stringify({ error: `SecondaryAxisB applies to Universal joints only — "${path}" is ${joint.jointType}` });
-      }
-      // The second axis is BODY-B-local: it is the axis the other side rotates
-      // about, and expressing it in Body A's frame would silently skew every
-      // universal joint whose two bodies are not aligned.
-      const bodyB = joint.bodyBPath ? ctx.viewer.registry?.getNode(joint.bodyBPath) ?? null : null;
-      secondary = frames.worldDirectionToAxisField(secondaryWorld, bodyB, false);
-    }
-
-    await this._mechCommit(ctx, bridge, path, planSetAxis(path, componentType, axis, secondary));
-    return JSON.stringify({ ok: true, path, componentType, from, axis, secondaryAxis: secondary ?? null });
+    return this._json(
+      await this._dispatch(ctx, 'webEditorMechanismSetAxis', {
+        path, componentType, candidateId, axisWorldJson, secondaryAxisWorldJson, snapToPrincipal,
+      }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
-  @McpTool('Add a MechanismBody to a link so the force analysis has a mass for it — without one the inverse dynamics reports "a link without mass" and every drive figure stays empty. densityPreset = steel|stainless|aluminum|pa|pom|custom. The mass itself is computed from the link\'s geometry and never stored, so it cannot go stale; use web_editor_mechanism_set_mass to override it. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  @McpTool('Add a MechanismBody to a link so the force analysis has a mass for it — without one the inverse dynamics reports "a link without mass" and every drive figure stays empty. densityPreset = steel|stainless|aluminum|pa|pom|custom. The mass itself is computed from the link\'s geometry and never stored, so it cannot go stale; use web_editor_mechanism_set_mass to override it. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false, command: 'mechanism.addBody' })
   async webEditorMechanismAddBody(
     @McpParam('path', 'Node path of the link to give a body.') path: string,
     @McpParam('densityPreset', 'steel | stainless | aluminum | pa | pom | custom (default steel).', 'string', false) densityPreset: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-    const preset = (densityPreset || 'steel').trim().toLowerCase();
-    const entry = m.DENSITY_PRESETS.find((p) => p.id === preset);
-    if (!entry) {
-      return JSON.stringify({
-        error: `Unknown densityPreset "${densityPreset}"`,
-        availablePresets: m.DENSITY_PRESETS.map((p) => p.id),
-      });
-    }
-    if (Object.keys(rvOf(node)).some((k) => /^MechanismBody(_\d+)?$/.test(k))) {
-      return JSON.stringify({ error: `"${path}" already carries a MechanismBody — change it with web_editor_mechanism_set_mass` });
-    }
-    await this._mechCommit(ctx, bridge, path, m.planAddBody(path, preset as DensityPresetId));
-    return JSON.stringify({
-      ok: true, path, densityPreset: entry.id,
-      densityKgM3: entry.density > 0 ? entry.density : 7850,
-    });
+    return this._json(
+      await this._dispatch(ctx, 'webEditorMechanismAddBody', { path, densityPreset }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
-  @McpTool('Set how heavy a link is — density preset, custom density, a pinned mass and a pinned centre of mass — in ONE composite and one undo step, because they are one decision. massKg="null" or comJson="null" DROP the respective override and return to the value computed from the geometry. Without masses the force figures are meaningless, so do this before reading web_editor_mechanism_forces. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  @McpTool('Set how heavy a link is — density preset, custom density, a pinned mass and a pinned centre of mass — in ONE composite and one undo step, because they are one decision. massKg="null" or comJson="null" DROP the respective override and return to the value computed from the geometry. Without masses the force figures are meaningless, so do this before reading web_editor_mechanism_forces. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false, command: 'mechanism.setMass' })
   async webEditorMechanismSetMass(
     @McpParam('path', 'Node path of the link (must already carry a MechanismBody).') path: string,
     @McpParam('densityPreset', 'steel | stainless | aluminum | pa | pom | custom.', 'string', false) densityPreset: string,
     @McpParam('densityKgM3', 'Density in kg/m³ — only meaningful with densityPreset=custom.', 'number', false) densityKgM3: number,
     @McpParam('massKg', 'Pinned mass in kg, or the string "null" to drop the override.', 'string', false) massKg: string,
     @McpParam('comJson', 'Centre of mass as JSON {x,y,z} in link-local mm, or "null" to drop it.', 'string', false) comJson: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (!Object.keys(rvOf(node)).some((k) => /^MechanismBody(_\d+)?$/.test(k))) {
-      return JSON.stringify({ error: `"${path}" carries no MechanismBody — add one with web_editor_mechanism_add_body first` });
-    }
-    const m = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-
-    // The three panel buttons become ONE MechanismOpPlan by concatenating their
-    // intents. `MechanismOpPlan` is plain data, so no fourth builder is needed —
-    // and one transaction is the difference between an undo that restores "how
-    // heavy is this part" and one that half-restores it.
-    const applied: string[] = [];
-    const intents: MechanismOpPlan['intents'] = [];
-
-    if (densityPreset?.trim()) {
-      const preset = densityPreset.trim().toLowerCase();
-      if (!m.DENSITY_PRESETS.some((p) => p.id === preset)) {
-        return JSON.stringify({
-          error: `Unknown densityPreset "${densityPreset}"`,
-          availablePresets: m.DENSITY_PRESETS.map((p) => p.id),
-        });
-      }
-      intents.push(...m.planSetDensity(path, preset as DensityPresetId, densityKgM3).intents);
-      applied.push('density');
-    }
-
-    const massRaw = (massKg ?? '').toString().trim();
-    if (massRaw) {
-      if (massRaw.toLowerCase() === 'null') {
-        intents.push(...m.planSetMassOverride(path, null).intents);
-        applied.push('massOverrideCleared');
-      } else {
-        const kg = Number(massRaw);
-        if (!Number.isFinite(kg) || kg <= 0) {
-          return JSON.stringify({ error: `massKg must be a positive number or "null", got "${massKg}"` });
-        }
-        intents.push(...m.planSetMassOverride(path, kg).intents);
-        applied.push('massOverride');
-      }
-    }
-
-    const comRaw = (comJson ?? '').trim();
-    if (comRaw) {
-      if (comRaw.toLowerCase() === 'null') {
-        intents.push(...m.planSetComOverride(path, null).intents);
-        applied.push('comOverrideCleared');
-      } else {
-        try {
-          const p = JSON.parse(comRaw) as { x?: number; y?: number; z?: number };
-          intents.push(...m.planSetComOverride(path, {
-            x: Number(p.x ?? 0), y: Number(p.y ?? 0), z: Number(p.z ?? 0),
-          }).intents);
-          applied.push('comOverride');
-        } catch {
-          return JSON.stringify({ error: 'comJson must be JSON {"x":..,"y":..,"z":..} or "null"' });
-        }
-      }
-    }
-
-    if (intents.length === 0) {
-      return JSON.stringify({ error: 'Pass at least one of densityPreset, massKg or comJson' });
-    }
-    await this._mechCommit(ctx, bridge, path, { label: 'Set body mass properties', intents });
-    return JSON.stringify({ ok: true, path, applied });
+    // The three panel controls are ONE command: each control passes one arg,
+    // this call may pass several — one plan, one transaction, one undo step.
+    return this._json(
+      await this._dispatch(ctx, 'webEditorMechanismSetMass', { path, densityPreset, densityKgM3, massKg, comJson }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
-  @McpTool('Set or clear a joint\'s motion limits — the travel a jog or a drive may use. useLimits=false switches them off and the bounds are ignored; useLimits=true takes lower/upper in degrees (Revolute) or millimetres (Prismatic). Read the current values with web_editor_mechanism_inspect. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false })
+  @McpTool('Set or clear a joint\'s motion limits — the travel a jog or a drive may use. useLimits=false switches them off and the bounds are ignored; useLimits=true takes lower/upper in degrees (Revolute) or millimetres (Prismatic). Read the current values with web_editor_mechanism_inspect. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable, one composite.', { readOnly: false, command: 'mechanism.setLimits' })
   async webEditorMechanismSetLimits(
     @McpParam('path', 'Node path of the joint.') path: string,
     @McpParam('componentType', 'Concrete joint key (e.g. KinematicJoint).') componentType: string,
     @McpParam('useLimits', 'true to enforce the bounds, false to switch limits off.', 'boolean') useLimits: boolean,
     @McpParam('lower', 'Lower bound (deg or mm) — only with useLimits=true.', 'number', false) lower: number,
     @McpParam('upper', 'Upper bound (deg or mm) — only with useLimits=true.', 'number', false) upper: number,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const node = ctx.viewer.registry?.getNode(path);
-    if (!node) return JSON.stringify({ error: `Node not found: ${path}` });
-    if (!(componentType in rvOf(node))) {
-      return JSON.stringify({ error: `No component "${componentType}" on ${path}`, components: Object.keys(rvOf(node)) });
-    }
-    const on = useLimits === true;
-    const lo = Number.isFinite(Number(lower)) && lower !== undefined ? Number(lower) : undefined;
-    const hi = Number.isFinite(Number(upper)) && upper !== undefined ? Number(upper) : undefined;
-    if (on && lo !== undefined && hi !== undefined && lo > hi) {
-      return JSON.stringify({ error: `lower (${lo}) must not exceed upper (${hi})` });
-    }
-    const { planSetLimits } = await import('@rv-private/plugins/asset-editor/mechanism/mechanism-authoring');
-    await this._mechCommit(ctx, bridge, path,
-      planSetLimits(path, componentType, { useLimits: on, lower: lo, upper: hi }));
-    return JSON.stringify({
-      ok: true, path, componentType, useLimits: on,
-      lower: on ? lo ?? null : null, upper: on ? hi ?? null : null,
-    });
+    return this._json(
+      await this._dispatch(ctx, 'webEditorMechanismSetLimits', { path, componentType, useLimits, lower, upper }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
-  /**
-   * Shape one forces snapshot for the wire, adding the recorder's sizing figures.
-   *
-   * `_forces` and `_statics` both answer with this, which is deliberate: the
-   * only difference between "what did the cycle need" and "what does holding it
-   * need" is which evaluation filled the numbers, not what the caller has to
-   * parse.
-   */
+  /** Shape one forces snapshot for the wire (the same serialisation `mechanism.statics` answers with). */
   private _forcesJson(
     snapshot: import('../../core/engine/rv-kinematic-registry').MechanismForcesSnapshot,
     recorder: import('../mechanism-force-recorder-plugin').MechanismForceRecorder,
     opts: { channelId?: string; series?: DownsampledSeries | null } = {},
   ): Record<string, unknown> {
-    return {
-      ok: true,
-      mechanismPath: snapshot.mechanismPath,
-      status: snapshot.status,
-      statusText: snapshot.statusText,
-      dynamicsValid: snapshot.dynamicsValid,
-      redundant: snapshot.redundant,
-      recording: recorder.recording,
-      channels: snapshot.channels.map((c) => {
-        const m = recorder.metrics(c.id);
-        return {
-          id: c.id, label: c.label, kind: c.kind, unit: c.unit, value: c.value,
-          peak: m.peak, rms: m.rms, holding: m.holding, sampleCount: m.sampleCount,
-          ...(opts.series && c.id === opts.channelId ? { series: opts.series } : {}),
-        };
-      }),
-      joints: snapshot.joints,
-    };
+    return mechanismForcesJson(snapshot, recorder, opts);
   }
 
   @McpTool('Read the DRIVE SIZING figures of a mechanism: per channel the current value plus peak, time-weighted RMS and holding force with their unit, and per joint the world reaction force and torque. This is what turns a built mechanism into a motor choice — continuous rating above RMS, peak rating above peak. Record a cycle first with web_editor_test_start/_stop; holding comes from web_editor_mechanism_statics. With channelId and series=true one channel also carries a downsampled time series. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Read-only.', { readOnly: true })
@@ -1887,60 +1771,22 @@ export class McpEditorTools {
     return JSON.stringify(out);
   }
 
-  @McpTool('Solve the HOLDING forces of a mechanism in its current pose (velocity and acceleration zero) and file them as each channel\'s holding figure — "what does it take to just hold this here", answerable without running the machine. Returns the same shape as web_editor_mechanism_forces with holding filled. Changes no pose and appends no undo entry, but it does replace the previously recorded holding numbers, which the panel shows. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false })
+  @McpTool('Solve the HOLDING forces of a mechanism in its current pose (velocity and acceleration zero) and file them as each channel\'s holding figure — "what does it take to just hold this here", answerable without running the machine. Returns the same shape as web_editor_mechanism_forces with holding filled. Changes no pose and appends no undo entry, but it does replace the previously recorded holding numbers, which the panel shows. NOTE: mechanism = the rigid-body joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics).', { readOnly: false, command: 'mechanism.statics' })
   async webEditorMechanismStatics(
     @McpParam('mechanismPath', 'Node path of the mechanism.') mechanismPath: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    const v = this.viewer;
-    if (!v) return JSON.stringify({ error: 'No viewer' });
-    const path = (mechanismPath || '').trim();
-    if (!path) return JSON.stringify({ error: 'mechanismPath is required' });
-    const { ensureForceRecorder } = await import('../mechanism-force-recorder-plugin');
-    const plugin = ensureForceRecorder(v);
-    const snapshot = plugin.captureStatics(path);
-    if (!snapshot) {
-      return JSON.stringify({
-        error: `Statics could not be solved for "${path}" — unknown mechanism, or links without mass (web_editor_mechanism_add_body)`,
-        availablePaths: bridge.list().map((m) => m.nodePath),
-      });
-    }
-    return JSON.stringify(this._forcesJson(snapshot, plugin.recorder));
+    // The value already IS the forces answer (`mechanismForcesJson`, with ok:true).
+    return this._json(await this._dispatch(ctx, 'webEditorMechanismStatics', { mechanismPath }));
   }
 
-  @McpTool('Apply the auto-fix of a FIXABLE finding on a joint and persist it as an ordinary field composite, so it undoes like a manual edit. Get the code from the findings of web_editor_mechanism_inspect or web_editor_mechanism_validate — only entries with fixable=true have one. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false })
+  @McpTool('Apply the auto-fix of a FIXABLE finding on a joint and persist it as an ordinary field composite, so it undoes like a manual edit. Get the code from the findings of web_editor_mechanism_inspect or web_editor_mechanism_validate — only entries with fixable=true have one. NOTE: mechanism = joint graph, NOT the axis-group Kinematic system (see web_editor_list_kinematics). Undoable.', { readOnly: false, command: 'mechanism.fix' })
   async webEditorMechanismFix(
     @McpParam('path', 'Node path of the joint the finding concerns.') path: string,
     @McpParam('code', 'Finding code, e.g. AnchorsApart or MissingSecondaryAxis.') code: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const bridge = await this._requireMechanismBridge();
-    if (isMechError(bridge)) return JSON.stringify(bridge);
-    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
-    const finding = (code || '').trim();
-    if (!finding) return JSON.stringify({ error: 'code is required' });
-
-    // `suggestFix` RETURNS the field edits instead of applying them, which makes
-    // the preview free — there is nothing to persist until this tool does it.
-    const fix = bridge.suggestFix(path, finding);
-    if (!fix || Object.keys(fix).length === 0) {
-      const fixable = bridge.list()
-        .flatMap((m) => m.findings)
-        .filter((f) => f.fixable && f.jointPath === path)
-        .map((f) => f.code);
-      return JSON.stringify({ error: `No auto-fix for "${finding}" on ${path}`, fixableCodes: fixable });
-    }
-    const componentType = Object.keys(rvOf(ctx.viewer.registry.getNode(path)!))
-      .find((k) => /^KinematicJoint(_\d+)?$/.test(k)) ?? 'KinematicJoint';
-    await this._mechCommit(ctx, bridge, path, {
-      label: `Fix ${finding}`,
-      intents: Object.entries(fix).map(([fieldName, value]) => ({
-        op: 'setField' as const, nodePath: path, componentType, fieldName, value,
-      })),
-    });
-    return JSON.stringify({ ok: true, path, componentType, code: finding, applied: fix });
+    return this._json(await this._dispatch(ctx, 'webEditorMechanismFix', { path, code }), (v) => ({ ok: true, ...v }));
   }
 
   // ═══ In-place test session (plan-410, driven per plan-706 F12) ═════════════
@@ -1987,36 +1833,62 @@ export class McpEditorTools {
     });
   }
 
-  @McpTool('Create a new kinematic axis: an empty top-level node with a Kinematic component linked to a fresh group (Quick Edit "Add Kinematic"). Assign members afterwards with web_editor_assign_to_kinematic. Returns the axis path + group name.', { readOnly: false })
+  @McpTool('Create a new kinematic axis: an empty top-level node with a Kinematic component linked to a fresh group (Quick Edit "Add Kinematic"). Assign members afterwards with web_editor_assign_to_kinematic. Returns the axis path + group name.', { readOnly: false, command: 'editor.createKinematic' })
   async webEditorCreateKinematic(
     @McpParam('name', 'Kinematic/group name (default auto "Kinematic_N").', 'string', false) name: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    const path = await mods.create.createKinematicWithGroup(ctx.viewer, ctx.doc, name);
-    if (!path) return JSON.stringify({ error: 'Kinematic creation failed' });
-    const node = ctx.viewer.registry?.getNode(path);
-    const groupName = node ? mods.transform.getKinematicGroupName(node) : null;
-    return JSON.stringify({ ok: true, kinematicPath: path, groupName });
+    return this._json(await this._dispatch(ctx, 'webEditorCreateKinematic', { name }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Assign nodes to a kinematic\'s group (they will move with the axis). Objects in another kinematic group are moved over; other kinematic axes are skipped. One undo unit.', { readOnly: false })
+  @McpTool('Assign nodes to a kinematic\'s group (they will move with the axis). Objects in another kinematic group are moved over; other kinematic axes are skipped. One undo unit.', { readOnly: false, command: ASSIGN_TO_KINEMATIC_BINDING })
   async webEditorAssignToKinematic(
     @McpParam('paths', 'Node paths to assign, comma/newline-separated.') paths: string,
     @McpParam('groupName', 'Target kinematic group name (see web_editor_list_kinematics).') groupName: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const kinPath = findKinematicPathForGroup(ctx.viewer, groupName);
-    if (!kinPath) {
-      return JSON.stringify({ error: `No kinematic references group "${groupName}" — create one first` });
-    }
-    const mods = await this._load();
-    await mods.group.autoAssignToKinematic(ctx.viewer, ctx.doc, parsePathsParam(paths), groupName, kinPath);
-    const node = ctx.viewer.registry?.getNode(kinPath);
-    const members = node ? mods.transform.kinematicGroupMemberCount(ctx.viewer, node) : 0;
-    return JSON.stringify({ ok: true, kinematicPath: kinPath, groupName, members });
+    // plan-499: the same command as the K picker, with requireExisting=true (the tool never creates an axis).
+    return this._json(
+      await this._dispatch<Record<string, unknown>>(ctx, 'webEditorAssignToKinematic', { paths, groupName }),
+      (v) => ({ ok: true, kinematicPath: v['kinematicPath'], groupName: v['groupName'], members: v['members'] }),
+    );
+  }
+
+  // ═══ Groups (plan-760 F13 — views of the Quick Edit Groups section) ═══
+
+  @McpTool('Add nodes to a PLAIN group (Quick Edit Groups): stamps a Group component, never creates a kinematic axis. Omit paths for the current selection. One undo unit.', { readOnly: false, command: GROUP_ASSIGN_COMMAND })
+  async webEditorGroupAssign(
+    @McpParam('name', 'Resolved group name (new or existing); "" and "/" refused.') name: string,
+    @McpParam('paths', 'Node paths, comma/newline-separated (default: selection).', 'string', false) paths: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    return this._json(await this._dispatch(ctx, 'webEditorGroupAssign', { name, paths }), (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Remove nodes from one group: strips every matching Group component of each node, other groups stay; non-members are skipped. Omit paths for the current selection. One undo unit.', { readOnly: false, command: GROUP_REMOVE_COMMAND })
+  async webEditorGroupRemove(
+    @McpParam('name', 'Resolved group name (see web_group_list).') name: string,
+    @McpParam('paths', 'Node paths, comma/newline-separated (default: selection).', 'string', false) paths: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    return this._json(await this._dispatch(ctx, 'webEditorGroupRemove', { name, paths }), (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Rename a group on every member Group component AND every owning Kinematic, one undo unit. Resolved names; refused on collision, empty name, "/" or when a member\'s GroupNamePrefix would be dropped. Same name = no-op.', { readOnly: false, command: GROUP_RENAME_COMMAND })
+  async webEditorGroupRename(
+    @McpParam('name', 'Current resolved group name.') name: string,
+    @McpParam('newName', 'New resolved group name.') newName: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    return this._json(await this._dispatch(ctx, 'webEditorGroupRename', { name, newName }), (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Dissolve a group: removes its Group component from every member and clears GroupName on every owning Kinematic; geometry and other groups stay. One undo unit.', { readOnly: false, command: GROUP_DISSOLVE_COMMAND })
+  async webEditorGroupDissolve(
+    @McpParam('name', 'Resolved group name (see web_group_list).') name: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    return this._json(await this._dispatch(ctx, 'webEditorGroupDissolve', { name }), (v) => ({ ok: true, ...v }));
   }
 
   @McpTool('List all kinematics in the asset: axis path, group name, member count, and the Drive on the axis (direction/speed/limits) when present.', { readOnly: true })
@@ -2053,77 +1925,122 @@ export class McpEditorTools {
 
   // ═══ Signals / logic ══════════════════════════════════════════════════
 
-  @McpTool('Create a PLC signal node as a child (Quick Edit "Signals"). sigType: PLCInputBool | PLCOutputBool | PLCInputFloat | PLCOutputFloat | PLCInputInt | PLCOutputInt. Optional name renames the node. Returns the new path.', { readOnly: false })
+  @McpTool('Create a PLC signal node as a child (Quick Edit "Signals"). sigType: PLCInputBool | PLCOutputBool | PLCInputFloat | PLCOutputFloat | PLCInputInt | PLCOutputInt. Optional name renames the node. Returns the new path.', { readOnly: false, command: 'editor.addSignal' })
   async webEditorAddSignal(
     @McpParam('parentPath', 'Parent node path.') parentPath: string,
     @McpParam('sigType', 'Signal type (e.g. PLCOutputBool).') sigType: string,
     @McpParam('name', 'Optional node name (default = signal type).', 'string', false) name: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    if (!ctx.viewer.registry?.getNode(parentPath)) {
-      return JSON.stringify({ error: `Node not found: ${parentPath}` });
-    }
-    await mods.create.createSignalNode(ctx.viewer, ctx.doc, parentPath, sigType);
-    let newPath = ctx.viewer.selectionManager.getSnapshot().primaryPath;
-    if (newPath && name?.trim()) {
-      const node = ctx.viewer.registry?.getNode(newPath);
-      if (node) {
-        ctx.doc.renameNode(newPath, name.trim(), node.name);
-        await ctx.doc.whenIdle();
-        const idx = newPath.lastIndexOf('/');
-        newPath = idx < 0 ? name.trim() : newPath.slice(0, idx + 1) + name.trim();
-      }
-    }
-    return JSON.stringify({ ok: true, path: newPath });
+    // plan-499 Phase 4: a view of `editor.addSignal` — the Quick Edit "Signals"
+    // Out/In buttons are the others (same plain-object rule).
+    return this._json(await this._dispatch(ctx, 'webEditorAddSignal', { parentPath, sigType, name }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Convert a signal node to another datatype (Bool | Int | Float), keeping direction and value.', { readOnly: false })
+  @McpTool('Convert a signal node to another datatype (Bool | Int | Float), keeping direction and value.', { readOnly: false, command: 'editor.convertSignal' })
   async webEditorConvertSignal(
     @McpParam('path', 'Signal node path.') path: string,
     @McpParam('target', 'Bool | Int | Float.') target: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const t = (target || '').trim();
-    if (!['Bool', 'Int', 'Float'].includes(t)) return JSON.stringify({ error: 'target must be Bool | Int | Float' });
-    const mods = await this._load();
-    await mods.create.convertSignalType(ctx.viewer, ctx.doc, path, t as 'Bool' | 'Int' | 'Float');
-    return JSON.stringify({ ok: true, path });
+    // plan-499 Phase 4: a view of `editor.convertSignal` (Quick Edit "To Bool/Int/Float").
+    return this._json(await this._dispatch(ctx, 'webEditorConvertSignal', { path, target }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Flip a signal node between PLC input and output (value preserved).', { readOnly: false })
+  @McpTool('Flip a signal node between PLC input and output (value preserved).', { readOnly: false, command: 'editor.toggleSignalDirection' })
   async webEditorToggleSignalDirection(
     @McpParam('path', 'Signal node path.') path: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    await mods.create.toggleSignalDirection(ctx.viewer, ctx.doc, path);
-    return JSON.stringify({ ok: true, path });
+    // plan-499 Phase 4: a view of `editor.toggleSignalDirection` (Quick Edit "To Input/Output").
+    return this._json(await this._dispatch(ctx, 'webEditorToggleSignalDirection', { path }), (v) => ({ ok: true, ...v }));
   }
 
-  @McpTool('Add a LogicStep to a node (Quick Edit "Logic Steps"). Unknown stepType returns the palette. Steps sequence one-per-node; a node that already has a step gets a sibling.', { readOnly: false })
+  @McpTool('Edit ONE field of a PLC signal node: Comment, OriginDataType (BOOL/INT/DINT/REAL/…) or Type (a full wire type, e.g. PLCInputFloat). "Name" is refused — rename with web_editor_signal_rename.', { readOnly: false, command: 'editor.signalSetField' })
+  async webEditorSignalSetField(
+    @McpParam('path', 'Signal node path.') path: string,
+    @McpParam('field', 'Comment | OriginDataType | Type.') field: string,
+    @McpParam('value', 'New value (empty clears Comment / OriginDataType).', 'string', false) value: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    // plan-589 F3: a view of `editor.signalSetField` — the inspector's "Signal" section is the other.
+    return this._json(await this._dispatch(ctx, 'webEditorSignalSetField', { path, field, value }), (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Set, change or remove the PLC binding of a MODEL signal on ONE CONNECT interface (MQTT: in one topic). Addresses live in CONNECT, never in the model. Omit protocolAddress where the interface needs none (MQTT Single/Json topic, PLCSIM/SHM/ABB name fallback); remove=true unbinds.', { readOnly: false, command: 'editor.signalSetBinding' })
+  async webEditorSignalSetBinding(
+    @McpParam('name', 'Model signal name (runtime name = the CONNECT signal name).') name: string,
+    @McpParam('interfaceId', 'CONNECT interface id.') interfaceId: string,
+    @McpParam('topic', 'MQTT topic container; omit for the interface-level signal list.', 'string', false) topic: string,
+    @McpParam('protocolAddress', 'Protocol address (DB10.DBX4.1, ns=2;s=Motor1.Speed, %IW13, …).', 'string', false) protocolAddress: string,
+    @McpParam('dataType', 'Data type as the interface schema spells it (Bool, Real, DINT, …).', 'string', false) dataType: string,
+    @McpParam('remove', 'Remove the binding instead of writing it.', 'boolean', false) remove: boolean,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    // plan-589 F4: a view of `editor.signalSetBinding` — the inspector's "PLC binding" rows are the
+    // others. Single signal, single interface; an atomic multi-write is plan-590.
+    return this._json(
+      await this._dispatch(ctx, 'webEditorSignalSetBinding',
+        { name, interfaceId, topic, protocolAddress, dataType, remove }),
+      (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Create model signals for an interface\'s plc-only signals (see web_signal_reconcile). Name verbatim, dataType becomes OriginDataType; Text/String is unsupported and skipped.', { readOnly: false, command: SIGNALS_CREATE_FROM_INTERFACE_COMMAND })
+  async webEditorSignalsCreateFromInterface(
+    @McpParam('interfaceId', 'CONNECT interface id.') interfaceId: string,
+    @McpParam('parentPath', 'Parent node; omit = selection.', 'string', false) parentPath: string,
+    @McpParam('names', 'Only these names, comma separated; omit = all creatable.', 'string', false) names: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    // plan-589 F7: a view of `editor.signalsCreateFromInterface` — the ConnectPanel button and the
+    // Problems entry's action are the others.
+    return this._json(
+      await this._dispatch(ctx, 'webEditorSignalsCreateFromInterface', { interfaceId, parentPath, names }),
+      (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Rename a PLC signal with every reference (model, overlay, planner, historian, CONNECT). dryRun=true returns the preview (steps, blockers, wireChanges); wire effects need confirmWireChange=true. One undo step.', { readOnly: false, command: SIGNAL_RENAME_COMMAND })
+  async webEditorSignalRename(
+    @McpParam('path', 'Signal node path.') path: string,
+    @McpParam('newName', 'New signal name.') newName: string,
+    @McpParam('dryRun', 'Preview only.', 'boolean', false) dryRun: boolean,
+    @McpParam('confirmWireChange', 'Accept wire name changes.', 'boolean', false) confirmWireChange: boolean,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    // plan-590 F10: a view of `editor.signalRename` — the inspector's rename dialog is the other.
+    return this._json(
+      await this._dispatch(ctx, 'webEditorSignalRename', { path, newName, dryRun, confirmWireChange }),
+      (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Retry what a failed signal rename could not restore (Problems "Repair").', { readOnly: false, command: SIGNAL_RENAME_REPAIR_COMMAND })
+  async webEditorSignalRenameRepair(
+    @McpParam('journalId', 'Journal id from the Problems entry.') journalId: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    // plan-590 F7: a view of `editor.signalRenameRepair` — the Problems entry's action is the other.
+    return this._json(await this._dispatch(ctx, 'webEditorSignalRenameRepair', { journalId }), (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Ask CONNECT again for a signal rename with an unknown outcome (Problems "Re-check").', { readOnly: false, command: SIGNAL_RENAME_RECHECK_COMMAND })
+  async webEditorSignalRenameRecheck(
+    @McpParam('journalId', 'Journal id from the Problems entry.') journalId: string,
+    ctx?: McpCallContext,
+  ): Promise<string> {
+    // plan-590 F7: a view of `editor.signalRenameRecheck` — the Problems entry's action is the other.
+    return this._json(await this._dispatch(ctx, 'webEditorSignalRenameRecheck', { journalId }), (v) => ({ ok: true, ...v }));
+  }
+
+  @McpTool('Add a LogicStep to a node (Quick Edit "Logic Steps"). Unknown stepType returns the palette. Steps sequence one-per-node; a node that already has a step gets a sibling.', { readOnly: false, command: 'editor.addLogicStep' })
   async webEditorAddLogicStep(
     @McpParam('path', 'Context node path.') path: string,
     @McpParam('stepType', 'LogicStep type (e.g. LogicStep_DriveTo).') stepType: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const mods = await this._load();
-    if (!mods.create.LOGIC_STEP_PALETTE.some((s) => s.type === stepType)) {
-      return JSON.stringify({
-        error: `Unknown stepType "${stepType}"`,
-        palette: mods.create.LOGIC_STEP_PALETTE,
-      });
-    }
-    if (!ctx.viewer.registry?.getNode(path)) return JSON.stringify({ error: `Node not found: ${path}` });
-    const qe = mods.quickEdit.computeQuickEditContext(ctx.viewer, {
-      selectedPaths: [path], primaryPath: path,
-    });
-    await mods.create.addLogicStep(ctx.viewer, ctx.doc, qe, stepType);
-    return JSON.stringify({ ok: true, path: ctx.viewer.selectionManager.getSnapshot().primaryPath ?? path });
+    // plan-499 Phase 4: a view of `editor.addLogicStep` — the Quick Edit starter
+    // and palette buttons are the others (same container rule; an unknown type
+    // still answers with the palette, now as refusal details).
+    return this._json(await this._dispatch(ctx, 'webEditorAddLogicStep', { path, stepType }), (v) => ({ ok: true, ...v }));
   }
 
   // ═══ Shortcuts ════════════════════════════════════════════════════════
@@ -2142,20 +2059,32 @@ export class McpEditorTools {
     'CTRL+Z': 'Undo',
     'CTRL+Y': 'Redo',
     'ESCAPE': 'Clear selection',
+    'SHIFT+Z': 'Toggle the wireframe view (arg "on" / "off" sets it explicitly); state is web_editor_status.wireframe',
   };
 
-  @McpTool('Run an editor keyboard shortcut on the CURRENT selection, exactly as a user would: "S>I" select identical, "S>M" same material, "S>V" invert, "K" + arg=name assign to kinematic, "H" hide, "Shift+H" show, "Delete", "Ctrl+Z"/"Ctrl+Y" undo/redo, "Escape" clear. Unknown keys return the table. Chain e.g. S>I then web_editor_assign_material (paths omitted = selection).', { readOnly: false })
+  @McpTool('Run an editor keyboard shortcut on the CURRENT selection, exactly as a user would: "S>I" select identical, "S>M" same material, "S>V" invert, "K" + arg=name assign to kinematic, "H" hide, "Shift+H" show, "Delete", "Ctrl+Z"/"Ctrl+Y" undo/redo, "Escape" clear, "Shift+Z" wireframe view (arg "on"/"off" sets it, omitted toggles). Unknown keys return the table. Chain e.g. S>I then web_editor_assign_material (paths omitted = selection).', { readOnly: false, command: SHORTCUT_BINDING })
   async webEditorShortcut(
     @McpParam('keys', 'Shortcut, e.g. "S>I", "K", "H", "Ctrl+Z".') keys: string,
-    @McpParam('arg', 'Argument for shortcuts that need one (K: kinematic/group name).', 'string', false) arg: string,
+    @McpParam('arg', 'Argument for shortcuts that take one (K: kinematic/group name; Shift+Z: "on" or "off").', 'string', false) arg: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const v = ctx.viewer;
-    const sm = v.selectionManager;
-    const combo = (keys || '').toUpperCase().replace(/\s+/g, '').replace(/BACKSPACE/, 'DELETE');
-    const selection = [...sm.getSnapshot().selectedPaths];
-    const mods = await this._load();
+    // plan-499 F6: a multiplexer over SHORTCUT_BINDING — every combo is a branch
+    // to the command the real key triggers; the local switch is gone.
+    const call = ctx ?? bindStandalone(this, 'webEditorShortcut', { keys, arg }, this.viewer);
+    const combo = normalizeShortcutKeys(keys);
+    if (!call.bound && !call.refusal) {
+      const guard = this._ctx();
+      if (isGuardError(guard)) return JSON.stringify(guard);
+      return JSON.stringify({
+        ...(combo ? { error: `Unknown shortcut "${keys}"` } : {}),
+        shortcuts: McpEditorTools.SHORTCUTS,
+      });
+    }
+    if (!call.bound) {
+      // A matched branch refused (K without a name): answer with the existing names.
+      const v = this.viewer;
+      return JSON.stringify({ error: call.refusal, ...(v ? { existing: await this._kinematicNames(v) } : {}) });
+    }
 
     // Show the same on-screen key badge a human keypress produces, chord
     // steps paced like real typing — the shortcut should read as "the user
@@ -2170,66 +2099,24 @@ export class McpEditorTools {
       }
     } catch { /* badge is cosmetic — never block the shortcut */ }
 
-    const needSelection = (): string | null =>
-      selection.length === 0 ? 'Nothing selected — select first (web_select / web_view_pick)' : null;
-
-    switch (combo) {
-      case 'S>I': case 'S>M': case 'S>V': {
-        const err = combo === 'S>V' ? null : needSelection();
-        if (err) return JSON.stringify({ error: err });
-        const universe = buildMeshUniverse(v);
-        let result: string[];
-        if (combo === 'S>V') {
-          result = computeInvertPaths(universe, selection);
-        } else {
-          const seeds = expandToUniverseMeshes(universe, selection);
-          if (seeds.size === 0) return JSON.stringify({ error: 'Selection contains no selectable meshes' });
-          result = combo === 'S>I'
-            ? computeIdenticalPaths(universe, seeds)
-            : computeSameMaterialPaths(universe, seeds);
-        }
-        sm.selectPaths(result);
-        return JSON.stringify({ shortcut: combo, selected: result.length });
-      }
-      case 'K': case 'K>NAME': {
-        const err = needSelection();
-        if (err) return JSON.stringify({ error: err });
-        const name = arg?.trim();
-        if (!name) {
-          return JSON.stringify({
-            error: 'K needs arg = kinematic/group name',
-            existing: await this._kinematicNames(v),
-          });
-        }
-        await mods.group.groupSelection(v, ctx.doc, selection, name);
-        const kinPath = findKinematicPathForGroup(v, name);
-        return JSON.stringify({ shortcut: 'K', groupName: name, kinematicPath: kinPath });
-      }
-      case 'H': case 'SHIFT+H': {
-        const err = needSelection();
-        if (err) return JSON.stringify({ error: err });
-        const visible = combo === 'SHIFT+H';
-        for (const p of selection) ctx.doc.setNodeVisible(p, visible);
-        await ctx.doc.whenIdle();
-        return JSON.stringify({ shortcut: combo, changed: selection.length, visible });
-      }
-      case 'DELETE': {
-        const err = needSelection();
-        if (err) return JSON.stringify({ error: err });
-        await mods.del.deleteSelectedNodes(v, ctx.doc);
-        return JSON.stringify({ shortcut: 'Delete', deleted: selection.length });
-      }
-      case 'CTRL+Z': return this.webEditorUndo(1);
-      case 'CTRL+Y': case 'CTRL+SHIFT+Z': return this.webEditorRedo(1);
-      case 'ESCAPE': {
-        sm.clear();
+    const r = await dispatchBoundCommand<Record<string, unknown>>(call, this.viewer);
+    if (!r.ok) return JSON.stringify(commandErrorJson(r));
+    const v = r.value ?? {};
+    switch (call.bound.id) {
+      case 'editor.assignToKinematic':
+        return JSON.stringify({ shortcut: 'K', groupName: v['groupName'], kinematicPath: v['kinematicPath'] });
+      case 'editor.hide': case 'editor.show':
+        return JSON.stringify({ shortcut: combo, changed: v['changed'], visible: v['visible'] });
+      case 'editor.delete':
+        return JSON.stringify({ shortcut: 'Delete', deleted: v['deleted'] });
+      case 'editor.undo': case 'editor.redo':
+        return JSON.stringify(v);
+      case 'selection.clear':
         return JSON.stringify({ shortcut: 'Escape', selected: 0 });
-      }
+      case 'editor.wireframe':
+        return JSON.stringify({ shortcut: 'Shift+Z', wireframe: v['wireframe'] });
       default:
-        return JSON.stringify({
-          ...(combo ? { error: `Unknown shortcut "${keys}"` } : {}),
-          shortcuts: McpEditorTools.SHORTCUTS,
-        });
+        return JSON.stringify({ shortcut: combo, selected: v['selected'] });
     }
   }
 
@@ -2301,7 +2188,7 @@ export class McpEditorTools {
     return groups;
   }
 
-  @McpTool('Assign a material to nodes (undoable, like the Materials panel): presetId (from web_editor_material_presets) OR free PBR values (color hex + metalness/roughness/opacity). Omit paths to paint the CURRENT selection — e.g. after web_editor_shortcut "S>I". Expands to paintable meshes automatically.', { readOnly: false })
+  @McpTool('Assign a material to nodes (undoable, like the Materials panel): presetId (from web_editor_material_presets) OR free PBR values (color hex + metalness/roughness/opacity). Omit paths to paint the CURRENT selection — e.g. after web_editor_shortcut "S>I". Expands to paintable meshes automatically.', { readOnly: false, command: 'editor.assignMaterial' })
   async webEditorAssignMaterial(
     @McpParam('paths', 'Node paths, comma/newline-separated (omit = current selection).', 'string', false) paths: string,
     @McpParam('presetId', 'Material preset id (e.g. "steel").', 'string', false) presetId: string,
@@ -2309,44 +2196,12 @@ export class McpEditorTools {
     @McpParam('metalness', 'Metalness 0..1 (default 0).', 'number', false) metalness: number,
     @McpParam('roughness', 'Roughness 0..1 (default 0.5).', 'number', false) roughness: number,
     @McpParam('opacity', 'Opacity 0..1 (default 1).', 'number', false) opacity: number,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    let list = parsePathsParam(paths ?? '');
-    if (list.length === 0) list = [...ctx.viewer.selectionManager.getSnapshot().selectedPaths];
-    if (list.length === 0) {
-      return JSON.stringify({ error: 'No paths given and nothing selected — pass paths or select first (web_select / web_editor_shortcut "S>I")' });
-    }
-    const value = await this._resolveMaterialValue(presetId, color, metalness, roughness, opacity);
-    if ('error' in value) return JSON.stringify(value);
-    ctx.doc.setMaterial(list, value);
-    await ctx.doc.whenIdle();
-    return JSON.stringify({ ok: true, applied: value.name, paths: list.length });
-  }
-
-  private async _resolveMaterialValue(
-    presetId?: string, color?: string, metalness?: number, roughness?: number, opacity?: number,
-  ): Promise<MaterialValue | { error: string }> {
-    const mods = await this._load();
-    if (presetId) {
-      const all = [...mods.presets.BUILTIN_MATERIAL_PRESETS, ...mods.presets.loadCustomPresets()];
-      const p = all.find((x) => x.id === presetId);
-      if (!p) return { error: `Unknown presetId "${presetId}" — see web_editor_material_presets` };
-      const { id: _id, category: _cat, ...value } = p;
-      return value;
-    }
-    if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) {
-      return { error: 'Pass presetId, or a hex color like "#8a8f94" for a free PBR value' };
-    }
-    const op = typeof opacity === 'number' && !Number.isNaN(opacity) ? Math.min(Math.max(opacity, 0), 1) : 1;
-    return {
-      name: 'Custom',
-      color,
-      metalness: clamp01(metalness, 0),
-      roughness: clamp01(roughness, 0.5),
-      opacity: op,
-      transparent: op < 1,
-    };
+    return this._json(
+      await this._dispatch(ctx, 'webEditorAssignMaterial', { paths, presetId, color, metalness, roughness, opacity }),
+      (v) => ({ ok: true, ...v }),
+    );
   }
 
   // ═══ Compounds ════════════════════════════════════════════════════════
@@ -2431,82 +2286,46 @@ export class McpEditorTools {
     });
   }
 
-  @McpTool('MATERIALIZE: call with no assignments to get the appearance groups (same as web_editor_material_stats), then call again with assignmentsJson = [{"key"|"samplePath": ..., "presetId"|"color"(+metalness/roughness/opacity): ...}, ...] to re-material whole appearance groups in ONE undo step.', { readOnly: false, timeoutMs: 60_000 })
+  @McpTool('MATERIALIZE: call with no assignments to get the appearance groups (same as web_editor_material_stats), then call again with assignmentsJson = [{"key"|"samplePath": ..., "presetId"|"color"(+metalness/roughness/opacity): ...}, ...] to re-material whole appearance groups in ONE undo step.', { readOnly: false, timeoutMs: 60_000, command: 'editor.materialize' })
   async webEditorMaterialize(
     @McpParam('assignmentsJson', 'JSON array of {key|samplePath, presetId|color,metalness,roughness,opacity}.', 'string', false) assignmentsJson: string,
+    ctx?: McpCallContext,
   ): Promise<string> {
-    const ctx = this._ctx();
-    if (isGuardError(ctx)) return JSON.stringify(ctx);
-    const root = ctx.viewer.currentModelRoot ?? null;
+    // The LISTING call (no assignments) is a read: it answers the appearance
+    // groups without dispatching — nothing is pressed, nothing changes.
     if (!assignmentsJson?.trim()) {
-      return JSON.stringify({ groups: this._appearanceGroups(root) });
+      const guard = this._ctx();
+      if (isGuardError(guard)) return JSON.stringify(guard);
+      return JSON.stringify({ groups: this._appearanceGroups(guard.viewer.currentModelRoot ?? null) });
     }
-    let assignments: Array<Record<string, unknown>>;
-    try {
-      const parsed = JSON.parse(assignmentsJson);
-      if (!Array.isArray(parsed)) throw new Error();
-      assignments = parsed as Array<Record<string, unknown>>;
-    } catch {
-      return JSON.stringify({ error: 'assignmentsJson must be a JSON array' });
-    }
-
-    const index = indexMeshPathsByMaterialValue(root);
-    const applied: Array<Record<string, unknown>> = [];
-    const skipped: Array<Record<string, unknown>> = [];
-    const resolved: Array<{ meshPaths: string[]; value: MaterialValue }> = [];
-
-    for (const a of assignments) {
-      // Resolve the target appearance group.
-      let key = typeof a['key'] === 'string' ? (a['key'] as string) : null;
-      const samplePath = typeof a['samplePath'] === 'string' ? (a['samplePath'] as string) : null;
-      if (!key && samplePath) {
-        const node = ctx.viewer.registry?.getNode(samplePath);
-        const value = node ? materialToValue((node as import('three').Mesh).material as import('three').Material) : null;
-        key = value ? materialValueKey(value) : null;
-      }
-      const meshPaths = key ? index.get(key) : undefined;
-      if (!key || !meshPaths?.length) {
-        skipped.push({ ...a, reason: 'appearance group not found' });
-        continue;
-      }
-      const value = await this._resolveMaterialValue(
-        a['presetId'] as string | undefined,
-        a['color'] as string | undefined,
-        a['metalness'] as number | undefined,
-        a['roughness'] as number | undefined,
-        a['opacity'] as number | undefined,
-      );
-      if ('error' in value) {
-        skipped.push({ ...a, reason: value.error });
-        continue;
-      }
-      resolved.push({ meshPaths, value });
-      applied.push({ key, material: value.name, meshCount: meshPaths.length });
-    }
-
-    if (resolved.length > 0) {
-      await ctx.doc.withTransaction('Materialize', async () => {
-        for (const r of resolved) ctx.doc.setMaterial(r.meshPaths, r.value);
-        await ctx.doc.whenIdle();
-      });
-      await ctx.doc.whenIdle();
-    }
-    return JSON.stringify({ ok: true, applied, skipped, undo: resolved.length > 0 ? 'One web_editor_undo reverts all assignments' : undefined });
+    return this._json(await this._dispatch(ctx, 'webEditorMaterialize', { assignmentsJson }), (v) => ({ ok: true, ...v }));
   }
 
   // ═══ Verify ═══════════════════════════════════════════════════════════
 
-  @McpTool('VERIFY a drive visually before saving — performed like a user would: selects the axis (gizmo + group highlight appear), frames a fitted 3/4 view, then smoothly drags the drive through its range in the viewport while capturing N poses on the fly, springs back, and returns ONE labelled montage. Wrong axis/pivot/membership is immediately visible. Defaults: limits when UseLimits, else ±180° rotary / ±500mm linear around home.', { readOnly: false, timeoutMs: 60_000 })
+  // readOnly stays FALSE: the drive itself is moved, not just a camera. The
+  // captures went offscreen with plan-740 P3.5 and the tool no longer touches
+  // the viewport — but it still drags the axis through its range and selects it,
+  // and CONNECT takes `readOnlyHint` blind for its write gate (D-A8 / I2).
+  @McpTool('VERIFY a drive visually before saving — performed like a user would: selects the axis (gizmo + group highlight appear), aims the AGENT camera at a fitted 3/4 view of the swept volume, then smoothly drags the drive through its range while rendering N poses offscreen, springs back, and returns ONE labelled montage cropped to the sweep volume. Wrong axis/pivot/membership is immediately visible. The user viewport is never moved. Defaults: limits when UseLimits, else ±180° rotary / ±500mm linear around home. Requires the classic WebGL renderer.', { readOnly: false, timeoutMs: 60_000 })
   async webEditorVerifyDrive(
     @McpParam('kinematicPath', 'Path of the node carrying the Drive (usually the kinematic axis).') kinematicPath: string,
     @McpParam('from', 'Sweep start (mm or °).', 'number', false) from: number,
     @McpParam('to', 'Sweep end (mm or °).', 'number', false) to: number,
     @McpParam('frames', 'Number of poses 2..12 (default 6).', 'integer', false) frames: number,
-    @McpParam('keepView', 'Keep the camera where the tool framed it (default true).', 'boolean', false) keepView: boolean,
+    @McpParam('keepView', 'Keep the agent camera where the tool framed it and the axis selected (default true).', 'boolean', false) keepView: boolean,
+  ): Promise<string> {
+    return serializeEyeCapture(() => this._verifyDrive(kinematicPath, from, to, frames, keepView));
+  }
+
+  private async _verifyDrive(
+    kinematicPath: string, from: number, to: number, frames: number, keepView: boolean,
   ): Promise<string> {
     const ctx = this._ctx();
     if (isGuardError(ctx)) return JSON.stringify(ctx);
     const v = ctx.viewer;
+    const guard = guardAgentCapture(v, 'web_editor_verify_drive');
+    if (guard) return JSON.stringify({ error: guard });
     const node = v.registry?.getNode(kinematicPath);
     if (!node) return JSON.stringify({ error: `Node not found: ${kinematicPath}` });
     const mods = await this._load();
@@ -2545,16 +2364,22 @@ export class McpEditorTools {
       }
       driver.cancel(dragCtx); // back to home before anything is visible
 
-      // 3. Frame a fitted 3/4 view of the sweep volume (animated), so both the
-      // watching user and the captures get a readable angle.
+      // 3. Aim the AGENT at a fitted 3/4 view of the sweep volume — instantly
+      // (plan-740 D-A7). The old code animated the VIEWPORT there and waited a
+      // second for it to arrive, which took a watching operator's view away for
+      // the whole verification. Same angle and standoff, no flight, no wait.
       if (!union.isEmpty()) {
         const center = union.getCenter(new Vector3());
         const size = union.getSize(new Vector3());
         const maxDim = Math.max(size.x, size.y, size.z, 0.1);
         const dist = maxDim * 2.1;
-        const pos = center.clone().add(new Vector3(0.7, 0.5, 0.7).normalize().multiplyScalar(dist));
-        v.animateCameraTo(pos, center, 0.9, 'easeInOut');
-        await sleep(1000);
+        const dir = new Vector3(0.7, 0.5, 0.7).normalize();
+        const eye = v.agentEye;
+        eye?.ensure();
+        eye?.setPose({
+          px: center.x + dir.x * dist, py: center.y + dir.y * dist, pz: center.z + dir.z * dist,
+          tx: center.x, ty: center.y, tz: center.z,
+        });
       }
 
       // 4. Drag the gizmo like a user: glide between sample positions with
@@ -2569,9 +2394,14 @@ export class McpEditorTools {
           await sleep(GLIDE_WAIT_MS);
         }
         prev = p;
-        const r = captureFrameCanvas(v, { worldBox: union.isEmpty() ? undefined : union, maxDim: 640 });
+        const r = await renderAgentChannels(v, {
+          size: 640, channels: ['beauty'],
+          ...(union.isEmpty() ? {} : { crop: union }),
+        });
         if ('error' in r) return JSON.stringify({ error: r.error });
-        shots.push(r.canvas);
+        const beauty = r.channels.find((c) => c.channel === 'beauty');
+        if (!beauty) return JSON.stringify({ error: 'Beauty channel missing' });
+        shots.push(beauty.canvas);
         labels.push(`${+p.toFixed(1)}${unit}`);
       }
 
@@ -2589,7 +2419,7 @@ export class McpEditorTools {
     return canvasToRvImage(mont, {
       drive: { path: kinematicPath, rotary, from: r3(p0), to: r3(p1), frames: n, unit },
       restored: true,
-    });
+    }, 'web_editor_verify_drive');
   }
 
   // ═══ Imports ══════════════════════════════════════════════════════════
@@ -2634,7 +2464,10 @@ export class McpEditorTools {
       const file = new File([read.bytes], read.name);
       const result = await provider.importFile(file, quality?.trim() || 'standard');
       const rootPath = await ctx.doc.importCad(result);
-      return JSON.stringify({ ok: true, rootPath });
+      // plan-561: non-fatal notes (e.g. CONNECT failed, converted in the browser —
+      // colours may be incomplete) reach the agent instead of a console line.
+      const warnings = result.warnings ?? [];
+      return JSON.stringify(warnings.length > 0 ? { ok: true, rootPath, warnings } : { ok: true, rootPath });
     } catch (e) {
       return JSON.stringify({ error: String(e) });
     }

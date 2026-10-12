@@ -52,7 +52,6 @@ describe('resolveStrategy — fallback matrix', () => {
   const base = {
     outlineAvailable: true,
     hasRenderedMesh: true,
-    proxyAvailable: false,
     meshCount: 5,
     maxMeshes: 200,
   };
@@ -60,11 +59,6 @@ describe('resolveStrategy — fallback matrix', () => {
   it('overlay profile never resolves to outline, even with rendered meshes', () => {
     expect(resolveStrategy({ ...base, desired: 'overlay' }))
       .toEqual({ strategy: 'overlay', fallback: false });
-  });
-
-  it('overlay profile takes fill-proxy when the proxy is available', () => {
-    expect(resolveStrategy({ ...base, desired: 'overlay', proxyAvailable: true }))
-      .toEqual({ strategy: 'fill-proxy', fallback: false });
   });
 
   it('overlay profile caps at bbox above the mesh budget (fallback)', () => {
@@ -87,9 +81,7 @@ describe('resolveStrategy — fallback matrix', () => {
       .toEqual({ strategy: 'overlay', fallback: true });
   });
 
-  it('outline fallback still honors the proxy and the bbox cap', () => {
-    expect(resolveStrategy({ ...base, desired: 'outline', hasRenderedMesh: false, proxyAvailable: true }))
-      .toEqual({ strategy: 'fill-proxy', fallback: true });
+  it('outline fallback still honors the bbox cap', () => {
     expect(resolveStrategy({ ...base, desired: 'outline', outlineAvailable: false, meshCount: 500 }))
       .toEqual({ strategy: 'bbox', fallback: true });
   });

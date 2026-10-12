@@ -26,11 +26,26 @@ export interface CadImportResult {
   glb: ArrayBuffer;
   /** The CADLink extras to stamp on the imported root. */
   cadlink: CADLinkExtras;
+  /**
+   * Visible, non-fatal notes about the import (e.g. "CONNECT conversion failed, converted in
+   * the browser — colours may be incomplete"). Absent or empty = nothing to report (plan-561).
+   */
+  warnings?: string[];
+}
+
+/** Options of {@link CadGeometryProvider.importFile}. */
+export interface CadImportOptions {
+  /**
+   * Force a converter (plan-561). A CADLink re-import passes the converter the original was
+   * made with so the tree stays identical. Absent = the provider chooses (STEP: CONNECT when a
+   * gateway reports the service, else the browser). Providers with a single converter ignore it.
+   */
+  converter?: 'connect' | 'browser';
 }
 
 export interface CadGeometryProvider {
   /** Convert a fresh CAD file to GLB (used by import and CADLink re-import). */
-  importFile(file: File, quality: string): Promise<CadImportResult>;
+  importFile(file: File, quality: string, opts?: CadImportOptions): Promise<CadImportResult>;
 
   /**
    * Re-convert previously imported geometry from the provider's cached ORIGINAL
@@ -38,7 +53,9 @@ export interface CadGeometryProvider {
    * GLB bytes (and re-populates the GLB cache), or null when the source bytes
    * are gone too — callers then surface a re-pick prompt.
    *
-   * Optional: a provider without a source cache simply omits it.
+   * Optional: a provider without a source cache simply omits it. A provider that cannot
+   * reach the converter recorded in `cadlink.Converter` THROWS (with a user-facing message)
+   * instead of switching converters — the replay records the message as the miss reason.
    */
   retessellate?(cadlink: CADLinkExtras): Promise<ArrayBuffer | null>;
 }

@@ -41,6 +41,9 @@ export interface PlaybackLike {
 /** Slice of RVLogicEngine the pipeline drives. */
 export interface LogicEngineLike {
   readonly activeOnly: ActiveOnly;
+  /** plan-538: per-root `Active` transitions for the connection state. Optional
+   *  so plain test fakes can omit it. Runs even while `activeOnly` is closed. */
+  updateConnection?(isConnected: boolean): void;
   fixedUpdate(dt: number): void;
 }
 
@@ -62,6 +65,9 @@ export interface DriveLike {
   readonly jogForward: boolean;
   readonly jogBackward: boolean;
   readonly isTransportSurface: boolean;
+  /** A behavior claimed the axis AND moved it this tick (RVDrive getter).
+   *  Optional so plain test fakes can omit it. */
+  readonly claimedMoveThisTick?: boolean;
   update(dt: number): void;
 }
 
@@ -140,6 +146,16 @@ export class CoreSubsystems {
   }
 
   /**
+   * Geometry was moved outside the drive loop (e.g. DES tweens writing vehicle
+   * or MU transforms) — request a render and a shadow refresh. Without it the
+   * on-demand render loop only repaints on the next user input.
+   */
+  markGeometryMoved(): void {
+    this.host.markRenderDirty();
+    this.host.markShadowsDirty();
+  }
+
+  /**
    * Pre-PRE subsystems: playback → LogicStep engine → IK path replay →
    * ReplayRecordings. Runs BEFORE the TickStage.PRE plugin hooks (interfaces
    * flush incoming PLC signals there), exactly as the legacy fixedUpdate did.
@@ -154,9 +170,14 @@ export class CoreSubsystems {
       h.playback.update(dt);
     }
 
-    // LogicStep engine — guarded by Active
-    if (h.logicEngine && isActiveForState(h.logicEngine.activeOnly, isConnected)) {
-      h.logicEngine.fixedUpdate(dt);
+    // LogicStep engine. plan-538: the per-root `Active` transitions (start /
+    // stop of virtual-PLC roots on a connection change) are processed FIRST and
+    // independently of the engine-wide guard — a closed guard must not hide a
+    // transition. Only the tick itself is guarded.
+    const logic = h.logicEngine;
+    if (logic) {
+      logic.updateConnection?.(isConnected);
+      if (isActiveForState(logic.activeOnly, isConnected)) logic.fixedUpdate(dt);
     }
 
     // Robot IK path replay engine — runs after LogicStep (so LogicStep-started
@@ -184,7 +205,9 @@ export class CoreSubsystems {
 
     for (const drive of h.drives) {
       drive.update(dt);
-      if (drive.isRunning || drive.positionOverwrite) {
+      // `claimedMoveThisTick`: a behavior (Drive_FollowPosition) wrote the
+      // position without arming physics — only true on ticks where it moved.
+      if (drive.isRunning || drive.positionOverwrite || drive.claimedMoveThisTick) {
         h.markRenderDirty();
         // TransportSurface drives don't move geometry — only belt speed changes.
         // Positioning drives can jog too and must refresh their moving shadows.

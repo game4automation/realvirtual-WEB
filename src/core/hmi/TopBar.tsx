@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useEffect, useSyncExternalStore, useRef } from 'react';
+import { useState, useEffect, useSyncExternalStore, useRef, type ReactElement } from 'react';
 import { useEditorPlugin } from '../../hooks/use-editor-plugin';
 import { Typography, Box, Paper } from '@mui/material';
-import { Layers } from '@mui/icons-material';
+import { Layers, MoreHoriz, ViewInAr } from '@mui/icons-material';
 import { useMobileLayout, isMobileDevice } from '../../hooks/use-mobile-layout';
 import { useViewer } from '../../hooks/use-viewer';
 import { useMode } from '../../hooks/use-mode';
@@ -16,9 +16,16 @@ import { useLeftWindowWidth, useRightWindowWidth } from '../../hooks/use-left-wi
 import { useViewportInsets } from '../../hooks/use-viewport-insets';
 import { useUIVisible } from './ui-context-store';
 import { ModeDropdown } from './ModeDropdown';
-import { CameraBookmarks, HmiToggleButton, FpvBarButton, FollowCamButton, SitOnCamButton } from './CameraBar';
+import {
+  useCameraSegments, useFollowSegments, HmiToggleButton,
+  useFpvActive, useFpvToggle, FPV_ICON,
+} from './CameraBar';
 import { useOverlayVisibilityState } from '../../hooks/use-overlay-visible';
-import { ActionGroupPill, ActionSegment, ActionDivider } from './action-group';
+import {
+  ActionGroupPill, ActionSegment, ActionDropdownSegment, withGroupDividers,
+  type ActionDropdownItem,
+} from './action-group';
+import { useRenderModeSegment } from './RenderModeBar';
 import { SettingsPanel } from './SettingsPanel';
 import { getSceneStore } from './scene/scene-store-singleton';
 import { MachineControlPanel } from './MachineControlPanel';
@@ -29,6 +36,15 @@ import {
 } from './left-panel-visibility';
 import { SlotRenderer } from './HMIShell';
 import { useSlot } from '../../hooks/use-slot';
+
+/**
+ * Bottom clearance of the view cluster below the mobile breakpoint: the docked
+ * tool row (44px targets + padding) the BottomBar also clears with its 56px,
+ * plus the cluster's usual 8px float gap.
+ */
+const MOBILE_DOCK_CLEARANCE = 56 + FLOATING_TOP_MARGIN;
+/** Right clearance below the mobile breakpoint: the search button (right 12, 40 wide) + gap. */
+const MOBILE_SEARCH_CLEARANCE = 12 + 40 + FLOATING_TOP_MARGIN;
 
 /**
  * Detect a left-panel slot that is "open" in the leftPanelManager but whose
@@ -76,6 +92,82 @@ export function orphanedLeftSlot(
   return null;
 }
 
+interface ViewOverflowOptions {
+  showVr: boolean;
+  showFpv: boolean;
+  vrOpen: boolean;
+  onToggleVr: () => void;
+}
+
+/**
+ * The cluster's overflow segment (plan-578 F13/F14): everything a viewer uses
+ * now and then — VR/AR, First-Person, and whatever a plugin contributes through
+ * the `view-overflow` slot (Record video) — behind ONE upward dropdown instead
+ * of permanent segments.
+ *
+ * The mobile gates are OPTIONS and land in the entry LIST, and the slot counts
+ * as content too — so "nothing to offer" is no segment at all, never an empty
+ * menu. `VRModal` itself is untouched; only its opener moved in here.
+ */
+export function useViewOverflowSegment({ showVr, showFpv, vrOpen, onToggleVr }: ViewOverflowOptions): ReactElement | null {
+  // FPV's active state is needed while the menu is CLOSED, so the trigger can
+  // show that FPV is engaged.
+  const fpvActive = useFpvActive();
+  const toggleFpv = useFpvToggle();
+  const pluginRows = useSlot('view-overflow');
+  const items: ActionDropdownItem[] = [];
+  if (showVr) {
+    items.push({
+      key: 'vr',
+      icon: <ViewInAr />,
+      // A toggle row: the CHECK carries the state, so the label stays the name.
+      label: 'VR / AR',
+      kind: 'checkbox',
+      active: vrOpen,
+      onClick: onToggleVr,
+      testId: 'overflow-vr',
+    });
+  }
+  if (showFpv) {
+    items.push({
+      key: 'fpv',
+      icon: FPV_ICON,
+      label: 'First-Person View',
+      shortcut: 'F',
+      kind: 'checkbox',
+      active: fpvActive,
+      onClick: toggleFpv,
+      testId: 'overflow-fpv',
+    });
+  }
+  if (items.length === 0 && pluginRows.length === 0) return null;
+  // The tooltip names what is behind the dots — "More view options" told nobody.
+  // A plugin row contributes its entry's `label` (the slot's settings-tab field).
+  const names = [
+    ...pluginRows.map((e) => e.label).filter((l): l is string => !!l),
+    ...items.map((i) => (i.shortcut ? `${i.label} (${i.shortcut})` : i.label)),
+  ];
+  return (
+    <ActionDropdownSegment
+      key="view-overflow"
+      title={names.length > 0 ? names.join(' · ') : 'More view options'}
+      menuLabel="More view options"
+      icon={fpvActive ? FPV_ICON : vrOpen ? <ViewInAr /> : <MoreHoriz />}
+      active={fpvActive || vrOpen}
+      items={items}
+      extraRows={pluginRows.length > 0 ? <SlotRenderer slot="view-overflow" /> : undefined}
+      buttonProps={{ 'data-testid': 'view-overflow-trigger', 'aria-label': 'More view options' }}
+    />
+  );
+}
+
+/** The overflow segment in its own pill — for a host that is not the view cluster. */
+export function ViewOverflowGroup(props: ViewOverflowOptions) {
+  const segment = useViewOverflowSegment(props);
+  if (!segment) return null;
+  return <ActionGroupPill>{segment}</ActionGroupPill>;
+}
+
 export function TopBar() {
   const viewer = useViewer();
   const [vrOpen, setVrOpen] = useState(false);
@@ -113,9 +205,13 @@ export function TopBar() {
   // plan-387: the TopBar itself stays mounted in the Viewer workspace — it hosts
   // Settings, the camera cluster and the Groups button, which are exactly what
   // the viewer keeps. Its AUTHORING children are gated one by one instead.
-  // The leading slot additionally carries plugin toolbars (Play/Pause, DES); the
-  // slot-level rules cover the known ones, this gate covers any that arrive later.
-  const showToolbarLeading = useUIVisible('toolbar-leading-slot', { hiddenIn: ['mode:viewer'] });
+  // The leading slot carries plugin toolbars (Play/Pause, DES, the Editor test
+  // run) and deliberately has NO mode rule here: each entry's own slot rule
+  // decides (SimControllerToolbar is hidden in des / hmi / editor, the DES and
+  // Editor toolbars are auto-gated to their mode by `modes`). The Viewer keeps
+  // Play/Pause/Reset/speed (2026-09-26, Thomas) — a blanket 'mode:viewer' here
+  // used to override that. The id stays as the user visibility setting.
+  const showToolbarLeading = useUIVisible('toolbar-leading-slot');
   const showPropertyInspector = useUIVisible('property-inspector', { hiddenIn: ['mode:viewer'] });
   const showAasDetail = useUIVisible('aas-detail-panel', { hiddenIn: ['mode:viewer'] });
   // The five gates that hide a panel owning a leftPanelManager slot. TopBar reads
@@ -129,6 +225,22 @@ export function TopBar() {
   const showConnectPanel = useUIVisible(CONNECT_PANEL_GATE.id, CONNECT_PANEL_GATE.rule);
   const showOrderPanel = useUIVisible(ORDER_PANEL_GATE.id, ORDER_PANEL_GATE.rule);
   const hasSimControls = useSlot('toolbar-button-leading').length > 0 && !modeLocked && showToolbarLeading;
+
+  // ── Bottom-right view cluster (plan-578) ──────────────────────────────
+  // The segment PRODUCERS hand over flat arrays of only the segments that are
+  // actually visible, and the dividers are interpolated over that list here
+  // (§2.7). A producer that returns nothing therefore contributes no divider —
+  // which is exactly what a `children`-walking helper could not guarantee.
+  const cameraSegments = useCameraSegments();
+  const followSegments = useFollowSegments();
+  const renderModeSegment = useRenderModeSegment();
+  const overflowSegment = useViewOverflowSegment({
+    showVr: !isMobile,
+    showFpv: !isMobileDevice(),
+    vrOpen,
+    onToggleVr: () => setVrOpen(!vrOpen),
+  });
+  const displayPanelReachable = (viewer.groups && viewer.groups.groupCount > 0) || overlayPresent;
 
   // leftPanelManager is the single source of truth for which left window is
   // open (the activity bar buttons drive it). The Hierarchy plugin and Settings
@@ -225,17 +337,34 @@ export function TopBar() {
             <SlotRenderer slot="toolbar-button-leading" />
           </ActionGroupPill>
         )}
+        {/* Status pills (e.g. the Simulation / PLC state) — set slightly apart
+            from the sim controls so they read as state, not as a control. */}
+        {hasSimControls && (
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, ml: 1, '&:empty': { display: 'none' } }}>
+            <SlotRenderer slot="toolbar-status" />
+          </Box>
+        )}
       </Box>
 
-      {/* Floating BOTTOM-right cluster — separate camera / view action groups,
-          each its own glassy pill (CAM bookmarks, HMI toggle, optional Groups,
-          FPV). Shifts left of an open right-docked window so it stays visible.
-          The orientation gizmo now owns the top-right corner. Hidden on mobile. */}
+      {/* Floating BOTTOM-right view cluster — ONE glass strip, one instrument
+          with sections instead of a row of separate pills:
+
+            [Follow · Sit-On] ┃ [Render ▾] ┃ [1 · 2 · +] ┃ [Eye · Display · ⋯]
+
+          Follow / Sit-On exist only while something followable is selected and
+          sit at the OUTER (left) end, so their arrival moves nothing the hand
+          already knows — the strip is right-anchored. Everything occasional
+          (Record video, VR/AR, First-Person) lives behind ⋯.
+
+          Shifts left of an open right-docked window so it stays visible. Below
+          the mobile breakpoint the tool row docks along the bottom edge and the
+          search button floats above it at the right, so the strip rises above
+          the dock and steps left of that button instead of hiding under them. */}
       <Box
         sx={{
           position: 'fixed',
-          bottom: FLOATING_TOP_MARGIN,
-          right: camRightOffset,
+          bottom: isMobile ? `calc(${MOBILE_DOCK_CLEARANCE}px + env(safe-area-inset-bottom, 0px))` : FLOATING_TOP_MARGIN,
+          right: isMobile ? Math.max(camRightOffset, MOBILE_SEARCH_CLEARANCE) : camRightOffset,
           zIndex: 1200,
           display: { xs: 'none', sm: 'flex' },
           alignItems: 'center',
@@ -244,58 +373,44 @@ export function TopBar() {
           '& > *': { pointerEvents: 'auto' },
         }}
       >
+        {/* Legacy plugin surface: a third-party pill still renders here, beside
+            the strip. Built-in occasional actions use `view-overflow` instead. */}
         <SlotRenderer slot="toolbar-button-trailing" />
-        <ActionGroupPill>
-          <CameraBookmarks />
-          {/* Follow / Sit-On sit next to the camera bookmarks. Right-click drag
-              for Sit-On look has no touch equivalent → desktop only. */}
-          {!isMobileDevice() && (
-            <>
-              <ActionDivider />
-              <FollowCamButton />
-              <ActionDivider />
-              <SitOnCamButton />
-            </>
-          )}
+        <ActionGroupPill role="toolbar" aria-label="View" data-testid="view-cluster">
+          {withGroupDividers([
+            // Sit-On's right-drag look has no touch equivalent → desktop only.
+            isMobileDevice() ? [] : followSegments,
+            renderModeSegment ? [renderModeSegment] : [],
+            cameraSegments,
+            [
+              <HmiToggleButton key="hmi-toggle" />,
+              ...(displayPanelReachable
+                ? [
+                    <ActionSegment
+                      key="display-panel"
+                      title="Toggle Display panel"
+                      active={viewer.groupsOverlayOpen}
+                      onClick={() => viewer.toggleGroupsOverlay()}
+                      icon={<Layers />}
+                      buttonProps={{ 'aria-pressed': !!viewer.groupsOverlayOpen }}
+                    />,
+                  ]
+                : []),
+              ...(overflowSegment ? [overflowSegment] : []),
+            ],
+          ])}
         </ActionGroupPill>
-        <ActionGroupPill><HmiToggleButton /></ActionGroupPill>
-        {((viewer.groups && viewer.groups.groupCount > 0) || overlayPresent) && (
-          <ActionGroupPill>
-            <ActionSegment
-              title="Toggle Display panel"
-              active={viewer.groupsOverlayOpen}
-              onClick={() => viewer.toggleGroupsOverlay()}
-              icon={<Layers />}
-            />
-          </ActionGroupPill>
-        )}
-        {/* VR/AR + First-Person share one action group. */}
-        {(() => {
-          const showVr = !isMobile;
-          const showFpv = !isMobileDevice();
-          if (!showVr && !showFpv) return null;
-          return (
-            <ActionGroupPill>
-              {showVr && (
-                <ActionSegment
-                  title={vrOpen ? 'Close VR/AR' : 'VR / AR'}
-                  active={vrOpen}
-                  onClick={() => setVrOpen(!vrOpen)}
-                  label="VR"
-                />
-              )}
-              {showVr && showFpv && <ActionDivider />}
-              {showFpv && <FpvBarButton />}
-            </ActionGroupPill>
-          );
-        })()}
       </Box>
 
       {/* Hierarchy browser panel (disabled on mobile, hidden when settings open) */}
       {showHierarchyBrowser && !isMobile && hierarchyOpen && !settingsOpen && <HierarchyBrowser viewer={viewer} />}
 
-      {/* Property inspector — docked: requires hierarchy open; detached: independent */}
-      {showPropertyInspector && !isMobile && !settingsOpen && pluginState.showInspector && pluginState.selectedNodePath
+      {/* Property inspector — docked: requires hierarchy open; detached: independent.
+          A path-less selection (a chunk mesh, a light — plan-754 D2) mounts it too:
+          the inspector renders its read-only runtime view, and for a chunk the
+          "Baked geometry" section (plan-505 F7). */}
+      {showPropertyInspector && !isMobile && !settingsOpen && pluginState.showInspector
+        && (pluginState.selectedNodePath || pluginState.selectedNode)
         && (hierarchyOpen || localStorage.getItem('rv-inspector-detached') === 'true')
         && <PropertyInspector viewer={viewer} />}
 

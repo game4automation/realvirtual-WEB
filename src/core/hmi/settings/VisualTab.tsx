@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import {
   Typography, Box, Button, ToggleButton, ToggleButtonGroup, Select, MenuItem, Switch,
   Dialog, DialogTitle, DialogContent, DialogActions, TextField, Tooltip,
@@ -13,17 +13,21 @@ import {
   loadVisualSettings, saveVisualSettings, setUIZoom,
   useSourceMarkersVisible,
   useToolbarShowLabels, setToolbarShowLabels,
-  TONE_MAPPING_OPTIONS, SHADOW_QUALITY_OPTIONS,
-  type VisualSettings, type ToneMappingType, type ShadowQuality, type ProjectionType,
+  TONE_MAPPING_OPTIONS, SHADOW_QUALITY_OPTIONS, FPS_CAP_OPTIONS,
+  type FpsCap, type VisualSettings, type ToneMappingType, type ShadowQuality, type ProjectionType,
   type AOMode,
 } from '../visual-settings-store';
 import {
-  listPresets, applyVisualPreset, captureCurrentPreset, savePreset, matchPreset,
+  listPresets, captureCurrentPreset, savePreset, matchPreset,
 } from '../visual-presets';
 import { markEnvironmentUserModified } from '../environment-presets';
+import { reloadHintSuppressedByTouch } from '../reload-hint-store';
 import { showInfoOverlay } from '../info-overlay-store';
 import { RENDER_MODES, getRenderMode, type RenderMode } from '../../rv-render-modes';
-import { STATIC_MERGE_LS_KEY, isStaticMeshMergingEnabled } from '../../engine/rv-static-merge-flag';
+import { commandRegistry } from '../rv-command-registry';
+import {
+  ensureViewCommandsRegistered, VIEW_RENDER_MODE_COMMAND, VIEW_VISUAL_PRESET_COMMAND,
+} from '../view-commands';
 import { SettingsSection, FieldRow, SliderRow } from './settings-helpers';
 
 /** Outer wrapper: remounts the body (via `key`) after a preset is applied so all
@@ -56,6 +60,7 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   const [shadowMapSize, setShadowMapSize] = useState<number>(settingsRef.current.shadowMapSize);
   const [shadowRadiusVal, setShadowRadiusVal] = useState<number>(settingsRef.current.shadowRadius);
   const [maxDpr, setMaxDpr] = useState<number>(settingsRef.current.maxDpr);
+  const [fpsCap, setFpsCap] = useState<FpsCap>(settingsRef.current.fpsCap);
   const [aoMode, setAoMode] = useState<AOMode>(settingsRef.current.aoMode);
   const [ssaoInt, setSsaoInt] = useState<number>(settingsRef.current.ssaoIntensity);
   const [ssaoRad, setSsaoRad] = useState<number>(settingsRef.current.ssaoRadius);
@@ -100,6 +105,7 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   const toolbarShowLabels = useToolbarShowLabels();
   const settingsLocked = isSettingsLocked();
   const [driveAxisGizmoOn, setDriveAxisGizmoOn] = useState<boolean>(settingsRef.current.showDriveAxisGizmo);
+  const [agentEyeOn, setAgentEyeOn] = useState<boolean>(settingsRef.current.showAgentEye);
 
   const updateSourceMarkersVisible = (_: unknown, v: boolean): void => {
     viewer.setSourceMarkersVisible(v);
@@ -113,39 +119,47 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   const updateDriveAxisGizmo = (_: unknown, v: boolean): void => {
     viewer.showDriveAxisGizmo = v; setDriveAxisGizmoOn(v); persist({ showDriveAxisGizmo: v });
   };
+
+  // plan-740 — the AI agent's camera-body cone. Routed through the plugin (not
+  // a viewer property) because the plugin owns the gizmo and the attach state.
+  const updateAgentEye = (_: unknown, v: boolean): void => {
+    viewer.getPlugin<{ id: string; setShowAgentEye?: (s: boolean) => void }>('agent-eye')?.setShowAgentEye?.(v);
+    setAgentEyeOn(v);
+    persist({ showAgentEye: v });
+  };
   const persistMode = () => persist({ modeSettings: { ...settingsRef.current.modeSettings } });
 
-  const updateMode = (newMode: RenderMode) => {
-    // Save current values into old mode
-    const old = settingsRef.current.modeSettings[mode];
-    old.lightIntensity = lightInt; old.toneMapping = toneMap; old.toneMappingExposure = exposure;
-    old.ambientColor = ambColor; old.ambientIntensity = ambInt;
-    old.dirLightEnabled = dirEnabled; old.dirLightColor = dirColor; old.dirLightIntensity = dirInt;
-    old.shadowEnabled = shadowOn; old.shadowIntensity = shadowInt; old.shadowQuality = shadowQual;
-    // Switch mode. Apply the per-mode lighting values BEFORE viewer.renderMode so
-    // the manager's applyLightingMode doesn't reset them. The renderMode setter
-    // itself gates AO / bloom / shadows by the mode's capabilities, so we don't
-    // toggle those manually here.
-    setMode(newMode);
-    const ms = settingsRef.current.modeSettings[newMode];
-    viewer.toneMapping = ms.toneMapping;
-    viewer.toneMappingExposure = ms.toneMappingExposure;
-    viewer.ambientColor = ms.ambientColor;
-    viewer.ambientIntensity = ms.ambientIntensity;
-    viewer.dirLightColor = ms.dirLightColor;
-    viewer.dirLightIntensity = ms.dirLightIntensity;
-    viewer.shadowIntensity = ms.shadowIntensity;
-    viewer.shadowQuality = ms.shadowQuality;
-    viewer.dirLightEnabled = ms.dirLightEnabled;
-    viewer.shadowEnabled = ms.shadowEnabled;
-    viewer.renderMode = newMode;
-    viewer.lightIntensity = ms.lightIntensity;
+  // plan-761: the dropdown is ONE view of `view.renderMode` (the toolbar pill
+  // and `web_view_render_mode` are the others). The command's `setRenderMode`
+  // pushes the per-mode lighting, persists `renderMode` and sets the viewer;
+  // nothing is persisted here. The old "save the React mirrors into the
+  // previous mode" block is gone — every slider already persists its own
+  // `modeSettings[mode]` through `persistMode()`.
+  ensureViewCommandsRegistered();
+  const updateMode = async (newMode: RenderMode) => {
+    const r = await commandRegistry.execute(VIEW_RENDER_MODE_COMMAND, { mode: newMode }, { origin: 'ui', viewer });
+    // Refused (locked deployment, invalid mode): the dropdown goes back to the
+    // viewer's actual state instead of showing a mode that never applied.
+    if (!r.ok) setMode(viewer.renderMode);
+  };
+
+  // Resync from the ONE source of truth whenever the mode changes — from this
+  // dropdown, the pill or MCP alike. The viewer's setter emits AFTER
+  // `setRenderMode` persisted, so a reload of the store already carries the
+  // new mode; `renderMode` is forced to the event value anyway, which also
+  // covers a `settings.json` override merged in by `loadVisualSettings`. A
+  // stale `settingsRef` would otherwise write the OLD mode back on the next
+  // slider persist (plan-761 F5).
+  useEffect(() => viewer.on('render-mode-changed', ({ mode: next }) => {
+    const fresh = { ...loadVisualSettings(), renderMode: next };
+    settingsRef.current = fresh;
+    setMode(next);
+    const ms = fresh.modeSettings[next];
     setLightInt(ms.lightIntensity); setToneMap(ms.toneMapping); setExposure(ms.toneMappingExposure);
     setAmbColor(ms.ambientColor); setAmbInt(ms.ambientIntensity);
     setDirEnabled(ms.dirLightEnabled); setDirColor(ms.dirLightColor); setDirInt(ms.dirLightIntensity);
     setShadowOn(ms.shadowEnabled); setShadowInt(ms.shadowIntensity); setShadowQual(ms.shadowQuality);
-    persist({ renderMode: newMode });
-  };
+  }), [viewer]);
 
   const updateLightInt = (_: unknown, v: number | number[]) => {
     const val = v as number; viewer.lightIntensity = val; setLightInt(val);
@@ -212,6 +226,11 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
     setMaxDpr(val);
     viewer.maxDpr = val;
     persist({ maxDpr: val });
+  };
+  const updateFpsCap = (val: FpsCap) => {
+    setFpsCap(val);
+    viewer.fpsCap = val;
+    persist({ fpsCap: val });
   };
 
   const updateAoMode = (next: AOMode) => {
@@ -347,10 +366,14 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   const presets = listPresets();
   const currentPresetName = matchPreset(presets) ?? '';
 
-  const applyPreset = (name: string) => {
-    const p = presets.find((x) => x.name === name);
-    if (!p) return;
-    applyVisualPreset(viewer, p);
+  // plan-591 F5: the dropdown is ONE view of `view.visualPreset` (the two
+  // quality rows of the render-mode menu and `web_view_visual_preset` are the
+  // others). Dispatching the command instead of calling `applyVisualPreset`
+  // here is what makes the reload hint appear once, centrally, no matter which
+  // view triggered the apply. `source: 'any'`: in the dialog a browser-local
+  // preset is a first-class choice, unlike in the two fixed quality rows.
+  const applyPreset = async (name: string) => {
+    await commandRegistry.execute(VIEW_VISUAL_PRESET_COMMAND, { name, source: 'any' }, { origin: 'ui', viewer });
     onPresetApplied(); // remount body so every control reflects the applied preset
   };
 
@@ -369,7 +392,14 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
   };
 
 
-  const antialiasMismatch = antialiasDesired !== viewer.antialiasActive;
+  // plan-591 F13: the SECOND display path of the reload hint. On a touch device
+  // `main.ts` vetoes antialias on every boot, so this mismatch is permanent and
+  // "Reload now" could never resolve it — gating only the new hint host would
+  // have left exactly that ineffective button standing, one level deeper. Same
+  // predicate as the host (`reloadHintSuppressedByTouch` → `isMobileDevice()`,
+  // never the wider `useTouchDevice()` hook). Removed again with plan-592.
+  const antialiasMismatch = antialiasDesired !== viewer.antialiasActive
+    && !reloadHintSuppressedByTouch();
   // Capabilities of the active render mode drive which control blocks render.
   const caps = getRenderMode(mode).capabilities;
   const colorInputStyle = { width: 28, height: 22, border: 'none', borderRadius: 4, padding: 0, cursor: 'pointer', background: 'none' } as const;
@@ -418,8 +448,9 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
             size="small"
             fullWidth
             value={mode}
-            onChange={(e) => updateMode(e.target.value as RenderMode)}
+            onChange={(e) => { void updateMode(e.target.value as RenderMode); }}
             disabled={settingsLocked}
+            data-testid="visual-render-mode-select"
           >
             {RENDER_MODES.map((m) => (
               <MenuItem key={m.id} value={m.id}>{m.label}</MenuItem>
@@ -427,8 +458,11 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
           </Select>
         </FieldRow>
 
-        {/* Brightness — shown in every mode (labelled by the environment capability) */}
-        <SliderRow label={caps.environment ? 'Environment' : 'Brightness'} min={0} max={2} step={0.05} value={lightInt} onChange={updateLightInt} />
+        {/* Brightness — shown in every mode (labelled by the environment capability).
+            The wrapper carries the test id: SliderRow forwards none. */}
+        <Box data-testid="visual-light-intensity">
+          <SliderRow label={caps.environment ? 'Environment' : 'Brightness'} min={0} max={2} step={0.05} value={lightInt} onChange={updateLightInt} />
+        </Box>
 
         {/* Base color — flat-ambient ("unlit") modes only */}
         {caps.ambientLight && (
@@ -698,6 +732,15 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
           />
         </FieldRow>
 
+        {/* AI eye (plan-740) — the agent's camera-body cone in the scene */}
+        <FieldRow label="Show AI eye" hint="Show the AI agent's camera cone in the scene. Double-click it to make your view follow the agent; any navigation detaches again.">
+          <Switch
+            size="small"
+            checked={agentEyeOn}
+            onChange={updateAgentEye}
+          />
+        </FieldRow>
+
         {/* Toolbar button labels — show text next to icons in top-left toolbar */}
         <FieldRow label="Toolbar labels" hint="Show text labels next to icons in the top-left toolbar. Always collapsed on mobile.">
           <Switch
@@ -731,6 +774,22 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
         {/* Render Resolution (DPR) */}
         <SliderRow label="Resolution" min={0.5} max={2} step={0.25} value={maxDpr} onChange={updateMaxDpr}
           valueText={maxDpr >= 2 ? 'Native' : `${maxDpr}x`} />
+
+        {/* Render frame-rate limit (plan-568) — simulation speed is unaffected */}
+        <FieldRow label="Frame rate limit" hint="Limits rendered frames per second. The simulation is not affected.">
+          <ToggleButtonGroup
+            exclusive
+            size="small"
+            value={fpsCap}
+            onChange={(_, v) => { if (v !== null) updateFpsCap(v as FpsCap); }}
+            aria-label="Frame rate limit"
+            sx={{ flex: 1, display: 'flex', '& .MuiToggleButton-root': { flex: 1, fontSize: 11, py: 0.25, textTransform: 'none' } }}
+          >
+            {FPS_CAP_OPTIONS.map((c) => (
+              <ToggleButton key={c} value={c}>{c === 0 ? 'Off' : String(c)}</ToggleButton>
+            ))}
+          </ToggleButtonGroup>
+        </FieldRow>
       </SettingsSection>
 
       {/* Renderer */}
@@ -757,17 +816,9 @@ function VisualTabBody({ onPresetApplied }: { onPresetApplied: () => void }) {
             )}
           </Select>
         </FieldRow>
-        {/* Static mesh batching (BatchedMesh arenas, per-instance visibility):
-            group/auto-filter hide and isolate work per instance. The switch
-            remains as a kill-switch for render problems — off renders every
-            static mesh individually (see rv-static-merge-flag.ts). */}
-        <FieldRow label="Static mesh batching" hint="Collapses static geometry into a few multi-draw batches. Disable only as a kill-switch for render problems. Reloads the viewer.">
-          <Switch
-            size="small"
-            checked={isStaticMeshMergingEnabled()}
-            onChange={(_, v) => { localStorage.setItem(STATIC_MERGE_LS_KEY, v ? '1' : '0'); window.location.reload(); }}
-          />
-        </FieldRow>
+        {/* The loader-bake switch that used to sit here went with plan-757
+            Phase 3: the bake is the only runtime, a failed bake is a load
+            error, and there is no override to switch it off. Do not add one. */}
       </SettingsSection>
 
       {/* Camera */}

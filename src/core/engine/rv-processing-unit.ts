@@ -145,10 +145,6 @@ function clamp01(v: number): number {
 }
 
 registerTooltipComponent(RVProcessingUnit, {
-  hoverable: true,
-  badgeColor: '#ff8a65',
-  filterLabel: 'Processing Units',
-  hoverEnabledByDefault: true,
-  hoverPriority: 10,
-  pinPriority: 5,
+  pick: 'select',
+  ui: { badge: '#ff8a65', filter: 'Processing Units', category: 'process', priority: 10 },
 });

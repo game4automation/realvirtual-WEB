@@ -752,7 +752,9 @@ describe('snapshot.documents follows scenes created after the project opened', (
 
     const docs = store.getSnapshot().documents;
     expect(docs.map(d => d.name)).toEqual(['Fresh']);
-    expect(docs[0]!.section).toBe('scenes');
+    // No `section` stamp since plan-744 Phase 2 — the row's PATH is what says
+    // where it is, and for a browser document that path is its bare id.
+    expect(docs[0]!.section).toBeUndefined();
   });
 
   it('and disappears again when the scene is deleted', async () => {

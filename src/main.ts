@@ -17,10 +17,11 @@ import { LoadAbortedError } from './core/engine/rv-scene-loader';
 import type { RVExtrasOverlay } from './core/engine/rv-extras-overlay-store';
 import { debug, logInfo } from './core/engine/rv-debug';
 import { initTestRunner } from './rv-test-runner';
+import { runLegacyCleanup } from './core/project/rv-project-legacy-cleanup';
 import { fetchAppConfig, setAppConfig, initAnalytics, lockedModeOf, trackAnalyticsEvent } from './core/rv-app-config';
-import { initFragmentSecret, decryptModelData } from './core/hmi/password-gate';
+import { initFragmentSecret, requireHostedPassword } from './core/hmi/password-gate';
 import { isLoopbackOrigin } from './core/hmi/connect-store';
-import { isEncryptedEnvelope } from './core/persistence/rv-crypto-utils';
+import { decryptServedBytes } from './core/persistence/rv-served-bytes';
 import { requireAnalyticsConsent } from './core/hmi/consent-gate';
 import { loadVisualSettings, hasStoredVisualSettings } from './core/hmi/visual-settings-store';
 import { applyUIBlurScale } from './core/hmi/rv-ui-blur';
@@ -49,7 +50,11 @@ import { setBrandedSplashVisible } from './core/hmi/scene-transition-store';
 
 // Private content (resolves to stubs when private folder is absent)
 import { initHMI } from '@rv-private/custom/hmi-entry';
-import { registerPrivatePlugins } from '@rv-private/private-plugins';
+import { registerPrivatePlugins, prefetchPrivateFeatures } from '@rv-private/private-plugins';
+import { startNonBlockingConsent } from './core/rv-consent-boot';
+import { runBootGates } from './core/rv-boot-gates';
+import { startBootDiscovery, mergeDiscoveredEntries, type GatewayModelEntry } from './core/project/rv-boot-discovery';
+import { preloadDracoDecoder } from './core/engine/rv-glb-parse';
 import { smoothMotionRegistry } from './core/engine/rv-smooth-motion-port';
 
 // Hide AGPL watermark only for explicitly commercial builds (RV_COMMERCIAL=1).
@@ -58,6 +63,10 @@ import { smoothMotionRegistry } from './core/engine/rv-smooth-motion-port';
 if (__RV_COMMERCIAL__) {
   const wm = document.getElementById('rv-watermark');
   if (wm) wm.style.display = 'none';
+} else {
+  // Public/community builds are not installable as an app (the manifest link is
+  // stripped at build time); this also suppresses any remaining install prompt.
+  window.addEventListener('beforeinstallprompt', (e) => e.preventDefault());
 }
 
 // Core Plugins (always included in public AGPL build)
@@ -67,12 +76,14 @@ import { CameraEventsPlugin } from './plugins/camera-events-plugin';
 import { DriveOrderPlugin } from './plugins/drive-order-plugin';
 import { IKPathVisualizerPlugin } from './plugins/ik-path-visualizer-plugin';
 import { PathVisualizerPlugin } from './plugins/path-visualizer-plugin';
+import { AgvScannerFieldPlugin } from './plugins/agv-scanner-field-plugin';
 import { IKTargetEditPlugin } from './plugins/ik-target-edit-plugin';
 import { DriveAxisGizmoPlugin } from './plugins/drive-axis-gizmo-plugin';
+import { MuInteractionPlugin } from './plugins/mu-interaction-plugin';
 import { CameraStartPosPlugin } from './plugins/camera-startpos-plugin';
+import { AgentEyePlugin } from './plugins/agent-eye-plugin';
 import { CameraFollowPlugin } from './plugins/camera-follow-plugin';
 import { KioskPlugin } from './plugins/kiosk-plugin';
-import { AdaptiveNavPlugin } from './plugins/adaptive-nav-plugin';
 import { MeasurementPlugin } from './plugins/measurement-plugin';
 import { ClippingPlugin } from './plugins/rv-clipping-plugin';
 import { OrientationGizmoPlugin } from './plugins/rv-orientation-gizmo-plugin';
@@ -105,6 +116,7 @@ import { DESWorkspacePlugin } from './plugins/des/des-workspace-plugin';
 
 // Scene window: multi-scene browser + layout registry
 import { initSceneStore } from './core/hmi/scene/scene-store-singleton';
+import { installSignalRenameWiring } from './core/hmi/signal-rename-wiring';
 import { migrateLegacyAutosave } from './core/hmi/scene/layout-registry';
 import { resolvePublishedSceneParam } from './core/hmi/scene/rv-published-scenes';
 import { readActiveId, listMetas } from './core/hmi/scene/rv-scene-storage';
@@ -129,8 +141,10 @@ import {
 // plan-716 §2.4 — an old `?scene=scn_…` link resolves through the alias map onto
 // the document it became, and the address bar is normalised to `?doc=`.
 import { resolveSceneRoute, sceneUrlToDocumentUrl } from './core/project/rv-doc-alias';
-import { documentsOf, findStartDocument } from './core/project/rv-project-documents';
-import { diagnoseKioskBoot, projectStartDocument, resolveResumeTarget } from './core/project/rv-project-open';
+import { documentsOf, findStartDocument, readDocuments } from './core/project/rv-project-documents';
+import {
+  diagnoseKioskBoot, projectStartDocument, resolveResumeTarget, resolveHostedBoot, resolveServedProjectUrl,
+} from './core/project/rv-project-open';
 import { forgetRememberedSession, readRememberedSession } from './core/project/rv-project-resume-store';
 import { reportMissingDocument } from './core/hmi/scene/rv-scene-live-sync';
 import { openProjectsDashboard } from './core/hmi/projects/projects-dashboard-store';
@@ -143,6 +157,7 @@ import { getCadGlbCacheSize, clearCadGlbCache } from './core/import/rv-cad-glb-c
 
 // CONNECT gateway plugin (NavButton + LeftPanel for interface management)
 import { ConnectPlugin } from './plugins/connect-plugin';
+import { FmuProvisioningPlugin } from './plugins/fmu-provisioning-plugin';
 import { getStoredConnectPanelWidth } from './core/hmi/layout-constants';
 import {
   attachConnectEmbedModeManager,
@@ -153,6 +168,7 @@ import {
 } from './plugins/connect-embed/connect-embed-store';
 import { HistorianTrendPlugin } from './plugins/historian-trend-plugin';
 import { SignalBindPlugin } from './plugins/signal-bind/SignalBindPlugin';
+import { PromptTaskPlugin } from './plugins/prompt-task-plugin';
 
 // Shared asset links — `?glb=<url>` / `?glb=s:<id>` (plan-386).
 import { SharePlugin, setSharedBookmarkHost } from './core/share/share-plugin';
@@ -207,7 +223,7 @@ function showLoadingOverlay(modelName: string) {
   loadingLabel.textContent = 'Loading ';
   loadingModelName.textContent = modelName;
   loadingProgressBar.classList.add('indeterminate');
-  loadingProgressBar.style.width = '';
+  loadingProgressBar.style.transform = '';
   loadingProgressPct.textContent = '';
   hideLoadingError();
   loadingOverlay.classList.remove('fade-out', 'hidden');
@@ -250,7 +266,7 @@ function setLoadingRetrying(attempt: number, total: number) {
   loadingLabel.textContent = `Connection problem — retrying (${attempt}/${total})…`;
   loadingModelName.textContent = '';
   loadingProgressBar.classList.add('indeterminate');
-  loadingProgressBar.style.width = '';
+  loadingProgressBar.style.transform = '';
   loadingProgressPct.textContent = '';
 }
 
@@ -265,7 +281,7 @@ function setLoadingProgress(loaded: number, total: number) {
   const pct = Math.round((loaded / total) * 100);
   reportModelLoadProgress(loaded, total);
   loadingProgressBar.classList.remove('indeterminate');
-  loadingProgressBar.style.width = `${pct}%`;
+  loadingProgressBar.style.transform = `scaleX(${pct / 100})`;
   const loadedMB = (loaded / (1024 * 1024)).toFixed(1);
   const totalMB = (total / (1024 * 1024)).toFixed(1);
   loadingProgressPct.textContent = `${loadedMB} / ${totalMB} MB`;
@@ -276,7 +292,7 @@ function setLoadingProgress(loaded: number, total: number) {
 function setLoadingPreparing() {
   reportModelLoadPreparing();
   loadingProgressBar.classList.add('indeterminate');
-  loadingProgressBar.style.width = '';
+  loadingProgressBar.style.transform = '';
   loadingProgressPct.textContent = 'Preparing scene…';
 }
 
@@ -547,16 +563,76 @@ async function init() {
   // Strict AND semantics: only effective when the base gate above is open
   // (computeFullPhysics evaluates settings.json kill-switch AND `rv.physics`
   // AND `rv.physics.full`). Load-time-only like `enabled`.
+  // plan-525 §2.6: the boot writes the INPUTS (kill-switch + Browser
+  // preferences) and derives the effective gate from them; a model with an
+  // authored WebPhysicsZone switches physics on for itself (the physics plugin
+  // sets `modelZone` per load) — the kill-switch still wins.
   {
-    const { physicsSettings, computePhysicsEnabled, computeFullPhysics } = await import('./core/engine/rv-physics-registry');
-    physicsSettings.enabled = computePhysicsEnabled(appConfig.simulation?.physicsEnabled);
-    physicsSettings.full = computeFullPhysics(appConfig.simulation?.physicsEnabled);
+    const {
+      physicsInputs, recomputePhysics, isPhysicsFlagEnabled, isFullPhysicsFlagEnabled,
+    } = await import('./core/engine/rv-physics-registry');
+    physicsInputs.deployAllowed = appConfig.simulation?.physicsEnabled !== false;
+    physicsInputs.userPref = isPhysicsFlagEnabled();
+    physicsInputs.userFullPref = isFullPhysicsFlagEnabled();
+    recomputePhysics();
   }
 
-  // Load shipped visual presets (public/presets/index.json). Non-blocking for
-  // correctness — the preset picker re-reads on open — but awaited here so the
-  // first Settings open already has them. Missing manifest → no-op.
-  await loadPublishedPresets();
+  // --- Boot gates + early starts (plan-598, order: rv-boot-gates.ts) ---
+  //
+  // 1. Hosted deploy password gate (plan-759 F5): an encrypted deploy shows the
+  //    password overlay HERE — before the viewer, the dashboard and the first
+  //    document fetch. The key is verified against the probe in settings.json
+  //    and held for every fetch of this tab. Resolves at once for an
+  //    unencrypted deploy. Still BLOCKING, and the FIRST gate (plan-598): the
+  //    consent dialog (z-index 30000) is not even mounted before the password
+  //    is accepted, so it can never cover the password overlay.
+  //
+  // 2. Analytics consent (plan-598 F1: NON-blocking). When a tracker is
+  //    configured (settings.json analytics.googleAnalyticsId), GA may not load
+  //    without prior opt-in (GDPR / §25 TDDDG). The dialog is shown exactly as
+  //    before, but the boot no longer waits for it: our own resources load
+  //    behind it, and only the third-party tracker waits — `initAnalytics` runs
+  //    once the user accepts, never on a decline (`?consent=decline`, plan-564).
+  //    A `model_view` that happened before the answer is sent once on the grant
+  //    (rv-consent-boot.ts). Deploys with no tracker id never see the dialog.
+  //
+  // 3. Early starts (plan-598 F2): everything independent begins NOW. Each of
+  //    these used to start only when the step before it had finished; none of
+  //    them depends on the viewer. They are awaited further down, at the exact
+  //    place each result was needed before — the ORDER of registration and
+  //    merge is unchanged, only the network overlaps:
+  //     - presets: one parallel batch; awaited right below only on a first
+  //       visit (the seed needs the list), otherwise the picker re-reads on open;
+  //     - private feature chunks + the smooth-motion wasm (registered later, in
+  //       order, by the private-plugin pass);
+  //     - the catalogue discovery fetches (merged later, in the old order);
+  //     - the Draco decoder — the BASE_URL path is final in the app entry.
+  //    All of it after the password gate on purpose: nothing project-related
+  //    may leave the tab before the key is in.
+  const mayHaveGatewayOrigin = connectEmbedEnabled || isLoopbackOrigin() || import.meta.env.DEV;
+  const { consent: analyticsConsent, early } = await runBootGates({
+    requirePassword: () => requireHostedPassword(appConfig),
+    startConsent: () => startNonBlockingConsent({
+      requireConsent: () => requireAnalyticsConsent(),
+      initAnalytics,
+      track: trackAnalyticsEvent,
+    }),
+    startEarly: () => {
+      const started = {
+        presetsLoaded: loadPublishedPresets(),
+        privateFeatureMods: prefetchPrivateFeatures(),
+        discovery: startBootDiscovery({
+          dev: import.meta.env.DEV,
+          baseUrl: import.meta.env.BASE_URL,
+          mayHaveGatewayOrigin,
+          readDemoManifest: () => getProjectStore().getBundledBackend().readManifest(),
+        }),
+      };
+      preloadDracoDecoder();
+      return started;
+    },
+  });
+  const { presetsLoaded, privateFeatureMods, discovery } = early;
 
   // Fresh install: seed the initial visual preset so the viewer boots on it
   // (and the Visual-settings dropdown shows it) instead of "Custom". Weak
@@ -565,8 +641,10 @@ async function init() {
   // get "Fast", everything else "Default", and the auto-quality modal informs
   // the user once. No-op once the user has saved visual settings. Must run
   // after loadPublishedPresets() (needs the preset list) and before the first
-  // loadVisualSettings() below.
+  // loadVisualSettings() below — which is why the preset batch is awaited
+  // here, and ONLY here (a returning visitor never waits for it).
   if (!hasStoredVisualSettings()) {
+    await presetsLoaded;
     const initialQuality = chooseInitialQualityPreset();
     const seeded = seedInitialVisualPreset(initialQuality.name);
     if (seeded && initialQuality.name === FAST_PRESET_NAME && initialQuality.reason) {
@@ -574,15 +652,6 @@ async function init() {
       queueAutoQualityNotice(initialQuality.reason);
     }
   }
-
-  // --- Analytics consent gate ---
-  // When a tracker is configured (settings.json analytics.googleAnalyticsId), GA
-  // may not load without prior opt-in (GDPR / §25 TDDDG). Block boot until the
-  // user accepts — without consent the app does not run. Private deploys with no
-  // tracker id skip the gate entirely (this resolves immediately).
-  await requireAnalyticsConsent();
-  // Inject GA now that consent is in place (no-op when no id is configured).
-  initAnalytics();
 
   // --- Bootstrap context-aware UI visibility (from settings.json `ui` key) ---
   {
@@ -654,6 +723,9 @@ async function init() {
   // idempotent for the same values and serves as a fallback if settings
   // change between boot and HMI mount.
   viewer.applyVisualSettings(initialSettings);
+  // plan-568: the stored frame-rate cap is applied by applyVisualSettings above.
+  // A `?perf` session measures uncapped — the stored choice stays untouched.
+  if (perfMode) viewer.loop.renderCapSuppressed = true;
 
   // Expose viewer globally for console debugging
   (window as unknown as { viewer: RVViewer }).viewer = viewer;
@@ -664,11 +736,62 @@ async function init() {
   viewer.on('model-loaded', () => {
     const url = viewer.currentModelUrl ?? '';
     const model = url.split(/[?#]/)[0].split('/').pop()?.replace(/\.glb$/i, '') || 'unknown';
-    trackAnalyticsEvent('model_view', { model });
+    // plan-598: held until the (non-blocking) consent answer, then sent once.
+    analyticsConsent.modelView({ model });
   });
   viewer.on('mode-changed', ({ to }) => {
     trackAnalyticsEvent('workspace_mode', { mode: to });
   });
+
+  // --- Recent documents: keep each entry's mode honest (plan-478 F1b) ---
+  //
+  // Attached HERE, and the placement is the contract (R3-5): the workspace mode
+  // boot near the end of this function is itself a `mode-changed`, and a
+  // listener wired after it would miss the very event that says which mode the
+  // resumed (or `?mode=`-addressed) document is being used in — the ring would
+  // then carry the mode of the PREVIOUS session until the user switched by
+  // hand. Subscribing this early is free: the retag only ever touches the ring
+  // head, and before any document is open `whatIsOpen()` answers null and the
+  // call does nothing at all.
+  //
+  // The open document is read off the scene store rather than a React snapshot
+  // for the same reason — the HMI is not mounted yet when the mode boots.
+  {
+    const { attachRecentsModeTracking } =
+      await import('./core/project/rv-project-recents-store');
+    const { getProjectStore: recentsProjectStore } =
+      await import('./core/project/project-store');
+    const { getSceneStore: recentsSceneStore } =
+      await import('./core/hmi/scene/scene-store-singleton');
+    attachRecentsModeTracking(viewer, () => ({
+      projectId: recentsProjectStore().getProject()?.id ?? null,
+      documentId: recentsSceneStore()?.openDocumentId ?? null,
+    }));
+    // The document's own last mode (plan-513 F2) — beside the ring's tracking
+    // and BEFORE the mode boot for the same reason: the boot's `mode-changed`
+    // is what records the mode a resumed document is used in. Inert inside an
+    // open-intent scope, under a kiosk lock and for a demo project.
+    const { attachDocumentModeTracking } =
+      await import('./core/project/rv-document-mode-store');
+    attachDocumentModeTracking(viewer, () => ({
+      projectId: recentsProjectStore().getProject()?.id ?? null,
+      backend: recentsProjectStore().getBackend()?.kind ?? null,
+      documentId: recentsSceneStore()?.openDocumentId ?? null,
+      isDemo: recentsProjectStore().getProject()?.kind === 'demo',
+    }));
+  }
+
+  // The cross-project model index (plan-509): every publish of the project
+  // store with a project open snapshots its document list into IndexedDB, so
+  // the dashboard's Projects screen can search the models of projects that
+  // are closed — and locked — without a permission prompt. Started BEFORE the
+  // boot resolves the active project, so that project is indexed too. The
+  // write is debounced and never blocks the boot.
+  {
+    const { startModelIndexWriter } =
+      await import('./core/project/rv-model-index-writer');
+    startModelIndexWriter(getProjectStore());
+  }
 
   // --- Register Industrial Interfaces ---
   const ifaceManager = new InterfaceManager();
@@ -684,9 +807,12 @@ async function init() {
     .use(new SensorMonitorPlugin(), 'core')
     .use(new TransportStatsPlugin(), 'core')
     .use(new CameraEventsPlugin(), 'core')
-    .use(new AdaptiveNavPlugin(), 'core')
     .use(new CameraStartPosPlugin(), 'core')
     .use(new CameraFollowPlugin(), 'core')
+    // plan-740: the AI agent's camera body. Core because every mode's
+    // web_camera_* tools target it, and the cone is the only thing telling a
+    // watching human where the agent is looking.
+    .use(new AgentEyePlugin(), 'core')
     .use(new KioskPlugin(), 'core')
     .use(new MeasurementPlugin(), 'core')
     .use(new ClippingPlugin(), 'core')
@@ -695,6 +821,9 @@ async function init() {
     .use(new CustomRuntimeInstructionPlugin(), 'core')
     .use(new RvExtrasEditorPlugin(), 'core')
     .use(new ConnectPlugin(), 'core')
+    // plan-498 Phase 3: runs `Fmu` instances in CONNECT (upload, consent dialog,
+    // leases) — only while the live transport IS the CONNECT gateway.
+    .use(new FmuProvisioningPlugin(), 'core')
     // plan-386 R13: the shared-link info card only ever appears because of this
     // line. It is listed as its own roadmap step and covered by
     // `share_PluginRegistered` for exactly that reason.
@@ -707,13 +836,21 @@ async function init() {
     .use(new OrientationGizmoPlugin(), 'core')
     .use(new LayoutPlannerPlugin(), 'core')
     .use(new SignalBindPlugin(), 'core')
+    // plan-486: "Task for agent…" in the context menu plus the queue panel.
+    // Core because the queue must survive a mode switch; its UI is gated to
+    // non-viewer / non-kiosk contexts by its own visibility rule.
+    .use(new PromptTaskPlugin(), 'core')
     .use(new SnapPointPlugin(), 'core')
     .use(new SnapFlipIconOverlay(), 'core')
     .use(new SimControllerPlugin(), 'core')
     .use(new IKPathVisualizerPlugin(), 'core')
     .use(new PathVisualizerPlugin(), 'core')
+    // plan-558: AGV scanner fields on the floor (overlay category 'safety-fields', default off).
+    .use(new AgvScannerFieldPlugin(), 'core')
     .use(new IKTargetEditPlugin(), 'core')
     .use(new DriveAxisGizmoPlugin(), 'core')
+    // plan-567: Commissioning — remove (Delete / context menu) and drag workpiece carriers.
+    .use(new MuInteractionPlugin(), 'core')
     .use(new DESWorkspacePlugin(), 'core')
     // WebComponent script components (plan-210, JS-in-GLB). Trust gate §10:
     // execution stays OFF unless ?scripts is passed (the phase-3 editor UI
@@ -737,6 +874,18 @@ async function init() {
   viewer.modelPluginManager = new ModelPluginManager({
     scriptRefProvider: ({ modelUrl }) =>
       scriptRefForModelUrl(getProjectStore().getProject(), modelUrl),
+    // …and which project's copy of that reference (plan-477 Phase 0). Every
+    // project binds its code as `plugins/index.ts` — the only entry the glob
+    // loads — so the reference alone cannot pick between them. `canonicalName`
+    // is the project's folder spelling (the manager matches it case-insensitively
+    // because `Toray` / `toray` legitimately differ); `name` is the fallback for
+    // a manifest written before canonicalName existed.
+    projectFolderProvider: () => {
+      const project = getProjectStore().getProject();
+      if (!project) return null;
+      const folder = project.canonicalName ?? project.name;
+      return typeof folder === 'string' && folder.trim() !== '' ? folder : null;
+    },
     // Stage 2b: a project may carry its own compiled code. The source is the
     // ACTIVE backend of the moment (the open project changes under a long-lived
     // manager), and reading a file is all the manager is given — no write side.
@@ -789,7 +938,11 @@ async function init() {
   // Awaited: internal-tier features load via a __RV_INTERNAL__-gated dynamic
   // import and must finish registering (modes, components) before the mode
   // registration below and the mode-boot block later in this function.
-  await registerPrivatePlugins(viewer);
+  //
+  // plan-598: the side-effect-free feature chunks (and the smooth-motion wasm)
+  // have been downloading since the early-start block above; this pass
+  // consumes those imports and registers in the same fixed order as always.
+  await registerPrivatePlugins(viewer, privateFeatureMods);
 
   // --- Smooth-motion provider gate (plan-281 Finding #14) ---
   // The jerk-limited drive core must be decided BEFORE the first model loads:
@@ -892,143 +1045,65 @@ async function init() {
   //
   // `project` is set only for models discovered inside a private project folder
   // (dev). Deploy-root models carry none: a deploy IS one project.
-  const entries: Array<{ filename: string; url: string; project?: string }> = [];
-
-  // Discover private project models. `/__api/private-models` is served ONLY by
-  // the dev-time Vite middleware (privateModelsPlugin); no deployed build serves
-  // it, so the fetch is dev-only — gating it keeps the public/private builds from
-  // logging a guaranteed 404 on every page load. (Deployed private projects swap
-  // models in via the runtime `models.json` manifest below, not this endpoint.)
-  if (import.meta.env.DEV) {
-    try {
-      const resp = await fetch('/__api/private-models');
-      if (resp.ok) {
-        const privateModels: Array<{ project: string; filename: string; url: string }> = await resp.json();
-        for (const pm of privateModels) {
-          // `project` is carried through: every private project's models come
-          // down this one endpoint, and a model belongs to exactly one of them.
-          // Dropping the tag here is what used to put Toray's and Mauser's GLBs
-          // into the DemoRealvirtual project's Models list.
-          entries.push({ filename: pm.filename, url: pm.url, project: pm.project });
-        }
-      }
-    } catch { /* private models endpoint not available — ignore */ }
-  }
-
-  // Runtime model manifest (generated during private project staging, replaces build-time glob).
-  // If present, the manifest is AUTHORITATIVE — the build-time glob bundles
-  // /public/models/*.glb from the dev environment (e.g. DemoRealvirtualWeb.glb) into every
-  // build, but private deploys swap out the models folder on the server. Keeping the
-  // build-time entries around would leave stale filenames matchable by localStorage, causing
-  // 404s when a returning user had previously opened a model that only exists in another deploy.
-  try {
-    const resp = await fetch(`${import.meta.env.BASE_URL}models.json`, { cache: 'no-store' });
-    if (resp.ok) {
-      const runtimeModels: string[] = await resp.json();
-      entries.length = 0;
-      for (const filename of runtimeModels) {
-        entries.push({ filename, url: `${import.meta.env.BASE_URL}models/${filename}` });
-      }
-    }
-  } catch { /* no manifest — use build-time discovery only */ }
-
-  // ── The demo project's own models (plan-737) ────────────────────────────
   //
-  // The demo ships as a FOLDER with a manifest in it, so the catalogue reads
-  // that manifest — the same rule as everywhere else since plan-735: a document
-  // exists because a `project.json` says so. This replaces the demo's old share
-  // of `models.json`, which the public deploy used to rewrite from the same
-  // manifest; two derivations of one set is exactly the duplication plan-735
-  // removed, and after the move they no longer even agreed on the URL.
+  // plan-598 F2: the four network reads below (private models, `models.json`,
+  // the demo manifest, the CONNECT gateway) were started in the early-start
+  // block right after the password gate and have been running while the viewer
+  // and the plugins were set up. They are MERGED here, in exactly the order the
+  // serial code used — see `rv-boot-discovery.ts`, which keeps every rule that
+  // used to be written out here (models.json authoritative, the demo project's
+  // own models additive and deduped, the gateway last and additive) together
+  // with the reasons for it.
   //
-  // ADDITIVE, and after `models.json` on purpose. A private deploy's
-  // `models.json` is authoritative about ITS models and clears the list above;
-  // the demo folder is a different project that may sit beside it, so it adds
-  // to the catalogue rather than replacing it. Deduped by filename so a deploy
-  // that carries the demo in both shapes lists it once.
-  //
-  // A deploy without the folder answers 404, the catch keeps boot silent, and
-  // `entries` degrades to whatever else was found — an empty selector, never a
-  // crash.
-  try {
-    const demoBase = `${import.meta.env.BASE_URL}${DEMO_BASE_PATH}`;
-    const resp = await fetch(`${demoBase}project.json`, { cache: 'no-cache' });
-    if (resp.ok) {
-      const manifest = await resp.json() as { documents?: Array<{ path?: unknown; devOnly?: unknown }> };
-      for (const doc of manifest.documents ?? []) {
-        const path = typeof doc?.path === 'string' ? doc.path.replace(/^\.?\//, '') : '';
-        if (!path.toLowerCase().endsWith('.glb')) continue;
-        // `library/` rows are not models — the library is app-level and has its
-        // own browser. (The demo declares none since plan-737; the guard keeps
-        // an older, still-deployed manifest from filling the selector with
-        // component parts.)
-        if (/^library\//i.test(path)) continue;
-        const filename = path.split('/').pop() ?? path;
-        if (entries.some(e => e.filename.toLowerCase() === filename.toLowerCase())) continue;
-        entries.push({ filename, url: `${demoBase}${path}` });
-      }
-    }
-  } catch { /* no demo folder on this deploy — nothing to add */ }
+  // `/__api/private-models` is served ONLY by the dev-time Vite middleware, so
+  // it is requested only in a dev build. `models.json` is a private deploy's
+  // runtime manifest and AUTHORITATIVE where present. The demo project ships as
+  // a FOLDER with a manifest (plan-737), read through the demo backend so the
+  // project resolution below reuses the same request (plan-598 F3). The CONNECT
+  // gateway's `/model/manifest` is a FOREIGN catalogue (plan-413 §2.6) probed
+  // only where a gateway can be the page origin (`mayHaveGatewayOrigin`).
+  const [discoveredPrivate, discoveredModelsJson, demoManifest, gatewayManifest] = await Promise.all([
+    discovery.privateModels,
+    discovery.modelsJson,
+    discovery.demoManifest,
+    discovery.gatewayManifest,
+  ]);
 
-  // Discover local working folder models (File System Access API, Chrome/Edge only)
+  // Discover local working folder models (File System Access API, Chrome/Edge only).
+  // Local, not network — read here, at its old place in the merge order.
+  const localFiles: Array<{ filename: string; url: string }> = [];
   if (isFsApiSupported()) {
     try {
-      const localFiles = await listSubfolderFiles('models', ['.glb']);
-      for (const f of localFiles) {
-        const blobUrl = await readFileAsUrl(f.handle);
-        entries.push({ filename: f.name, url: blobUrl });
+      const files = await listSubfolderFiles('models', ['.glb']);
+      for (const f of files) {
+        localFiles.push({ filename: f.name, url: await readFileAsUrl(f.handle) });
       }
     } catch { /* permission denied or handle expired — skip silently */ }
   }
 
-  // Models published to a running CONNECT gateway (plan-365 §2.1). Laid over the
-  // catalogue resolved above, never replacing it: `models.json` stays authoritative
-  // where it exists, and the embedded models stay in the list (F8).
-  //
-  // Deliberately LAST and deliberately additive — this is the recovery path for
-  // every publish this tab did not witness: a `model_changed` that arrived while
-  // the browser was closed, or while the WebSocket was down, is picked up here on
-  // the next load. A gateway-less deploy answers 404 and the catch below keeps the
-  // boot silent, exactly as the `models.json` probe above already does.
-  //
-  // ## `manifest.models` is a FOREIGN catalogue, not a project manifest (plan-413 §2.6)
-  //
-  // plan-413 replaced `models[]`/`scenes[]`/`library[]` with one `documents[]`
-  // list — in the manifests realvirtual WEB itself writes. This one it does not
-  // write: `/model/manifest` is produced by the CONNECT gateway, a separate
-  // program with its own release cycle, and the shape below is its published
-  // contract. Renaming the field here would only mean reading a key nobody
-  // sends. So this stays a compatibility ADAPTER: CONNECT's `models[]` is
-  // translated into viewer catalogue entries at this boundary and the document
-  // model begins on the other side of it. Same decision plan-397 took for the
-  // plan-700/701 delivery manifests. If CONNECT ever speaks `documents[]`, the
-  // change belongs here and nowhere else.
-  // Probed only where a CONNECT gateway can actually be the page origin: the
-  // embedded bundle (CONNECT serves the page), a loopback origin (local
-  // gateway / dev), or any dev build (the Vite proxy forwards to the gateway,
-  // remote-dev included). A static CDN deploy can never answer this route, and
-  // the guaranteed 404 was a red line in every visitor's console (2026-08-31).
-  const mayHaveGatewayOrigin = connectEmbedEnabled || isLoopbackOrigin() || import.meta.env.DEV;
+  // Models published to a running CONNECT gateway (plan-365 §2.1) — the
+  // recovery path for every publish this tab did not witness. Canonicalised
+  // here; the revision the gateway reports is what makes a later download ask
+  // for the current bytes instead of whatever the browser cached last week.
+  const gatewayModels: GatewayModelEntry[] = [];
   try {
-    const resp = mayHaveGatewayOrigin
-      ? await fetch('/model/manifest', { cache: 'no-store' })
-      : null;
-    if (resp?.ok) {
-      const manifest: { models?: Array<{ name?: string; url?: string; revision?: string }> } =
-        await resp.json();
-      for (const model of manifest.models ?? []) {
-        if (!model.url) continue;
-        const url = canonicalModelUrl(model.url, import.meta.env.BASE_URL);
-        const filename = model.name ?? modelFileName(url);
-        // The revision the gateway reports is what makes a later download ask for
-        // the current bytes instead of whatever the browser cached last week.
-        setModelRevision(url, model.revision);
-        if (!entries.some((e) => e.filename.toLowerCase() === filename.toLowerCase())) {
-          entries.push({ filename, url });
-        }
-      }
+    for (const model of gatewayManifest?.models ?? []) {
+      if (!model.url) continue;
+      const url = canonicalModelUrl(model.url, import.meta.env.BASE_URL);
+      setModelRevision(url, model.revision);
+      gatewayModels.push({ filename: model.name ?? modelFileName(url), url });
     }
-  } catch { /* no gateway on this origin — the build-time catalogue stands */ }
+  } catch { /* malformed gateway answer — the catalogue above stands */ }
+
+  const entries = mergeDiscoveredEntries({
+    privateModels: discoveredPrivate,
+    modelsJson: discoveredModelsJson,
+    demoDocuments: readDocuments(demoManifest),
+    demoBase: `${import.meta.env.BASE_URL}${DEMO_BASE_PATH}`,
+    baseUrl: import.meta.env.BASE_URL,
+    localFiles,
+    gatewayModels,
+  });
 
   // Expose discovered models to the HMI model selector.
   // A base entry may be expanded with selectable "model options" (supplier variants)
@@ -1089,11 +1164,23 @@ async function init() {
   let servedProjectUrl: string | null = null;
   let servedProjectManifestOk = false;
 
+  // The workspace root is retired (plan-743). Its keys are dropped BEFORE the
+  // project resolves, so the demo collision guard in this same boot cannot see
+  // a handle that is about to disappear. Never throws, never blocks the boot.
+  await runLegacyCleanup();
+
   try {
     // Only the demo project's own models. `viewer.availableModels` is the
     // deploy-wide selector list — in dev that includes every private customer
     // project — and handing it to the bundled backend would make each of those
     // GLBs a model *of* the demo project.
+    //
+    // plan-598: the demo backend singleton already exists at this point — the
+    // early discovery read its manifest through it — so these options do not
+    // reach a constructor any more. That is harmless by construction: a bundled
+    // backend consults `models` only with `discover: true`, which the demo
+    // instance never has (bundled-backend.ts `_withDiscoveredModels`). The call
+    // stays so the demo/model relation is still stated in one place.
     const demoModelUrls = new Set(
       entries.filter(e => !e.project || e.project === DEMO_PROJECT_FOLDER).map(e => e.url),
     );
@@ -1110,13 +1197,21 @@ async function init() {
     const urlProject = urlParams.get('project');
     // ?projectUrl=<deploy root> opens a project published somewhere else,
     // read-only (plan-700 Phase 7 / F12). It resolves BEFORE ?project=, which
-    // then selects within that deploy rather than within ours.
-    const urlProjectRoot = urlParams.get('projectUrl');
+    // then selects within that deploy rather than within ours. Since plan-759
+    // a hosted deploy names its served project in settings.json (`projectUrl`,
+    // `p/` next to the runtime); the query keeps overriding it. A hosted boot
+    // resolves ONLY that project (`remoteRequired`, F4b): a fetch error shows
+    // the error card and never another project of this origin.
+    const urlProjectRoot = resolveServedProjectUrl(
+      urlParams.get('projectUrl'),
+      appConfig.projectUrl,
+      document.baseURI,
+    );
     servedProjectUrl = urlProjectRoot;
     await getProjectStore().resolveActiveProject({
       bundledBackend: bundled,
       ...(urlProject ? { projectId: urlProject } : {}),
-      ...(urlProjectRoot ? { remoteBaseUrl: urlProjectRoot } : {}),
+      ...(urlProjectRoot ? { remoteBaseUrl: urlProjectRoot, remoteRequired: true } : {}),
     });
     // The backend is cached per base URL, so this is the SAME instance
     // `resolveActiveProject` just consulted — the flag, not a second fetch.
@@ -1144,6 +1239,11 @@ async function init() {
   // the cache or returns false, and writes nothing. What genuinely needs the
   // project is `hydrateProjectScenes()`, which stays where it was.
   getProjectStore().attachToSceneStore(sceneStore);
+
+  // plan-590: the signal-rename coordinator intercepts undo / redo of its tagged entries in the
+  // scene document and in every asset document the editor opens — from the moment they open, so a
+  // tagged entry from a reloaded session is refused instead of being undone model-only.
+  installSignalRenameWiring(viewer);
 
   // ── User plugin overrides: restore what the user switched off (plan-435) ──
   // Placed after the last `viewer.use()` and after project resolution, but
@@ -1258,13 +1358,12 @@ async function init() {
         onRetry: setLoadingRetrying,
       });
 
-      // plan-267: an encrypted deploy ships the GLB as an RVE1 envelope under its
-      // normal .glb name (self-describing via magic). Show the password gate and
-      // decrypt BEFORE parsing — the model never reaches GLTFLoader.parse until
-      // the password is correct.
-      if (isEncryptedEnvelope(new Uint8Array(data))) {
-        data = await decryptModelData(data);
-      }
+      // plan-267 / plan-759: an encrypted deploy ships every GLB as an RVE1
+      // envelope under its normal .glb name. The boot gate (`requireHostedPassword`)
+      // has verified the key before anything is fetched; here the bytes only
+      // need to be passed through the one decrypt seam. Without a key this
+      // throws `EncryptedWithoutKeyError` — never ciphertext into the parser.
+      data = await decryptServedBytes(data, url);
 
       const sizeMB = (data.byteLength / (1024 * 1024)).toFixed(1) + ' MB';
 
@@ -1987,7 +2086,28 @@ async function init() {
           // no keyboard, so the verdict below still turns each cause into a
           // visible
           // card instead (F8).
-          if (modeLocked && servedProjectUrl) {
+          // ── The hosted boot (plan-759 F4c / D14) ──────────────────────
+          //
+          // A served project WITHOUT a kiosk lock is the customer's hosted
+          // deploy: its root is the project's dashboard, always. A document
+          // opens only through its own `?doc=`, which routed above and never
+          // reaches this branch. `defaultModel` is not consulted — the kiosk
+          // branch below keeps its own start-document contract untouched.
+          const hostedBoot = resolveHostedBoot({
+            servedProjectUrl,
+            modeLocked,
+            hasDeployedManifest: servedProjectManifestOk,
+            documentCount: documentsOf(project).length,
+          });
+          if (hostedBoot.kind === 'error') {
+            console.error(`[main] Hosted boot failed (${hostedBoot.reason}): ${hostedBoot.detail}`);
+            showLoadingError(`${hostedBoot.detail}\n\nChecked at ${new Date().toISOString()}.`);
+            sceneRouted = true;
+          } else if (hostedBoot.kind === 'dashboard') {
+            hideLoadingOverlay();
+            openProjectsDashboard();
+            sceneRouted = true;
+          } else if (modeLocked && servedProjectUrl) {
             const documents = documentsOf(project);
             const doc = findStartDocument(documents, target.asset) ?? undefined;
             const verdict = diagnoseKioskBoot({
@@ -2031,6 +2151,19 @@ async function init() {
               // every single reload, which is the opposite of an escape hatch.
               forgetRememberedSession(projectId);
             } else {
+              // plan-513 F9 — the mode this document was last USED in, read
+              // BEFORE the open: the remembered pair's mode is written once, on
+              // open, and never follows a later switch (`rememberSession`), so
+              // on its own it restores the mode the document was OPENED in. The
+              // open is told the mode is decided here, so the row's declared
+              // mode is not applied twice; the mode boot below activates it,
+              // and `?mode=` / a published boot mode still come first there.
+              const { readDocumentMode } = await import('./core/project/rv-document-mode-store');
+              const { resumeModeOf } = await import('./core/project/rv-document-mode');
+              const resumeBackend = getProjectStore().getBackend()?.kind ?? null;
+              const lastMode = resumeBackend
+                ? await readDocumentMode(resumeBackend, projectId, doc.id)
+                : null;
               // THE open verb (plan-716 §2.5), for both sections — a scene and a
               // model are the same thing since plan-413, and `openDocument` is
               // where that stopped being a claim. It also supplies the two
@@ -2038,13 +2171,17 @@ async function init() {
               // bar, so the NEXT reload does not need the remembered pair at
               // all, and the cross-mode document identity the asset editor reads
               // to decide what to bind to when the restored mode takes over.
-              await sceneStore.openDocument(doc.id, { name: doc.name });
+              await sceneStore.openDocument(doc.id, { name: doc.name, modeDecidedByCaller: true });
               hideLoadingOverlay();
               sceneRouted = true;
+              resumeBootMode = resumeModeOf({
+                lastMode,
+                declaredMode: typeof doc.mode === 'string' ? doc.mode : null,
+                isDemo: project?.kind === 'demo',
+                has: (m) => viewer.modes.has(m),
+                sessionMode: target.mode,
+              });
             }
-            // The mode comes from the remembered pair only — `resolveResumeTarget`
-            // guarantees a URL and a `defaultModel` both return `mode: null`.
-            if (sceneRouted && target.mode) resumeBootMode = target.mode;
           } else if (target.source === 'defaultModel' && target.asset) {
             // ── The project's start document (plan-726 F2) ────────────────
             //
@@ -2194,6 +2331,14 @@ async function init() {
   // --- Initialize HMI React Overlay ---
   initHMI(viewer);
 
+  // --- Dev-only: Inspector building-block gallery (plan-510, DESIGN.md) ---
+  // `?rvDev=inspector-gallery` on the dev server. The statically false
+  // `import.meta.env.DEV` of a production build drops this branch, the dynamic
+  // import and its chunk (tests/inspector-gallery-gate.node.test.ts).
+  if (import.meta.env.DEV && new URLSearchParams(location.search).get('rvDev') === 'inspector-gallery') {
+    void import('./core/hmi/dev/mount-inspector-gallery').then((m) => m.mountInspectorGallery());
+  }
+
   // --- Dev-only: test runner + debug endpoint ---
   if (import.meta.env.DEV) {
     initTestRunner();
@@ -2241,12 +2386,34 @@ async function init() {
         fixedTimeStep: viewer.loop.fixedTimeStep,
       });
 
+      // plan-469: the A/B prototype switches that live below the transport
+      // manager (`RVMovingUnit.updateAABB`, `MUInstancePool`). Dev-only, both
+      // false until `?proto=walk,bounds` arms them.
+      const { rvProtoFlags } = await import('./core/engine/rv-mu');
+      (window as unknown as { __rvProtoFlags?: unknown }).__rvProtoFlags = rvProtoFlags;
+
+      // The Object3D CONSTRUCTOR, for the probe's world-matrix wrappers. Taken
+      // via a dynamic import inside the DEV guard so `main.ts` keeps no
+      // top-level three.js import.
+      const { Object3D: PerfObject3D } = await import('three');
+
       const probe = new RVPerfProbe();
       (window as unknown as { __rvPerfProbe?: unknown }).__rvPerfProbe = {
         instance: probe,
+        // plan-469 `?hooks=off`: leave the manager's region hooks null (the
+        // production state) so the run prices the instrumentation by difference.
+        get regionHooksEnabled() { return probe.regionHooksEnabled; },
+        set regionHooksEnabled(v: boolean) { probe.regionHooksEnabled = v; },
         start: () => probe.start({
           loop: viewer.loop,
           transport: viewer.transportManager,
+          // plan-469 Phase 0d: the live renderer (main/shadow pass split) and the
+          // Object3D constructor (world-matrix counters). Both are handed IN so
+          // the probe module keeps its zero three.js dependency; both are only
+          // touched while `regionHooksEnabled` is true, so `?hooks=off` is still
+          // the untouched production frame.
+          renderer: (viewer as unknown as { renderer?: unknown }).renderer as never,
+          object3D: PerfObject3D as unknown as { prototype: Record<string, unknown> },
           rendererInfo: () => viewer.getRendererInfo(),
           signalStats: () => viewer.signalStore!.stats(),
           readSignal: (name: string) => viewer.signalStore?.get(name),

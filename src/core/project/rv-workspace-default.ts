@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-workspace-default — "My Workspace", the home every document has
+ * rv-workspace-default — the "Browser project", the home every document has
  * (plan-716 §2.2, F2).
  *
  * Before this module there was a whole mode with no project in it: open the
@@ -46,8 +46,19 @@ import type { RvProject } from './rv-project-types';
 /** The one id of the implicit browser project. Constant, never minted. */
 export const WORKSPACE_DEFAULT_PROJECT_ID = 'workspace-default';
 
-/** What the user sees in the project switcher and the library tab. */
-export const WORKSPACE_DEFAULT_PROJECT_NAME = 'My Workspace';
+/**
+ * What the user sees in the project switcher and the library tab.
+ *
+ * Renamed from "My Workspace" by plan-743, which deleted the workspace: the old
+ * name was the second thing called a workspace on the same screen, and it named
+ * the one project that is NOT a folder. The id stays `workspace-default` —
+ * every stored row and every localStorage key is keyed on it, and renaming an
+ * id to match a label would cost users their browser project for a word.
+ */
+export const WORKSPACE_DEFAULT_PROJECT_NAME = 'Browser project';
+
+/** The secondary line on its dashboard row: where its bytes actually are. */
+export const WORKSPACE_DEFAULT_PROJECT_HINT = 'lives in this browser';
 
 /** Is this the implicit browser project? */
 export function isWorkspaceDefaultProject(idOrProject: string | { id?: string } | null): boolean {

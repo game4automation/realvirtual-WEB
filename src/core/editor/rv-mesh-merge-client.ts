@@ -3,16 +3,14 @@
 
 /**
  * rv-mesh-merge-client — thin main-thread wrapper around the mesh merge worker
- * (plan-372, Phase 4). Built to the plan-331 separator-client blueprint, not on top of
- * it: same mechanics, own request and response types.
+ * (plan-372, Phase 4).
  *
  * Owns three things and nothing else:
  *
  * 1. **Copy in, TRANSFER in, transfer out.** The request arrays are tight copies made by
  *    the `serialize*` helpers, so they are already independent of the live geometry —
  *    which is precisely why they may go on the transfer list instead of being cloned a
- *    second time by `postMessage`. Nothing live is ever detached. (The separator client
- *    leaves that saving on the table; plan-372 finding 8.)
+ *    second time by `postMessage`. Nothing live is ever detached.
  * 2. **A monotonically increasing `id` as the abort epoch.** Every request supersedes the
  *    previous one; a response carrying a stale `id` is dropped. Dialog cancel, a changed
  *    subtree and `dispose()` all abort the same way.

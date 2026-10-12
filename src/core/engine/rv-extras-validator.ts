@@ -20,6 +20,7 @@
  */
 
 import { getConsumedFieldsFromSchema, getRegisteredCapabilities } from './rv-component-registry';
+import { validateOperatorPanelConfig } from '../hmi/operator-devices/operator-panel-model';
 
 /**
  * Fields consumed by each TypeScript parser (actively read and used).
@@ -41,6 +42,7 @@ const CONSUMED: Record<string, string[]> = {
   GripTarget: [], // all fields in RVGripTarget.schema
   ConnectSignal: [], // all fields in RVConnectSignal.schema
   Lamp: ['OnColor'], // Unity Color is read raw; scalar fields are schema-derived
+  Zone: [],       // plan-521 — all fields in RVZone.schema
 
 
   // plan-417 — 3D scene buttons. Only the material NAMES are read raw (they
@@ -98,19 +100,24 @@ const CONSUMED: Record<string, string[]> = {
   // schema field (the schema mapper has no string-array type).
   WebPhysicsZone: ['StaticColliders'],
 
-  // MU — no extras parsed yet (template nodes only)
-  MU: [],
+  // MU — LoadSeatDepth (plan-577) on carriers; the schema registered in rv-mu.ts adds it too
+  MU: ['LoadSeatDepth'],
 
   // BoxCollider — used by createAABBFromExtras()
   BoxCollider: ['center', 'size'],
 
-  // Signal types — connection-relevant fields editable, Status read-only (object)
-  PLCOutputBool: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active'],
-  PLCInputBool: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active'],
-  PLCOutputFloat: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active'],
-  PLCInputFloat: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active'],
-  PLCOutputInt: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active'],
-  PLCInputInt: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active'],
+  // Signal types — connection-relevant fields editable, Status read-only (object).
+  // `Generated` (plan-589) is the PROVENANCE flag written by `addSignal()` and
+  // `registerBehaviorSignals()`: it marks a signal the runtime created, whose
+  // persisted `Name` is asset-local and gets instance-scoped on load. It must
+  // survive the GLB export, so it belongs in this list — without it the
+  // validator would drop it and every reload would read the leaf as authored.
+  PLCOutputBool: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active', 'Generated'],
+  PLCInputBool: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active', 'Generated'],
+  PLCOutputFloat: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active', 'Generated'],
+  PLCInputFloat: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active', 'Generated'],
+  PLCOutputInt: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active', 'Generated'],
+  PLCInputInt: ['Comment', 'OriginDataType', 'Settings', 'Metadata', 'Active', 'Generated'],
 
   // DrivesRecorder — recorder settings parsing
   DrivesRecorder: [
@@ -132,10 +139,12 @@ const CONSUMED: Record<string, string[]> = {
 
   // LogicStep types — parsed by RVLogicEngine.build()
   LogicStep_SerialContainer: ['Active'],  // container, Active parsed for top-level guard
+  LogicStep_JavaScript: ['Active'],
   LogicStep_ParallelContainer: ['Active'],
   LogicStep_SetSignalBool: ['Signal', 'SetToTrue', 'Active'],
-  LogicStep_WaitForSensor: ['Sensor', 'WaitForOccupied', 'Active'],
-  LogicStep_WaitForSignalBool: ['Signal', 'WaitForTrue', 'Active'],
+  LogicStep_WaitForSensor: ['Sensor', 'WaitForOccupied', 'WaitForStopped', 'Active'],
+  LogicStep_WaitForZone: ['Zone', 'WaitForOccupied', 'Active'],
+  LogicStep_WaitForSignalBool: ['Signal', 'WaitForTrue', 'Edge', 'Active'],  // Edge: plan-538 F5
   LogicStep_Delay: ['Duration', 'Active'],
   LogicStep_DriveToPosition: ['drive', 'Destination', 'Relative', 'Direction', 'Active'],
   LogicStep_DriveTo: ['drive', 'Destination', 'Relative', 'Direction', 'Active'],
@@ -151,12 +160,19 @@ const CONSUMED: Record<string, string[]> = {
   LogicStep_GripPlace: ['Grip', 'Blocking', 'Active'],
   LogicStep_JumpOnSignal: ['Signal', 'JumpOn', 'JumpToStep', 'Active'],
   LogicStep_IKPath: ['IKPath', 'Active'],
+  // plan-729 — built by the private mechanism feature through the
+  // rv-logic-step-registry seam; the fields are the same shape as IKPath's.
+  LogicStep_MechanismPath: ['MechanismPath', 'Active'],
   LogicStep_SetActiveOnly: ['Active'],
   LogicStep_CinemachineCamera: ['Active'],
   LogicStep_StatStartCycle: ['Active'],
   LogicStep_StatEndCycle: ['Active'],
   LogicStep_StatState: ['Active'],
   LogicStep_StatOutput: ['Active'],
+
+  // MechanismPath (plan-729) — the schema fields are derived automatically;
+  // StartNextPath is a rawFields entry read straight from the extras.
+  MechanismPath: ['StartNextPath'],
 
   // RuntimeMetadata — parsed by scene loader for tooltip content
   RuntimeMetadata: ['content'],
@@ -171,11 +187,16 @@ const CONSUMED: Record<string, string[]> = {
 
   // Group — fields fully covered by the schema in rv-group-component.ts
 
-  // Kinematic — parsed by the scene loader (collect) + applyKinematicParenting
+  // Kinematic — parsed by the scene loader (collect + resolveKinematicGroupNames)
+  // and the `Kinematic` pre-bake hook (the re-parenting, rv-pre-bake-hooks.ts)
   Kinematic: [
     'IntegrateGroupEnable', 'GroupName', 'GroupNamePrefix', 'SimplifyHierarchy',
     'KinematicParentEnable', 'Parent',
   ],
+
+  // Fmu (plan-498) — every field is schema-derived; FmuEmbed / FmuVariables
+  // are structured and shape-checked by validateFmuExtras() below.
+  Fmu: [],
 
   // Pipeline components — parsed by loadGLB pipeline parsing (schemas in rv-pipe.ts / rv-tank.ts / rv-pump.ts / rv-processing-unit.ts)
   Pipe: [
@@ -238,10 +259,10 @@ const IGNORED: Record<string, string[]> = {
   // plan-466 — `Active` is the realvirtualBehavior ActiveOnly flag that every Unity
   // component carries (Connected/Disconnected playback). The ribbon components have no
   // web equivalent for it, exactly like the signals and LogicSteps above.
-  RibbonRoller: ['Active'],
-  RibbonWinder: ['Active'],
-  RibbonDancer: ['Active'],
-  RibbonPath: ['Active'],
+  RibbonRoller: ['Active', 'RotationDirection'],
+  RibbonWinder: ['Active', 'RotationDirection'],
+  RibbonDancer: ['Active', 'RotationDirection'],
+  RibbonPath: ['Active', 'ReportAlarms'],
 
   SceneButtonBase: ['Name', 'Active', 'OnToggleOn', 'OnToggleOff'],
   SceneButtonMoveable: ['renderer', 'currentOffset', 'Name', 'Active'],
@@ -389,6 +410,7 @@ const IGNORED: Record<string, string[]> = {
   ],
   LogicStep_SetSignalBool: [...LOGIC_STEP_STATUS, 'Name'],
   LogicStep_WaitForSensor: [...LOGIC_STEP_STATUS, 'Name'],
+  LogicStep_WaitForZone: [...LOGIC_STEP_STATUS, 'Name'],
   LogicStep_WaitForSignalBool: [...LOGIC_STEP_STATUS, 'Name'],
   LogicStep_Delay: [...LOGIC_STEP_STATUS, 'Name'],
   LogicStep_DriveToPosition: [...LOGIC_STEP_STATUS, 'Name'],
@@ -464,6 +486,16 @@ const IGNORED: Record<string, string[]> = {
   //                     side effect of plan-273 §2.3 and has no runtime role on
   //                     either side. The web host derives joint state from the
   //                     solver, never from a captured editor pose.
+  // MeshCollider (plan-467 Phase 1) — a `colliders[]` ENTRY type, not a
+  // top-level extras key, so `validateExtras('MeshCollider', …)` is never
+  // called for it. It is listed here so `isKnownComponentType('MeshCollider')`
+  // reports it as known: the physics side DOES consume `convex` / `enabled` /
+  // `isTrigger` (rv-collider-extras.ts → convex-hull kinematic bodies). The
+  // entry lives in IGNORED rather than CONSUMED on purpose — CONSUMED types are
+  // asserted to have an rv-ODT `$def` (tests/spec-loading.test.ts) and the
+  // collider array has no `$def` in schema v1.
+  MeshCollider: ['type', 'convex', 'enabled', 'isTrigger', 'cookingOptions', 'sharedMaterial'],
+
   KinematicMechanism: ['Active'],
   KinematicJoint: [
     'Active',
@@ -472,6 +504,332 @@ const IGNORED: Record<string, string[]> = {
 };
 
 /** Summary of unhandled fields per component type (collected during load) */
+// ─── Fmu shape (plan-498) ──────────────────────────────────────────────
+
+/** The package record of an `Fmu` component, shape-checked. */
+export interface FmuEmbedShape {
+  fileName: string;
+  sha256: string;
+  guid: string;
+  modelName: string;
+  fmiVersion: string;
+  generationTool?: string;
+  generationDateAndTime?: string;
+  byteLength: number;
+  /** Index of the bufferView holding the bytes; -1 = not saved with bytes. */
+  bufferView: number;
+}
+
+/** One `FmuVariables[]` record, shape-checked. */
+export interface FmuVariableShape {
+  name: string;
+  valueReference: number;
+  causality: 'input' | 'output' | 'parameter' | 'calculatedParameter';
+  variability: string;
+  type: 'Real' | 'Integer' | 'Boolean' | 'String' | 'Enumeration';
+  start?: string;
+  unit?: string;
+  description?: string;
+  /** plan-502 — FMI `initial` attribute. */
+  initial?: 'exact' | 'approx' | 'calculated';
+  /** plan-502 — numeric range of the variable (absent in pre-502 extras). */
+  min?: number;
+  max?: number;
+  /** plan-502 — `declaredType` (SimpleType name). */
+  declaredType?: string;
+  /** plan-502 — enumeration items `{ name, value }` (Enumeration variables only). */
+  enumItems?: Array<{ name: string; value: number; description?: string }>;
+}
+
+/** Result of {@link validateFmuExtras}: what is usable plus what was dropped. */
+export interface FmuExtrasCheck {
+  /** Null when no package is attached (no `FmuEmbed.sha256`). */
+  embed: FmuEmbedShape | null;
+  variables: FmuVariableShape[];
+  /**
+   * plan-502 — `FmuStartOverrides` as a name → string map. Only the SHAPE is
+   * checked here (string values; numbers/booleans are stringified); whether a
+   * name is known and allowed is `RVFmu`'s call (orphaned overrides).
+   */
+  startOverrides: Record<string, string>;
+  /** Human-readable reasons for every dropped record/field. */
+  issues: string[];
+}
+
+const FMU_CAUSALITIES = new Set(['input', 'output', 'parameter', 'calculatedParameter']);
+const FMU_TYPES = new Set(['Real', 'Integer', 'Boolean', 'String', 'Enumeration']);
+const FMU_BASE_UNIT_KEYS = new Set(['kg', 'm', 's', 'A', 'K', 'mol', 'cd', 'rad', 'factor', 'offset']);
+
+function optString(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : undefined;
+}
+
+/**
+ * Defensive reader of an `Fmu` extras record — the ONE shape check of
+ * `FmuEmbed` and `FmuVariables` (plan-498 F11). Never throws: a malformed
+ * variable is dropped and named in `issues`; an `FmuEmbed` without a SHA means
+ * "no package attached" (`embed: null`), which is a valid authoring state.
+ */
+export function validateFmuExtras(data: Record<string, unknown> | undefined | null): FmuExtrasCheck {
+  const issues: string[] = [];
+  const rawEmbed = data?.FmuEmbed;
+  let embed: FmuEmbedShape | null = null;
+  if (rawEmbed && typeof rawEmbed === 'object' && !Array.isArray(rawEmbed)) {
+    const e = rawEmbed as Record<string, unknown>;
+    const sha = typeof e.sha256 === 'string' ? e.sha256.trim().toLowerCase() : '';
+    if (sha && /^[0-9a-f]{64}$/.test(sha)) {
+      const bufferView = Number.isInteger(e.bufferView) ? (e.bufferView as number) : -1;
+      const byteLength = typeof e.byteLength === 'number' && e.byteLength >= 0 ? e.byteLength : 0;
+      embed = {
+        fileName: optString(e.fileName) ?? '',
+        sha256: sha,
+        guid: optString(e.guid) ?? '',
+        modelName: optString(e.modelName) ?? '',
+        fmiVersion: optString(e.fmiVersion) ?? '2.0',
+        byteLength,
+        bufferView: bufferView >= 0 ? bufferView : -1,
+      };
+      const tool = optString(e.generationTool);
+      if (tool !== undefined) embed.generationTool = tool;
+      const when = optString(e.generationDateAndTime);
+      if (when !== undefined) embed.generationDateAndTime = when;
+      if (embed.fmiVersion !== '2.0') issues.push(`FmuEmbed.fmiVersion "${embed.fmiVersion}" is not 2.0`);
+    } else if (sha) {
+      issues.push(`FmuEmbed.sha256 "${sha}" is not a SHA-256 hex digest`);
+    }
+  } else if (rawEmbed !== undefined && rawEmbed !== null) {
+    issues.push('FmuEmbed is not an object');
+  }
+
+  const variables: FmuVariableShape[] = [];
+  const rawVars = data?.FmuVariables;
+  if (Array.isArray(rawVars)) {
+    const seen = new Set<string>();
+    rawVars.forEach((raw, i) => {
+      if (!raw || typeof raw !== 'object') { issues.push(`FmuVariables[${i}] is not an object`); return; }
+      const v = raw as Record<string, unknown>;
+      const name = typeof v.name === 'string' ? v.name : '';
+      const vr = typeof v.valueReference === 'number' ? v.valueReference : Number(v.valueReference);
+      const causality = String(v.causality ?? '');
+      const type = String(v.type ?? '');
+      if (!name || name.includes('/')) { issues.push(`FmuVariables[${i}] has no usable name`); return; }
+      if (!Number.isInteger(vr) || vr < 0) { issues.push(`FmuVariables[${i}] (${name}) has no valueReference`); return; }
+      if (!FMU_CAUSALITIES.has(causality)) { issues.push(`FmuVariables[${i}] (${name}) has causality "${causality}"`); return; }
+      if (!FMU_TYPES.has(type)) { issues.push(`FmuVariables[${i}] (${name}) has type "${type}"`); return; }
+      if (seen.has(name)) { issues.push(`FmuVariables[${i}] (${name}) is a duplicate`); return; }
+      seen.add(name);
+      const out: FmuVariableShape = {
+        name, valueReference: vr,
+        causality: causality as FmuVariableShape['causality'],
+        variability: typeof v.variability === 'string' ? v.variability : 'continuous',
+        type: type as FmuVariableShape['type'],
+      };
+      if (v.start !== undefined && v.start !== null) out.start = String(v.start);
+      const unit = optString(v.unit);
+      if (unit !== undefined) out.unit = unit;
+      const description = optString(v.description);
+      if (description !== undefined) out.description = description;
+      // plan-502 — optional; every field is dropped silently when malformed.
+      const initial = v.initial;
+      if (initial === 'exact' || initial === 'approx' || initial === 'calculated') out.initial = initial;
+      if (typeof v.min === 'number' && Number.isFinite(v.min)) out.min = v.min;
+      if (typeof v.max === 'number' && Number.isFinite(v.max)) out.max = v.max;
+      const declaredType = optString(v.declaredType);
+      if (declaredType !== undefined) out.declaredType = declaredType;
+      if (Array.isArray(v.enumItems)) {
+        const items: NonNullable<FmuVariableShape['enumItems']> = [];
+        for (const it of v.enumItems as unknown[]) {
+          if (!it || typeof it !== 'object') continue;
+          const r = it as Record<string, unknown>;
+          if (typeof r.name !== 'string' || !r.name || typeof r.value !== 'number' || !Number.isInteger(r.value)) continue;
+          const item: { name: string; value: number; description?: string } = { name: r.name, value: r.value };
+          if (typeof r.description === 'string') item.description = r.description;
+          items.push(item);
+        }
+        if (items.length > 0) out.enumItems = items;
+      }
+      variables.push(out);
+    });
+  } else if (rawVars !== undefined && rawVars !== null) {
+    issues.push('FmuVariables is not an array');
+  }
+
+  const startOverrides: Record<string, string> = {};
+  const rawOverrides = data?.FmuStartOverrides;
+  if (rawOverrides && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)) {
+    for (const [name, value] of Object.entries(rawOverrides as Record<string, unknown>)) {
+      if (!name) continue;
+      if (typeof value === 'string') startOverrides[name] = value;
+      else if ((typeof value === 'number' && Number.isFinite(value)) || typeof value === 'boolean') startOverrides[name] = String(value);
+      else issues.push(`FmuStartOverrides.${name} is not a string value`);
+    }
+  } else if (rawOverrides !== undefined && rawOverrides !== null) {
+    issues.push('FmuStartOverrides is not an object');
+  }
+
+  // plan-512 F11 — `FmuUnits` (unit name → FMI BaseUnit). Shape only: the unit
+  // kernel reads it defensively (`unitDefsFromBaseUnits`), a malformed entry is
+  // named here and then ignored there.
+  const rawUnits = data?.FmuUnits;
+  if (rawUnits && typeof rawUnits === 'object' && !Array.isArray(rawUnits)) {
+    for (const [name, value] of Object.entries(rawUnits as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        issues.push(`FmuUnits.${name} is not a BaseUnit object`);
+        continue;
+      }
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        if (!FMU_BASE_UNIT_KEYS.has(k)) issues.push(`FmuUnits.${name}.${k} is not a BaseUnit attribute`);
+        else if (typeof v !== 'number' || !Number.isFinite(v)) issues.push(`FmuUnits.${name}.${k} is not a number`);
+      }
+    }
+  } else if (rawUnits !== undefined && rawUnits !== null) {
+    issues.push('FmuUnits is not an object');
+  }
+  return { embed, variables, startOverrides, issues };
+}
+
+/** The fields of a `Zone` the authoring rules look at (plan-521 F2/F3). */
+export interface ZoneRuleInput {
+  Detect: boolean;
+  Block: boolean;
+  Hold: boolean;
+  Activation: string;
+  /** Resolved signal address (or the raw reference when unresolved), null when unset. */
+  ActivationSignal: unknown;
+  /** Resolved drive (or the raw reference when unresolved), null when unset. */
+  ActivationDrive: unknown;
+  Size: { x: number; y: number; z: number };
+  /** plan-530 — optional so older callers keep compiling (absent = false). */
+  SingleRelease?: boolean;
+}
+
+/**
+ * Field rules of a `Zone` (plan-521, spec §7a.66 "Authoring rules"). Returns
+ * human-readable problems — empty when the configuration is complete. A zone
+ * with a problem still loads (defensive parsing); the reader warns instead of
+ * refusing it. Active in every build: a silently inert zone is exactly the
+ * failure an author cannot see.
+ */
+export function zoneRuleWarnings(zone: ZoneRuleInput): string[] {
+  const out: string[] = [];
+  if (!zone.Detect && !zone.Block && !zone.Hold) {
+    out.push('no effect set (Detect, Block and Hold are all false) — the zone does nothing');
+  }
+  if (zone.Activation === 'Signal' && !zone.ActivationSignal) {
+    out.push('Activation "Signal" needs ActivationSignal — the zone stays inactive');
+  }
+  if (zone.Activation === 'Axis' && !zone.ActivationDrive) {
+    out.push('Activation "Axis" needs ActivationDrive — the zone stays inactive');
+  }
+  const sz = zone.Size;
+  if (!(sz.x > 0 && sz.y > 0 && sz.z > 0)) {
+    out.push('Size must be positive on all three axes — the box is empty');
+  }
+  if (zone.SingleRelease === true && !zone.Block) {
+    out.push('SingleRelease needs Block — without it SingleRelease does nothing');
+  }
+  if (zone.SingleRelease === true && zone.Hold) {
+    out.push('SingleRelease is ignored while Hold is on');
+  }
+  return out;
+}
+
+/** One top-level logic root as the plan-538 root rules see it. */
+export interface LogicRootRuleInput {
+  /** Root name (for the message). */
+  name: string;
+  /** The root's `Active` value (`DontChange` counts as `Always`). */
+  active: string;
+  /** Signal addresses written by the root's SetSignal steps (owned outputs). */
+  outputs: readonly string[];
+  /** Drives commanded by the root's motion steps (identity compared). */
+  drives: readonly unknown[];
+  /** Names of steps that start motion but have no cancel hook. */
+  motionWithoutCancel: readonly string[];
+}
+
+/**
+ * Rules of the per-root `Active` lifecycle (plan-538 F1f / F1g). Returns
+ * human-readable warnings — empty when the roots are unproblematic. Active in
+ * every build (like {@link zoneRuleWarnings}): an output fought over by a
+ * virtual PLC and a real PLC is exactly the failure an author cannot see.
+ *
+ * - An output signal or a drive used by roots with DIFFERENT `Active` values
+ *   is shared between a virtual-PLC root and its counterpart: deactivating one
+ *   never resets what an active root currently owns, but the author should
+ *   know the two compete.
+ * - A step that starts motion without a cancel hook in a root whose `Active`
+ *   is not `Always`: switching the root off could not stop that motion.
+ */
+export function logicRootRuleWarnings(roots: readonly LogicRootRuleInput[]): string[] {
+  const out: string[] = [];
+  const norm = (a: string): string => (a === 'DontChange' ? 'Always' : a);
+  const report = (kind: string, key: unknown, label: string): void => {
+    const users = roots.filter((r) => (kind === 'output' ? r.outputs : r.drives).includes(key as never));
+    const actives = new Set(users.map((r) => norm(r.active)));
+    if (actives.size > 1) {
+      out.push(`${kind} ${label} is shared between roots with different Active (${users.map((r) => `"${r.name}"=${norm(r.active)}`).join(', ')})`);
+    }
+  };
+  const outputs = new Set<string>();
+  for (const r of roots) for (const o of r.outputs) outputs.add(o);
+  for (const o of outputs) report('output', o, `"${o}"`);
+  const drives = new Set<unknown>();
+  for (const r of roots) for (const d of r.drives) drives.add(d);
+  for (const d of drives) {
+    const name = (d as { name?: unknown; node?: { name?: unknown } }).name ?? (d as { node?: { name?: unknown } }).node?.name ?? '?';
+    report('drive', d, `"${String(name)}"`);
+  }
+  for (const r of roots) {
+    if (norm(r.active) === 'Always') continue;
+    for (const step of r.motionWithoutCancel) {
+      out.push(`root "${r.name}" (Active=${r.active}): step "${step}" starts motion but cannot be cancelled — deactivating the root leaves it moving`);
+    }
+  }
+  return out;
+}
+
+// ─── WebOperatorPanel (plan-543) ───────────────────────────────────────
+
+/** Result of {@link parseWebOperatorPanelConfig}: the parsed JSON, or why there is none. */
+export interface WebOperatorPanelConfigParse {
+  /** The parsed config (unvalidated), or null when `Config` is empty or not JSON. */
+  raw: unknown;
+  /** JSON-level problems ("Config is not valid JSON: …"); empty when it parsed. */
+  errors: string[];
+}
+
+/**
+ * Reads the `Config` field of a `WebOperatorPanel`: a JSON STRING (the authored
+ * form), tolerating an already-parsed object (an MCP `valueJson` that carried
+ * the object instead of a JSON string). Never throws.
+ */
+export function parseWebOperatorPanelConfig(value: unknown): WebOperatorPanelConfigParse {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) return { raw: value, errors: [] };
+  if (typeof value !== 'string' || value.trim() === '') {
+    return { raw: null, errors: ['Config is empty — paste an operator panel JSON (web_help topic "operator-panel")'] };
+  }
+  try {
+    return { raw: JSON.parse(value) as unknown, errors: [] };
+  } catch (e) {
+    return { raw: null, errors: [`Config is not valid JSON: ${e instanceof Error ? e.message : String(e)}`] };
+  }
+}
+
+/**
+ * Field rule of a `WebOperatorPanel` (plan-543 F1, spec §7d.14): `Config` must
+ * parse and be a valid operator panel; with `hasSignal`, every signal it uses
+ * must exist in the model. Returns the problems, each with its JSON path
+ * (`buttons[3].signal 'BT9' not found in model`) — empty when valid. Active in
+ * every build: a panel that silently shows nothing is the failure an author
+ * cannot see.
+ */
+export function webOperatorPanelRuleWarnings(config: unknown, hasSignal?: (name: string) => boolean): string[] {
+  const parsed = parseWebOperatorPanelConfig(config);
+  if (parsed.errors.length > 0) return parsed.errors;
+  return validateOperatorPanelConfig(parsed.raw, hasSignal).errors;
+}
+
 const unhandledSummary = new Map<string, Map<string, unknown>>();
 
 /**

@@ -85,14 +85,29 @@ function qualityToken(quality: string): string {
   return cleaned || 'default';
 }
 
-/** `<version>.<sha256>.<quality>.glb` — the Cache-API entry name. */
-export function cadGlbFileName(sha256: string, quality: string): string {
-  return `${CACHE_VERSION}.${sha256}.${qualityToken(quality)}.glb`;
+/**
+ * Converter that produced a cached GLB (plan-561). Browser and CONNECT conversions of the same
+ * file yield different trees, so they must never share an entry. `undefined` and `'browser'`
+ * address the LEGACY key — bit-identical to every entry written before plan-561 — while
+ * `'connect'` appends `.connect` to the quality token. `qualityToken` maps `.` to `-`, so no
+ * quality preset can ever produce the suffixed token on its own.
+ */
+export type CadConverter = 'connect' | 'browser';
+
+/** Quality token including the converter suffix (legacy token for the browser). */
+function keyToken(quality: string, converter?: CadConverter): string {
+  const q = qualityToken(quality);
+  return converter === 'connect' ? `${q}.connect` : q;
+}
+
+/** `<version>.<sha256>.<quality>[.connect].glb` — the Cache-API entry name. */
+export function cadGlbFileName(sha256: string, quality: string, converter?: CadConverter): string {
+  return `${CACHE_VERSION}.${sha256}.${keyToken(quality, converter)}.glb`;
 }
 
 /** Synthetic but deterministic URL under which the Cache API stores an entry. */
-function cacheUrl(sha256: string, quality: string): string {
-  return `https://rv-cad-cache.local/${cadGlbFileName(sha256, quality)}`;
+function cacheUrl(sha256: string, token: string): string {
+  return `https://rv-cad-cache.local/${CACHE_VERSION}.${sha256}.${token}.glb`;
 }
 
 // ─── OPFS tier ───────────────────────────────────────────────────────────
@@ -113,18 +128,23 @@ const cadOpfsKeys = new Set<string>();
  * The OPFS store validates every key against a strict sha256 regex — that regex
  * IS its path-traversal guard, so a composite like `<sha>-<quality>` would be
  * (correctly) rejected. Hashing the tuple keeps one opaque, valid key while
- * still separating qualities and cache versions from one another.
+ * still separating qualities, converters and cache versions from one another.
  */
-async function opfsKey(sha256: string, quality: string): Promise<string> {
-  const material = `${CACHE_VERSION}:${sha256}:${qualityToken(quality)}`;
+export async function cadGlbOpfsKey(sha256: string, quality: string, converter?: CadConverter): Promise<string> {
+  return opfsKey(sha256, keyToken(quality, converter));
+}
+
+/** {@link cadGlbOpfsKey} on an already-built key token. */
+async function opfsKey(sha256: string, token: string): Promise<string> {
+  const material = `${CACHE_VERSION}:${sha256}:${token}`;
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material));
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function readFromOpfs(sha256: string, quality: string): Promise<ArrayBuffer | null> {
+async function readFromOpfs(sha256: string, token: string): Promise<ArrayBuffer | null> {
   if (!isOpfsSupported()) return null;
   try {
-    const resolved = await getBlobUrl(await opfsKey(sha256, quality));
+    const resolved = await getBlobUrl(await opfsKey(sha256, token));
     if (!resolved) return null;
     try {
       return await (await fetch(resolved.url)).arrayBuffer();
@@ -137,10 +157,10 @@ async function readFromOpfs(sha256: string, quality: string): Promise<ArrayBuffe
   }
 }
 
-async function writeToOpfs(sha256: string, quality: string, bytes: ArrayBuffer): Promise<boolean> {
+async function writeToOpfs(sha256: string, token: string, bytes: ArrayBuffer): Promise<boolean> {
   if (!isOpfsSupported()) return false;
   try {
-    const key = await opfsKey(sha256, quality);
+    const key = await opfsKey(sha256, token);
     await putBlob(key, new Blob([bytes], { type: GLB_MIME }));
     cadOpfsKeys.add(key);
     return true;
@@ -183,11 +203,11 @@ async function enforceByteBudget(cache: Cache): Promise<void> {
   }
 }
 
-async function readFromCacheApi(sha256: string, quality: string): Promise<ArrayBuffer | null> {
+async function readFromCacheApi(sha256: string, token: string): Promise<ArrayBuffer | null> {
   if (!cacheApiAvailable()) return null;
   try {
     const cache = await caches.open(CAD_GLB_BUCKET);
-    const url = cacheUrl(sha256, quality);
+    const url = cacheUrl(sha256, token);
     const hit = await cache.match(url);
     if (!hit) return null;
     const bytes = await hit.clone().arrayBuffer();
@@ -204,14 +224,14 @@ async function readFromCacheApi(sha256: string, quality: string): Promise<ArrayB
   }
 }
 
-async function writeToCacheApi(sha256: string, quality: string, bytes: ArrayBuffer): Promise<boolean> {
+async function writeToCacheApi(sha256: string, token: string, bytes: ArrayBuffer): Promise<boolean> {
   if (!cacheApiAvailable()) return false;
   try {
     const cache = await caches.open(CAD_GLB_BUCKET);
     const resp = new Response(bytes, {
       headers: { 'Content-Type': GLB_MIME, [SIZE_HEADER]: String(bytes.byteLength) },
     });
-    await cache.put(cacheUrl(sha256, quality), resp);
+    await cache.put(cacheUrl(sha256, token), resp);
     await enforceByteBudget(cache);
     return true;
   } catch {
@@ -235,7 +255,8 @@ export async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
 export type CadCacheTier = 'opfs' | 'cache-api' | 'none';
 
 /**
- * Store converted GLB bytes under `(sha256, quality)`.
+ * Store converted GLB bytes under `(sha256, quality, converter)`. `converter` absent or
+ * `'browser'` = the legacy key (see {@link CadConverter}).
  *
  * OPFS first, Cache API otherwise. Returns the tier that accepted the
  * write — `'none'` means nothing durable happened and the caller should surface
@@ -246,26 +267,33 @@ export async function putCadGlb(
   sha256: string,
   quality: string,
   bytes: ArrayBuffer,
+  converter?: CadConverter,
 ): Promise<CadCacheTier> {
-  if (await writeToOpfs(sha256, quality, bytes)) return 'opfs';
-  if (await writeToCacheApi(sha256, quality, bytes)) return 'cache-api';
+  const token = keyToken(quality, converter);
+  if (await writeToOpfs(sha256, token, bytes)) return 'opfs';
+  if (await writeToCacheApi(sha256, token, bytes)) return 'cache-api';
   return 'none';
 }
 
 /**
- * Retrieve converted GLB bytes for `(sha256, quality)`, or null on a miss.
+ * Retrieve converted GLB bytes for `(sha256, quality, converter)`, or null on a miss.
  *
  * A miss is recoverable, never fatal: the CAD provider can re-tessellate from
  * its cached source bytes, and failing that the user is prompted to re-pick the
  * file. Never prompts for filesystem permission — safe to call at boot.
  */
-export async function getCadGlb(sha256: string, quality: string): Promise<ArrayBuffer | null> {
-  return (await readFromOpfs(sha256, quality)) ?? (await readFromCacheApi(sha256, quality));
+export async function getCadGlb(
+  sha256: string,
+  quality: string,
+  converter?: CadConverter,
+): Promise<ArrayBuffer | null> {
+  const token = keyToken(quality, converter);
+  return (await readFromOpfs(sha256, token)) ?? (await readFromCacheApi(sha256, token));
 }
 
 /** True when the bytes are already cached (no read of the body). */
-export async function hasCadGlb(sha256: string, quality: string): Promise<boolean> {
-  return (await getCadGlb(sha256, quality)) !== null;
+export async function hasCadGlb(sha256: string, quality: string, converter?: CadConverter): Promise<boolean> {
+  return (await getCadGlb(sha256, quality, converter)) !== null;
 }
 
 /** Wipe both tiers. Used by dev tools and tests. */

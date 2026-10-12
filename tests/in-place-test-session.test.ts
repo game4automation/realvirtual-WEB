@@ -322,6 +322,34 @@ describe('InPlaceTestSession — stop restores the authoring state', () => {
     doc.dispose();
   });
 
+  it('restores original file indices after a test export adds and reorders nodes', async () => {
+    const env = makeEnv({ loadImpl: async () => {
+      env.viewer.registry!.setGltfNodeIndices(
+        new Map([[env.model, 0], [created, 1], [env.box, 2]]),
+        ['Asset', 'Created', 'Box'],
+      );
+    } });
+    const registry = env.viewer.registry!;
+    registry.setGltfNodeIndices(new Map([[env.model, 0], [env.box, 1]]), ['Asset', 'Box']);
+    const created = new Object3D();
+    created.name = 'Created';
+    env.model.add(created);
+    registry.registerNode('Asset/Created', created);
+    const doc = scratchAssetDocument(env.viewer);
+    const { session } = makeSession(env, doc);
+
+    for (let run = 0; run < 2; run++) {
+      await session.start();
+      expect(registry.getGltfNodeIndex(env.boxPath)).toBe(2);
+      await session.stop();
+      expect(session.state).toBe('idle');
+      expect(registry.getGltfNodeNames()).toEqual(['Asset', 'Box']);
+      expect(registry.getGltfNodeIndex(env.boxPath)).toBe(1);
+      expect(registry.getGltfNodeIndex('Asset/Created')).toBeNull();
+    }
+    doc.dispose();
+  });
+
   it('stop without a run is a no-op', async () => {
     const env = makeEnv();
     const doc = scratchAssetDocument(env.viewer);

@@ -18,6 +18,11 @@
  *   - name      = the file stem, humanized (e.g. `RollConveyor-2m`
  *                 -> "Roll Conveyor 2m").
  *   - glbUrl    = path relative to the library root (resolved at load time).
+ *   - sha256 / sizeBytes = the bytes behind glbUrl (plan-508). The browser's
+ *                 blob cache keys on the hash and verifies every download
+ *                 against it. These are the UNSIGNED dev bytes — correct for
+ *                 `vite dev`; a signing deploy re-stamps the shipped catalog
+ *                 AFTER signing (`stampCatalogHashes` in `_bunny-lib.mjs`).
  * Thumbnails are rendered at runtime by the planner, so none are emitted here.
  *
  * Run: `node scripts/build-local-library-catalog.mjs`
@@ -27,6 +32,7 @@ import { readdir, writeFile, stat } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { sha256File } from './lib/rv-hash.mjs';
 
 export const ROOT = fileURLToPath(new URL('..', import.meta.url));
 export const LIBRARY_DIR = join(ROOT, 'public', 'library');
@@ -48,15 +54,15 @@ export function slug(s) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-/** Recursively collect all `.glb` files under `dir`, returned as paths relative to LIBRARY_DIR. */
-export async function collectGlbs(dir) {
+/** Recursively collect all `.glb` files under `dir`, returned as paths relative to `root` (default LIBRARY_DIR). */
+export async function collectGlbs(dir, root = LIBRARY_DIR) {
   const out = [];
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
-      out.push(...await collectGlbs(full));
+      out.push(...await collectGlbs(full, root));
     } else if (entry.isFile() && /\.glb$/i.test(entry.name)) {
-      out.push(relative(LIBRARY_DIR, full));
+      out.push(relative(root, full));
     }
   }
   return out;
@@ -104,6 +110,43 @@ export function libraryAssetId(rel) {
   return slug(rel.replace(/\.glb$/i, ''));
 }
 
+/**
+ * Build the catalog object for `libraryDir` (default: the bundled library).
+ *
+ * `filterIgnored` drops Git-ignored files; it only makes sense for the real
+ * LIBRARY_DIR (the ignore rules are spelled against `public/library`), so a
+ * caller scanning another folder (the hash test) passes `false`.
+ */
+export async function buildLocalCatalog(libraryDir = LIBRARY_DIR, { filterIgnored = libraryDir === LIBRARY_DIR, log = () => {} } = {}) {
+  const scanned = (await collectGlbs(libraryDir, libraryDir)).sort();
+  const ignored = filterIgnored ? gitIgnored(scanned) : new Set();
+  if (ignored.size > 0) {
+    log(`[build-local-library-catalog] skipping ${ignored.size} Git-ignored asset(s) — local only, never catalogued.`);
+  }
+  const relPaths = scanned.filter((rel) => !ignored.has(rel));
+  const entries = relPaths.map((rel) => {
+    const parts = rel.split(sep);
+    const file = parts[parts.length - 1];
+    const folder = parts.length > 1 ? parts[0] : 'General';
+    const stem = file.replace(/\.glb$/i, '');
+    const glbUrl = parts.join('/'); // POSIX-style URL relative to the library root
+    const { sha256, sizeBytes } = sha256File(join(libraryDir, rel));
+    return {
+      id: slug(rel.replace(/\.glb$/i, '')),
+      name: humanize(stem),
+      category: humanize(folder),
+      glbUrl,
+      sha256,
+      sizeBytes,
+    };
+  });
+
+  // Stable order: by category, then name.
+  entries.sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
+
+  return { version: '1.0', name: 'realvirtual Library', entries };
+}
+
 async function main() {
   try {
     await stat(LIBRARY_DIR);
@@ -115,30 +158,8 @@ async function main() {
     process.exit(0);
   }
 
-  const scanned = (await collectGlbs(LIBRARY_DIR)).sort();
-  const ignored = gitIgnored(scanned);
-  if (ignored.size > 0) {
-    console.warn(`[build-local-library-catalog] skipping ${ignored.size} Git-ignored asset(s) — local only, never catalogued.`);
-  }
-  const relPaths = scanned.filter((rel) => !ignored.has(rel));
-  const entries = relPaths.map((rel) => {
-    const parts = rel.split(sep);
-    const file = parts[parts.length - 1];
-    const folder = parts.length > 1 ? parts[0] : 'General';
-    const stem = file.replace(/\.glb$/i, '');
-    const glbUrl = parts.join('/'); // POSIX-style URL relative to the library root
-    return {
-      id: slug(rel.replace(/\.glb$/i, '')),
-      name: humanize(stem),
-      category: humanize(folder),
-      glbUrl,
-    };
-  });
-
-  // Stable order: by category, then name.
-  entries.sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
-
-  const catalog = { version: '1.0', name: 'realvirtual Library', entries };
+  const catalog = await buildLocalCatalog(LIBRARY_DIR, { log: (m) => console.warn(m) });
+  const { entries } = catalog;
   await writeFile(OUTPUT, JSON.stringify(catalog, null, 2) + '\n', 'utf8');
 
   const byCat = entries.reduce((m, e) => ((m[e.category] = (m[e.category] || 0) + 1), m), {});

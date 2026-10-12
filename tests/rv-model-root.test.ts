@@ -160,6 +160,10 @@ async function makeExecutorUnderTest(modelRoot: Object3D, nodes: Record<string, 
     registry: {
       getNode: (p: string) => nodes[p] ?? null,
       recomputePathsForSubtrees: () => {},
+      // The transform path re-bases an editor Drive on the node it moved
+      // (`_refreshDriveBase`); with no components in this fake scene the
+      // registry answers "none" rather than being absent.
+      getComponentsAt: () => null,
     },
     instancePickIndex: null,
     markRenderDirty: () => {},

@@ -10,7 +10,17 @@
  * When a renderer with setAnimationLoop is provided (WebXR-capable), the loop
  * delegates frame scheduling to the renderer. Otherwise falls back to
  * requestAnimationFrame (legacy/desktop behavior).
+ *
+ * Frame-rate cap (plan-568): with `minFrameInterval > 0` the simulation still
+ * integrates EVERY callback unchanged — only `onRender` is rate-limited against
+ * a render deadline that is carried forward by one interval per rendered frame
+ * (144 Hz / 165 Hz displays → 60 renders/s at a 60 cap). Simulated time is
+ * therefore identical with and without a cap. `minFrameInterval = 0` (default)
+ * renders every callback exactly as before.
  */
+
+/** Early-tick tolerance of the render deadline in seconds (rAF jitter). */
+export const RENDER_DEADLINE_TOLERANCE = 0.001;
 
 /** Minimal interface for a renderer that can drive the animation loop (e.g. WebGLRenderer). */
 export interface AnimationLoopRenderer {
@@ -59,6 +69,21 @@ export class SimulationLoop {
    *  (pause reason held or `_integrationEnabled === false`). NOT a loss —
    *  reported separately so a paused tab is never counted as drift. */
   private _pausedSeconds = 0;
+
+  // ── Render frame-rate cap (plan-568) ──────────────────────────────────
+  /** Minimum seconds between two `onRender` calls; 0 = no cap. */
+  private _minFrameInterval = 0;
+  /** Wall time (s, tick clock) at which the next capped render is due. 0 = render now. */
+  private _nextRenderAt = 0;
+  /** Clamped frame time accumulated across skipped renders, handed to the next `onRender`. */
+  private _pendingRenderTime = 0;
+
+  /** Optional guard: returning `false` disables the cap for this callback
+   *  (the viewer returns false while an XR session presents or a capture runs). */
+  shouldThrottle: (() => boolean) | null = null;
+  /** While true the cap is effectively off (perf measurements). The configured
+   *  {@link minFrameInterval} is kept and applies again once this is cleared. */
+  renderCapSuppressed = false;
 
   onFixedUpdate: (dt: number) => void = () => {};
   onRender: (frameTime: number) => void = () => {};
@@ -117,6 +142,16 @@ export class SimulationLoop {
    */
   get lostSimSeconds(): number { return this._clampedSeconds + this._droppedBacklogSeconds; }
 
+  /** Minimum seconds between two renders (0 = uncapped). Changing it applies
+   *  on the next callback — the pending deadline is reset. */
+  get minFrameInterval(): number { return this._minFrameInterval; }
+  set minFrameInterval(seconds: number) {
+    const v = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+    if (v === this._minFrameInterval) return;
+    this._minFrameInterval = v;
+    this._nextRenderAt = 0;
+  }
+
   /** Zero all lost-time counters (used by the perf probe between runs). */
   resetLostTimeCounters(): void {
     this._clampedSeconds = 0;
@@ -166,8 +201,38 @@ export class SimulationLoop {
     return frameTime;
   }
 
+  /**
+   * Render gate shared by BOTH tick paths. The simulation has already advanced
+   * for this callback; here only the `onRender` dispatch is rate-limited. A
+   * skipped callback keeps its frame time for the next render, and nothing
+   * renderer-side is touched, so the viewer's dirty flags survive a skip.
+   * Hot path: number comparisons only, no allocation.
+   */
+  private dispatchRender(now: number, frameTime: number): void {
+    this._pendingRenderTime += frameTime;
+    const interval = this._minFrameInterval;
+    if (interval > 0 && !this.renderCapSuppressed && (this.shouldThrottle === null || this.shouldThrottle())) {
+      const due = this._nextRenderAt;
+      if (now < due - RENDER_DEADLINE_TOLERANCE) return; // too early — skip this render
+      // Carry the deadline forward by one interval (late ticks keep the grid,
+      // so 144 Hz averages exactly the cap); an early tick inside the tolerance
+      // re-anchors to its own time so a display marginally faster than the cap
+      // does not drift into periodic skips. Far behind (stall, first frame) →
+      // start a fresh grid from now.
+      const next = (now < due ? now : due) + interval;
+      this._nextRenderAt = next <= now ? now + interval : next;
+    } else {
+      this._nextRenderAt = 0;
+    }
+    const ft = this._pendingRenderTime;
+    this._pendingRenderTime = 0;
+    this.onRender(ft);
+  }
+
   start() {
     this.running = true;
+    this._nextRenderAt = 0;
+    this._pendingRenderTime = 0;
     if (this.renderer) {
       this.rendererFirstTick = true;
       this.renderer.setAnimationLoop((time: DOMHighResTimeStamp) => this.tickFromRenderer(time));
@@ -193,7 +258,7 @@ export class SimulationLoop {
     const rawFrameTime = now - this.lastTime;
     this.lastTime = now;
 
-    this.onRender(this.advanceAccumulator(rawFrameTime));
+    this.dispatchRender(now, this.advanceAccumulator(rawFrameTime));
   };
 
   /** Renderer-driven path: called by renderer.setAnimationLoop (supports WebXR). */
@@ -206,13 +271,13 @@ export class SimulationLoop {
     if (this.rendererFirstTick) {
       this.rendererFirstTick = false;
       this.lastTime = now;
-      this.onRender(0);
+      this.dispatchRender(now, 0);
       return;
     }
 
     const rawFrameTime = now - this.lastTime;
     this.lastTime = now;
 
-    this.onRender(this.advanceAccumulator(rawFrameTime));
+    this.dispatchRender(now, this.advanceAccumulator(rawFrameTime));
   }
 }

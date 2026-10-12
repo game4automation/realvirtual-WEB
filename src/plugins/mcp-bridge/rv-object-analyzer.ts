@@ -16,7 +16,10 @@
  * private render target: a VISIBLE mask (clones drawn against the live
  * scene's depth buffer — pixels where the target actually shows) and a FULL
  * silhouette mask (clones alone). Occluded parts get a dimmed "X-ray" fill
- * and edge, so buried objects stay locatable. No geometry-based edge
+ * and edge, so buried objects stay locatable. The NEAR context tile marks the
+ * target with X-ray edges instead — silhouette plus interior creases from a
+ * view-space normal pass over the clones — while the far tile keeps the plain
+ * silhouette outline. No geometry-based edge
  * extraction (EdgesGeometry) and no interaction with the interactive
  * highlight manager — this is deliberately self-contained.
  *
@@ -39,6 +42,7 @@ import {
   DirectionalLight,
   Group,
   MeshBasicMaterial,
+  MeshNormalMaterial,
   PerspectiveCamera,
   Scene,
   SRGBColorSpace,
@@ -47,6 +51,7 @@ import {
 } from 'three';
 import type { Camera, Mesh, Object3D, WebGLRenderer } from 'three';
 import { disableOverlayLayers } from '../../core/engine/rv-group-registry';
+import { ensureShadowMaps, readRenderTargetPixelsFlipped } from '../../core/engine/rv-offscreen-capture';
 import type { RVViewer } from '../../core/rv-viewer';
 import {
   formatBoundsLabel,
@@ -74,6 +79,12 @@ const FILL_ALPHA_OCCLUDED = 38;
 const EDGE_ALPHA_VISIBLE = 255;
 const EDGE_ALPHA_OCCLUDED = 115;
 
+/** X-ray edge detection (near context tile): a crease shows up as a jump in
+ *  the encoded view-space normal. Threshold is the per-channel sum in 0..255
+ *  units — ~48 is roughly a 20 degree angle, crisp on CAD without speckling
+ *  tessellated curves. */
+const NORMAL_EDGE_THRESHOLD = 48;
+
 /** Neutral mid-grey backdrop for isolated tiles — reads for dark AND light parts. */
 const ISOLATED_BACKDROP = '#62686e';
 const CONTEXT_BACKDROP = '#202020';
@@ -83,6 +94,13 @@ export interface AnalyzeOptions {
   tileSize: number;
   /** Header line 1 content (the resolved node paths, ellipsized when long). */
   pathsLabel: string;
+  /**
+   * Unit vector from the aim point TOWARDS the viewpoint for the two CONTEXT
+   * tiles — the agent camera's own direction since plan-740 P3.4. Omitted
+   * (harness, no agent body) falls back to the fixed ISO_FRONT angle, which is
+   * what every caller got before. Isolated ¾ tiles ignore this by design.
+   */
+  contextDir?: [number, number, number];
 }
 
 export interface AnalyzeResult {
@@ -114,6 +132,11 @@ export class ObjectAnalyzer {
     polygonOffsetFactor: -1,
     polygonOffsetUnits: -2,
   });
+
+  /** View-space normal material for the near tile's X-ray edge pass. Smooth
+   *  shading on purpose: flat shading would turn every triangle of a
+   *  tessellated curve into an edge. */
+  private _normalMat = new MeshNormalMaterial();
 
   // Pre-allocated temps (no GC in the render pass).
   private _tmpVec = new Vector3();
@@ -180,7 +203,16 @@ export class ObjectAnalyzer {
       try {
         for (const cell of layout.cells) {
           let view = VIEW_DEFS.find((v) => v.name === cell.view)!;
-          if (view.framing === 'near') {
+          // Context tiles look from where the AGENT stands (P3.4), and that
+          // REPLACES the near tile's occluder probe: the probe searches the
+          // four fixed diagonals for the least-buried one, which is the right
+          // answer only while nobody has chosen an angle. Once the agent has,
+          // showing it a different one is the bug, not the fix — a part it
+          // cannot see from where it is standing is exactly what it needs to
+          // learn.
+          const agentAngle = view.kind === 'context' && opts.contextDir;
+          if (agentAngle) view = { ...view, dir: opts.contextDir! };
+          else if (view.framing === 'near') {
             // The fixed ¾ angle can look straight into an occluder — probe
             // the four diagonal angles and take the one showing the target.
             view = { ...view, dir: this._pickNearDir(renderer, mainScene, view, center, size, sceneBox, contentBox) };
@@ -216,6 +248,7 @@ export class ObjectAnalyzer {
     for (const rt of this._targets.values()) rt.dispose();
     this._targets.clear();
     this._maskMat.dispose();
+    this._normalMat.dispose();
     this._isoScene.environment = null; // shared IBL — never owned
     this._scratch = null;
   }
@@ -376,20 +409,17 @@ export class ObjectAnalyzer {
     return rt;
   }
 
-  /** Read the RT back as a top-down RGBA byte array (WebGL rows are bottom-up). */
+  /**
+   * Read the RT back as a top-down RGBA byte array (WebGL rows are bottom-up).
+   *
+   * The flip itself lives in `rv-offscreen-capture.ts` since plan-740 P2.1 —
+   * it was the third copy of the same loop. A FRESH array every call is
+   * deliberate and must stay: `_maskPasses` holds three readbacks alive at once
+   * (scene colour, visible mask, full silhouette) and compares them, so a
+   * shared buffer would make all three the last one.
+   */
   private _readPixels(renderer: WebGLRenderer, rt: WebGLRenderTarget, size: number): Uint8Array {
-    const px = new Uint8Array(size * size * 4);
-    renderer.readRenderTargetPixels(rt, 0, 0, size, size, px);
-    const rowBytes = size * 4;
-    const tmp = new Uint8Array(rowBytes);
-    for (let y = 0; y < size >> 1; y++) {
-      const a = y * rowBytes;
-      const b = (size - 1 - y) * rowBytes;
-      tmp.set(px.subarray(a, a + rowBytes));
-      px.copyWithin(a, b, b + rowBytes);
-      px.set(tmp, b);
-    }
-    return px;
+    return readRenderTargetPixelsFlipped(renderer, rt, size, size);
   }
 
   /** Composite top-down RGBA pixels into the mosaic over a backdrop color. */
@@ -441,20 +471,25 @@ export class ObjectAnalyzer {
    * depth), (2) the clone wrapper flat-magenta WITHOUT clearing —
    * depth-tested against the live depth buffer, so only the VISIBLE part of
    * the target survives, (3) after a clear, the wrapper alone — the FULL
-   * silhouette.
+   * silhouette. With `withNormals`, a fourth pass renders the wrapper's
+   * view-space normals, from which the X-ray edges are detected.
    */
   private _maskPasses(
     renderer: WebGLRenderer,
     mainScene: Scene,
     camera: Camera,
     size: number,
-  ): { color: Uint8Array; visPix: Uint8Array; allPix: Uint8Array } {
+    withNormals = false,
+  ): { color: Uint8Array; visPix: Uint8Array; allPix: Uint8Array; normPix: Uint8Array | null } {
     const rt = this._target(size);
     renderer.setRenderTarget(rt);
     renderer.setClearAlpha(0);
 
     renderer.autoClear = true;
     renderer.clear();
+    // The live scene with its real materials: the shadow map must exist or
+    // every lit draw is dropped (see ensureShadowMaps in rv-offscreen-capture).
+    ensureShadowMaps(renderer, mainScene);
     renderer.render(mainScene, camera);
     const color = this._readPixels(renderer, rt, size);
 
@@ -466,10 +501,19 @@ export class ObjectAnalyzer {
     renderer.clear();
     renderer.render(this._isoScene, camera);
     const allPix = this._readPixels(renderer, rt, size);
+
+    let normPix: Uint8Array | null = null;
+    if (withNormals) {
+      this._isoScene.overrideMaterial = this._normalMat;
+      renderer.clear();
+      renderer.render(this._isoScene, camera);
+      normPix = this._readPixels(renderer, rt, size);
+    }
+
     this._isoScene.overrideMaterial = null;
     renderer.autoClear = true;
 
-    return { color, visPix, allPix };
+    return { color, visPix, allPix, normPix };
   }
 
   /** Probe the four diagonal ¾ angles at low resolution and pick the one
@@ -515,22 +559,35 @@ export class ObjectAnalyzer {
     ctx: CanvasRenderingContext2D,
     targetCenter: Vector3,
   ): void {
-    const { color, visPix, allPix } = this._maskPasses(renderer, mainScene, camera, cell.size);
+    // The near tile gets X-ray edges (silhouette + interior creases) instead
+    // of the plain silhouette outline — the translucent fill stays on both.
+    const xray = cell.view === 'near';
+    const { color, visPix, allPix, normPix } = this._maskPasses(
+      renderer,
+      mainScene,
+      camera,
+      cell.size,
+      xray,
+    );
     this._blit(ctx, cell, color, CONTEXT_BACKDROP);
-    const silhouettePx = this._compositeHighlight(ctx, cell, visPix, allPix);
+    const silhouettePx = this._compositeHighlight(ctx, cell, visPix, allPix, normPix);
     // A near-invisible highlight (tiny or fully buried target) gets a ring
     // so the location still jumps out.
     const tiny = silhouettePx < cell.size * cell.size * 0.003;
     this._drawCenterMarker(ctx, camera, targetCenter, cell, tiny);
   }
 
-  /** Build the fill+edge highlight overlay from the two mask readbacks.
-   *  Returns the silhouette pixel count. */
+  /** Build the fill+edge highlight overlay from the mask readbacks.
+   *  With `normPix` the edges become X-ray edges — the silhouette plus the
+   *  target's interior creases, occluded parts still drawn at the dimmed
+   *  alpha — instead of the plain 2px silhouette outline. Returns the
+   *  silhouette pixel count. */
   private _compositeHighlight(
     ctx: CanvasRenderingContext2D,
     cell: MosaicCell,
     visPix: Uint8Array,
     allPix: Uint8Array,
+    normPix: Uint8Array | null = null,
   ): number {
     const size = cell.size;
     const n = size * size;
@@ -557,13 +614,17 @@ export class ObjectAnalyzer {
       for (let x = 0; x < size; x++) {
         const i = y * size + x;
         const inMask = all[i] === 1;
-        // 2px edge: inner boundary pixels of the mask plus their outer
-        // neighbors — crisp at any mesh density (no geometry edges).
         const l = x > 0 ? all[i - 1] : 0;
         const r = x < size - 1 ? all[i + 1] : 0;
         const u = y > 0 ? all[i - size] : 0;
         const d = y < size - 1 ? all[i + size] : 0;
-        const boundary = inMask ? l + r + u + d < 4 : l + r + u + d > 0;
+        // X-ray mode: 1px inner silhouette line plus the interior creases.
+        // Otherwise the original 2px edge (inner boundary + outer neighbors).
+        const boundary = normPix
+          ? inMask && (l + r + u + d < 4 || this._isCrease(normPix, all, i, x, y, size))
+          : inMask
+            ? l + r + u + d < 4
+            : l + r + u + d > 0;
 
         let alpha = 0;
         let visible = vis[i] === 1;
@@ -592,6 +653,32 @@ export class ObjectAnalyzer {
     sctx.putImageData(overlay, 0, 0);
     ctx.drawImage(this._scratch!, cell.x, cell.y);
     return silhouettePx;
+  }
+
+  /** True where the encoded view-space normal jumps against the right or the
+   *  lower neighbor — an interior crease of the target. Both pixels must sit
+   *  inside the silhouette so the background never contributes an edge. */
+  private _isCrease(
+    normPix: Uint8Array,
+    all: Uint8Array,
+    i: number,
+    x: number,
+    y: number,
+    size: number,
+  ): boolean {
+    const o = i * 4;
+    const right = x < size - 1 ? i + 1 : -1;
+    const down = y < size - 1 ? i + size : -1;
+    for (const j of [right, down]) {
+      if (j < 0 || all[j] !== 1) continue;
+      const p = j * 4;
+      const diff =
+        Math.abs(normPix[o] - normPix[p]) +
+        Math.abs(normPix[o + 1] - normPix[p + 1]) +
+        Math.abs(normPix[o + 2] - normPix[p + 2]);
+      if (diff >= NORMAL_EDGE_THRESHOLD) return true;
+    }
+    return false;
   }
 
   /** Small crosshair at the projected target center (context tiles); adds a

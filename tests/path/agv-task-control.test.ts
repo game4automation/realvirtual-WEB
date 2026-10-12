@@ -18,20 +18,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { Object3D } from 'three';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
-import { EventEmitter } from '../../src/core/rv-events';
-import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
-import {
-  createBindContext,
-  applyKinematicsSpec,
-  iterateFixedUpdate,
-  type BindContextHost,
-  type BindContextHandle,
-  type KinematicsSpec,
-  type RVBindContext,
-} from '../../src/core/behavior-runtime';
-import { createSelf, type MaterialFlowSelf } from '../../src/core/material-flow/material-flow-self';
+import { iterateFixedUpdate } from '../../src/core/behavior-runtime';
 import type { MaterialFlowDefinition } from '../../src/core/material-flow/define-material-flow';
 import { parsePathExtras } from '../../src/core/engine/rv-path';
 import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
@@ -40,71 +27,16 @@ import { getDefaultZoneRegistry } from '../../src/core/engine/rv-zone-registry';
 import { getDefaultAgvFleet, type AgvTask } from '../../src/core/engine/rv-agv-fleet';
 import { getDefaultPathDockRegistry } from '../../src/core/engine/rv-path-dock';
 import { clearLiveControl } from '../../src/core/engine/rv-live-control';
-import AgvBehavior, { AgvFlow } from '../../src/behaviors/Agv';
+import { AgvFlow } from '../../src/behaviors/Agv';
+import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { makeHost, makeAgvRoot as makeAgv, bindContinuous, bindDes, clearShared, sig,
+  type AgvTestHost as Host,
+} from '../helpers/agv-harness';
 
 const AgvDef = AgvFlow as unknown as MaterialFlowDefinition;
 const TICK = 1 / 60;
 
 // ─── Harness (agv-des-parity pattern) ───────────────────────────────────────
-
-interface Host extends BindContextHost {
-  values: Map<string, boolean | number>;
-}
-
-function makeHost(): Host {
-  const subs = new Map<string, Set<(v: boolean | number) => void>>();
-  const values = new Map<string, boolean | number>();
-  const events = new EventEmitter<Record<string, unknown>>();
-  return {
-    values,
-    signalStore: {
-      get: (n: string) => values.get(n),
-      set: (n: string, v: boolean | number) => { values.set(n, v); subs.get(n)?.forEach((cb) => cb(v)); },
-      subscribe: (n: string, cb: (v: boolean | number) => void) => {
-        let s = subs.get(n); if (!s) { s = new Set(); subs.set(n, s); }
-        s.add(cb); return () => { s!.delete(cb); };
-      },
-    },
-    on: (e, cb) => events.on(e, cb as never),
-    contextMenu: new ContextMenuStore(),
-    drives: [],
-    registry: null,
-  } as Host;
-}
-
-function makeAgv(name: string, cfg: Record<string, unknown>): Object3D {
-  const root = new Object3D();
-  root.name = name;
-  root.userData.realvirtual = { LayoutObject: { Name: name }, Agv: cfg };
-  return root;
-}
-
-function bindContinuous(root: Object3D, host: Host): BindContextHandle {
-  const accum: KinematicsSpec = {};
-  const { ctx, handle } = createBindContext(root, host, accum);
-  AgvBehavior.bind(ctx);
-  applyKinematicsSpec(root, accum);
-  return handle;
-}
-
-function makeCtx(root: Object3D, host: Host): { ctx: RVBindContext; handle: BindContextHandle } {
-  const accum: KinematicsSpec = {};
-  const { ctx, handle } = createBindContext(root, host, accum);
-  applyKinematicsSpec(root, accum);
-  return { ctx, handle };
-}
-
-function bindDes(runner: DESRunner, root: Object3D, host: Host): MaterialFlowSelf {
-  const { ctx } = makeCtx(root, host);
-  let adapter: { entityId: number } | null = null;
-  const self = createSelf(ctx, AgvDef, {
-    mode: 'des',
-    scheduler: runner.makeScheduler(AgvDef, () => adapter?.entityId ?? -1),
-    local: (AgvDef.state ?? AgvDef.local)?.(),
-  });
-  adapter = runner.addInstance(AgvDef, self, root);
-  return self;
-}
 
 function line(id: string, x: number, z0: number, z1: number, successors: string[] = []): void {
   getDefaultPathNetwork().register(parsePathExtras({
@@ -122,17 +54,9 @@ function makeYGraph(): void {
   line('C', 0, 3, 5);              // 2 m — the destination segment
 }
 
-const sig = (host: Host, agv: string, key: string): boolean | number | undefined =>
-  host.values.get(`${agv}.Agv.${key}`);
-
 beforeEach(() => {
-  getDefaultPathNetwork().clear();
-  getDefaultSpacingController().clear();
-  getDefaultZoneRegistry().clear();
-  getDefaultAgvFleet().clear();
+  clearShared(); // path network, spacing, zones, fleet, BOTH movement authorities, live control
   getDefaultPathDockRegistry().clear();
-  _resetDesHookCache();
-  clearLiveControl();
 });
 afterEach(() => clearLiveControl());
 
@@ -298,7 +222,7 @@ describe('Agv physics — continuous acceleration + queueing behind a dwell', ()
     expect(prevV).toBeCloseTo(1000, 3); // reached max speed (1 s ramp + margin)
   });
 
-  it('a follower queues behind a dwelling vehicle: gap in [MinGap, ~SafetyDistance], Blocked', () => {
+  it('a follower queues behind a dwelling vehicle: body gap = SafetyGap (plan-558), Blocked', () => {
     line('P1', 0, 0, 5, ['P2']);
     line('P2', 0, 5, 10);
     const host = makeHost();
@@ -313,16 +237,21 @@ describe('Agv physics — continuous acceleration + queueing behind a dwell', ()
     const hF = bindContinuous(follower, host);
     getDefaultAgvFleet().get('Lead')!.assign({ destination: 'P2', serviceSec: 60 });
 
-    for (let i = 0; i < 900; i++) {
+    // 25 s: the follower's scanner warning field holds it at DockingSpeed
+    // (0.3 m/s) over the last metres of the approach to the standing leader.
+    for (let i = 0; i < 1500; i++) {
       iterateFixedUpdate(hL, TICK);
       iterateFixedUpdate(hF, TICK);
     }
     // Leader dwells at the end of P2 (z=10); follower parked behind it.
     expect(leader.position.z).toBeCloseTo(10, 2);
     expect(getDefaultAgvFleet().get('Lead')!.phase).toBe('servicing');
+    // plan-558: the planned follower keeps SafetyGap (300 mm default) between
+    // its front and the leader's rear — 1 m fallback bodies → 1.3 m root gap
+    // (the legacy leader is an obstacle for the planner, mixed fleet).
     const gapMm = (leader.position.z - follower.position.z) * 1000;
-    expect(gapMm).toBeGreaterThanOrEqual(200);        // never inside MinGap
-    expect(gapMm).toBeLessThanOrEqual(1100);          // settled near SafetyDistance
+    expect(gapMm).toBeGreaterThanOrEqual(1300 - 1e-6);
+    expect(gapMm).toBeLessThanOrEqual(1300 + 10);
     expect(sig(host, 'Follow', 'Moving')).toBe(false);
     expect(sig(host, 'Follow', 'Blocked')).toBe(true);
   });
@@ -447,52 +376,44 @@ describe('Agv docks — DES mode', () => {
 });
 
 describe('Agv DES parity — segment occupancy queueing (Stau an Pfadenden)', () => {
-  it('a follower never shares a segment with a serving leader; both finish in order', () => {
+  it('plan-558: no segment-occupancy rule — the follower queues SafetyGap behind the serving leader; both finish in order', () => {
     // Corridor P1 → P2 → P3; the leader serves 3 s at the end of P2 (its
-    // destination); the follower must WAIT at the end of P1 (segment boundary)
-    // until the leader has moved on to P3.
+    // destination). The old one-vehicle-per-segment rule is gone: the follower
+    // drives up to SafetyGap behind the leader's rear (on P2 if it fits) and
+    // waits there; bodies never overlap.
     line('P1', 0, 0, 2, ['P2']);
     line('P2', 0, 2, 4, ['P3']);
     line('P3', 0, 4, 6);
     const host = makeHost();
-    const leader = makeAgv('Lead', { PathId: 'P1', StartPosition: 1500, TargetSpeed: 1000, UseAcceleration: false });
-    const follower = makeAgv('Follow', { PathId: 'P1', StartPosition: 0, TargetSpeed: 1000, UseAcceleration: false });
+    // Scanner fields off: the warning field would cap the follower's approach.
+    const leader = makeAgv('Lead', { PathId: 'P1', StartPosition: 1500, TargetSpeed: 1000, UseAcceleration: false, ScannerFields: false });
+    const follower = makeAgv('Follow', { PathId: 'P1', StartPosition: 0, TargetSpeed: 1000, UseAcceleration: false, ScannerFields: false });
     const runner = new DESRunner({ subMode: 'animated' });
-    const selfL = bindDes(runner, leader, host);
+    bindDes(runner, leader, host);
     bindDes(runner, follower, host);
     const fleet = getDefaultAgvFleet();
-    const sc = getDefaultSpacingController();
     runner.start([AgvDef], { root: new Object3D() });
     fleet.get('Lead')!.assign({ destination: 'P2', serviceSec: 3,
       onServiceEnd: () => fleet.get('Lead')!.assign({ destination: 'P3' }) });
-    // The follower's own goal is P2 — free once the leader moved on to P3
-    // (an idle vehicle keeps its segment occupied, so both need distinct ends).
     fleet.get('Follow')!.assign({ destination: 'P2' });
 
-    let violations = 0;
-    let seedPhaseOver = false; // both seeded on P1 — the rule governs TRANSFERS
-    let followWaitedAtBoundary = false;
-    const leadT = (sc as unknown as { byId: Map<string, { traveler: { path: { id: string } | null } }> }).byId.get('Lead')!.traveler;
-    const folT = (sc as unknown as { byId: Map<string, { traveler: { path: { id: string } | null; s: number; blocked: boolean } }> }).byId.get('Follow')!.traveler;
+    let minGap = Infinity;
+    let followWaited = false;
     for (let i = 0; i < 60 * 30; i++) {
       runner.tick(TICK);
       runner.lateTick(TICK);
-      // Invariant: never both on the same segment — AFTER the shared seed
-      // resolved (the occupancy rule governs transfers, not the initial seed).
-      if (!seedPhaseOver && leadT.path?.id !== folT.path?.id) seedPhaseOver = true;
-      if (seedPhaseOver && leadT.path && folT.path && leadT.path.id === folT.path.id) violations++;
-      // The follower waits AT the boundary (end of P1) while the leader serves on P2.
-      if (fleet.get('Lead')!.phase === 'servicing' && folT.path?.id === 'P1'
-          && folT.blocked && Math.abs(folT.s - 2) < 1e-6) {
-        followWaitedAtBoundary = true;
-      }
+      // 1 m fallback bodies: root distance − 1 m = front-to-rear gap.
+      const gap = leader.position.z - follower.position.z - 1;
+      if (gap < minGap) minGap = gap;
+      if (fleet.get('Lead')!.phase === 'servicing' && sig(host, 'Follow', 'Blocked') === true) followWaited = true;
       if (fleet.get('Lead')!.phase === 'idle' && fleet.get('Follow')!.phase === 'idle') break;
     }
     runner.dispose();
-    expect(violations).toBe(0);
-    expect(followWaitedAtBoundary).toBe(true);
+    expect(minGap).toBeGreaterThanOrEqual(0.3 - 1e-6);
+    expect(followWaited).toBe(true);
     expect(fleet.get('Lead')!.phase).toBe('idle');
     expect(fleet.get('Follow')!.phase).toBe('idle');
-    void selfL;
+    expect(leader.position.z).toBeCloseTo(6, 4);
+    expect(follower.position.z).toBeCloseTo(4, 4);
   });
 });

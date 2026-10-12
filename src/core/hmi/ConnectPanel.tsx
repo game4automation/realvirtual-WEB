@@ -73,6 +73,8 @@ import {
 } from '@mui/icons-material';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useViewer } from '../../hooks/use-viewer';
+import { SignalUsageButton } from './rv-signal-usage-list';
+import { ConnectAutoMapSection } from './ConnectAutoMapSection';
 import { LeftPanel } from './LeftPanel';
 import { FloatingPanel } from './FloatingPanel';
 import {
@@ -101,11 +103,15 @@ import {
   updateMqttTopic,
   fetchInterfaces,
   fetchLogs,
-  fetchStatus,
+  requestConnectInterfaceEdit,
+  setConnectLogOpen,
   fetchMirrors,
   putMirrors,
-  fetchMappings,
   putMappings,
+  getConnectBridges,
+  subscribeConnectBridges,
+  reloadConnectBridges,
+  requestConnectBridgeReveal,
   fetchProfiles,
   saveProfile,
   updateProfile,
@@ -115,8 +121,11 @@ import {
   nextInterfaceId,
   removeSignal,
   getSignalSchema,
+  ensureInterfaceTypes,
   CONNECT_INTERFACE_TYPES,
   getAvailableInterfaceTypes,
+  isModelManagedInterfaceType,
+  MODEL_MANAGED_INTERFACE_HINT,
   TWINCAT_SETTINGS_DEFAULTS,
   MODBUS_SETTINGS_DEFAULTS,
   MODBUS_SERVER_SETTINGS_DEFAULTS,
@@ -128,6 +137,19 @@ import {
   FANUC_SETTINGS_DEFAULTS,
   DENSO_SETTINGS_DEFAULTS,
   ABB_ROBOTSTUDIO_SETTINGS_DEFAULTS,
+  PLCSIMADVANCED_SETTINGS_DEFAULTS,
+  PVI_SETTINGS_DEFAULTS,
+  S7_SETTINGS_DEFAULTS,
+  KUKA_SETTINGS_DEFAULTS,
+  KUKARSI_SETTINGS_DEFAULTS,
+  UNIVERSALROBOTS_SETTINGS_DEFAULTS,
+  IGUSREBEL_SETTINGS_DEFAULTS,
+  MITSUBISHI_SETTINGS_DEFAULTS,
+  UDP_SETTINGS_DEFAULTS,
+  WEBSOCKETREALTIME_SETTINGS_DEFAULTS,
+  WINMODY200_SETTINGS_DEFAULTS,
+  ROBODK_SETTINGS_DEFAULTS,
+  WANDELBOTSNOVA_SETTINGS_DEFAULTS,
   humanizeConnectError,
   humanizeConnectWorkerStatus,
   type ConnectInterface,
@@ -154,6 +176,20 @@ import {
   type DensoSettings,
   type DensoControllerType,
   type AbbRobotStudioSettings,
+  type PlcSimAdvancedSettings,
+  type PviSettings,
+  type PviConnectionType,
+  type S7Settings,
+  type KukaSettings,
+  type KukaRsiSettings,
+  type UniversalRobotsSettings,
+  type IgusRebelSettings,
+  type MitsubishiSettings,
+  type UdpSettings,
+  type WebSocketRealtimeSettings,
+  type WinmodY200Settings,
+  type RoboDkSettings,
+  type WandelbotsNovaSettings,
   type ConnectSignalIssue,
   type ConnectMqttTopic,
   type MqttTopicMode,
@@ -178,6 +214,7 @@ import {
   type SewImportResult,
 } from '../import/sew-symbol-table';
 import { ISA_GREEN, ISA_RED, ISA_AMBER, connectionStateColor } from './isa-colors';
+import { connectStreamBlock } from './connect-stream';
 import { SignalBadge } from './rv-signal-badge';
 import { SignalEditDialog } from './SignalEditDialog';
 import {
@@ -218,7 +255,7 @@ import {
 import { useSignalActivityIndicator, setSignalActivityIndicator } from './signal-activity-indicator-store';
 import { useThrottledSignalValue } from '../../hooks/use-throttled-signal';
 import { useSignalActivityValue } from '../../hooks/use-signal-activity';
-import { WarningAmber, RemoveCircleOutline, Sensors, Link as LinkIcon, Hub, InfoOutlined, PrecisionManufacturing } from '@mui/icons-material';
+import { WarningAmber, RemoveCircleOutline, Sensors, Link as LinkIcon, Hub, InfoOutlined, PrecisionManufacturing, Functions, AutoAwesome } from '@mui/icons-material';
 import { memo } from 'react';
 import {
   supportsFsAccess,
@@ -238,6 +275,12 @@ import { ConnectUpdateNotice } from './ConnectUpdateNotice';
 import { CONNECT_STABLE_DOWNLOAD_URL } from './connect-downloads';
 import { useConnectDownloads } from './use-connect-downloads';
 import { statusAge } from './connect-staleness';
+import { parseDecimal } from './rv-number-format';
+import {
+  clearWriteGateReadOnly,
+  isWriteGateReadOnly,
+  useWriteGateDecisions,
+} from './connect-write-gate-store';
 
 // ── Signal-count helper (counts ProcessImage topic signals + legacy signals) ──
 
@@ -281,7 +324,62 @@ function statusDisplay(
 }
 
 /** Human-readable label for an interface type — gateway catalog first, static registry as fallback. */
-function interfaceTypeLabel(type: ConnectInterfaceType): string {
+/**
+ * One-line endpoint summary of an interface, as the card shows it next to its id.
+ * Pure and exported so the per-type summary stays testable without rendering a card.
+ */
+export function interfaceEndpointLabel(iface: ConnectInterface): string {
+  if (iface.type === 'OpcUa') return (iface.endpoint as string) ?? '';
+  if (iface.type === 'S7') return `${iface.ipAddress ?? ''} R:${iface.rack ?? 0} S:${iface.slot ?? 1}`;
+  if (iface.type === 'MQTT') return (iface.brokerUrl as string) ?? '';
+  if (iface.type === 'TwinCat') return iface.twinCat?.netId ?? '';
+  if (iface.type === 'Modbus' || iface.type === 'ModbusServer') {
+    return iface.modbus ? `${iface.modbus.host}:${iface.modbus.port}` : '';
+  }
+  if (iface.type === 'EthernetIp') return iface.ethernetIp?.gateway ?? '';
+  if (iface.type === 'CtrlX') return iface.ctrlX?.address ?? '';
+  if (iface.type === 'CtrlXDataLayer') return iface.ctrlXDataLayer?.address ?? '';
+  if (iface.type === 'Keba') return iface.keba?.host ?? '';
+  if (iface.type === 'Festo') return iface.festo ? `${iface.festo.host}:${iface.festo.port}` : '';
+  if (iface.type === 'Fanuc') return iface.fanuc ? `${iface.fanuc.address}:${iface.fanuc.port}` : '';
+  if (iface.type === 'Denso') return iface.denso ? `${iface.denso.host} (${iface.denso.controllerName})` : '';
+  if (iface.type === 'Kuka') return iface.kuka ? `${iface.kuka.host}:${iface.kuka.port}` : '';
+  if (iface.type === 'KukaRsi') return iface.kukaRsi ? `${iface.kukaRsi.listenIp}:${iface.kukaRsi.rsiPort}` : '';
+  if (iface.type === 'UniversalRobots') {
+    return iface.universalRobots ? `${iface.universalRobots.host}:${iface.universalRobots.rtdePort}` : '';
+  }
+  if (iface.type === 'IgusRebel') return iface.igusRebel ? `${iface.igusRebel.host}:${iface.igusRebel.port}` : '';
+  if (iface.type === 'Mitsubishi') return iface.mitsubishi ? `${iface.mitsubishi.host}:${iface.mitsubishi.port}` : '';
+  if (iface.type === 'Udp') return iface.udp ? `${iface.udp.remoteHost}:${iface.udp.remotePort}` : '';
+  if (iface.type === 'WebSocketRealtime') {
+    const ws = iface.webSocketRealtime;
+    if (!ws) return '';
+    return ws.isServer ? `${ws.bindAddress}:${ws.port} (server)` : `${ws.address}:${ws.port}`;
+  }
+  if (iface.type === 'WinmodY200') return iface.winmodY200?.sharedMemoryName ?? '';
+  if (iface.type === 'RoboDk') return iface.roboDk ? `${iface.roboDk.host}:${iface.roboDk.port}` : '';
+  if (iface.type === 'WandelbotsNova') {
+    return iface.wandelbotsNova ? `${iface.wandelbotsNova.server} (${iface.wandelbotsNova.cell})` : '';
+  }
+  if (iface.type === 'AbbRobotStudio') return iface.abbRobotStudio?.sharedMemoryName ?? '';
+  if (iface.type === 'PlcSimAdvanced') return iface.plcSimAdvanced?.instanceName ?? '';
+  if (iface.type === 'Pvi') {
+    const pvi = iface.pvi;
+    if (!pvi) return '';
+    const line = pvi.connectionType === 'Ina2000' ? 'INA2000' : 'ANSL';
+    return `${line} ${pvi.host}${pvi.port != null ? `:${pvi.port}` : ''}`;
+  }
+  if (iface.type === 'SHM') return (iface.sharedMemory as { sharedMemoryName?: string })?.sharedMemoryName ?? '';
+  return '';
+}
+
+/**
+ * Human-readable label of an interface type — the connected gateway's own
+ * catalog first, the static registry as fallback. Exported since plan-562: the
+ * write-gate overlay names the same target the card names, and it must read the
+ * label from here rather than keep a second spelling of it.
+ */
+export function interfaceTypeLabel(type: ConnectInterfaceType): string {
   return getAvailableInterfaceTypes().find(d => d.type === type)?.label
     ?? CONNECT_INTERFACE_TYPES.find(d => d.type === type)?.label
     ?? type;
@@ -374,6 +472,19 @@ function channelBuildTitle(build: number | null, buildDate: string | null): stri
   return parts.join(' · ');
 }
 
+/** Shown while the published build is not code-signed yet: Windows SmartScreen blocks the first
+ *  start with "Windows protected your PC" until the user confirms. */
+function UnsignedDownloadHint({ unsigned }: { unsigned?: boolean }) {
+  if (!unsigned) return null;
+  return (
+    <Typography sx={{ fontSize: 10, lineHeight: 1.4, color: 'text.secondary', mt: 0.25, width: '100%' }}>
+      This build is not code-signed yet. If Windows SmartScreen warns on start, choose
+      {' '}<Box component="span" sx={{ fontWeight: 600 }}>More info</Box>{' → '}
+      <Box component="span" sx={{ fontWeight: 600 }}>Run anyway</Box>.
+    </Typography>
+  );
+}
+
 /** Stable + beta download affordance reused in every connection dead end. Versions come from
  *  the published release manifests; the beta link appears ONLY when a beta build exists. */
 export function ConnectDownloadLinks() {
@@ -407,6 +518,7 @@ export function ConnectDownloadLinks() {
           {beta.version ? `beta ${beta.version}` : 'beta'}
         </Button>
       )}
+      <UnsignedDownloadHint unsigned={stable.unsigned} />
     </Box>
   );
 }
@@ -437,11 +549,11 @@ export function ConnectOpener({ failedUrl }: { failedUrl: string | null }) {
   return (
     <Box sx={{ mt: 0.75, color: 'text.secondary' }}>
       <Typography sx={{ fontSize: 12, fontWeight: 600, color: 'text.primary', lineHeight: 1.5 }}>
-        Live PLC data in this viewer
+        Connect this viewer to real automation
       </Typography>
       <Typography sx={{ fontSize: 11, lineHeight: 1.5, mt: 0.25 }}>
-        realvirtual CONNECT is the local gateway that links this viewer to real
-        controllers and robots. The free tier includes 20 PLC signals.
+        realvirtual CONNECT is the local gateway between this viewer and your PLCs,
+        robots, simulation models and AI tools. The free tier includes 20 PLC signals.
       </Typography>
       <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1, mt: 1 }}>
         <Button
@@ -471,6 +583,7 @@ export function ConnectOpener({ failedUrl }: { failedUrl: string | null }) {
           </Button>
         )}
       </Box>
+      <UnsignedDownloadHint unsigned={stable.unsigned} />
       <Typography sx={{ fontSize: 11, lineHeight: 1.5, mt: 0.75 }}>
         Already installed? Start CONNECT on that machine, then press Connect.
       </Typography>
@@ -480,7 +593,22 @@ export function ConnectOpener({ failedUrl }: { failedUrl: string | null }) {
         </Typography>
       )}
       <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', my: 1 }} />
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+      <ConnectCapabilities />
+    </Box>
+  );
+}
+
+/** What CONNECT is FOR — shown wherever no gateway is connected (the opener AND the
+ *  failed-connect error path), so a user who never reached a gateway still learns
+ *  why they would want one. */
+export function ConnectCapabilities({ heading = false }: { heading?: boolean }) {
+  return (
+    <Box data-testid="connect-capabilities" sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
+      {heading && (
+        <Typography sx={{ fontSize: 11, fontWeight: 600, color: 'text.primary' }}>
+          What realvirtual CONNECT adds
+        </Typography>
+      )}
         <OpenerCapability
           icon={<Sensors sx={{ fontSize: 14 }} />}
           title="Live signals"
@@ -493,10 +621,19 @@ export function ConnectOpener({ failedUrl }: { failedUrl: string | null }) {
         />
         <OpenerCapability
           icon={<Hub sx={{ fontSize: 14 }} />}
-          title="Real controllers"
-          text="S7, TwinCAT ADS, OPC UA, Modbus TCP, EtherNet/IP, ctrlX and MQTT, plus robot interfaces (FANUC, Denso, ABB)."
+          title="PLC and robot interfaces"
+          text="Siemens S7 and PLCSIM Advanced, TwinCAT ADS, OPC UA, Modbus TCP, EtherNet/IP, Mitsubishi, ctrlX, MQTT, UDP, WINMOD and B&R PVI, plus KUKA, Universal Robots, igus, FANUC, Denso, ABB, RoboDK and Wandelbots NOVA."
         />
-      </Box>
+        <OpenerCapability
+          icon={<Functions sx={{ fontSize: 14 }} />}
+          title="FMU co-simulation"
+          text="run FMI 2.0 simulation models (Modelica, Simulink and others) next to the 3D scene and bind their values to drives and signals."
+        />
+        <OpenerCapability
+          icon={<AutoAwesome sx={{ fontSize: 14 }} />}
+          title="AI integration"
+          text="AI assistants such as Claude build the digital twin with you over MCP: define kinematics, wire signals, and test the twin - and diagnose the machine from its own documents."
+        />
     </Box>
   );
 }
@@ -676,6 +813,15 @@ export function ConnectPanel() {
   const lpm = viewer.leftPanelManager;
   const panelSnap = useSyncExternalStore(lpm.subscribe, lpm.getSnapshot);
   const snap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
+
+  // Self-heal a missing type catalog: without it no interface has a signal schema, which silently
+  // costs manual signal authoring (the "+" and the add dialog) for a whole session. No-op whenever
+  // the catalog is present or the gateway genuinely has none.
+  useEffect(() => { void ensureInterfaceTypes(); }, [snap.state, snap.availableTypes]);
+
+  // Same rule the connect plugin attaches the stream with — imported, not restated, so this
+  // explanation cannot describe behaviour the plugin has since changed.
+  const streamBlock = connectStreamBlock(!!viewer.lastLoadResult, viewer.loadTrust.trusted);
   const licenseSnap = useSyncExternalStore(subscribeLicenseStore, getLicenseSnapshot);
   // Historian status is polled by the trend-plugin toolbar button while
   // connected; the panel only reads it (recording-fault line + gear badge).
@@ -686,13 +832,20 @@ export function ConnectPanel() {
   const [expandedIface, setExpandedIface] = useState<string | null>(loadExpandedIface);
   const [importOpen, setImportOpen] = useState(false);
   const [importTarget, setImportTarget] = useState<string | null>(null);
-  const [logOpen, setLogOpen] = useState(false);
+  // The log window's open state lives in the CONNECT store (plan-562 F11): the
+  // no-data notice offers "Open log" from over the 3D view, where this panel is
+  // closed, so the flag must be settable from outside this component.
+  const logOpen = snap.logOpen === true;
   // Bridges (mirror rules + 1:1 signal mappings) — null while unloaded / unsupported gateway.
   const bridges = useBridges(snap.state === 'connected');
   // Open the Add-Mapping dialog; a string pre-fills the source signal (signal-row bridge action).
   const [mappingDialog, setMappingDialog] = useState<{ sourceSignal: string } | null>(null);
   // Pending destructive action awaiting confirmation (interface delete).
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
+  // plan-562 F8: a "Read only, don't ask again" is not part of the gateway
+  // snapshot, so the card needs its own subscription to show the chip that is
+  // the only way back from that decision.
+  useWriteGateDecisions();
 
   // Persist which interface is expanded so it survives a browser reload.
   useEffect(() => { saveExpandedIface(expandedIface); }, [expandedIface]);
@@ -799,17 +952,23 @@ export function ConnectPanel() {
     [],
   );
 
-  // Poll per-interface worker status while connected — drives the green/red status dots.
-  // Gated on `isOpen` as well (plan-344 Phase 3.4): ConnectPanel stays MOUNTED
-  // when closed (App.tsx renders it permanently; the `null` return below sits
-  // after all hooks) so the user's panel state survives, but a closed panel must
-  // not keep polling the gateway — nothing it produces is visible.
+  // No status poll here. Since plan-562 the ONE owner is `ConnectStatusPoll` in
+  // connect-plugin.tsx: the write-gate overlay and the no-data notice need the
+  // same counters while this panel is CLOSED, so an `isOpen`-gated poll (plan-344
+  // Phase 3.4) could no longer be the only source. The panel is now purely a
+  // reader of `snap.interfaceStatus`, which costs it no request at all.
+
+  // Another surface asked for an interface's Edit dialog (the "Writes blocked"
+  // chip, the overlay's "Update CONNECT" route). Honour it once, then clear the
+  // request so reopening the panel later does not replay it.
   useEffect(() => {
-    if (!isOpen || snap.state !== 'connected') return;
-    fetchStatus();
-    const id = setInterval(fetchStatus, 2000);
-    return () => clearInterval(id);
-  }, [isOpen, snap.state]);
+    if (!snap.editInterfaceId) return;
+    const target = snap.interfaces.find(i => i.id === snap.editInterfaceId);
+    requestConnectInterfaceEdit(null);
+    if (!target) return;
+    setExpandedIface(target.id);
+    setEditIface(target);
+  }, [snap.editInterfaceId, snap.interfaces]);
 
   // While the gateway is unreachable no store updates arrive, so tick locally
   // every second to keep the "last response Xs ago" age counting up. Same
@@ -868,7 +1027,7 @@ export function ConnectPanel() {
           fullWidth
           variant="text"
           startIcon={<Article sx={{ fontSize: 14 }} />}
-          onClick={() => setLogOpen(true)}
+          onClick={() => setConnectLogOpen(true)}
           sx={{ fontSize: 11, textTransform: 'none', py: 0.5, color: 'text.secondary' }}
         >
           Log
@@ -1011,6 +1170,13 @@ export function ConnectPanel() {
                 {snap.errorMessage}
               </Typography>
               <ConnectDownloadLinks />
+              {/* No gateway reached: say what CONNECT is for, not only that it failed. */}
+              {!isConnected && !unreachable && (
+                <>
+                  <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', my: 1 }} />
+                  <ConnectCapabilities heading />
+                </>
+              )}
             </Box>
           )}
           {showOpener && (
@@ -1033,6 +1199,17 @@ export function ConnectPanel() {
             {snap.interfaces.length === 0 && (
               <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', textAlign: 'center', py: 2 }}>
                 No interfaces yet — Add one to link a PLC, robot or broker.
+              </Typography>
+            )}
+
+            {/* Values are streamed per MODEL, the REST connection is not. Without that stream an
+                interface sits at "Connected" — gateway happily reading the PLC — while every signal
+                chip below stays blank, and nothing on screen said why. */}
+            {snap.interfaces.length > 0 && streamBlock !== null && (
+              <Typography sx={{ fontSize: 10, color: ISA_AMBER, lineHeight: 1.45, px: 0.5, pb: 0.75 }}>
+                {streamBlock === 'no-model'
+                  ? 'No model loaded — signal values are not streamed. Interfaces stay connected and the gateway keeps reading the PLC; open a project or model to see live values.'
+                  : 'This model was loaded from a shared link — live signal values are not streamed for untrusted models. Open it from a project to see live values.'}
               </Typography>
             )}
 
@@ -1079,12 +1256,15 @@ export function ConnectPanel() {
                         onImport={() => handleOpenImport(iface.id)}
                         onEdit={() => setEditIface(iface)}
                         onDelete={() => handleRemoveInterface(iface)}
+                        writesBlocked={iface.allowWebToPlc !== true
+                          && isWriteGateReadOnly(snap.serverUrl, iface.id)}
                         onMirror={bridges.supported
                           ? (t, prefix) => void handleOneClickMirror(iface, t, prefix)
                           : undefined}
                         mirrorRole={mirrorRoleFor(iface.id, bridges.mirrors)}
                       />
                     </Box>
+                    {expanded && <ConnectAutoMapSection iface={iface} />}
                     {/* Signals shown inline whenever the interface is expanded — tree grows to fill space */}
                     {showSignals && (
                       <SignalListView
@@ -1093,11 +1273,14 @@ export function ConnectPanel() {
                         onBridgeSignal={bridges.supported ? handleBridgeSignalByName : undefined}
                       />
                     )}
-                    {/* Older gateways without a signal schema: expanding an empty interface
-                        must still say something instead of toggling nothing visible. */}
+                    {/* No signal schema for this type: either the gateway has no catalog (older
+                        build) or it has not arrived yet. Name only the routes the ⋮ menu of THIS
+                        interface actually offers — the old copy promised "Browse" on types that
+                        have no discovery at all (S7, Modbus), which reads as "cannot be done". */}
                     {expanded && !showSignals && (
                       <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', px: 1, py: 1 }}>
-                        No signals yet — use the ⋮ menu to Browse or Import.
+                        No signals yet — use the ⋮ menu of this interface to
+                        {' '}{menuRoutesLabel(iface.type)}.
                       </Typography>
                     )}
                   </Box>
@@ -1182,7 +1365,7 @@ export function ConnectPanel() {
       />
 
       {/* ── Log Window ── */}
-      <ConnectLogDialog open={logOpen} onClose={() => setLogOpen(false)} />
+      <ConnectLogDialog open={logOpen} onClose={() => setConnectLogOpen(false)} />
 
       {/* ── Browse Window (discovery + add to signals) ── */}
       <BrowseWindow open={!!snap.activeInterfaceId} onClose={() => setActiveInterface(null)} />
@@ -1192,7 +1375,12 @@ export function ConnectPanel() {
 
 // ── InterfaceCard ──────────────────────────────────────────────────────
 
-function InterfaceCard({
+/**
+ * One interface row of the panel. Exported since plan-562 so the "Writes
+ * blocked" chip — the only way back from a "Read only, don't ask again" — can be
+ * asserted without rendering the whole panel.
+ */
+export function InterfaceCard({
   iface,
   status,
   statusError,
@@ -1208,6 +1396,7 @@ function InterfaceCard({
   onDelete,
   onMirror,
   mirrorRole,
+  writesBlocked,
 }: {
   iface: ConnectInterface;
   status?: string;
@@ -1228,6 +1417,12 @@ function InterfaceCard({
   onMirror?: (targetType: 'MQTT' | 'SHM', topicPrefix?: string) => void;
   /** Mirror rules referencing this interface (plan-353 F11) — drives the badges. */
   mirrorRole?: { isSource: boolean; isTarget: boolean };
+  /**
+   * The user answered "Read only, don't ask again" for this interface (plan-562
+   * F8). The chip is the WAY BACK from that answer — a decision the overlay can
+   * no longer ask about must stay visible and reversible somewhere.
+   */
+  writesBlocked?: boolean;
 }) {
   // All per-interface actions live in one "⋮" menu so the card stays a single line.
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
@@ -1246,6 +1441,8 @@ function InterfaceCard({
 
   /** A sink cannot mirror into itself, and an older gateway hides the action. */
   const canMirror = !!onMirror && iface.type !== 'MQTT' && iface.type !== 'SHM';
+  /** FMI (plan-498): realvirtual WEB owns this interface — no edit, enable or browse here. */
+  const modelManaged = isModelManagedInterfaceType(iface.type);
   // Count ProcessImage topic signals + legacy signals (R19 — otherwise always 0 for ProcessImage).
   const signalCount = interfaceSignalCount(iface);
 
@@ -1253,32 +1450,12 @@ function InterfaceCard({
   // worker implements IDiscoveryCapable). Older gateways without a schema fall back to the previous
   // hardcoded discovery-capable type list.
   const signalSchema = getSignalSchema(iface.type);
-  const canBrowse = signalSchema
+  const canBrowse = modelManaged ? false : signalSchema
     ? signalSchema.supportsDiscovery
-    : (iface.type === 'OpcUa' || iface.type === 'MQTT' || iface.type === 'TwinCat' || iface.type === 'EthernetIp' || iface.type === 'CtrlX' || iface.type === 'CtrlXDataLayer' || iface.type === 'Keba' || iface.type === 'Festo');
+    : (iface.type === 'OpcUa' || iface.type === 'MQTT' || iface.type === 'TwinCat' || iface.type === 'EthernetIp' || iface.type === 'CtrlX' || iface.type === 'CtrlXDataLayer' || iface.type === 'Keba' || iface.type === 'Festo' || iface.type === 'PlcSimAdvanced' || iface.type === 'Pvi');
 
-  // Extract display info based on interface type
-  const getEndpointLabel = (): string => {
-    if (iface.type === 'OpcUa') return (iface.endpoint as string) ?? '';
-    if (iface.type === 'S7') return `${iface.ipAddress ?? ''} R:${iface.rack ?? 0} S:${iface.slot ?? 1}`;
-    if (iface.type === 'MQTT') return (iface.brokerUrl as string) ?? '';
-    if (iface.type === 'TwinCat') return iface.twinCat?.netId ?? '';
-    if (iface.type === 'Modbus' || iface.type === 'ModbusServer') {
-      return iface.modbus ? `${iface.modbus.host}:${iface.modbus.port}` : '';
-    }
-    if (iface.type === 'EthernetIp') return iface.ethernetIp?.gateway ?? '';
-    if (iface.type === 'CtrlX') return iface.ctrlX?.address ?? '';
-    if (iface.type === 'CtrlXDataLayer') return iface.ctrlXDataLayer?.address ?? '';
-    if (iface.type === 'Keba') return iface.keba?.host ?? '';
-    if (iface.type === 'Festo') return iface.festo ? `${iface.festo.host}:${iface.festo.port}` : '';
-    if (iface.type === 'Fanuc') return iface.fanuc ? `${iface.fanuc.address}:${iface.fanuc.port}` : '';
-    if (iface.type === 'Denso') return iface.denso ? `${iface.denso.host} (${iface.denso.controllerName})` : '';
-    if (iface.type === 'AbbRobotStudio') return iface.abbRobotStudio?.sharedMemoryName ?? '';
-    if (iface.type === 'SHM') return (iface.sharedMemory as { sharedMemoryName?: string })?.sharedMemoryName ?? '';
-    return '';
-  };
-
-  const endpoint = getEndpointLabel();
+  // Extract display info based on interface type (shared, testable helper).
+  const endpoint = interfaceEndpointLabel(iface);
   const statusText = status
     ? humanizeConnectWorkerStatus(status)
     : (iface.enabled ? 'Unknown' : 'Disabled');
@@ -1355,6 +1532,30 @@ function InterfaceCard({
             />
           </Tooltip>
         )}
+        {modelManaged && (
+          <Tooltip title={MODEL_MANAGED_INTERFACE_HINT}>
+            <Chip size="small" label="Managed by model" data-testid="model-managed-badge" sx={MIRROR_BADGE_SX} />
+          </Tooltip>
+        )}
+        {/* plan-562 F8: "Read only, don't ask again" is remembered, so the chip
+            is the only remaining route to change that mind. It opens the Edit
+            dialog AND forgets the answer, because leaving the answer in place
+            would silence the overlay again the moment the gate stays closed. */}
+        {writesBlocked && (
+          <Tooltip title="Writes from realvirtual WEB are blocked for this interface - open the interface settings to allow them">
+            <Chip
+              size="small"
+              label="Writes blocked"
+              data-testid="writes-blocked-badge"
+              onClick={(e) => {
+                e.stopPropagation();
+                clearWriteGateReadOnly(getConnectSnapshot().serverUrl, iface.id);
+                onEdit();
+              }}
+              sx={{ ...MIRROR_BADGE_SX, cursor: 'pointer' }}
+            />
+          </Tooltip>
+        )}
         {/* Always-visible amber badge: N configured signals can never decode (details on click). */}
         {!!signalIssues?.length && <SignalIssueBadge issues={signalIssues} />}
         <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', fontFamily: 'monospace', flexShrink: 0 }}>
@@ -1384,11 +1585,13 @@ function InterfaceCard({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Enable/disable decides whether the worker connects and signals flow. */}
-        <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onSetEnabled(!iface.enabled); }}>
-          <PowerSettingsNew sx={{ fontSize: 14, color: iface.enabled ? 'rgba(255,255,255,0.6)' : ISA_GREEN }} />
-          {iface.enabled ? 'Disable' : 'Enable'}
-        </MenuItem>
-        <Divider />
+        {!modelManaged && (
+          <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onSetEnabled(!iface.enabled); }}>
+            <PowerSettingsNew sx={{ fontSize: 14, color: iface.enabled ? 'rgba(255,255,255,0.6)' : ISA_GREEN }} />
+            {iface.enabled ? 'Disable' : 'Enable'}
+          </MenuItem>
+        )}
+        {!modelManaged && <Divider />}
         {canBrowse && (
           <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onBrowse(); }}>
             <Search sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Browse signals…
@@ -1399,9 +1602,11 @@ function InterfaceCard({
             <Upload sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Import tag table…
           </MenuItem>
         )}
-        <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onEdit(); }}>
-          <Edit sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Edit…
-        </MenuItem>
+        {!modelManaged && (
+          <MenuItem sx={{ fontSize: 12, gap: 1 }} onClick={() => { closeMenu(); onEdit(); }}>
+            <Edit sx={{ fontSize: 14, color: 'rgba(255,255,255,0.6)' }} /> Edit…
+          </MenuItem>
+        )}
         {/* One-click bridge: mirror ALL signals of this interface into an MQTT/SHM sink,
             direction-preserving (out stays out, in stays in). Sinks don't offer it.
             MQTT asks for a topic prefix first (plan-353 F10) — see the popover
@@ -1488,7 +1693,12 @@ function InterfaceCard({
 // the fresh card and opens the Edit dialog for detail configuration — the Add
 // flow always ends in a visible next step, never in silence.
 
-function AddInterfaceDialog({
+/** Row identity in the Add-Interface list — `type` alone collides for vendor presets. */
+function catalogKey(def: ConnectInterfaceTypeDef): string {
+  return def.preset ? `${def.type}:${def.preset}` : def.type;
+}
+
+export function AddInterfaceDialog({
   open,
   onClose,
   onCreated,
@@ -1498,22 +1708,42 @@ function AddInterfaceDialog({
   /** Called with the server-created interface so the parent can continue the flow (expand + Edit). */
   onCreated?: (iface: ConnectInterface) => void;
 }) {
-  const [creatingType, setCreatingType] = useState<ConnectInterfaceType | null>(null);
+  // Keyed by type + preset: a vendor preset (plan-457 SEW) shares its worker type with the base row.
+  const [creatingType, setCreatingType] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * The picked type, waiting for the write-permission answer (plan-562 F9).
+   *
+   * Only THIS path asks. The one-click mirror, the MQTT quick-connect and the
+   * tag-table import create interfaces too, but none of them is the moment a
+   * user decides what a new PLC link may do — they inherit CONNECT's default
+   * (`false`) and the write-gate overlay catches them the first time a value is
+   * actually dropped.
+   */
+  const [pending, setPending] = useState<ConnectInterfaceTypeDef | null>(null);
+  /**
+   * Preselected: virtual commissioning is what nearly every new interface is
+   * for, and a viewer that cannot write is the very failure this plan is about.
+   * The hint names the one case where it must be turned off.
+   */
+  const [allowWrites, setAllowWrites] = useState(true);
 
-  const handlePick = useCallback(async (def: ConnectInterfaceTypeDef) => {
+  const create = useCallback(async (def: ConnectInterfaceTypeDef, allowWebToPlc: boolean) => {
     if (creatingType) return;
-    setCreatingType(def.type);
+    setCreatingType(catalogKey(def));
     setError(null);
     try {
-      const id = nextInterfaceId(def.type);
+      const id = nextInterfaceId(def.type, def.preset);
       const created = await addInterface({
         id,
         type: def.type,
         enabled: false,
         ...def.defaults,
+        allowWebToPlc,
       } as Omit<ConnectInterface, 'id' | 'signals'> & { id?: string });
       setCreatingType(null);
+      setPending(null);
+      setAllowWrites(true);
       onClose();
       onCreated?.(created);
     } catch (err) {
@@ -1522,8 +1752,73 @@ function AddInterfaceDialog({
     }
   }, [creatingType, onClose, onCreated]);
 
+  const handlePick = useCallback((def: ConnectInterfaceTypeDef) => {
+    if (creatingType) return;
+    setError(null);
+    setAllowWrites(true);
+    setPending(def);
+  }, [creatingType]);
+
+  const handleBack = useCallback(() => {
+    if (creatingType) return;
+    setPending(null);
+  }, [creatingType]);
+
+  const handleCancel = useCallback(() => {
+    setPending(null);
+    setAllowWrites(true);
+    setError(null);
+    onClose();
+  }, [onClose]);
+
+  if (pending) {
+    const creating = creatingType === catalogKey(pending);
+    return (
+      <Dialog open={open} onClose={handleCancel} maxWidth="xs" fullWidth>
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, fontSize: 14 }}>
+          <Add sx={{ color: 'primary.main' }} />
+          Add {pending.label}
+        </DialogTitle>
+        <DialogContent sx={{ pt: 1 }}>
+          {error && (
+            <Typography sx={{ fontSize: 11, color: ISA_RED, mb: 1 }}>{error}</Typography>
+          )}
+          <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
+            <Checkbox
+              size="small"
+              checked={allowWrites}
+              data-testid="add-interface-allow-writes"
+              inputProps={{ 'aria-label': 'Allow realvirtual WEB to write inputs to the PLC' }}
+              onChange={(e) => setAllowWrites(e.target.checked)}
+              sx={{ p: 0.25 }}
+            />
+            <Box sx={{ minWidth: 0 }}>
+              <Typography sx={{ fontSize: 12, color: 'text.primary' }}>
+                Allow realvirtual WEB to write inputs to the PLC?
+              </Typography>
+              <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.65)' }}>
+                Leave on for virtual commissioning. Turn off if the target is a live machine.
+              </Typography>
+            </Box>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleBack} disabled={creating} sx={{ textTransform: 'none' }}>Back</Button>
+          <Button
+            variant="contained"
+            onClick={() => void create(pending, allowWrites)}
+            disabled={creating}
+            sx={{ textTransform: 'none' }}
+          >
+            {creating ? <CircularProgress size={14} /> : 'Create'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    );
+  }
+
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
+    <Dialog open={open} onClose={handleCancel} maxWidth="xs" fullWidth>
       <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, fontSize: 14 }}>
         <Add sx={{ color: 'primary.main' }} />
         Add Interface
@@ -1534,12 +1829,16 @@ function AddInterfaceDialog({
         )}
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
           {getAvailableInterfaceTypes().map((def) => {
-            const isCreatingThis = creatingType === def.type;
-            const disabled = !!creatingType && !isCreatingThis;
+            const isCreatingThis = creatingType === catalogKey(def);
+            // plan-498: FMI is provisioned from the model, never added by hand.
+            const managed = isModelManagedInterfaceType(def.type);
+            const disabled = managed || (!!creatingType && !isCreatingThis);
             return (
               <Box
-                key={def.type}
-                onClick={() => void handlePick(def)}
+                key={catalogKey(def)}
+                data-testid={`add-interface-row-${catalogKey(def)}`}
+                aria-disabled={managed || undefined}
+                onClick={managed ? undefined : () => handlePick(def)}
                 sx={{
                   display: 'flex',
                   alignItems: 'center',
@@ -1548,10 +1847,10 @@ function AddInterfaceDialog({
                   py: 1,
                   borderRadius: 1,
                   bgcolor: 'rgba(255,255,255,0.03)',
-                  cursor: creatingType ? 'default' : 'pointer',
+                  cursor: creatingType || managed ? 'default' : 'pointer',
                   opacity: disabled ? 0.4 : 1,
                   transition: 'background-color 0.1s',
-                  '&:hover': creatingType ? undefined : { bgcolor: 'rgba(79,195,247,0.08)' },
+                  '&:hover': creatingType || managed ? undefined : { bgcolor: 'rgba(79,195,247,0.08)' },
                 }}
               >
                 <Box sx={{ flex: 1, minWidth: 0 }}>
@@ -1561,6 +1860,11 @@ function AddInterfaceDialog({
                   <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.65)' }}>
                     {def.description}
                   </Typography>
+                  {managed && (
+                    <Typography data-testid="add-interface-managed-hint" sx={{ fontSize: 10, color: 'rgba(255,255,255,0.8)', fontStyle: 'italic' }}>
+                      {MODEL_MANAGED_INTERFACE_HINT}
+                    </Typography>
+                  )}
                 </Box>
                 {isCreatingThis && <CircularProgress size={14} />}
               </Box>
@@ -1569,7 +1873,7 @@ function AddInterfaceDialog({
         </Box>
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose} sx={{ textTransform: 'none' }}>Cancel</Button>
+        <Button onClick={handleCancel} sx={{ textTransform: 'none' }}>Cancel</Button>
       </DialogActions>
     </Dialog>
   );
@@ -1700,6 +2004,13 @@ function ModbusFieldsBlock({
           </Select>
         </FormControl>
       </Box>
+      {!isServerMode && (
+        <TextField
+          fullWidth size="small" label="Connection timeout (ms)" value={value.connectionTimeoutMs}
+          onChange={(e) => onChange({ connectionTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ mb: 1 }}
+        />
+      )}
     </>
   );
 }
@@ -1803,6 +2114,15 @@ function CtrlXFieldsBlock({
           sx={{ mb: 1 }}
         />
       )}
+      <TextField
+        fullWidth size="small" label="Bridge publish interval (ms, empty = bridge setting)"
+        value={value.publishIntervalMs ?? ''}
+        onChange={(e) => {
+          const text = e.target.value.trim();
+          onChange({ publishIntervalMs: text === '' ? null : (parseInt(text, 10) || 0) });
+        }}
+        sx={{ mb: 1 }}
+      />
     </>
   );
 }
@@ -2039,6 +2359,23 @@ function KebaFieldsBlock({
           placeholder="SYS, PLC" sx={{ flex: 1 }}
         />
       </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Input topic" value={value.inputTopicName}
+          onChange={(e) => onChange({ inputTopicName: e.target.value })}
+          placeholder="realvirtual_inputs" sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Output topic" value={value.outputTopicName}
+          onChange={(e) => onChange({ outputTopicName: e.target.value })}
+          placeholder="realvirtual_outputs" sx={{ flex: 1 }}
+        />
+      </Box>
+      <DecimalTextField
+        label="Connection timeout (s)" value={value.connectionTimeoutSeconds}
+        onCommit={(connectionTimeoutSeconds) => onChange({ connectionTimeoutSeconds })}
+        sx={{ mb: 1, width: '100%' }}
+      />
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
         <Checkbox size="small" checked={value.useOnChange} onChange={(e) => onChange({ useOnChange: e.target.checked })} />
         <Typography sx={{ fontSize: 12 }}>Subscribe on-change (instead of periodic)</Typography>
@@ -2093,6 +2430,17 @@ function FestoFieldsBlock({
           <Typography sx={{ fontSize: 12 }}>Use TLS</Typography>
         </Box>
       </Box>
+      {value.useTls && (
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+          <Checkbox size="small" checked={value.validateCertificate} onChange={(e) => onChange({ validateCertificate: e.target.checked })} />
+          <Typography sx={{ fontSize: 12 }}>Validate certificate (off accepts a self-signed PLCnext certificate)</Typography>
+        </Box>
+      )}
+      <DecimalTextField
+        label="Connection timeout (s)" value={value.connectionTimeoutSeconds}
+        onCommit={(connectionTimeoutSeconds) => onChange({ connectionTimeoutSeconds })}
+        sx={{ mb: 1, width: '100%' }}
+      />
       <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
         <TextField
           size="small" label="Username" value={value.username ?? ''}
@@ -2212,7 +2560,8 @@ function DensoFieldsBlock({
         />
       )}
       <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
-        Signal addresses are VRC symbols: IO&lt;n&gt; (bool), I&lt;n&gt; (int), F&lt;n&gt; (float), S&lt;n&gt; (string).
+        Signal addresses are VRC symbols: IO&lt;n&gt; (bool), I&lt;n&gt; (int), F&lt;n&gt; (float), S&lt;n&gt; (string),
+        P&lt;n&gt; (position as .x/.y/.z/.rx/.ry/.rz), axis&lt;N&gt; (joint).
       </Typography>
     </>
   );
@@ -2241,7 +2590,1118 @@ function AbbRobotStudioFieldsBlock({
   );
 }
 
-function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface; open: boolean; onClose: () => void }) {
+/** Siemens PLCSIM Advanced native-API fields (nested `plcSimAdvanced` settings block, plan-491). */
+export function PlcSimAdvancedFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: PlcSimAdvancedSettings;
+  onChange: (patch: Partial<PlcSimAdvancedSettings>) => void;
+}) {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  /** One comma-separated regex list field — the three discovery lists share this shape. */
+  const regexField = (
+    label: string,
+    key: 'regExImportSignals' | 'regExSkipSignals' | 'regExSymbolIsInput',
+    placeholder: string,
+    hint: string,
+  ) => (
+    <Box key={key} sx={{ mb: 1 }}>
+      <TextField
+        fullWidth size="small" label={label}
+        value={value[key].join(', ')}
+        onChange={(e) => onChange({ [key]: e.target.value.split(',').map(part => part.trim()) } as Partial<PlcSimAdvancedSettings>)}
+        onBlur={() => onChange({ [key]: value[key].filter(Boolean) } as Partial<PlcSimAdvancedSettings>)}
+        placeholder={placeholder}
+        sx={{ mb: 0.25 }}
+      />
+      <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, lineHeight: 1.5 }}>
+        {hint}
+      </Typography>
+    </Box>
+  );
+
+  return (
+    <>
+      <TextField
+        fullWidth size="small" label="Instance Name" value={value.instanceName}
+        onChange={(e) => onChange({ instanceName: e.target.value })}
+        placeholder="PLCSimInstance" sx={{ mb: 0.25 }}
+      />
+      <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, mb: 1, lineHeight: 1.5 }}>
+        Name the instance is registered under in the PLCSIM Advanced Control Panel. CONNECT attaches
+        to an existing instance and never creates one.
+      </Typography>
+      <TextField
+        fullWidth size="small" label="Remote address (host[:port], empty = this PC)" value={value.remoteAddress ?? ''}
+        onChange={(e) => onChange({ remoteAddress: e.target.value })}
+        placeholder="192.168.0.20:50000" sx={{ mb: 0.25 }}
+      />
+      <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, mb: 1, lineHeight: 1.5 }}>
+        Remote PLCSIM Advanced Runtime Manager. The remote PC must allow remote connections in its Control Panel.
+      </Typography>
+      <FormControlLabel
+        sx={{ m: 0, alignItems: 'center' }}
+        control={(
+          <Checkbox
+            size="small"
+            checked={value.ensureRunning}
+            onChange={(e) => onChange({ ensureRunning: e.target.checked })}
+          />
+        )}
+        label={<Typography sx={{ fontSize: 12 }}>Power on and run the instance on connect</Typography>}
+      />
+      <Typography sx={{ fontSize: 10, color: 'text.secondary', ml: 4.5, mb: 1, lineHeight: 1.5 }}>
+        Off (the default) observes only and never changes the operator&apos;s simulation state.
+      </Typography>
+
+      <Button
+        size="small"
+        color="inherit"
+        endIcon={advancedOpen ? <ExpandLess /> : <ExpandMore />}
+        aria-expanded={advancedOpen}
+        aria-controls="plcsim-advanced-advanced-fields"
+        onClick={() => setAdvancedOpen(open => !open)}
+        sx={{ px: 0.5, mb: 0.5, color: 'text.secondary', fontSize: 11, textTransform: 'none' }}
+      >
+        Advanced
+      </Button>
+      <Collapse in={advancedOpen}>
+        <Box id="plcsim-advanced-advanced-fields">
+          <TextField
+            fullWidth size="small" label="API Path Override" value={value.apiPathOverride}
+            onChange={(e) => onChange({ apiPathOverride: e.target.value })}
+            placeholder="C:\\Siemens\\Simulation\\Siemens.Simatic.Simulation.Runtime.Api.x64.dll"
+            sx={{ mb: 0.25 }}
+          />
+          <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, mb: 1, lineHeight: 1.5 }}>
+            Leave empty to auto-detect the runtime API from the registry installation path.
+          </Typography>
+
+          <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: 1.25 }} />
+          <Typography sx={{ fontSize: 11, fontWeight: 600, color: 'text.secondary', mb: 1 }}>
+            Discovery
+          </Typography>
+          <FormControlLabel
+            sx={{ m: 0, alignItems: 'center' }}
+            control={(
+              <Checkbox
+                size="small"
+                checked={value.hmiTagsOnly}
+                onChange={(e) => onChange({ hmiTagsOnly: e.target.checked })}
+              />
+            )}
+            label={<Typography sx={{ fontSize: 12 }}>Browse HMI-visible tags only</Typography>}
+          />
+          <Typography sx={{ fontSize: 10, color: 'text.secondary', ml: 4.5, mb: 1, lineHeight: 1.5 }}>
+            Off browses every tag of the process image and the named blocks. When the instance&apos;s tag
+            list exceeds 500 000 entries, CONNECT retries with HMI-visible tags only and reports that
+            under <code>tagListFallback</code> in GET /status and in the gateway log.
+          </Typography>
+          <TextField
+            fullWidth size="small" label="Data Block Filter" value={value.dataBlockFilter}
+            onChange={(e) => onChange({ dataBlockFilter: e.target.value })}
+            placeholder="Data_block_1, Recipe"
+            sx={{ mb: 0.25 }}
+          />
+          <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, mb: 1, lineHeight: 1.5 }}>
+            Comma-separated data-block names; quoting is added automatically. Empty = only the blocks used
+            by the configured signals (&quot;DB&quot;.Member) are loaded; browsing lists no data block tags then.
+          </Typography>
+          <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, mb: 1, lineHeight: 1.5 }}>
+            Enter data block names above to browse data block tags.
+          </Typography>
+          {regexField('Import Regexes', 'regExImportSignals', '^Motor.*',
+            'Comma-separated. Empty imports every browsed tag.')}
+          {regexField('Skip Regexes', 'regExSkipSignals', '.*_internal$',
+            'Applied after the import regexes.')}
+          {regexField('Input Regexes (viewer to PLC)', 'regExSymbolIsInput', '.*_Cmd$',
+            'A matching marker or data-block tag becomes a PLCInput. %I and %Q tags keep the direction of their area.')}
+        </Box>
+      </Collapse>
+    </>
+  );
+}
+
+/** B&R PVI fields (nested `pvi` settings block, plan-552 §3.1, Windows-only on the gateway). */
+export function PviFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: PviSettings;
+  onChange: (patch: Partial<PviSettings>) => void;
+}) {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const isIna = value.connectionType === 'Ina2000';
+  /** Integer field: anything unparsable commits 0 (the panel's convention for integer settings). */
+  const int = (text: string) => parseInt(text, 10) || 0;
+
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <FormControl size="small" sx={{ flex: 1 }}>
+          <InputLabel id="pvi-connection-label">Connection</InputLabel>
+          <Select
+            labelId="pvi-connection-label"
+            label="Connection"
+            value={value.connectionType}
+            onChange={(e) => onChange({ connectionType: e.target.value as PviConnectionType })}
+          >
+            <MenuItem value="Ansl">ANSL (TCP)</MenuItem>
+            <MenuItem value="Ina2000">INA2000 (TCP/IP)</MenuItem>
+          </Select>
+        </FormControl>
+        <TextField
+          size="small" label="Host" value={value.host}
+          onChange={(e) => onChange({ host: e.target.value })}
+          placeholder="127.0.0.1" sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Port (empty = PVI default)"
+          value={value.port ?? ''}
+          onChange={(e) => {
+            const text = e.target.value.trim();
+            onChange({ port: text === '' ? null : int(text) });
+          }}
+          placeholder={isIna ? '' : '11169'} sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Timeout (ms)" value={value.communicationTimeoutMs}
+          onChange={(e) => onChange({ communicationTimeoutMs: int(e.target.value) })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="User" value={value.userName ?? ''}
+          onChange={(e) => onChange({ userName: e.target.value || null })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Password" type="password" value={value.password ?? ''}
+          onChange={(e) => onChange({ password: e.target.value || null })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Refresh (ms)" value={value.refreshTimeMs}
+          onChange={(e) => onChange({ refreshTimeMs: int(e.target.value) })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="CPU poll (s)" value={value.cpuStatePollSeconds}
+          onChange={(e) => onChange({ cpuStatePollSeconds: int(e.target.value) })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      {isIna && (
+        <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+          <TextField
+            size="small" label="Source station" value={value.sourceStation}
+            onChange={(e) => onChange({ sourceStation: int(e.target.value) })}
+            sx={{ flex: 1 }}
+          />
+          <TextField
+            size="small" label="Destination station" value={value.destinationStation}
+            onChange={(e) => onChange({ destinationStation: int(e.target.value) })}
+            sx={{ flex: 1 }}
+          />
+          <TextField
+            size="small" label="Local port (0 = default)" value={value.localPort}
+            onChange={(e) => onChange({ localPort: int(e.target.value) })}
+            sx={{ flex: 1 }}
+          />
+        </Box>
+      )}
+      <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, mb: 1, lineHeight: 1.5 }}>
+        Needs B&amp;R PVI on the CONNECT machine (Windows). ANSL for Automation Runtime 4.08 and newer and
+        ArSim, INA2000 for older CPUs. Without a PVI licence the runtime stops after two hours.
+      </Typography>
+
+      <Button
+        size="small"
+        color="inherit"
+        endIcon={advancedOpen ? <ExpandLess /> : <ExpandMore />}
+        aria-expanded={advancedOpen}
+        aria-controls="pvi-advanced-fields"
+        onClick={() => setAdvancedOpen(open => !open)}
+        sx={{ px: 0.5, mb: 0.5, color: 'text.secondary', fontSize: 11, textTransform: 'none' }}
+      >
+        Advanced
+      </Button>
+      <Collapse in={advancedOpen}>
+        <Box id="pvi-advanced-fields">
+          <TextField
+            fullWidth size="small" label="PVI path override" value={value.apiPathOverride ?? ''}
+            onChange={(e) => onChange({ apiPathOverride: e.target.value || null })}
+            placeholder={'C:\\BRAutomation\\PVI\\V6.x\\PVI\\PviServices\\VS2012'}
+            sx={{ mb: 0.25 }}
+          />
+          <Typography sx={{ fontSize: 10, color: 'text.secondary', mx: 0.5, mb: 1, lineHeight: 1.5 }}>
+            Folder of BR.AN.PviServices.dll. Leave empty to find it through the PVI installation.
+          </Typography>
+          <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+            <TextField
+              size="small" label="Licence poll (s)" value={value.licensePollSeconds}
+              onChange={(e) => onChange({ licensePollSeconds: int(e.target.value) })}
+              sx={{ flex: 1 }}
+            />
+            <TextField
+              size="small" label="Max browse variables" value={value.maxBrowseVariables}
+              onChange={(e) => onChange({ maxBrowseVariables: int(e.target.value) })}
+              sx={{ flex: 1 }}
+            />
+          </Box>
+        </Box>
+      </Collapse>
+    </>
+  );
+}
+
+// ── plan-540 field blocks (robot and controller ports of the Unity interfaces) ──
+
+/**
+ * Decimal input for a fractional setting (frequency, velocity, timeout in seconds). Keeps the typed
+ * draft so `0.` or `1,` can be finished, commits every complete value parsed with `parseDecimal`
+ * (comma and dot both decimal) and restores the last committed value on blur.
+ */
+function DecimalTextField({
+  label,
+  value,
+  onCommit,
+  sx,
+}: {
+  label: string;
+  value: number;
+  onCommit: (value: number) => void;
+  sx?: Record<string, unknown>;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <TextField
+      size="small" label={label}
+      value={draft ?? String(value)}
+      inputProps={{ inputMode: 'decimal' }}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        const parsed = parseDecimal(e.target.value);
+        if (parsed !== null) onCommit(parsed);
+      }}
+      onBlur={() => setDraft(null)}
+      sx={sx}
+    />
+  );
+}
+
+/** Comma-separated list field → trimmed, non-empty entries (Keba / PLCSIM pattern). */
+function splitList(text: string): string[] {
+  return text.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/** Siemens S7 optional settings (nested `s7` block, plan-540 Phase 11) — the connection stays in the flat fields. */
+export function S7FieldsBlock({
+  value,
+  onChange,
+}: {
+  value: S7Settings;
+  onChange: (patch: Partial<S7Settings>) => void;
+}) {
+  return (
+    <>
+      <TextField
+        fullWidth size="small" label="Connection timeout (ms)" value={value.connectionTimeoutMs}
+        onChange={(e) => onChange({ connectionTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+        sx={{ mt: 1, mb: 1 }}
+      />
+      <TextField
+        fullWidth size="small" label="TIA symbol table .sdf (path on the CONNECT machine)" value={value.symbolTable}
+        onChange={(e) => onChange({ symbolTable: e.target.value })}
+        sx={{ mb: 0.5 }}
+      />
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        Signal discovery (Browse) lists the symbols of this table.
+      </Typography>
+    </>
+  );
+}
+
+/** KUKA OfficeLite Y200 TCP fields (nested `kuka` settings block, plan-540 Phase 1). */
+export function KukaFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: KukaSettings;
+  onChange: (patch: Partial<KukaSettings>) => void;
+}) {
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Host (OC_Assistant_OfficeLite)" value={value.host}
+          onChange={(e) => onChange({ host: e.target.value })}
+          placeholder="127.0.0.1" sx={{ flex: 2 }}
+        />
+        <TextField
+          size="small" label="Port" value={value.port}
+          onChange={(e) => onChange({ port: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Axes" value={value.axisCount}
+          onChange={(e) => onChange({ axisCount: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Digital signals ($IN/$OUT)" value={value.maxDigitalSignals}
+          onChange={(e) => onChange({ maxDigitalSignals: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Connect timeout (ms)" value={value.connectTimeoutMs}
+          onChange={(e) => onChange({ connectTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        Signal addresses: in&lt;N&gt; = $IN[N], out&lt;N&gt; = $OUT[N], axis&lt;N&gt; = joint N in degrees.
+      </Typography>
+    </>
+  );
+}
+
+/** KUKA iiQKA / RSI Ethernet fields (nested `kukaRsi` settings block, plan-540 Phase 2). */
+export function KukaRsiFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: KukaRsiSettings;
+  onChange: (patch: Partial<KukaRsiSettings>) => void;
+}) {
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Listen IP" value={value.listenIp}
+          onChange={(e) => onChange({ listenIp: e.target.value })}
+          placeholder="0.0.0.0" sx={{ flex: 2 }}
+        />
+        <TextField
+          size="small" label="RSI Port" value={value.rsiPort}
+          onChange={(e) => onChange({ rsiPort: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="RSI cycle (ms)" value={value.cycleMs}
+          onChange={(e) => onChange({ cycleMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Axis position tag" value={value.axisPosTag}
+          onChange={(e) => onChange({ axisPosTag: e.target.value })}
+          placeholder="AIPos" sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Axes" value={value.axisCount}
+          onChange={(e) => onChange({ axisCount: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Digital channels" value={value.digitalChannels}
+          onChange={(e) => onChange({ digitalChannels: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Analog channels" value={value.analogChannels}
+          onChange={(e) => onChange({ analogChannels: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Receive timeout (ms)" value={value.receiveTimeoutMs}
+          onChange={(e) => onChange({ receiveTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Max timeouts in a row" value={value.maxConsecutiveTimeouts}
+          onChange={(e) => onChange({ maxConsecutiveTimeouts: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.echoIpoc} onChange={(e) => onChange({ echoIpoc: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Echo IPOC in every answer</Typography>
+      </Box>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        CONNECT is the UDP server the RSI context sends to. Signal addresses: digin&lt;N&gt;, digout&lt;N&gt;,
+        anain&lt;N&gt;, anaout&lt;N&gt;, axis&lt;N&gt;.
+      </Typography>
+    </>
+  );
+}
+
+/** Universal Robots RTDE fields (nested `universalRobots` settings block, plan-540 Phase 3). */
+export function UniversalRobotsFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: UniversalRobotsSettings;
+  onChange: (patch: Partial<UniversalRobotsSettings>) => void;
+}) {
+  return (
+    <>
+      <TextField
+        fullWidth size="small" label="Host (URSim or UR controller)" value={value.host}
+        onChange={(e) => onChange({ host: e.target.value })}
+        placeholder="192.168.0.4" sx={{ mb: 1 }}
+      />
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="RTDE Port" value={value.rtdePort}
+          onChange={(e) => onChange({ rtdePort: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Secondary Port" value={value.secondaryPort}
+          onChange={(e) => onChange({ secondaryPort: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <DecimalTextField
+          label="Frequency (Hz)" value={value.outputFrequency}
+          onCommit={(outputFrequency) => onChange({ outputFrequency })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Axes" value={value.axisCount}
+          onChange={(e) => onChange({ axisCount: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Connect timeout (ms)" value={value.connectTimeoutMs}
+          onChange={(e) => onChange({ connectTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        Signal addresses: do&lt;N&gt; / cdo&lt;N&gt; (outputs), di&lt;N&gt; / cdi&lt;N&gt; (inputs, N = 0…7),
+        axis&lt;N&gt;, status, runtime.
+      </Typography>
+    </>
+  );
+}
+
+/** igus ReBeL (iRC via CRI) fields (nested `igusRebel` settings block, plan-540 Phase 4). */
+export function IgusRebelFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: IgusRebelSettings;
+  onChange: (patch: Partial<IgusRebelSettings>) => void;
+}) {
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Host (iRC)" value={value.host}
+          onChange={(e) => onChange({ host: e.target.value })}
+          placeholder="192.168.3.11" sx={{ flex: 2 }}
+        />
+        <TextField
+          size="small" label="Port" value={value.port}
+          onChange={(e) => onChange({ port: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Axes" value={value.axisCount}
+          onChange={(e) => onChange({ axisCount: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Speed override (%)" value={value.speed}
+          onChange={(e) => onChange({ speed: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <DecimalTextField
+          label="Joint velocity (%)" value={value.jointVelocityPercent}
+          onCommit={(jointVelocityPercent) => onChange({ jointVelocityPercent })}
+          sx={{ flex: 1 }}
+        />
+        <DecimalTextField
+          label="Cartesian velocity (mm/s)" value={value.cartVelocityMmPerSec}
+          onCommit={(cartVelocityMmPerSec) => onChange({ cartVelocityMmPerSec })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Connect timeout (ms)" value={value.connectTimeoutMs}
+          onChange={(e) => onChange({ connectTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Alive timeout (ms)" value={value.aliveTimeoutMs}
+          onChange={(e) => onChange({ aliveTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.activateOnConnect} onChange={(e) => onChange({ activateOnConnect: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Activate the robot on connect (SetActive)</Typography>
+      </Box>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        Signal addresses: axis&lt;N&gt;, dout&lt;N&gt;, gsig&lt;N&gt;, cmd:override, cmd:active, cmd:movejoint, cmd:movecart.
+      </Typography>
+    </>
+  );
+}
+
+/** Mitsubishi MELSEC MC 3E fields (nested `mitsubishi` settings block, plan-540 Phase 5). */
+export function MitsubishiFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: MitsubishiSettings;
+  onChange: (patch: Partial<MitsubishiSettings>) => void;
+}) {
+  const [importOpen, setImportOpen] = useState(false);
+
+  /** One CSV import filter checkbox — the device-class switches share this shape. */
+  const importToggle = (
+    key: 'importPhysicalInputs' | 'importPhysicalOutputs' | 'importInternalRelays' | 'importDataRegisters'
+      | 'importTimers' | 'importCounters' | 'importStateRelays' | 'importSpecialDevices',
+    label: string,
+  ) => (
+    <Box key={key} sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flex: '1 1 45%' }}>
+      <Checkbox size="small" checked={value[key]} onChange={(e) => onChange({ [key]: e.target.checked } as Partial<MitsubishiSettings>)} />
+      <Typography sx={{ fontSize: 12 }}>{label}</Typography>
+    </Box>
+  );
+
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Host" value={value.host}
+          onChange={(e) => onChange({ host: e.target.value })}
+          placeholder="192.168.3.39" sx={{ flex: 2 }}
+        />
+        <TextField
+          size="small" label="Port" value={value.port}
+          onChange={(e) => onChange({ port: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <TextField
+        fullWidth size="small" label="Connection timeout (ms)" value={value.connectionTimeoutMs}
+        onChange={(e) => onChange({ connectionTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+        sx={{ mb: 1 }}
+      />
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.optimizeBatchReads} onChange={(e) => onChange({ optimizeBatchReads: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Batch neighbouring devices into one read</Typography>
+      </Box>
+      {value.optimizeBatchReads && (
+        <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+          <TextField
+            size="small" label="Max gap" value={value.maxGapSize}
+            onChange={(e) => onChange({ maxGapSize: parseInt(e.target.value, 10) || 0 })}
+            sx={{ flex: 1 }}
+          />
+          <TextField
+            size="small" label="Min batch" value={value.minBatchSize}
+            onChange={(e) => onChange({ minBatchSize: parseInt(e.target.value, 10) || 0 })}
+            sx={{ flex: 1 }}
+          />
+          <TextField
+            size="small" label="Max bits" value={value.maxBatchSizeBits}
+            onChange={(e) => onChange({ maxBatchSizeBits: parseInt(e.target.value, 10) || 0 })}
+            sx={{ flex: 1 }}
+          />
+          <TextField
+            size="small" label="Max words" value={value.maxBatchSizeWords}
+            onChange={(e) => onChange({ maxBatchSizeWords: parseInt(e.target.value, 10) || 0 })}
+            sx={{ flex: 1 }}
+          />
+        </Box>
+      )}
+      <TextField
+        fullWidth size="small" label="GX Works3 device comment CSV (path on the CONNECT machine)"
+        value={value.csvFile}
+        onChange={(e) => onChange({ csvFile: e.target.value })}
+        placeholder="C:\Projects\Line1\comments.csv" sx={{ mb: 0.5 }}
+      />
+      <Button
+        size="small"
+        color="inherit"
+        endIcon={importOpen ? <ExpandLess /> : <ExpandMore />}
+        aria-expanded={importOpen}
+        aria-controls="mitsubishi-import-fields"
+        onClick={() => setImportOpen(open => !open)}
+        sx={{ px: 0.5, mb: 0.5, color: 'text.secondary', fontSize: 11, textTransform: 'none' }}
+      >
+        CSV import options
+      </Button>
+      <Collapse in={importOpen}>
+        <Box id="mitsubishi-import-fields">
+          <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+            <TextField
+              size="small" label="Max devices" value={value.maxImportDevices}
+              onChange={(e) => onChange({ maxImportDevices: parseInt(e.target.value, 10) || 0 })}
+              sx={{ flex: 1 }}
+            />
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flex: 1 }}>
+              <Checkbox size="small" checked={value.importComments} onChange={(e) => onChange({ importComments: e.target.checked })} />
+              <Typography sx={{ fontSize: 12 }}>Comments as signal names</Typography>
+            </Box>
+          </Box>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+            <Checkbox size="small" checked={value.validateDeviceAddresses} onChange={(e) => onChange({ validateDeviceAddresses: e.target.checked })} />
+            <Typography sx={{ fontSize: 12 }}>Skip devices outside the address limits</Typography>
+          </Box>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', mb: 1 }}>
+            {importToggle('importPhysicalInputs', 'Inputs (X)')}
+            {importToggle('importPhysicalOutputs', 'Outputs (Y)')}
+            {importToggle('importInternalRelays', 'Internal relays (M)')}
+            {importToggle('importDataRegisters', 'Data registers (D)')}
+            {importToggle('importTimers', 'Timers (T)')}
+            {importToggle('importCounters', 'Counters (C)')}
+            {importToggle('importStateRelays', 'State relays (S)')}
+            {importToggle('importSpecialDevices', 'Special devices (SM/SD)')}
+          </Box>
+        </Box>
+      </Collapse>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        Signal addresses are MELSEC devices (M0, X1F, D100, D200:float). X, Y and W are hexadecimal.
+      </Typography>
+    </>
+  );
+}
+
+/** UDP telegram fields (nested `udp` settings block, plan-540 Phase 6). */
+export function UdpFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: UdpSettings;
+  onChange: (patch: Partial<UdpSettings>) => void;
+}) {
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Remote host" value={value.remoteHost}
+          onChange={(e) => onChange({ remoteHost: e.target.value })}
+          placeholder="127.0.0.1" sx={{ flex: 2 }}
+        />
+        <TextField
+          size="small" label="Remote port" value={value.remotePort}
+          onChange={(e) => onChange({ remotePort: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Local bind address" value={value.localBindAddress}
+          onChange={(e) => onChange({ localBindAddress: e.target.value })}
+          placeholder="0.0.0.0" sx={{ flex: 2 }}
+        />
+        <TextField
+          size="small" label="Local port" value={value.localPort}
+          onChange={(e) => onChange({ localPort: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.littleEndian} onChange={(e) => onChange({ littleEndian: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Little-endian INT and REAL (off = big-endian, Siemens)</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Symbol table CSV (path on the CONNECT machine)" value={value.symbolTable}
+          onChange={(e) => onChange({ symbolTable: e.target.value })}
+          sx={{ flex: 3 }}
+        />
+        <TextField
+          size="small" label="Separator" value={value.splitChar}
+          onChange={(e) => onChange({ splitChar: e.target.value })}
+          placeholder=";" sx={{ flex: 1 }}
+        />
+      </Box>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        Signal addresses are &lt;offset&gt;:&lt;BOOL|INT|REAL&gt; in the send or receive telegram (0:BOOL, 4:INT, 8:REAL).
+      </Typography>
+    </>
+  );
+}
+
+/** WebSocket Realtime (realvirtual protocol v2) fields (nested `webSocketRealtime` settings block, plan-540 Phase 7). */
+export function WebSocketRealtimeFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: WebSocketRealtimeSettings;
+  onChange: (patch: Partial<WebSocketRealtimeSettings>) => void;
+}) {
+  return (
+    <>
+      <FormControl fullWidth size="small" sx={{ mb: 1 }}>
+        <InputLabel id="wsrt-mode-label">Mode</InputLabel>
+        <Select
+          labelId="wsrt-mode-label" label="Mode"
+          value={value.isServer ? 'server' : 'client'}
+          onChange={(e) => onChange({ isServer: e.target.value === 'server' })}
+        >
+          <MenuItem value="server">Server (peers connect to CONNECT)</MenuItem>
+          <MenuItem value="client">Client (CONNECT connects to a server)</MenuItem>
+        </Select>
+      </FormControl>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        {value.isServer ? (
+          <TextField
+            size="small" label="Bind address" value={value.bindAddress}
+            onChange={(e) => onChange({ bindAddress: e.target.value })}
+            placeholder="127.0.0.1" sx={{ flex: 2 }}
+          />
+        ) : (
+          <TextField
+            size="small" label="Server address" value={value.address}
+            onChange={(e) => onChange({ address: e.target.value })}
+            placeholder="127.0.0.1" sx={{ flex: 2 }}
+          />
+        )}
+        <TextField
+          size="small" label="Port" value={value.port}
+          onChange={(e) => onChange({ port: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Path" value={value.path}
+          onChange={(e) => onChange({ path: e.target.value })}
+          placeholder="/" sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="API key" type="password" value={value.apiKey ?? ''}
+          onChange={(e) => onChange({ apiKey: e.target.value || null })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      {value.isServer ? (
+        <>
+          <TextField
+            fullWidth size="small" label="Allowed browser origins (comma-sep.)"
+            value={value.allowedOrigins.join(', ')}
+            onChange={(e) => onChange({ allowedOrigins: splitList(e.target.value) })}
+            placeholder="https://hmi.example.com" sx={{ mb: 0.5 }}
+          />
+          <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+            127.0.0.1 accepts peers on this machine only. Any other bind address requires an API key.
+          </Typography>
+        </>
+      ) : (
+        <>
+          <TextField
+            fullWidth size="small" label="Client name" value={value.clientName}
+            onChange={(e) => onChange({ clientName: e.target.value })}
+            sx={{ mb: 1 }}
+          />
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+            <Checkbox size="small" checked={value.useSsl} onChange={(e) => onChange({ useSsl: e.target.checked })} />
+            <Typography sx={{ fontSize: 12 }}>Use SSL (wss://)</Typography>
+          </Box>
+        </>
+      )}
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.onlyTransmitChangedInputs} onChange={(e) => onChange({ onlyTransmitChangedInputs: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Send changed inputs only</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Max message (bytes)" value={value.maxMessageBytes}
+          onChange={(e) => onChange({ maxMessageBytes: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <FormControl size="small" sx={{ flex: 1 }}>
+          <InputLabel id="wsrt-dir-label">Import default direction</InputLabel>
+          <Select
+            labelId="wsrt-dir-label" label="Import default direction"
+            value={value.defaultSignalDirection === 'Input' ? 'Input' : 'Output'}
+            onChange={(e) => onChange({ defaultSignalDirection: e.target.value })}
+          >
+            <MenuItem value="Output">Output</MenuItem>
+            <MenuItem value="Input">Input</MenuItem>
+          </Select>
+        </FormControl>
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.usePatternMatching} onChange={(e) => onChange({ usePatternMatching: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Infer direction from signal names (import)</Typography>
+      </Box>
+      {value.usePatternMatching && (
+        <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+          <TextField
+            size="small" label="Input patterns"
+            value={value.inputPatterns.join(', ')}
+            onChange={(e) => onChange({ inputPatterns: splitList(e.target.value) })}
+            placeholder="Unity" sx={{ flex: 1 }}
+          />
+          <TextField
+            size="small" label="Output patterns"
+            value={value.outputPatterns.join(', ')}
+            onChange={(e) => onChange({ outputPatterns: splitList(e.target.value) })}
+            sx={{ flex: 1 }}
+          />
+        </Box>
+      )}
+    </>
+  );
+}
+
+/** WINMOD Y200 shared-memory fields (nested `winmodY200` settings block, plan-540 Phase 8). */
+export function WinmodY200FieldsBlock({
+  value,
+  onChange,
+}: {
+  value: WinmodY200Settings;
+  onChange: (patch: Partial<WinmodY200Settings>) => void;
+}) {
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Shared Memory Name" value={value.sharedMemoryName}
+          onChange={(e) => onChange({ sharedMemoryName: e.target.value })}
+          placeholder="Y200" sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Mutex Name" value={value.mutexName}
+          onChange={(e) => onChange({ mutexName: e.target.value })}
+          placeholder="<name>_Mutex" sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Mutex timeout (ms)" value={value.mutexTimeoutMs}
+          onChange={(e) => onChange({ mutexTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Keep-alive (s, 0 = off)" value={value.keepAliveSeconds}
+          onChange={(e) => onChange({ keepAliveSeconds: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <TextField
+        fullWidth size="small" label="WINMOD signal list (path on the CONNECT machine)"
+        value={value.signalList}
+        onChange={(e) => onChange({ signalList: e.target.value })}
+        sx={{ mb: 0.5 }}
+      />
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        WINMOD creates the shared memory; CONNECT attaches to it on the same Windows machine.
+        Signal addresses: MB&lt;n&gt;.&lt;bit&gt;, MB&lt;n&gt;, MI&lt;n&gt;, MD&lt;n&gt;, MF&lt;n&gt;.
+      </Typography>
+    </>
+  );
+}
+
+/** RoboDK API fields (nested `roboDk` settings block, plan-540 Phase 9). */
+export function RoboDkFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: RoboDkSettings;
+  onChange: (patch: Partial<RoboDkSettings>) => void;
+}) {
+  return (
+    <>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Host (PC running RoboDK)" value={value.host}
+          onChange={(e) => onChange({ host: e.target.value })}
+          placeholder="localhost" sx={{ flex: 2 }}
+        />
+        <TextField
+          size="small" label="Port" value={value.port}
+          onChange={(e) => onChange({ port: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Robot name (empty = first)" value={value.robotName}
+          onChange={(e) => onChange({ robotName: e.target.value })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Program name" value={value.programName}
+          onChange={(e) => onChange({ programName: e.target.value })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Axes" value={value.axisCount}
+          onChange={(e) => onChange({ axisCount: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Parameter poll (ms)" value={value.paramPollMs}
+          onChange={(e) => onChange({ paramPollMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <DecimalTextField
+          label="Simulation speed" value={value.simulationSpeed}
+          onCommit={(simulationSpeed) => onChange({ simulationSpeed })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.runProgramOnConnect} onChange={(e) => onChange({ runProgramOnConnect: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Start the program on the first connect</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.loopProgram} onChange={(e) => onChange({ loopProgram: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Loop the program</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.stopProgramOnDisconnect} onChange={(e) => onChange({ stopProgramOnDisconnect: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Stop the program on disconnect</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.forceSimulateRunMode} onChange={(e) => onChange({ forceSimulateRunMode: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Switch RoboDK to simulation run mode</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Connect timeout (ms)" value={value.connectTimeoutMs}
+          onChange={(e) => onChange({ connectTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Response timeout (ms)" value={value.responseTimeoutMs}
+          onChange={(e) => onChange({ responseTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        RoboDK must already run with the station open. Program and station changes need Allow Web → PLC writes.
+      </Typography>
+    </>
+  );
+}
+
+/** Wandelbots NOVA fields (nested `wandelbotsNova` settings block, plan-540 Phase 10). */
+export function WandelbotsNovaFieldsBlock({
+  value,
+  onChange,
+}: {
+  value: WandelbotsNovaSettings;
+  onChange: (patch: Partial<WandelbotsNovaSettings>) => void;
+}) {
+  return (
+    <>
+      <TextField
+        fullWidth size="small" label="Server URL" value={value.server}
+        onChange={(e) => onChange({ server: e.target.value })}
+        placeholder="http://localhost" sx={{ mb: 1 }}
+      />
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Cell" value={value.cell}
+          onChange={(e) => onChange({ cell: e.target.value })}
+          placeholder="cell" sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Motion group" value={value.motionGroup}
+          onChange={(e) => onChange({ motionGroup: e.target.value })}
+          placeholder="0@ur10e" sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Controller (optional)" value={value.controller}
+          onChange={(e) => onChange({ controller: e.target.value })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Username" value={value.username ?? ''}
+          onChange={(e) => onChange({ username: e.target.value || null })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Password" type="password" value={value.password ?? ''}
+          onChange={(e) => onChange({ password: e.target.value || null })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <TextField
+        fullWidth size="small" label="Access token (wins over username / password)" type="password"
+        value={value.token ?? ''}
+        onChange={(e) => onChange({ token: e.target.value || null })}
+        sx={{ mb: 1 }}
+      />
+      <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+        <TextField
+          size="small" label="Axes" value={value.axisCount}
+          onChange={(e) => onChange({ axisCount: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Stream rate (ms)" value={value.streamRateMs}
+          onChange={(e) => onChange({ streamRateMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+        <TextField
+          size="small" label="Response timeout (ms)" value={value.responseTimeoutMs}
+          onChange={(e) => onChange({ responseTimeoutMs: parseInt(e.target.value, 10) || 0 })}
+          sx={{ flex: 1 }}
+        />
+      </Box>
+      <TextField
+        fullWidth multiline minRows={3} maxRows={8} size="small" label="Wandelscript program (prog:run)"
+        value={value.programTemplate}
+        onChange={(e) => onChange({ programTemplate: e.target.value })}
+        sx={{ mb: 1 }}
+      />
+      <TextField
+        fullWidth size="small" label="Program timeout (s)" value={value.programTimeoutSeconds}
+        onChange={(e) => onChange({ programTimeoutSeconds: parseInt(e.target.value, 10) || 0 })}
+        sx={{ mb: 1 }}
+      />
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.startProgramOnConnect} onChange={(e) => onChange({ startProgramOnConnect: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Start the program on the first connect</Typography>
+      </Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+        <Checkbox size="small" checked={value.loopProgram} onChange={(e) => onChange({ loopProgram: e.target.checked })} />
+        <Typography sx={{ fontSize: 12 }}>Loop the program</Typography>
+      </Box>
+      <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.45)', mb: 1 }}>
+        Signal addresses: axis&lt;N&gt;, io:&lt;name&gt;, prog:run, prog:stop, prog:loop.
+      </Typography>
+    </>
+  );
+}
+
+export function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface; open: boolean; onClose: () => void }) {
   // ── Common fields — unchanged behavior (Enabled, UpdateCycleMs) plus AllowWebToPlc ──
   const [enabled, setEnabled] = useState(iface.enabled);
   const [updateCycleMs, setUpdateCycleMs] = useState(String(iface.updateCycleMs ?? 50));
@@ -2288,9 +3748,42 @@ function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface
   const [denso, setDenso] = useState<DensoSettings>(
     () => ({ ...DENSO_SETTINGS_DEFAULTS, ...iface.denso }),
   );
+  const [s7, setS7] = useState<S7Settings>(() => ({ ...S7_SETTINGS_DEFAULTS, ...iface.s7 }));
+  const [kuka, setKuka] = useState<KukaSettings>(() => ({ ...KUKA_SETTINGS_DEFAULTS, ...iface.kuka }));
+  const [kukaRsi, setKukaRsi] = useState<KukaRsiSettings>(() => ({ ...KUKARSI_SETTINGS_DEFAULTS, ...iface.kukaRsi }));
+  const [universalRobots, setUniversalRobots] = useState<UniversalRobotsSettings>(
+    () => ({ ...UNIVERSALROBOTS_SETTINGS_DEFAULTS, ...iface.universalRobots }),
+  );
+  const [igusRebel, setIgusRebel] = useState<IgusRebelSettings>(() => ({ ...IGUSREBEL_SETTINGS_DEFAULTS, ...iface.igusRebel }));
+  const [mitsubishi, setMitsubishi] = useState<MitsubishiSettings>(
+    () => ({ ...MITSUBISHI_SETTINGS_DEFAULTS, ...iface.mitsubishi }),
+  );
+  const [udp, setUdp] = useState<UdpSettings>(() => ({ ...UDP_SETTINGS_DEFAULTS, ...iface.udp }));
+  const [webSocketRealtime, setWebSocketRealtime] = useState<WebSocketRealtimeSettings>(() => ({
+    ...WEBSOCKETREALTIME_SETTINGS_DEFAULTS,
+    ...iface.webSocketRealtime,
+    allowedOrigins: [...(iface.webSocketRealtime?.allowedOrigins ?? WEBSOCKETREALTIME_SETTINGS_DEFAULTS.allowedOrigins)],
+    inputPatterns: [...(iface.webSocketRealtime?.inputPatterns ?? WEBSOCKETREALTIME_SETTINGS_DEFAULTS.inputPatterns)],
+    outputPatterns: [...(iface.webSocketRealtime?.outputPatterns ?? WEBSOCKETREALTIME_SETTINGS_DEFAULTS.outputPatterns)],
+  }));
+  const [winmodY200, setWinmodY200] = useState<WinmodY200Settings>(
+    () => ({ ...WINMODY200_SETTINGS_DEFAULTS, ...iface.winmodY200 }),
+  );
+  const [roboDk, setRoboDk] = useState<RoboDkSettings>(() => ({ ...ROBODK_SETTINGS_DEFAULTS, ...iface.roboDk }));
+  const [wandelbotsNova, setWandelbotsNova] = useState<WandelbotsNovaSettings>(
+    () => ({ ...WANDELBOTSNOVA_SETTINGS_DEFAULTS, ...iface.wandelbotsNova }),
+  );
   const [abbRobotStudio, setAbbRobotStudio] = useState<AbbRobotStudioSettings>(
     () => ({ ...ABB_ROBOTSTUDIO_SETTINGS_DEFAULTS, ...iface.abbRobotStudio }),
   );
+  const [plcSimAdvanced, setPlcSimAdvanced] = useState<PlcSimAdvancedSettings>(() => ({
+    ...PLCSIMADVANCED_SETTINGS_DEFAULTS,
+    ...iface.plcSimAdvanced,
+    regExImportSignals: [...(iface.plcSimAdvanced?.regExImportSignals ?? [])],
+    regExSkipSignals: [...(iface.plcSimAdvanced?.regExSkipSignals ?? [])],
+    regExSymbolIsInput: [...(iface.plcSimAdvanced?.regExSymbolIsInput ?? [])],
+  }));
+  const [pvi, setPvi] = useState<PviSettings>(() => ({ ...PVI_SETTINGS_DEFAULTS, ...iface.pvi }));
 
   const patchTwinCat = useCallback((patch: Partial<TwinCatSettings>) => setTwinCat(prev => ({ ...prev, ...patch })), []);
   const patchModbus = useCallback((patch: Partial<ModbusSettings>) => setModbus(prev => ({ ...prev, ...patch })), []);
@@ -2301,7 +3794,20 @@ function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface
   const patchFesto = useCallback((patch: Partial<FestoSettings>) => setFesto(prev => ({ ...prev, ...patch })), []);
   const patchFanuc = useCallback((patch: Partial<FanucSettings>) => setFanuc(prev => ({ ...prev, ...patch })), []);
   const patchDenso = useCallback((patch: Partial<DensoSettings>) => setDenso(prev => ({ ...prev, ...patch })), []);
+  const patchS7 = useCallback((patch: Partial<S7Settings>) => setS7(prev => ({ ...prev, ...patch })), []);
+  const patchKuka = useCallback((patch: Partial<KukaSettings>) => setKuka(prev => ({ ...prev, ...patch })), []);
+  const patchKukaRsi = useCallback((patch: Partial<KukaRsiSettings>) => setKukaRsi(prev => ({ ...prev, ...patch })), []);
+  const patchUniversalRobots = useCallback((patch: Partial<UniversalRobotsSettings>) => setUniversalRobots(prev => ({ ...prev, ...patch })), []);
+  const patchIgusRebel = useCallback((patch: Partial<IgusRebelSettings>) => setIgusRebel(prev => ({ ...prev, ...patch })), []);
+  const patchMitsubishi = useCallback((patch: Partial<MitsubishiSettings>) => setMitsubishi(prev => ({ ...prev, ...patch })), []);
+  const patchUdp = useCallback((patch: Partial<UdpSettings>) => setUdp(prev => ({ ...prev, ...patch })), []);
+  const patchWebSocketRealtime = useCallback((patch: Partial<WebSocketRealtimeSettings>) => setWebSocketRealtime(prev => ({ ...prev, ...patch })), []);
+  const patchWinmodY200 = useCallback((patch: Partial<WinmodY200Settings>) => setWinmodY200(prev => ({ ...prev, ...patch })), []);
+  const patchRoboDk = useCallback((patch: Partial<RoboDkSettings>) => setRoboDk(prev => ({ ...prev, ...patch })), []);
+  const patchWandelbotsNova = useCallback((patch: Partial<WandelbotsNovaSettings>) => setWandelbotsNova(prev => ({ ...prev, ...patch })), []);
   const patchAbbRobotStudio = useCallback((patch: Partial<AbbRobotStudioSettings>) => setAbbRobotStudio(prev => ({ ...prev, ...patch })), []);
+  const patchPlcSimAdvanced = useCallback((patch: Partial<PlcSimAdvancedSettings>) => setPlcSimAdvanced(prev => ({ ...prev, ...patch })), []);
+  const patchPvi = useCallback((patch: Partial<PviSettings>) => setPvi(prev => ({ ...prev, ...patch })), []);
 
   const [saving, setSaving] = useState(false);
 
@@ -2314,7 +3820,10 @@ function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface
         allowWebToPlc,
       };
       if (iface.type === 'OpcUa') updates.endpoint = endpoint;
-      else if (iface.type === 'S7') { updates.ipAddress = ipAddress; updates.rack = parseInt(rack, 10); updates.slot = parseInt(slot, 10); }
+      else if (iface.type === 'S7') {
+        updates.ipAddress = ipAddress; updates.rack = parseInt(rack, 10); updates.slot = parseInt(slot, 10);
+        updates.s7 = s7;
+      }
       else if (iface.type === 'MQTT') updates.brokerUrl = brokerUrl;
       else if (iface.type === 'TwinCat') updates.twinCat = twinCat;
       else if (iface.type === 'Modbus' || iface.type === 'ModbusServer') updates.modbus = modbus;
@@ -2325,12 +3834,24 @@ function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface
       else if (iface.type === 'Festo') updates.festo = festo;
       else if (iface.type === 'Fanuc') updates.fanuc = fanuc;
       else if (iface.type === 'Denso') updates.denso = denso;
+      else if (iface.type === 'Kuka') updates.kuka = kuka;
+      else if (iface.type === 'KukaRsi') updates.kukaRsi = kukaRsi;
+      else if (iface.type === 'UniversalRobots') updates.universalRobots = universalRobots;
+      else if (iface.type === 'IgusRebel') updates.igusRebel = igusRebel;
+      else if (iface.type === 'Mitsubishi') updates.mitsubishi = mitsubishi;
+      else if (iface.type === 'Udp') updates.udp = udp;
+      else if (iface.type === 'WebSocketRealtime') updates.webSocketRealtime = webSocketRealtime;
+      else if (iface.type === 'WinmodY200') updates.winmodY200 = winmodY200;
+      else if (iface.type === 'RoboDk') updates.roboDk = roboDk;
+      else if (iface.type === 'WandelbotsNova') updates.wandelbotsNova = wandelbotsNova;
       else if (iface.type === 'AbbRobotStudio') updates.abbRobotStudio = abbRobotStudio;
+      else if (iface.type === 'PlcSimAdvanced') updates.plcSimAdvanced = plcSimAdvanced;
+      else if (iface.type === 'Pvi') updates.pvi = pvi;
       await updateInterface(iface.id, updates);
       onClose();
     } catch { /* logged in store */ }
     setSaving(false);
-  }, [iface, endpoint, ipAddress, rack, slot, brokerUrl, enabled, updateCycleMs, allowWebToPlc, twinCat, modbus, ethernetIp, ctrlX, ctrlXDataLayer, keba, festo, fanuc, denso, abbRobotStudio, onClose]);
+  }, [iface, endpoint, ipAddress, rack, slot, brokerUrl, enabled, updateCycleMs, allowWebToPlc, twinCat, modbus, ethernetIp, ctrlX, ctrlXDataLayer, keba, festo, fanuc, denso, s7, kuka, kukaRsi, universalRobots, igusRebel, mitsubishi, udp, webSocketRealtime, winmodY200, roboDk, wandelbotsNova, abbRobotStudio, plcSimAdvanced, pvi, onClose]);
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
@@ -2362,6 +3883,7 @@ function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface
               <TextField size="small" label="Rack" value={rack} onChange={(e) => setRack(e.target.value)} sx={{ flex: 1 }} />
               <TextField size="small" label="Slot" value={slot} onChange={(e) => setSlot(e.target.value)} sx={{ flex: 1 }} />
             </Box>
+            <S7FieldsBlock value={s7} onChange={patchS7} />
           </>
         )}
 
@@ -2391,7 +3913,31 @@ function EditInterfaceDialog({ iface, open, onClose }: { iface: ConnectInterface
 
         {iface.type === 'Denso' && <DensoFieldsBlock value={denso} onChange={patchDenso} />}
 
+        {iface.type === 'Kuka' && <KukaFieldsBlock value={kuka} onChange={patchKuka} />}
+
+        {iface.type === 'KukaRsi' && <KukaRsiFieldsBlock value={kukaRsi} onChange={patchKukaRsi} />}
+
+        {iface.type === 'UniversalRobots' && <UniversalRobotsFieldsBlock value={universalRobots} onChange={patchUniversalRobots} />}
+
+        {iface.type === 'IgusRebel' && <IgusRebelFieldsBlock value={igusRebel} onChange={patchIgusRebel} />}
+
+        {iface.type === 'Mitsubishi' && <MitsubishiFieldsBlock value={mitsubishi} onChange={patchMitsubishi} />}
+
+        {iface.type === 'Udp' && <UdpFieldsBlock value={udp} onChange={patchUdp} />}
+
+        {iface.type === 'WebSocketRealtime' && <WebSocketRealtimeFieldsBlock value={webSocketRealtime} onChange={patchWebSocketRealtime} />}
+
+        {iface.type === 'WinmodY200' && <WinmodY200FieldsBlock value={winmodY200} onChange={patchWinmodY200} />}
+
+        {iface.type === 'RoboDk' && <RoboDkFieldsBlock value={roboDk} onChange={patchRoboDk} />}
+
+        {iface.type === 'WandelbotsNova' && <WandelbotsNovaFieldsBlock value={wandelbotsNova} onChange={patchWandelbotsNova} />}
+
         {iface.type === 'AbbRobotStudio' && <AbbRobotStudioFieldsBlock value={abbRobotStudio} onChange={patchAbbRobotStudio} />}
+
+        {iface.type === 'PlcSimAdvanced' && <PlcSimAdvancedFieldsBlock value={plcSimAdvanced} onChange={patchPlcSimAdvanced} />}
+
+        {iface.type === 'Pvi' && <PviFieldsBlock value={pvi} onChange={patchPvi} />}
 
         <TextField fullWidth size="small" label="Update Cycle (ms)" value={updateCycleMs} onChange={(e) => setUpdateCycleMs(e.target.value)} sx={{ mt: 1 }} />
       </DialogContent>
@@ -2430,7 +3976,9 @@ type SignalListRow =
    *  `depth` is set for tree leaves and drives their indentation (undefined = flat rendering). */
   | { kind: 'signal'; sig: ConnectInterfaceSignal; flat?: boolean; topic?: string; depth?: number;
       /** Signal of a Json topic — rendered without an address column (plan-457). */
-      jsonMode?: boolean };
+      jsonMode?: boolean;
+      /** plan-589: payload mode of `topic` — part of the signal's PLACE, which the edit dialog needs. */
+      mode?: MqttTopicMode };
 
 /**
  * Derive the transient set of topics opened by the active signal filter.
@@ -2493,14 +4041,20 @@ interface SignalRowItemProps {
   linkedLabel?: string;
   /** Node path of the linked target, to navigate to on click. */
   linkedPath?: string;
-  /** Manual-edit callbacks (stable refs so memo keeps working) — undefined hides the hover icons. */
-  onEdit?: (sig: ConnectInterfaceSignal) => void;
-  onDelete?: (sig: ConnectInterfaceSignal) => void;
+  /**
+   * Manual-edit callbacks (stable refs so memo keeps working) — undefined hides the hover icons.
+   * plan-589: both pass the row's own PLACE (`topic` + `mode`) so the dialog edits the right
+   * container — two topics may carry the same signal name.
+   */
+  onEdit?: (sig: ConnectInterfaceSignal, topic?: string, mode?: MqttTopicMode) => void;
+  onDelete?: (sig: ConnectInterfaceSignal, topic?: string) => void;
   /** Bridge this signal 1:1 to a signal of another interface (plan-257) — undefined hides the icon. */
   onBridge?: (sig: ConnectInterfaceSignal) => void;
   /** Toggle CONNECT's persisted historian Record flag. */
   onRecordChange?: (sig: ConnectInterfaceSignal, record: boolean, topic?: string) => void;
   topic?: string;
+  /** plan-589: payload mode of `topic` — part of the row's place, handed to the edit dialog. */
+  mode?: MqttTopicMode;
   interfaceId: string;
   recordPending?: boolean;
   /** This configured signal was rejected by the current license budget. */
@@ -2531,7 +4085,7 @@ interface SignalRowItemProps {
 const SignalRowItem = memo(function SignalRowItem({
   sig, direction, plcType, inModel, hasTopics, depth, viewer, indicatorOn, hideAddress,
   linkedLabel, linkedPath,
-  onEdit, onDelete, onBridge, onRecordChange, topic, interfaceId, recordPending, limitExceeded,
+  onEdit, onDelete, onBridge, onRecordChange, topic, mode, interfaceId, recordPending, limitExceeded,
   selected, onSelect, onContextMenu,
 }: SignalRowItemProps) {
   const signalStore = viewer.signalStore ?? null;
@@ -2723,20 +4277,22 @@ const SignalRowItem = memo(function SignalRowItem({
           )}
           {onEdit && (
             <Tooltip title="Edit signal" disableInteractive>
-              <IconButton size="small" aria-label={`Edit signal '${sig.name}'`} onClick={(e) => { e.stopPropagation(); onEdit(sig); }} sx={{ p: 0.25 }}>
+              <IconButton size="small" aria-label={`Edit signal '${sig.name}'`} onClick={(e) => { e.stopPropagation(); onEdit(sig, topic, mode); }} sx={{ p: 0.25 }}>
                 <Edit sx={{ fontSize: 12, color: 'rgba(255,255,255,0.6)' }} />
               </IconButton>
             </Tooltip>
           )}
           {onDelete && (
             <Tooltip title="Delete signal" disableInteractive>
-              <IconButton size="small" aria-label={`Delete signal '${sig.name}'`} onClick={(e) => { e.stopPropagation(); onDelete(sig); }} sx={{ p: 0.25, '&:hover': { color: ISA_RED } }}>
+              <IconButton size="small" aria-label={`Delete signal '${sig.name}'`} onClick={(e) => { e.stopPropagation(); onDelete(sig, topic); }} sx={{ p: 0.25, '&:hover': { color: ISA_RED } }}>
                 <Delete sx={{ fontSize: 12, color: 'rgba(255,255,255,0.6)' }} />
               </IconButton>
             </Tooltip>
           )}
         </Box>
       )}
+      {/* plan-566 R1: "Used by N" — also for process-image signals without a scene node. */}
+      <SignalUsageButton viewer={viewer} name={sig.name} />
       {/* Full drag payload (address/comment; source comes from the mirrored store
           meta) so a Shift+Drag from the CONNECT list carries everything (F11). */}
       <SignalBadge
@@ -2901,6 +4457,25 @@ function SignalFilterPopover({
 }
 
 /**
+ * The signal-acquisition routes an interface type's ⋮ menu really shows, as a sentence fragment.
+ * Mirrors the menu's own gating (`canBrowse` from the schema with the legacy type list as fallback,
+ * Import for MQTT/S7) so the empty state can never name an entry that is not there.
+ */
+function menuRoutesLabel(type: string): string {
+  const schema = getSignalSchema(type);
+  const canBrowse = schema
+    ? schema.supportsDiscovery
+    : (type === 'OpcUa' || type === 'MQTT' || type === 'TwinCat' || type === 'EthernetIp'
+      || type === 'CtrlX' || type === 'CtrlXDataLayer' || type === 'Keba' || type === 'Festo'
+      || type === 'PlcSimAdvanced' || type === 'Pvi');
+  const routes: string[] = [];
+  if (canBrowse) routes.push('Browse');
+  if (type === 'MQTT' || type === 'S7') routes.push('Import');
+  if (routes.length === 0) return 'add them';
+  return `${routes.join(' or ')} them`;
+}
+
+/**
  * Searchable, virtualized signal view grouped as Interface > Topic > Signals (topic-bundled MQTT
  * ProcessImage) or Interface > Signals (flat, other protocols). Each signal renders with the shared
  * SignalBadge chip; live values stream in from the viewer SignalStore.
@@ -2946,11 +4521,16 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
   const overLimitSignalNames = useMemo(() => new Set(overLimitSignals), [overLimitSignals]);
   const hasTopics = (iface.topics?.length ?? 0) > 0;
 
-  // Manual signal editing (gateway signal schema): add/edit/delete of interface-level (flat)
-  // signals. Topic-nested ProcessImage signals stay import-only. `{ sig: null }` = add mode.
+  // Manual signal editing (gateway signal schema): add/edit/delete of a signal in ITS container.
+  // `{ sig: null }` = add mode on the interface-level list. plan-589: a topic's own signals are
+  // editable too — the dialog gets the place (`topic` + `mode`), which decides whether an address
+  // is mandatory and how it is validated, and writes back into that same container.
   const schema = getSignalSchema(iface.type);
-  const [signalDialog, setSignalDialog] = useState<{ sig: ConnectInterfaceSignal | null } | null>(null);
-  const handleEditSignal = useCallback((sig: ConnectInterfaceSignal) => setSignalDialog({ sig }), []);
+  const [signalDialog, setSignalDialog] =
+    useState<{ sig: ConnectInterfaceSignal | null; topic?: string; mode?: MqttTopicMode } | null>(null);
+  const handleEditSignal = useCallback(
+    (sig: ConnectInterfaceSignal, topic?: string, mode?: MqttTopicMode) => setSignalDialog({ sig, topic, mode }),
+    []);
   // Stable ref (memo rows): maps the row's signal to the parent's bridge-dialog opener.
   const handleBridgeSignal = useMemo(
     () => (onBridgeSignal ? (sig: ConnectInterfaceSignal) => onBridgeSignal(sig.name) : undefined),
@@ -2958,16 +4538,38 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
   // Signal delete confirms via the shared product dialog (same pattern as
   // interface and profile delete — one delete flow everywhere).
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
-  const handleDeleteSignal = useCallback((sig: ConnectInterfaceSignal) => {
+  const handleDeleteSignal = useCallback((sig: ConnectInterfaceSignal, topic?: string) => {
+    const where = topic === undefined ? `interface '${iface.id}'` : `topic '${topic}' of '${iface.id}'`;
     setConfirmAction({
       title: `Delete signal '${sig.name}'?`,
-      message: `Removes '${sig.name}' (${sig.protocolAddress}) from interface '${iface.id}'. This can't be undone.`,
+      message: `Removes '${sig.name}'${sig.protocolAddress ? ` (${sig.protocolAddress})` : ''} from ${where}. This can't be undone.`,
       confirmLabel: 'Delete signal',
-      onConfirm: () => removeSignal(iface.id, sig.name).catch((err) =>
+      // plan-589: out of the signal's OWN container — a same-named signal in another topic stays.
+      onConfirm: () => removeSignal(iface.id, sig.name, topic).catch((err) =>
         console.error('[ConnectPanel] Failed to delete signal:', err)),
     });
   }, [iface.id]);
-  const manualEdit = !!schema?.supportsManualAdd;
+  // plan-498: an FMI interface's signals ARE the model's FMU children — read-only here.
+  const manualEdit = !!schema?.supportsManualAdd && !isModelManagedInterfaceType(iface.type);
+
+  /**
+   * Empty-state routes, named from the type's own schema instead of a static sentence.
+   * The old copy said "use Browse or Import" for every type — on S7/Modbus (supportsDiscovery
+   * = false) that pointed at a menu entry that does not exist, while the working route (the "+"
+   * in the header right above) went unmentioned. Say only what this interface can actually do.
+   */
+  const canImportTagTable = iface.type === 'MQTT' || iface.type === 'S7';
+  const emptyHint = useMemo(() => {
+    const routes: string[] = [];
+    if (manualEdit) {
+      const examples = (schema?.addressExamples ?? []).slice(0, 2).join(', ');
+      routes.push(examples ? `add one manually (${examples}, …)` : 'add one manually');
+    }
+    if (schema?.supportsDiscovery) routes.push('browse the device for symbols');
+    if (canImportTagTable) routes.push('import a tag table');
+    if (routes.length === 0) return 'No signals yet.';
+    return `No signals yet — ${routes.join(' or ')}.`;
+  }, [manualEdit, schema, canImportTagTable]);
 
   /** Patch flat and MQTT ProcessImage signals through their distinct CONNECT containers. */
   const handleRecordChange = useCallback(async (
@@ -3199,7 +4801,7 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
       out.push({ kind: 'group', topic: t.topic, total: t.signals?.length ?? 0, mode: t.mode });
       const open = isGroupOpen(topicKey(t.topic));
       const jsonMode = t.mode === 'Json';
-      if (open) for (const s of sigs) out.push({ kind: 'signal', sig: s, topic: t.topic, jsonMode });
+      if (open) for (const s of sigs) out.push({ kind: 'signal', sig: s, topic: t.topic, jsonMode, mode: t.mode });
     }
     // Pass 2 — flat (interface-level) signals: the manually editable ones. For MQTT they are
     // emitted as the derived topic tree; every other protocol keeps the plain flat list.
@@ -3513,11 +5115,23 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
         sx={{ flex: '1 1 auto', minHeight: 0, overflow: 'auto', position: 'relative' }}
       >
         {rows.length === 0 ? (
-          <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', textAlign: 'center', py: 2, px: 1 }}>
-            {filterActive
-              ? 'No signals match the filter.'
-              : 'No signals yet — use Browse or Import on this interface to add some.'}
-          </Typography>
+          <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, py: 2, px: 1 }}>
+            <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.55)', textAlign: 'center' }}>
+              {filterActive ? 'No signals match the filter.' : emptyHint}
+            </Typography>
+            {/* The "+" in the header is the same action; a labelled button makes the first
+                signal reachable without decoding an unlabelled icon. */}
+            {!filterActive && manualEdit && (
+              <Button
+                size="small"
+                startIcon={<Add sx={{ fontSize: 14 }} />}
+                onClick={() => setSignalDialog({ sig: null })}
+                sx={{ fontSize: 11, textTransform: 'none', color: 'rgba(255,255,255,0.75)' }}
+              >
+                Add signal
+              </Button>
+            )}
+          </Box>
         ) : (
           <Box sx={{ height: rowVirtualizer.getTotalSize(), width: '100%', position: 'relative' }}>
             {rowVirtualizer.getVirtualItems().map((vRow) => {
@@ -3619,14 +5233,15 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
                     hideAddress={row.jsonMode}
                     linkedLabel={linkedLabel}
                     linkedPath={firstLink?.path}
-                    onEdit={manualEdit && row.flat ? handleEditSignal : undefined}
-                    onDelete={manualEdit && row.flat ? handleDeleteSignal : undefined}
+                    onEdit={manualEdit ? handleEditSignal : undefined}
+                    onDelete={manualEdit ? handleDeleteSignal : undefined}
                     selected={selectedSignals.has(selectionKey(row.topic, sig.name))}
                     onSelect={manualEdit ? handleSignalSelect : undefined}
                     onContextMenu={manualEdit ? handleSignalContextMenu : undefined}
                     onBridge={handleBridgeSignal}
                     onRecordChange={handleRecordChange}
                     topic={row.topic}
+                    mode={row.mode}
                     interfaceId={iface.id}
                     recordPending={recordPending.has(`${row.topic ?? '__flat__'}\u0000${sig.name}\u0000${sig.protocolAddress}`)}
                     limitExceeded={overLimitSignalNames.has(sig.name)}
@@ -3657,6 +5272,8 @@ export function SignalListView({ iface, overLimitSignals, onBridgeSignal }: {
           schema={schema}
           editSignal={signalDialog.sig}
           isBound={signalDialog.sig ? binding.kind.has(signalDialog.sig.name) : false}
+          topic={signalDialog.topic}
+          mode={signalDialog.mode}
         />
       )}
 
@@ -4556,8 +6173,9 @@ export function ImportTagTableDialog({
 
         {targetIsS7 && (
           <Typography sx={{ fontSize: 11, color: 'text.secondary', mb: 1.5 }}>
-            Tags are imported directly onto the S7 interface. Their process-image / flag
-            addresses (%Q, %M, %I) are read from the PLC; %I signals are written back.
+            Tags are imported directly onto the S7 interface. Direction follows the address
+            area: %Q, %A, %M and DB addresses are read from the PLC; %I and %E are written
+            to it. A direction carried by the imported tag itself wins over this.
           </Typography>
         )}
 
@@ -4971,35 +6589,34 @@ interface BridgesApi {
   reload: () => Promise<void>;
 }
 
-/** Load + persist bridges while connected. Save errors (gateway validation) land in `error`. */
+/**
+ * Load + persist bridges while connected. Save errors (gateway validation) land in `error`.
+ *
+ * The bridges themselves live in the connect-store cache since plan-566 (R2-1),
+ * so the signal cross-reference list sees them while this panel is closed;
+ * this hook only reads that cache and loads it when the gateway connects.
+ */
 function useBridges(isConnected: boolean): BridgesApi {
-  const [mirrors, setMirrors] = useState<ConnectMirrorRule[] | null>(null);
-  const [mappings, setMappings] = useState<ConnectSignalMapping[] | null>(null);
-  const [supported, setSupported] = useState(false);
+  const cache = useSyncExternalStore(subscribeConnectBridges, getConnectBridges);
   const [error, setError] = useState<string | null>(null);
 
-  const reload = useCallback(async () => {
-    try {
-      const [mi, ma] = await Promise.all([fetchMirrors(), fetchMappings()]);
-      setMirrors(mi); setMappings(ma); setSupported(true);
-    } catch {
-      // Older gateway without the endpoints — hide the whole bridges UI.
-      setSupported(false);
-    }
-  }, []);
+  const reload = useCallback(() => reloadConnectBridges(), []);
 
   useEffect(() => {
     if (!isConnected) {
-      setMirrors(null); setMappings(null); setSupported(false); setError(null);
+      setError(null);
       return;
     }
-    void reload();
-  }, [isConnected, reload]);
+    void reloadConnectBridges();
+  }, [isConnected]);
+
+  const mirrors = isConnected ? cache.mirrors : null;
+  const mappings = isConnected ? cache.mappings : null;
+  const supported = isConnected && cache.supported;
 
   const saveMirrors = useCallback(async (next: ConnectMirrorRule[]) => {
     try {
-      await putMirrors(next);
-      setMirrors(next);
+      await putMirrors(next); // updates the cache on success
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save mirror rules.');
@@ -5009,8 +6626,7 @@ function useBridges(isConnected: boolean): BridgesApi {
 
   const saveMappings = useCallback(async (next: ConnectSignalMapping[]) => {
     try {
-      await putMappings(next);
-      setMappings(next);
+      await putMappings(next); // updates the cache on success
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save signal mappings.');
@@ -5083,6 +6699,22 @@ function BridgeSection({
   const count = mirrors.length + mappings.length;
   const sinks = sinkInterfaces(interfaces);
 
+  // plan-566 R2-1: a "Used by" entry asked for one bridge row. Scroll to it,
+  // tint it for a moment and clear the request so a later reopen does not replay it.
+  const { revealKey } = useSyncExternalStore(subscribeConnectBridges, getConnectBridges);
+  const [flashKey, setFlashKey] = useState<string | null>(null);
+  const sectionRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!revealKey || (bridges.mirrors === null && bridges.mappings === null)) return;
+    requestConnectBridgeReveal(null);
+    setFlashKey(revealKey);
+    const row = sectionRef.current?.querySelector<HTMLElement>(`[data-bridge-key="${revealKey}"]`);
+    row?.scrollIntoView?.({ block: 'nearest' });
+    const timer = window.setTimeout(() => setFlashKey(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [revealKey, bridges.mirrors, bridges.mappings]);
+  const flashSx = (key: string) => (flashKey === key ? { bgcolor: 'rgba(255,179,0,0.16)' } : {});
+
   const handleAddMirror = useCallback(async () => {
     if (!srcId || !dstId) return;
     try {
@@ -5101,7 +6733,7 @@ function BridgeSection({
   const rowSx = { display: 'flex', alignItems: 'center', gap: 0.5, px: 0.5, py: 0.25, borderRadius: 0.5, '&:hover': { bgcolor: 'rgba(255,255,255,0.04)' } } as const;
 
   return (
-    <Box sx={{ flexShrink: 0, pt: 1 }}>
+    <Box ref={sectionRef} sx={{ flexShrink: 0, pt: 1 }}>
       <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: 0.5 }} />
       <Box sx={{ display: 'flex', alignItems: 'center', mb: 0.5 }}>
         <Typography sx={{ fontSize: 11, color: 'text.secondary', flex: 1 }}>
@@ -5174,7 +6806,7 @@ function BridgeSection({
           is explained by their button tooltips, not a standing paragraph. */}
 
       {mirrors.map((m, idx) => (
-        <Box key={`mi-${idx}`} sx={rowSx}>
+        <Box key={`mi-${idx}`} data-bridge-key={`mirror:${idx}`} sx={{ ...rowSx, ...flashSx(`mirror:${idx}`) }}>
           <Switch
             size="small" checked={m.enabled}
             onChange={(e) => void bridges.saveMirrors(mirrors.map((x, i) => i === idx ? { ...x, enabled: e.target.checked } : x)).catch(() => {})}
@@ -5197,7 +6829,7 @@ function BridgeSection({
       ))}
 
       {mappings.map((m, idx) => (
-        <Box key={`ma-${idx}`} sx={rowSx}>
+        <Box key={`ma-${idx}`} data-bridge-key={`mapping:${idx}`} sx={{ ...rowSx, ...flashSx(`mapping:${idx}`) }}>
           <Switch
             size="small" checked={m.enabled}
             onChange={(e) => void bridges.saveMappings(mappings.map((x, i) => i === idx ? { ...x, enabled: e.target.checked } : x)).catch(() => {})}

@@ -26,7 +26,7 @@ import { Group, Mesh, BoxGeometry, MeshStandardMaterial, Object3D } from 'three'
 import { objectToGlb } from '../src/core/import/rv-import-object';
 import {
   compose,
-  resolveReferencePath,
+  resolveReferenceUrl,
   ReferenceCycleError,
   ReferenceDepthError,
   ComposeAbortedError,
@@ -111,36 +111,36 @@ function driveSpeedAt(occurrenceRoot: Object3D): number | undefined {
 
 // ─── Relative path resolution (F18) ──────────────────────────────────────
 
-describe('resolveReferencePath (F18)', () => {
+describe('resolveReferenceUrl (F18)', () => {
   it('resolves against the containing file, not against the scene root', () => {
     // anlage.glb → unterordner/baugruppe.glb → ./teil.glb  ⇒  unterordner/teil.glb
-    expect(resolveReferencePath('unterordner/baugruppe.glb', './teil.glb')).toBe('unterordner/teil.glb');
+    expect(resolveReferenceUrl('unterordner/baugruppe.glb', './teil.glb')).toBe('unterordner/teil.glb');
   });
 
   it('keeps a relative base relative — no document origin is baked in', () => {
-    expect(resolveReferencePath('a/b/c.glb', 'd.glb')).toBe('a/b/d.glb');
+    expect(resolveReferenceUrl('a/b/c.glb', 'd.glb')).toBe('a/b/d.glb');
   });
 
   it('walks up with ..', () => {
-    expect(resolveReferencePath('a/b/c.glb', '../d/e.glb')).toBe('a/d/e.glb');
+    expect(resolveReferenceUrl('a/b/c.glb', '../d/e.glb')).toBe('a/d/e.glb');
   });
 
   it('resolves against an absolute base through the URL rules', () => {
-    expect(resolveReferencePath('https://x.test/lib/asm.glb', './part.glb'))
+    expect(resolveReferenceUrl('https://x.test/lib/asm.glb', './part.glb'))
       .toBe('https://x.test/lib/part.glb');
   });
 
   it('leaves an already-absolute path alone', () => {
-    expect(resolveReferencePath('a/b.glb', 'https://y.test/p.glb')).toBe('https://y.test/p.glb');
+    expect(resolveReferenceUrl('a/b.glb', 'https://y.test/p.glb')).toBe('https://y.test/p.glb');
   });
 
   it('does not throw under an opaque blob: base — the path passes through', () => {
     // A library provider hands out object URLs as the child frame's baseUrl.
     // `new URL('./teil.glb', 'blob:…')` throws TypeError; the resolver's
     // assetId step is the real lookup there, so the path is passed through.
-    expect(resolveReferencePath('blob:http://localhost:5173/5c6c62af', './teil.glb'))
+    expect(resolveReferenceUrl('blob:http://localhost:5173/5c6c62af', './teil.glb'))
       .toBe('teil.glb');
-    expect(resolveReferencePath('data:application/octet-stream;base64,AAAA', 'sub/x.glb'))
+    expect(resolveReferenceUrl('data:application/octet-stream;base64,AAAA', 'sub/x.glb'))
       .toBe('sub/x.glb');
   });
 });

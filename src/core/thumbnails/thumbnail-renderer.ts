@@ -38,6 +38,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { computeSubtreeAABB, disposeSubtree } from '../engine/rv-traverse-utils';
+import { OffscreenCapture } from '../engine/rv-offscreen-capture';
 import { bakeContactShadow } from './thumbnail-contact-shadow';
 
 const _box = new Box3();
@@ -92,7 +93,7 @@ export class ThumbnailRenderer {
   /** Private camera for {@link renderLive} — never the viewport camera. */
   private _liveCamera: PerspectiveCamera | null = null;
   /** Private render target for {@link renderLive} (no composer on that path). */
-  private _liveRT: WebGLRenderTarget | null = null;
+  private _liveCapture: OffscreenCapture | null = null;
   /** Full-resolution scratch canvas for the y-flip (supersampled size). */
   private _ssCanvas: HTMLCanvasElement | null = null;
   /** Output canvas at the requested size (downscale destination). */
@@ -292,7 +293,7 @@ export class ThumbnailRenderer {
    * re-upload + shader recompile on the next viewport frame. On a large model
    * that froze the projects dashboard for ~20 s per open/switch. Here the live
    * scene is rendered in place with a private camera into a private render
-   * target (the `web_render` "beauty" pattern) — the live model's resources
+   * target (the `web_eye` "beauty" pattern) — the live model's resources
    * are never touched.
    *
    * Look trade-off, accepted: the picture is the live look (current lighting,
@@ -342,32 +343,33 @@ export class ThumbnailRenderer {
     camera.updateProjectionMatrix();
     camera.updateMatrixWorld(true);
 
-    if (!this._liveRT) {
-      this._liveRT = new WebGLRenderTarget(ss, ss, { type: UnsignedByteType, colorSpace: SRGBColorSpace });
-    } else if (this._liveRT.width !== ss) {
-      this._liveRT.setSize(ss, ss);
-    }
-
-    // Save/restore exactly what the render touches. Tone mapping is NOT
-    // swapped: rendering into a target skips tone mapping anyway (three applies
-    // it only on the default framebuffer / via OutputPass), and the sRGB
-    // conversion follows the target texture's colorSpace.
-    const prevTarget = this._renderer.getRenderTarget();
-    const prevClearAlpha = this._renderer.getClearAlpha();
-    const prevBackground = this._mainScene.background;
-    try {
-      // Background null + clearAlpha 0 = transparent card background; the
-      // live environment lighting still applies (scene.environment untouched).
-      this._mainScene.background = null;
-      this._renderer.setClearAlpha(0);
-      this._renderer.setRenderTarget(this._liveRT);
-      this._renderer.render(this._mainScene, camera);
-      this._renderer.readRenderTargetPixels(this._liveRT, 0, 0, ss, ss, this._pixels!);
-    } finally {
-      this._mainScene.background = prevBackground;
-      this._renderer.setClearAlpha(prevClearAlpha);
-      this._renderer.setRenderTarget(prevTarget);
-    }
+    // One shared offscreen path since plan-740 P2.1: the target lifecycle and
+    // the save/restore live in OffscreenCapture, and this call states its
+    // contract as parameters — layer 0 only (so overlay layers, isolate and
+    // measurement UI stay out of a card thumbnail), transparent clear, live
+    // scene background detached. Tone mapping is deliberately NOT in the pass:
+    // rendering into a target skips it anyway (three applies it only on the
+    // default framebuffer / via OutputPass), and the sRGB conversion follows
+    // the target texture's colorSpace.
+    this._liveCapture ??= new OffscreenCapture(() => this._renderer);
+    this._liveCapture.withPass(
+      {
+        width: ss, height: ss, supersample: 1,
+        layerMask: 1 << 0,
+        clearAlpha: 0,
+        background: null,
+        colorSpace: SRGBColorSpace,
+        scene: this._mainScene,
+        camera,
+      },
+      ({ target }) => {
+        this._renderer.render(this._mainScene, camera);
+        // Read BOTTOM-UP into the shared buffer: `_encodeReadback` owns the
+        // flip, and going through the capture's flipping readback here would
+        // flip twice and turn every thumbnail upside down.
+        this._renderer.readRenderTargetPixels(target, 0, 0, ss, ss, this._pixels!);
+      },
+    );
 
     return this._encodeReadback(ss, size);
   }
@@ -425,8 +427,8 @@ export class ThumbnailRenderer {
       this._composer = null;
     }
     this._composerSize = 0;
-    this._liveRT?.dispose();
-    this._liveRT = null;
+    this._liveCapture?.dispose();
+    this._liveCapture = null;
     this._liveCamera = null;
     // Detach the shared environment reference (we never owned it).
     this._scene.environment = null;

@@ -44,7 +44,7 @@
 import type { TreeNode, VisibleTreeRow } from '../hmi/hierarchy-utils';
 import { flattenVisibleTree } from '../hmi/hierarchy-utils';
 import {
-  CONNECT_CONFIG_SUFFIX, KNOWLEDGE_FILE_SUFFIX,
+  CONNECT_CONFIG_SUFFIX, knowledgeSuffixOf,
   isConnectConfigPath, isKnowledgeFilePath,
 } from './rv-project-refs';
 
@@ -646,8 +646,9 @@ export function canRenameInTree(
       // therefore restored whole, whatever the user typed.
       if (!isConnectConfigPath(trimmed)) trimmed += CONNECT_CONFIG_SUFFIX;
     } else if (isKnowledgeFilePath(leaf)) {
-      // Same compound-ending rule for knowledge files.
-      if (!isKnowledgeFilePath(trimmed)) trimmed += KNOWLEDGE_FILE_SUFFIX;
+      // Same rule for knowledge files, restoring the ending this leaf owns:
+      // `.knowledge.md` stays compound, a plain `.md` stays plain.
+      if (!isKnowledgeFilePath(trimmed)) trimmed += knowledgeSuffixOf(leaf);
     } else {
       const dot = leaf.lastIndexOf('.');
       const ext = dot > 0 ? leaf.slice(dot) : '';

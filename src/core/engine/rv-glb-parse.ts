@@ -23,6 +23,7 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { isPureSanitization } from './rv-three-names';
 import { unwrapGltfRoot } from './rv-gltf-unwrap';
 import { debug } from './rv-debug';
+import { parseGlbCollectingResources } from './rv-binary-resources';
 
 // ─── Singleton loader ────────────────────────────────────────────────────
 
@@ -44,6 +45,23 @@ dracoLoader.setDecoderPath(`${import.meta.env.BASE_URL}draco/`);
  */
 export function setDracoDecoderPath(path: string): void {
   dracoLoader.setDecoderPath(path);
+}
+
+let _dracoPreloaded = false;
+
+/**
+ * Start fetching the Draco decoder (wrapper + wasm) NOW, in parallel with
+ * whatever else the boot is waiting for (plan-598 F4). Without this the decoder
+ * was requested only when the first compressed mesh was decoded — i.e. strictly
+ * AFTER the GLB had finished downloading, one more serial round trip before the
+ * first frame. Idempotent (`DRACOLoader` memoises its decoder promise, and so do
+ * we). Must run AFTER the final {@link setDracoDecoderPath}: the loader binds the
+ * path at the moment the fetch starts.
+ */
+export function preloadDracoDecoder(): void {
+  if (_dracoPreloaded) return;
+  _dracoPreloaded = true;
+  dracoLoader.preload();
 }
 
 /** The one GLTFLoader used by `loadGLB` and `parseGlbSubtree` alike. */
@@ -247,9 +265,16 @@ export function collectGltfNodeNames(gltfParser: GltfParserLike | undefined): (s
  * (the asset executors call `_registerSubtree`; the planner calls
  * `registerPlaced`).
  */
-export async function parseGlbSubtree(bytes: ArrayBuffer): Promise<Object3D> {
-  return (await parseGlbSubtreeWithMeta(bytes)).root;
+export async function parseGlbSubtree(bytes: ArrayBuffer, documentId?: string): Promise<Object3D> {
+  return (await parseGlbSubtreeWithMeta(bytes, documentId)).root;
 }
+
+/**
+ * Store document id of a subtree parse whose caller names none (plan-498): the
+ * binary resources of an imported / composed subtree belong to whichever
+ * document the subtree is grafted into, which this module cannot know.
+ */
+export const SUBTREE_DOCUMENT_ID = 'subtree';
 
 /** A parsed subtree together with everything the parser knew about its source file. */
 export interface ParsedGlbSubtree {
@@ -276,9 +301,13 @@ export interface ParsedGlbSubtree {
  * The parser is dropped when this returns, which is why everything worth having
  * is extracted here rather than handed out as a live object.
  */
-export async function parseGlbSubtreeWithMeta(bytes: ArrayBuffer): Promise<ParsedGlbSubtree> {
-  // Self-contained GLB (textures + buffers embedded) → empty resource path.
-  const gltf = await gltfLoader.parseAsync(bytes, '');
+export async function parseGlbSubtreeWithMeta(
+  bytes: ArrayBuffer,
+  documentId: string = SUBTREE_DOCUMENT_ID,
+): Promise<ParsedGlbSubtree> {
+  // THE parse wrapper (plan-498): embedded FMU packages reach the binary
+  // resource store before the parser is dropped.
+  const gltf = await parseGlbCollectingResources(bytes, documentId, gltfLoader);
   const parser = (gltf as unknown as { parser?: GltfParserLike }).parser;
   const renamedNodes = detectRenamedNodes(parser);
   const gltfNodeIndices = collectGltfNodeIndices(parser);

@@ -82,13 +82,13 @@ describe('deriveDocuments — documents[] is the source, not the mirror', () => 
       ['models/machine.glb', stableDocumentId('models/machine.glb')],
       ['library/gripper.glb', stableDocumentId('library/gripper.glb')],
     ]);
-    // plan-736 F3/F5: the migration still READS the three arrays — that is its
-    // whole job — but it no longer writes their names back onto the rows. The
-    // scene row keeps its `section` as the transitional Alt-Client stamp
-    // (see `documentOfSceneEntry`); the other two carry their folder in the
-    // path and nothing else.
+    // plan-736 F3/F5 + plan-744 Phase 2: the migration still READS the three
+    // arrays — that is its whole job — but it no longer writes their names
+    // back onto any row. The scene row's `section`, the last transitional
+    // Alt-Client stamp, is gone with its gate; every row carries its folder in
+    // the path and nothing else.
     expect(derived!.documents.map(d => d.section))
-      .toEqual(['scenes', undefined, undefined]);
+      .toEqual([undefined, undefined, undefined]);
     expect(derived!.marker).toEqual({
       at: '2026-08-10T00:00:00.000Z', schemaVersion: 2,
       counts: { scenes: 1, models: 1, library: 1 },

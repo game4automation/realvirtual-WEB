@@ -604,3 +604,83 @@ describe('deprecated ConnectedDrive / SpeedSource', () => {
     expect(hits()).toHaveLength(2);
   });
 });
+
+/**
+ * plan-468 §9.6 — the pre-arc at the unwinder shifts every segment index by one,
+ * and the slit must not move with it.
+ *
+ * `_rollerArcStartSample` addresses roller `k`'s arrival as segment `2k - 2`;
+ * a `WrapDeg` on roller 0 prepends one arc and makes that `2k - 1`. Forgetting
+ * the correction leaves the slit a whole straight run upstream of the blade — the
+ * shared full-width web would then be drawn over the strip's own lane, which is
+ * the z-fighting the arrival-point rule exists to prevent.
+ */
+describe('end wrap does not shift the slit (plan-468)', () => {
+  const SLIT_AT_NIP = { RibbonWidthMm: 400, FullWidthMm: 860, SlitAtRoller: transformRef('Root/Nip') };
+
+  /** Unwinder(WrapDeg) — Idler_01 — Nip — Rewinder, slit at the nip. */
+  function slitter(wrapDeg: number) {
+    const h = ribbonHarness([
+      { name: 'Unwinder', xMm: 0, yMm: 1200, radiusMm: 400, winder: true, extras: { WrapDeg: wrapDeg } },
+      { name: 'Idler_01', xMm: 1000, yMm: 1700, radiusMm: 200, extras: { RibbonSide: 'Auto' } },
+      { name: 'Nip', xMm: 2200, yMm: 1200, radiusMm: 190, driven: true, extras: { RibbonSide: 'Auto' } },
+      { name: 'Rewinder', xMm: 3400, yMm: 1400, radiusMm: 90, winder: true },
+    ]);
+    return h.addPath('Ribbon_A', ['Unwinder', 'Idler_01', 'Nip', 'Rewinder'], SLIT_AT_NIP);
+  }
+
+  /** mm — the centre of band sample `i`, in the path's (= the root's) frame. */
+  function sampleMm(path: ReturnType<typeof slitter>, i: number): [number, number, number] {
+    const pos = path.band!.mesh.geometry.getAttribute('position');
+    return [
+      ((pos.getX(i * 2) + pos.getX(i * 2 + 1)) / 2) * MM_TO_METERS,
+      ((pos.getY(i * 2) + pos.getY(i * 2 + 1)) / 2) * MM_TO_METERS,
+      ((pos.getZ(i * 2) + pos.getZ(i * 2 + 1)) / 2) * MM_TO_METERS,
+    ];
+  }
+
+  it('a WrapDeg on the unwinder lengthens the path but leaves the slit on the nip', () => {
+    const plain = slitter(0);
+    const wrapped = slitter(270);
+    expect(plain.slitSampleIndex).toBeGreaterThan(0);
+    expect(wrapped.slitSampleIndex).toBeGreaterThan(plain.slitSampleIndex);
+    // Same rollers, same density: the two builds are on the SAME absolute grid,
+    // so their sample indices are directly comparable.
+    expect(wrapped.sampleStepMm).toBeCloseTo(plain.sampleStepMm, 9);
+
+    // The pre-arc is `r * wrapRad` at the unwinder's CONTACT radius (the roll plus
+    // half the caliper), and it is the ONLY thing the path grew by.
+    const preArcMm = (400 + 0.1 / 2) * (270 * Math.PI) / 180;
+    expect(wrapped.lengthMm - plain.lengthMm).toBeCloseTo(preArcMm, 6);
+    // …so the slit index moves by exactly that many samples, ±1 for the rounding
+    // onto the grid. Without the `_startArcOffset` correction it would move by a
+    // whole straight run less (the 1.2 m Idler_01 -> Nip span, ~77 samples).
+    const shift = wrapped.slitSampleIndex - plain.slitSampleIndex;
+    expect(Math.abs(shift - preArcMm / plain.sampleStepMm)).toBeLessThanOrEqual(1);
+
+    // And the physical point is the same one: the arrival tangent on the nip.
+    const a = sampleMm(plain, plain.slitSampleIndex);
+    const b = sampleMm(wrapped, wrapped.slitSampleIndex);
+    expect(Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]))
+      .toBeLessThanOrEqual(plain.sampleStepMm);
+    // It sits ON the nip, at its contact radius — the blade, not somewhere on the
+    // span before it. (The nip is at 2200/1200 mm; the band's axial lane is the
+    // third component and drops out of the in-plane distance.)
+    expect(Math.hypot(b[0] - 2200, b[1] - 1200)).toBeCloseTo(190 + 0.1 / 2, 0);
+  });
+
+  it('the band of a wrapped unwinder starts ON the roll, not at the tangent point', () => {
+    const plain = slitter(0);
+    const wrapped = slitter(270);
+    const centre: [number, number] = [0, 1200];
+    const contactMm = 400 + 0.1 / 2;
+    const first = sampleMm(wrapped, 0);
+    expect(Math.hypot(first[0] - centre[0], first[1] - centre[1])).toBeCloseTo(contactMm, 3);
+    // The plain build starts on the roll surface too (a tangent point IS on the
+    // circle) — the difference is WHERE, so the two first samples must differ by
+    // far more than a sample step.
+    const plainFirst = sampleMm(plain, 0);
+    expect(Math.hypot(first[0] - plainFirst[0], first[1] - plainFirst[1]))
+      .toBeGreaterThan(plain.sampleStepMm * 10);
+  });
+});

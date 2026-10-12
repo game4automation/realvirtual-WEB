@@ -21,7 +21,19 @@
  * Runs unconditionally: pure op plumbing, no wasm and no GLB.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { Group, Object3D, Scene } from 'three';
+import type { RVViewer } from '../src/core/rv-viewer';
+import type { AssetDocument } from '../src/core/editor/rv-asset-document';
+import { NodeRegistry } from '../src/core/engine/rv-node-registry';
+import { setActiveAssetContext } from '../src/core/editor/active-asset-store';
+import { __clearDraftStoresForTests } from '../src/core/ops/rv-document-drafts';
+import { ERR_EDITOR_UNAVAILABLE } from '../src/core/editor/rv-editor-guard-core';
+import { commandRegistry } from '../src/core/hmi/rv-command-registry';
+import { setMechanismUiBridge, type MechanismUiBridge } from '../src/core/engine/rv-kinematic-registry';
+// plan-504: importing the MCP tool module IS the (eager) registration of the mechanism commands.
+import { McpEditorTools } from '../src/plugins/mcp-bridge/rv-mcp-editor-tools';
+import { scratchAssetDocument } from './helpers/scratch-asset-document';
 import * as authoring from '@rv-private/plugins/asset-editor/mechanism/mechanism-authoring';
 import {
   planAddJoint, planAssignDrive, planCreateMechanism, planSetAnchor, planSetAxis, planSetLimits,
@@ -397,5 +409,92 @@ describe('T9 — undo and redo', () => {
 
     doc.redo(); doc.redo(); doc.redo();
     expect(JSON.stringify([...doc.state].map(([p, c]) => [p, [...c]]))).toBe(final);
+  });
+});
+
+// ─── plan-504 §9.2b — the batch through the PRODUCTIVELY registered command ─
+
+/**
+ * "Add Bodies (n)" is `mechanism.addBodies`, descriptor twelve of twelve — a UI
+ * command without a tool. Nothing here registers it: importing the MCP tool
+ * module does (the eager registration every mechanism test relies on).
+ */
+describe('plan-504 — mechanism.addBodies: one command, one transaction, one undo step', () => {
+  function makeScene(): { viewer: RVViewer; doc: AssetDocument; rebuilt: string[] } {
+    const scene = new Scene();
+    const root = new Group();
+    root.name = 'Asset';
+    root.userData['realvirtual'] = { KinematicMechanism: { SolverIterations: 4 } };
+    scene.add(root);
+    for (const name of ['L1', 'L2', 'L3']) {
+      const link = new Object3D();
+      link.name = name;
+      root.add(link);
+    }
+    const registry = new NodeRegistry();
+    root.traverse((n) => registry.registerNode(NodeRegistry.computeNodePath(n), n));
+    const viewer = {
+      scene, registry, signalStore: null, transportManager: null,
+      get currentModelRoot() { return root; },
+      modes: { activeMode: 'editor', has: () => true, setMode() {}, list: () => [{ id: 'editor' }], subscribe: () => () => {} },
+      selectionManager: { select() {}, selectPaths() {}, clear() {}, getSnapshot: () => ({ selectedPaths: [] as string[] }) },
+      markRenderDirty() {}, markShadowsDirty() {}, emit() {},
+      on() { return () => {}; },
+      rebuildGroupedBvh() {}, refitRaycastSubtrees() {},
+    } as unknown as RVViewer;
+    const doc = scratchAssetDocument(viewer);
+    setActiveAssetContext({ viewer, doc });
+    const rebuilt: string[] = [];
+    setMechanismUiBridge({
+      list: () => [], rebuild: (p: string) => { rebuilt.push(p); },
+    } as unknown as MechanismUiBridge);
+    return { viewer, doc, rebuilt };
+  }
+
+  afterEach(() => {
+    setMechanismUiBridge(null);
+    setActiveAssetContext(null);
+  });
+
+  it('is registered by the tool module (no setup registration)', () => {
+    expect(McpEditorTools).toBeDefined(); // the import is the registration
+    expect(commandRegistry.get('mechanism.addBodies')).toBeDefined();
+    expect(commandRegistry.get('mechanism.addBodies')?.mcp).toBeUndefined();
+  });
+
+  it('three links → ONE undo entry; undo removes all three bodies, redo restores all three', async () => {
+    await __clearDraftStoresForTests();
+    const { viewer, doc, rebuilt } = makeScene();
+    try {
+      const paths = ['Asset/L1', 'Asset/L2', 'Asset/L3'];
+      const bodies = (): number => paths.filter((p) =>
+        Object.keys((viewer.registry!.getNode(p)!.userData['realvirtual'] ?? {}) as object)
+          .some((k) => k.startsWith('MechanismBody'))).length;
+      const r = await commandRegistry.execute('mechanism.addBodies', { pathsJson: JSON.stringify(paths) }, { origin: 'ui', viewer });
+      if (!__RV_HAS_PRIVATE__) {
+        // Community cold start: the first call is the edition refusal, never "Unknown command".
+        expect(r).toEqual({ ok: false, kind: 'unavailable', reason: ERR_EDITOR_UNAVAILABLE });
+        expect(doc.getSnapshot().opCount).toBe(0);
+        return;
+      }
+      expect(r).toEqual({ ok: true, value: { paths } });
+      expect(bodies()).toBe(3);
+      expect(doc.getSnapshot().undoLabel).toBe('Add 3 mechanism bodies');
+      expect(rebuilt).toEqual(['Asset']); // the ancestor walk found the mechanism once
+
+      await doc.undo();
+      await doc.whenIdle();
+      expect(bodies()).toBe(0); // ONE undo step took all three
+      expect(doc.getSnapshot().undoLabel).toBeNull();
+      await doc.redo();
+      await doc.whenIdle();
+      expect(bodies()).toBe(3);
+
+      // A second batch over a link that has a body now is refused by the rule, not half-applied.
+      const again = await commandRegistry.execute('mechanism.addBodies', { pathsJson: JSON.stringify(paths) }, { origin: 'ui', viewer });
+      expect(again).toMatchObject({ ok: false, kind: 'disabled' });
+    } finally {
+      doc.dispose();
+    }
   });
 });

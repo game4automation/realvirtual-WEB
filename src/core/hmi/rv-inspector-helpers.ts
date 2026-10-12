@@ -10,12 +10,15 @@
  */
 
 import { getConsumedFields, getIgnoredFields, isKnownComponentType } from '../engine/rv-extras-validator';
-import { getCapabilities } from '../engine/rv-component-registry';
+import { getCapabilities, DEFAULT_BADGE_COLOR, getFieldDescriptor } from '../engine/rv-component-registry';
 import { COLLISION_ROLES } from '../engine/rv-collision-role';
+import { DriveDirection, isRotation } from '../engine/rv-coordinate-utils';
 import { NODE_KNOWLEDGE_PROVENANCE_FIELDS, NODE_KNOWLEDGE_TYPE } from '../engine/rv-node-knowledge';
 import type { FieldDescriptor } from '../engine/rv-component-registry';
 import type { SignalStore } from '../engine/rv-signal-store';
 import { readSignalValue, formatValue } from './rv-value-resolver';
+import { formatDecimal } from './rv-number-format';
+import { FMU_STATE_COLORS, FMU_TYPE, type FmuState } from '../engine/rv-fmu-constants';
 import {
   SIGNAL_VALUE_NEUTRAL,
   signalDirectionFromType,
@@ -38,13 +41,13 @@ import {
 
 /**
  * Returns true if a component type should be hidden in the inspector.
- * Uses the capabilities registry (inspectorVisible) as the primary check.
+ * Uses the capabilities registry (`ui.hidden`) as the primary check.
  * Falls back to the validator for types without capabilities.
  */
 export function isHiddenComponentType(type: string): boolean {
-  // If the type has explicit capabilities, use inspectorVisible
+  // If the type has explicit capabilities, use ui.hidden
   const caps = getCapabilities(type);
-  if (!caps.inspectorVisible) return true;
+  if (caps.ui.hidden) return true;
   // Fall back to unknown-component check
   return !isKnownComponentType(type);
 }
@@ -101,11 +104,12 @@ export const ENUM_FIELDS: Record<string, string[]> = {
 // ── Field units ──────────────────────────────────────────────────────────
 
 /**
- * Units shown inside numeric inputs (right-aligned, e.g. "mm", "mm/s", "°", "s").
- * Keyed by either the component-qualified field (`"Drive.TargetSpeed"`) or the
- * bare field name (`"TargetSpeed"`). A qualified key wins over a bare key, so a
- * field can carry different units per component. Extend this map to add units —
- * `getFieldUnit()` is the single lookup point.
+ * FALLBACK units shown inside numeric inputs (right-aligned, e.g. "mm", "mm/s",
+ * "°", "s") for fields whose rv-ODT schema declares no `unit` (plan-512 F10:
+ * the schema is the SSOT). Keyed by either the component-qualified field
+ * (`"Drive.TargetSpeed"`) or the bare field name (`"TargetSpeed"`). A qualified
+ * key wins over a bare key. Add a unit to the SCHEMA first — a row here that
+ * has a schema pendant must agree with it (`field-unit-schema-ssot.test.ts`).
  */
 export const FIELD_UNITS: Record<string, string> = {
   // Distances / positions (millimetres)
@@ -132,11 +136,39 @@ export const FIELD_UNITS: Record<string, string> = {
   Delay: 's',
 };
 
-/** Resolve the unit suffix for a numeric field, or undefined if none. Prefers a
- *  component-qualified entry (`Type.Field`) over a bare `Field` entry. */
-export function getFieldUnit(componentType: string, fieldName: string): string | undefined {
+/** Display spelling of a schema unit: `mm/s2` → `mm/s²` (the schema writes UCUM-style). */
+function displayUnit(unit: string): string {
+  return unit.replace(/(\/s)2$/, '$1²').replace(/(\/s)3$/, '$1³');
+}
+
+/**
+ * Resolve the unit suffix for a numeric field, or undefined if none (plan-512
+ * F10). The schema's `unit` keyword is the single source; {@link FIELD_UNITS}
+ * answers only for fields the schema leaves without one, preferring a
+ * component-qualified entry (`Type.Field`) over a bare `Field` entry.
+ */
+export function getFieldUnit(
+  componentType: string, fieldName: string, data?: Readonly<Record<string, unknown>>,
+): string | undefined {
   const base = baseComponentType(componentType);
-  return FIELD_UNITS[`${base}.${fieldName}`] ?? FIELD_UNITS[fieldName];
+  const schemaUnit = getFieldDescriptor(base, fieldName)?.unit;
+  const unit = schemaUnit ? displayUnit(schemaUnit) : (FIELD_UNITS[`${base}.${fieldName}`] ?? FIELD_UNITS[fieldName]);
+  if (unit && base === 'Drive' && isRotaryDirection(data?.['Direction'])) return rotaryUnit(unit);
+  return unit;
+}
+
+/** True for the three `RotationX/Y/Z` values of `Drive.Direction`. */
+function isRotaryDirection(direction: unknown): boolean {
+  return typeof direction === 'string' && isRotation(direction as DriveDirection);
+}
+
+/**
+ * The schema writes Drive units for a LINEAR axis (`mm`, `mm/s`, `mm/s²`,
+ * `mm/s³`); a rotary drive stores the same fields in degrees. Swap the length
+ * part, keep the time part: `mm/s²` → `°/s²`.
+ */
+function rotaryUnit(unit: string): string {
+  return unit.startsWith('mm') ? `°${unit.slice(2)}` : unit;
 }
 
 // ── Hidden fields ────────────────────────────────────────────────────────
@@ -164,6 +196,12 @@ export const HIDDEN_FIELDS_PER_TYPE: Record<string, ReadonlySet<string>> = {
   LayoutObject: new Set(['Locked', 'Visible']),
   Splat: new Set(['InvertX', 'InvertY', 'InvertZ']),
   [NODE_KNOWLEDGE_TYPE]: new Set(NODE_KNOWLEDGE_PROVENANCE_FIELDS),
+  // plan-498/502: `FmuVariables` is NOT hidden — its field renderer
+  // (rv-fmu-parameters-field-renderer.tsx, "Parameters") replaces the
+  // raw row; `isFieldHidden` runs BEFORE the renderer lookup, so a hidden field
+  // would never reach it. The raw override map is edited only through that
+  // section (setFmuStartOverride / clearFmuStartOverride).
+  Fmu: new Set(['FmuStartOverrides']),
 };
 
 /** True if the given field should be hidden in the inspector, considering
@@ -215,7 +253,7 @@ export function baseComponentType(type: string): string {
 
 // ── Field type inference ──────────────────────────────────────────────────
 
-export type FieldType = 'number' | 'boolean' | 'string' | 'enum' | 'vector3' | 'reference' | 'scriptableobject' | 'object';
+export type FieldType = 'number' | 'boolean' | 'string' | 'enum' | 'vector3' | 'color' | 'reference' | 'scriptableobject' | 'object';
 
 /** Check if a value is a ComponentReference ({ type: "ComponentReference", path, componentType }). */
 export function isComponentRef(value: unknown): value is { type: string; path: string; componentType: string } {
@@ -230,12 +268,37 @@ export function isScriptableObject(value: unknown): boolean {
   return (value as Record<string, unknown>)['type'] === 'ScriptableObject';
 }
 
+/** A Unity Color `{r, g, b, a?}` with 0..1 floats — how rv_extras store colours (e.g. `Lamp.OnColor`). */
+export function isColorValue(value: unknown): value is { r: number; g: number; b: number; a?: number } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const c = value as Record<string, unknown>;
+  const keys = Object.keys(c);
+  return typeof c['r'] === 'number' && typeof c['g'] === 'number' && typeof c['b'] === 'number'
+    && keys.every((k) => k === 'r' || k === 'g' || k === 'b' || k === 'a')
+    && (c['a'] === undefined || typeof c['a'] === 'number');
+}
+
+/** `{r,g,b}` (0..1) → `#rrggbb`, the same mapping the runtime uses (`parseColorToHex`). */
+export function colorToHex(c: { r: number; g: number; b: number }): string {
+  const ch = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0');
+  return `#${ch(c.r)}${ch(c.g)}${ch(c.b)}`;
+}
+
+/** `#rrggbb` → `{r,g,b,a}` (0..1, 4 decimals); the alpha of `prev` is kept (default 1). Null for a malformed hex. */
+export function hexToColor(hex: string, prev?: { a?: number }): { r: number; g: number; b: number; a: number } | null {
+  const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex.trim());
+  if (!m) return null;
+  const f = (s: string) => Math.round((parseInt(s, 16) / 255) * 10000) / 10000;
+  return { r: f(m[1]), g: f(m[2]), b: f(m[3]), a: typeof prev?.a === 'number' ? prev.a : 1 };
+}
+
 export function inferFieldType(fieldName: string, value: unknown): FieldType {
   if (typeof value === 'boolean') return 'boolean';
   if (typeof value === 'number') return 'number';
   if (Array.isArray(value)) return 'object';
   if (isComponentRef(value)) return 'reference';
   if (isScriptableObject(value)) return 'scriptableobject';
+  if (isColorValue(value)) return 'color';
   if (
     typeof value === 'object' &&
     value !== null &&
@@ -288,8 +351,8 @@ export function componentColor(type: string): string {
   if (type.startsWith('Drive_')) return '#29b6f6';
   // Registry has priority, then legacy BADGE_COLORS map
   const caps = getCapabilities(type);
-  if (caps.badgeColor !== '#90a4ae') return caps.badgeColor;
-  return BADGE_COLORS[type] ?? '#90a4ae';
+  if (caps.ui.badge !== DEFAULT_BADGE_COLOR) return caps.ui.badge;
+  return BADGE_COLORS[type] ?? DEFAULT_BADGE_COLOR;
 }
 
 /**
@@ -316,7 +379,8 @@ export function componentTypeIcon(type: string): SvgIconComponent {
 export function formatDisplayValue(value: unknown): string {
   if (value === null || value === undefined) return '\u2014';
   if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'number') return String(value);
+  // Read-only display: dot decimal, float noise trimmed (plan-510).
+  if (typeof value === 'number') return formatDecimal(value);
   if (typeof value === 'string') return value;
   if (isComponentRef(value)) {
     const last = value.path.split('/').pop() ?? value.path;
@@ -328,7 +392,8 @@ export function formatDisplayValue(value: unknown): string {
   }
   if (typeof value === 'object' && 'x' in (value as Record<string, unknown>)) {
     const v = value as { x: number; y: number; z: number };
-    return `(${v.x}, ${v.y}, ${v.z})`;
+    const f = (n: unknown): string => (typeof n === 'number' ? formatDecimal(n) : String(n));
+    return `(${f(v.x)}, ${f(v.y)}, ${f(v.z)})`;
   }
   return JSON.stringify(value);
 }
@@ -406,6 +471,10 @@ export function isSignalComponentType(type: string): boolean {
  * Non-signal component types keep their component colour.
  */
 export function getSignalHeaderColor(componentType: string, signalValue: string): string {
+  // plan-510: the Fmu header shows the instance state in its state colour.
+  if (baseComponentType(componentType) === FMU_TYPE) {
+    return FMU_STATE_COLORS[signalValue as FmuState] ?? componentColor(componentType);
+  }
   const dir = signalDirectionFromType(componentType);
   if (dir === 'unknown') return componentColor(componentType);
   if (componentType.includes('Bool')) {

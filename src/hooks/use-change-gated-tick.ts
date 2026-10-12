@@ -28,6 +28,7 @@
  */
 
 import { useState, useEffect, useRef } from 'react';
+import { subscribePoll } from './shared-ui-ticker';
 
 export interface ChangeGatedTickOptions<T> {
   /** Reads the current value. Called on every poll; must be cheap and pure. */
@@ -64,14 +65,15 @@ export function useChangeGatedTick<T>({
     // Baseline against the CURRENT value, so the first poll after a reset does
     // not report a spurious change (which would defeat the whole point).
     let committed = readRef.current();
-    const id = setInterval(() => {
+    // A poll of the shared ticker: wall clock normally, one recording tick per video frame while
+    // a recording replaces the timers (plan-556 F4).
+    return subscribePoll(() => {
       const next = readRef.current();
       const same = equalRef.current ? equalRef.current(committed, next) : Object.is(committed, next);
       if (same) return;
       committed = next;
       setTick((t) => t + 1);
     }, intervalMs);
-    return () => clearInterval(id);
   }, [enabled, intervalMs, resetKey]);
 
   return tick;

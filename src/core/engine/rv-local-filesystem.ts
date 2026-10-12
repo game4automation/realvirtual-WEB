@@ -48,8 +48,20 @@ const LS_KEY = 'rv-local-folders';
  */
 export const HANDLE_KEY_WORKFOLDER = 'workfolder';
 
-/** Handle slot for the (optional) workspace root that contains project folders. */
-export const HANDLE_KEY_WORKSPACE = 'workspace';
+// `HANDLE_KEY_WORKSPACE = 'workspace'` stood here until plan-743. The workspace
+// root is gone; every project carries its own `projectfolder:<id>` handle. The
+// dead slot is deleted from IndexedDB on the first boot after the update by
+// `runLegacyCleanup`, which spells the literal itself rather than importing a
+// constant nothing else may use.
+
+/**
+ * Handle slot for the folder "New project" last created a project *inside*.
+ *
+ * Remembered so the second project does not make the user navigate the picker
+ * to the same place again. It is a PARENT: nothing is ever read from it, and
+ * the only write is the new project's own subfolder.
+ */
+export const HANDLE_KEY_NEW_PROJECT_PARENT = 'newprojectparent';
 
 /** Handle slot for a single project folder picked outside a workspace. */
 export function projectHandleKey(projectId: string): string {

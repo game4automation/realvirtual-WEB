@@ -15,7 +15,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { BufferAttribute, BufferGeometry, Mesh, MeshStandardMaterial, Object3D, Scene } from 'three';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { applySchema, type ComponentContext } from '../src/core/engine/rv-component-registry';
-import { isBatchSafe } from '../src/core/engine/rv-batched-render';
+import { bakeFateOf } from './helpers/bake-fate';
 import {
   CHUNK_CAPACITY_HEADROOM,
   RVMachiningVolume,
@@ -494,13 +494,13 @@ describe('RVMachiningVolume — chunk geometry (plan-405 §9.4, R2 finding 2)', 
   });
 
   /**
-   * The one-word change in `EXCLUDED_SUBTREE_KEYS` is the entire protection
-   * against a batched — and therefore permanently uncut — workpiece. The arena
-   * bakes the HOME pose once, so a MachiningVolume that slipped into a batch
-   * would still LOOK right on load and never change again: a silent failure that
-   * no other test in this file would catch.
+   * The component's `bake:'keep'` role is the entire protection against a
+   * baked — and therefore permanently uncut — workpiece. The bake stages the
+   * HOME pose once, so a MachiningVolume that slipped into a chunk would still
+   * LOOK right on load and never change again: a silent failure that no other
+   * test in this file would catch.
    */
-  it('excludes the whole MachiningVolume subtree from arena batching (plan-405 §5.2)', () => {
+  it('keeps the whole MachiningVolume subtree out of the bake chunks (plan-405 §5.2)', async () => {
     const root = new Object3D();
     const volumeNode = new Object3D();
     volumeNode.name = 'Workpiece';
@@ -511,12 +511,12 @@ describe('RVMachiningVolume — chunk geometry (plan-405 §9.4, R2 finding 2)', 
     const mesh = new Mesh(geo, new MeshStandardMaterial());
     volumeNode.add(mesh);
 
-    // Control: without the marker the very same mesh IS batch-safe, so the
-    // assertion below really is about the exclusion key and nothing else.
-    expect(isBatchSafe(mesh, root)).toBe(true);
+    // Control: without the marker the very same mesh IS staged, so the
+    // assertion below really is about the role and nothing else.
+    expect(await bakeFateOf(mesh, root)).toBe('static');
 
     volumeNode.userData.realvirtual = { MachiningVolume: { Shape: 'Box' } };
-    expect(isBatchSafe(mesh, root)).toBe(false);
+    expect(await bakeFateOf(mesh, root)).toBe('keep');
 
     // ... and it holds for a deeper descendant too (the chunk meshes live under
     // a `CsgChunks` child, one level below the marked node).
@@ -524,7 +524,7 @@ describe('RVMachiningVolume — chunk geometry (plan-405 §9.4, R2 finding 2)', 
     volumeNode.add(deep);
     const chunkMeshObj = new Mesh(geo, new MeshStandardMaterial());
     deep.add(chunkMeshObj);
-    expect(isBatchSafe(chunkMeshObj, root)).toBe(false);
+    expect(await bakeFateOf(chunkMeshObj, root)).toBe('keep');
   });
 
   it('reports live state for the inspector', () => {

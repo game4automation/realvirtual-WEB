@@ -1,0 +1,33 @@
+{
+  "recording": { "width": 1920, "height": 1080, "maxDurationSec": 180 },
+  "batches": [
+    [
+      { "type": "waitFor", "selector": "[data-testid=welcome-dismiss]", "timeoutMs": 60000 },
+      { "type": "click", "selector": "[data-testid=welcome-dismiss]" },
+      { "type": "waitFor", "selector": "#loading-overlay.hidden", "state": "attached", "timeoutMs": 60000 },
+      { "type": "waitFor", "selector": "[role=region][aria-label=\"Ribbon Tension\"]", "timeoutMs": 30000 },
+      { "type": "waitFor", "selector": "[data-testid=serve-session-badge]", "state": "hidden" }
+    ],
+    [
+      { "type": "wheel", "x": 980, "y": 560, "deltaY": -650 },
+      { "type": "wait", "ms": 1000 },
+      { "type": "drag", "button": "middle", "fromX": 1100, "fromY": 550, "toX": 1260, "toY": 500, "durationMs": 1200 },
+      { "type": "click", "selector": "button:has-text(\"Reset\")" },
+      { "type": "wait", "ms": 1500 }
+    ],
+    [
+      { "type": "wait", "ms": 6000 },
+      { "type": "drag", "button": "right", "fromX": 1150, "fromY": 550, "toX": 1240, "toY": 530, "durationMs": 6000 },
+      { "type": "wait", "ms": 2500 },
+      { "type": "click", "selector": "button:has-text(\"Measurements\")" },
+      { "type": "wait", "ms": 4000 },
+      { "type": "click", "selector": "button:has-text(\"Brake fault\")" },
+      { "type": "wait", "ms": 4500 },
+      { "type": "click", "selector": "button:has-text(\"Reset\")" },
+      { "type": "wait", "ms": 4500 },
+      { "type": "click", "selector": "[role=group][aria-label=\"Values in scene\"] button:has-text(\"Off\")" },
+      { "type": "drag", "button": "right", "fromX": 1200, "fromY": 530, "toX": 1140, "toY": 550, "durationMs": 4500 },
+      { "type": "wait", "ms": 4500 }
+    ]
+  ]
+}

@@ -125,10 +125,7 @@ export class RVTank {
 }
 
 registerTooltipComponent(RVTank, {
-  hoverable: true,
-  badgeColor: '#42a5f5',
-  filterLabel: 'Tanks',
-  hoverEnabledByDefault: true,
-  hoverPriority: 10,
-  pinPriority: 5,
+  pick: 'select',
+  bake: 'keep',    // fill-level material swap — the original meshes stay
+  ui: { badge: '#42a5f5', filter: 'Tanks', category: 'process', priority: 10 },
 });

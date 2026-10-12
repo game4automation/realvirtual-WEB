@@ -26,6 +26,7 @@ import type {
 } from '../core/hmi/instruction-store';
 import type { PdfSource } from '../core/hmi/pdf-viewer-store';
 import type { RVViewer } from '../core/rv-viewer';
+import type { HierarchyFilterId } from '../core/hmi/hierarchy-utils';
 
 // ─── Code-first (primary) ──────────────────────────────────────────────
 
@@ -77,7 +78,7 @@ export interface TourApi {
 
   // Left-panel filter (hierarchy)
   filter(opts: {
-    typeFilter?: 'all' | 'drives' | 'sensors' | 'signals' | 'logic';
+    typeFilter?: HierarchyFilterId;
     searchTerm?: string;
     panelWidth?: number;          // default 320
   }): void;
@@ -131,7 +132,7 @@ export type TourAction =
   | { type: 'highlight'; paths: string[]; clearOthers?: boolean }
   | { type: 'pdf'; title: string; source: PdfSource }
   | { type: 'message'; title: string; subtitle?: string; severity: 'info' | 'warning' | 'error'; componentPath?: string; autoClearAfterMs?: number }
-  | { type: 'filter'; typeFilter?: 'all' | 'drives' | 'sensors' | 'signals' | 'logic'; searchTerm?: string; panelWidth?: number }
+  | { type: 'filter'; typeFilter?: HierarchyFilterId; searchTerm?: string; panelWidth?: number }
   | { type: 'inspector'; path: string }
   | { type: 'chart'; chart: ChartKind }
   | { type: 'instruction'; text: string; anchor?: InstructionAnchor; style?: InstructionStyle; id?: string; priority?: number; autoClearAfterMs?: number };

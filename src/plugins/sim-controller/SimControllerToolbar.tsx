@@ -11,13 +11,14 @@
  * remove), not every render frame.
  */
 
-import { useSyncExternalStore, useCallback, useMemo, useState, useEffect, type MouseEvent } from 'react';
+import { useSyncExternalStore, useMemo, useRef, useState, useEffect } from 'react';
 import { PlayArrow, Pause, Replay, Speed, Schedule } from '@mui/icons-material';
 import { Menu, MenuItem, Box } from '@mui/material';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
 import { ActionSegment, ActionDivider } from '../../core/hmi/action-group';
 import { SIM_CONTROLLER_PAUSE_REASON } from './index';
-import { getDriveSpeedOverride, setDriveSpeedOverride, subscribeDriveSpeedOverride } from '../../core/engine/rv-speed-override';
+import { getDriveSpeedOverride, subscribeDriveSpeedOverride } from '../../core/engine/rv-speed-override';
+import { commandRegistry } from '../../core/hmi/rv-command-registry';
 import { formatSimClock } from './format-sim-time';
 
 /** Snapshot shape returned by `getPauseSnapshot`. Compared by reference so
@@ -42,10 +43,6 @@ export function PlayPauseSegment({ viewer }: UISlotProps) {
 
   const userPaused = snap.reasons.includes(SIM_CONTROLLER_PAUSE_REASON);
 
-  const handleTogglePlayPause = useCallback(() => {
-    viewer.setSimulationPaused(SIM_CONTROLLER_PAUSE_REASON, !userPaused);
-  }, [viewer, userPaused]);
-
   // Icon reflects the ACTUAL sim state (paused by ANY reason — user, planner
   // 'layout-edit', AR, …) so the toolbar shows "paused" whenever the sim is
   // held, e.g. on entering the Layout-Planner. (Size is normalized by ActionSegment.)
@@ -68,7 +65,9 @@ export function PlayPauseSegment({ viewer }: UISlotProps) {
   return (
     <ActionSegment
       title={playPauseTitle}
-      onClick={handleTogglePlayPause}
+      // plan-499: a view of `sim.playPause` (Space and web_sim_play_pause are the
+      // others); the explicit value keeps the toggle semantics of the old onClick.
+      command={{ id: 'sim.playPause', args: () => ({ paused: !userPaused }), viewer }}
       color={playPauseColor}
       icon={playPauseIcon}
       buttonProps={{ 'data-testid': 'sim-controller-playpause' }}
@@ -82,14 +81,11 @@ export function PlayPauseSegment({ viewer }: UISlotProps) {
  * reuse by the DES controller toolbar.
  */
 export function ResetSegment({ viewer }: UISlotProps) {
-  const handleReset = useCallback(() => {
-    viewer.resetSimulation();
-  }, [viewer]);
-
   return (
     <ActionSegment
       title="Reset MUs and LogicSteps (Shift+R)"
-      onClick={handleReset}
+      // plan-499: a view of `sim.reset` (Shift+R and web_sim_reset are the others).
+      command={{ id: 'sim.reset', viewer }}
       icon={<Replay />}
       buttonProps={{ 'data-testid': 'sim-controller-reset' }}
     />
@@ -134,7 +130,7 @@ export function SimControllerToolbar({ viewer }: UISlotProps) {
       <ActionDivider />
       <ResetSegment viewer={viewer} />
       <ActionDivider />
-      <SpeedSelector />
+      <SpeedSelector viewer={viewer} />
       <ActionDivider />
       <SimClockSegment viewer={viewer} />
     </>
@@ -150,19 +146,21 @@ export function SimControllerToolbar({ viewer }: UISlotProps) {
 const SPEED_OPTIONS = [0.25, 0.5, 1, 2, 5, 10, 25, 50, 100];
 
 /** Exported for reuse by the editor's test-run toolbar (same override store). */
-export function SpeedSelector() {
+export function SpeedSelector({ viewer }: { viewer?: UISlotProps['viewer'] } = {}) {
   const factor = useSyncExternalStore(subscribeDriveSpeedOverride, getDriveSpeedOverride, getDriveSpeedOverride);
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
+  const segRef = useRef<HTMLElement | null>(null);
   return (
     <>
       <ActionSegment
         title="Drive speed override — scales all drive speeds (1× = normal)"
         icon={<Speed />}
         label={`${factor}×`}
-        buttonProps={{
-          'data-testid': 'sim-speed-selector',
-          onClick: (e: MouseEvent<HTMLElement>) => setAnchor(e.currentTarget),
-        }}
+        // plan-499: the segment is the (interactive) view of `sim.speedOverride`:
+        // a click opens the menu, a menu item dispatches; the choreography and
+        // the afterglow of web_drive_speed_override land on this segment.
+        command={{ id: 'sim.speedOverride', args: () => ({ factor }), invoke: () => setAnchor(segRef.current), ...(viewer ? { viewer } : {}) }}
+        buttonProps={{ 'data-testid': 'sim-speed-selector', ref: segRef }}
       />
       <Menu
         anchorEl={anchor}
@@ -176,7 +174,10 @@ export function SpeedSelector() {
           <MenuItem
             key={o}
             selected={o === factor}
-            onClick={() => { setDriveSpeedOverride(o); setAnchor(null); }}
+            onClick={() => {
+              void commandRegistry.execute('sim.speedOverride', { factor: o }, { origin: 'ui', ...(viewer ? { viewer } : {}) });
+              setAnchor(null);
+            }}
             sx={{ fontSize: 13, minHeight: 0, py: 0.5, justifyContent: 'center' }}
           >
             {o}×

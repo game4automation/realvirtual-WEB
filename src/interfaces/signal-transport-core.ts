@@ -33,6 +33,12 @@ export interface WsMessage {
   name?: string;
   signals?: Record<string, unknown>;
   signalTypes?: Record<string, string>;
+  /**
+   * `import_answer` (plan-563): PLC inputs CONNECT has never received a real value for. They are
+   * still listed in `signals` (with their type default) but must not be taken as a value — the
+   * viewer offers its model value via `init_values` instead. Absent from older gateways.
+   */
+  uninitialized?: string[];
   subscribe?: string[];
   config?: Record<string, unknown>;
   success?: boolean;
@@ -65,6 +71,8 @@ export type TransportInboundMessage =
   | { type: 'disconnect' }
   | { type: 'discover' }
   | { type: 'outgoing'; signals: Record<string, boolean | number> }
+  /** plan-563: offer model values for PLC inputs CONNECT listed as never set (first value wins there). */
+  | { type: 'init_values'; signals: Record<string, boolean | number> }
   | { type: 'visible' }; // resync-on-visibilitychange (F10)
 
 /** Messages the worker posts OUT to the main thread. */
@@ -73,8 +81,16 @@ export type TransportOutboundMessage =
   | { type: 'closed'; reason: string }
   | { type: 'error'; error: string }
   | { type: 'delta'; signals: Record<string, boolean | number> }
-  | { type: 'import_answer'; signals: Record<string, unknown>; signalTypes: Record<string, string> }
+  | {
+      type: 'import_answer';
+      signals: Record<string, unknown>;
+      signalTypes: Record<string, string>;
+      /** plan-563: present only from a gateway that tracks the init status (may be empty). */
+      uninitialized?: string[];
+    }
   | { type: 'import_error'; error: string }
+  /** plan-563: the gateway's signal catalog changed (registered / removed / reloaded) — rediscover. */
+  | { type: 'catalog_changed' }
   /**
    * A gateway announced a published model. The worker forwards WHAT changed instead of
    * discarding it (plan-365 Phase 2): without the URL the host cannot tell whether the
@@ -266,6 +282,11 @@ export class SignalTransport {
       case 'outgoing':
         this.sendData(msg.signals);
         break;
+      case 'init_values':
+        if (msg.signals && Object.keys(msg.signals).length > 0) {
+          this.wsSend({ type: 'init_values', version: 2, signals: msg.signals as Record<string, unknown> });
+        }
+        break;
       case 'visible':
         this.onVisible();
         break;
@@ -382,6 +403,11 @@ export class SignalTransport {
           type: 'import_answer',
           signals: msg.signals ?? {},
           signalTypes: msg.signalTypes ?? {},
+          // plan-563: forwarded only when the gateway sent it — its absence is how the viewer
+          // recognises an older CONNECT (and then offers nothing).
+          ...(Array.isArray(msg.uninitialized)
+            ? { uninitialized: msg.uninitialized.filter((n): n is string => typeof n === 'string') }
+            : {}),
         });
         // Subscribe to everything the server offered.
         this.wsSend({ type: 'subscribe', version: 2, subscribe: Object.keys(msg.signals ?? {}) });
@@ -410,6 +436,10 @@ export class SignalTransport {
             ...(msg.revision !== undefined ? { revision: msg.revision } : {}),
           });
         }
+        break;
+
+      case 'catalog_changed':
+        this.post({ type: 'catalog_changed' });
         break;
 
       case 'config_answer':

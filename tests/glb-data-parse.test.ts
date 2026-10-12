@@ -61,8 +61,12 @@ describe.skipIf(!DEV_ASSETS)('loadAndPrepareGLTF data (ArrayBuffer) path', () =>
     const { root } = await loadAndPrepareGLTF(GLB_URL, scene, bytes);
     expect(root).toBeTruthy();
     expect(countNodes(root)).toBeGreaterThan(1);
-    // The root must actually be attached to the target scene.
-    expect(scene.children).toContain(root);
+    // Since 97bc6643 (2026-09-17) the parsed root is parked under an UNRENDERED
+    // staging parent; loadGLB moves it into the scene only after every load
+    // phase. The target scene stays untouched by the parse.
+    expect(scene.children).not.toContain(root);
+    expect(root.parent?.name).toBe('_rvLoadStaging');
+    expect(root.parent?.parent ?? null).toBeNull();
   }, 30000);
 
   it('produces the same node count as the URL (loadAsync) path', async () => {

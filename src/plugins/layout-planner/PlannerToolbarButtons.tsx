@@ -61,8 +61,23 @@ import { getSceneStore } from '../../core/hmi/scene/scene-store-singleton';
 import { LAYOUT_PANEL_WIDTH } from '../../core/hmi/layout-constants';
 import type { SceneSnapshot } from '../../core/hmi/scene/scene-store';
 import { DragNumberField } from '../../core/hmi/DragNumberField';
+import { parseDecimal } from '../../core/hmi/rv-number-format';
 import type { LayoutPlannerPlugin } from './index';
 import type { LayoutSnapshot } from './rv-layout-store';
+import { aiTouchSx, useCommandView } from '../../core/hmi/rv-command-view';
+import { getAiTouchMs } from '../../core/hmi/button-sim-state';
+
+/**
+ * plan-499: sx for a planner IconButton that is a command view — the simulated
+ * hover/press of the MCP choreography and the AI afterglow (colour + opacity
+ * only, no transform, so reduced motion needs no special case).
+ */
+function commandButtonSx(view: ReturnType<typeof useCommandView>): Record<string, unknown> {
+  return {
+    ...(view.simPhase === 'hover' || view.simPhase === 'pressed' ? { bgcolor: 'rgba(79,195,247,0.18)' } : null),
+    ...(view.touch ? aiTouchSx(view.aiTouch, getAiTouchMs()) : null),
+  };
+}
 
 // Sane bounds for typed values — keeps the gizmo from getting micro-snap or
 // >360° steps. The user can still set anything within these ranges precisely.
@@ -99,12 +114,12 @@ function usePlannerToolbarState(): {
 
 /**
  * Clamp + sanity-check a numeric input. Returns null when input is empty or
- * NaN (caller keeps the editor in "draft" state without committing).
+ * not a number (caller keeps the editor in "draft" state without committing).
+ * Comma and dot are both decimal separators (plan-510, `parseDecimal`).
  */
-function clampNumber(raw: string, min: number, max: number): number | null {
-  if (raw.trim() === '') return null;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return null;
+export function clampNumber(raw: string, min: number, max: number): number | null {
+  const n = parseDecimal(raw);
+  if (n === null) return null;
   return Math.min(max, Math.max(min, n));
 }
 
@@ -389,15 +404,20 @@ export function PlannerDocModeButton() {
 export function PlannerDeleteButton() {
   const { plugin } = usePlannerToolbarState();
   const selection = useSelection();
+  // plan-499: a view of `layout.remove` with `id: null` = "the selection" — the
+  // Delete key and web_layout_remove are the others. Disabled + tooltip come
+  // from the command's rule; the afterglow of web_layout_remove lands here.
+  const viewer = useViewer();
+  const view = useCommandView({ id: 'layout.remove', args: () => ({ id: null }), viewer });
   if (!plugin) return null;
 
   // Spawned MUs are registered selectable scene nodes, so they appear in
   // SelectionManager paths just like layout objects — no special-casing here.
   const count = selection.selectedPaths.length;
-  const disabled = count === 0;
+  const disabled = view.disabled;
   const tooltip = disabled
-    ? 'Delete (select something first)'
-    : count === 1 ? 'Delete' : `Delete ${count} items`;
+    ? (view.reason ?? 'Delete (select something first)')
+    : count <= 1 ? 'Delete' : `Delete ${count} items`;
 
   return (
     <Tooltip title={tooltip} placement="right">
@@ -406,11 +426,14 @@ export function PlannerDeleteButton() {
       <span>
         <IconButton
           size="small"
-          onClick={() => { void plugin.removeSelected(); }}
+          onClick={view.onClick}
           disabled={disabled}
+          {...view.dataAttrs}
+          aria-description={view.touch ? 'Triggered by AI' : undefined}
           sx={{
             p: 0.75,
             color: disabled ? 'text.disabled' : '#ef5350',
+            ...commandButtonSx(view),
           }}
           aria-label="Delete selected"
         >
@@ -471,11 +494,14 @@ function HistoryButton({ kind }: { kind: 'undo' | 'redo' }) {
     store?.subscribe ?? _noopSubscribe,
     store?.getSnapshot ?? _nullSnapshot,
   );
+  // plan-499: a view of `layout.undo` / `layout.redo` (the SceneStore history —
+  // no second one); the snapshot subscription above re-renders on every op.
+  const viewer = useViewer();
+  const view = useCommandView({ id: kind === 'undo' ? 'layout.undo' : 'layout.redo', viewer });
   if (!store) return null;
 
-  const enabled = (kind === 'undo' ? snap.canUndo : snap.canRedo) === true;
-  const label = (kind === 'undo' ? snap.undoLabel : snap.redoLabel) ?? (kind === 'undo' ? 'Undo' : 'Redo');
-  const run = () => { void (kind === 'undo' ? store.undo() : store.redo()); };
+  const enabled = !view.disabled;
+  const label = (kind === 'undo' ? snap.undoLabel : snap.redoLabel) ?? view.reason ?? (kind === 'undo' ? 'Undo' : 'Redo');
 
   return (
     <Tooltip title={label} placement="right">
@@ -483,9 +509,10 @@ function HistoryButton({ kind }: { kind: 'undo' | 'redo' }) {
       <span>
         <IconButton
           size="small"
-          onClick={run}
+          onClick={view.onClick}
           disabled={!enabled}
-          sx={{ p: 0.75, color: enabled ? 'text.secondary' : 'text.disabled' }}
+          {...view.dataAttrs}
+          sx={{ p: 0.75, color: enabled ? 'text.secondary' : 'text.disabled', ...commandButtonSx(view) }}
           aria-label={kind === 'undo' ? 'Undo' : 'Redo'}
         >
           {kind === 'undo' ? <Undo sx={{ fontSize: 18 }} /> : <Redo sx={{ fontSize: 18 }} />}

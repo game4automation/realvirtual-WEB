@@ -7,7 +7,7 @@
  * Historical note: this module used to also build the visibility-OWNER
  * resolver for the plan-294 static merge passes (chunks parented per group /
  * auto-filter root). That machinery was retired when the static merge moved
- * to BatchedMesh arenas with per-instance visibility (setVisibleAt via the
+ * to bake chunks with per-node visibility (window rewrites via the
  * BatchVisibilityService) — no owners, no chunk parenting. What remains is
  * the single-source auto-filter node collection shared with
  * `AutoFilterRegistry.build()`.
@@ -15,7 +15,7 @@
  * IMPORTANT: auto-filter roots are derived from the SAME source as
  * `AutoFilterRegistry.build()` — `getRegisteredCapabilities()` + NodeRegistry —
  * NOT from `userData._rvType` (components like IKPath/IKTarget/RobotIK/
- * TransportSurface register a filterLabel without setting _rvType, and a node
+ * TransportSurface register a `ui.filter` without setting _rvType, and a node
  * can be registered under multiple types).
  */
 
@@ -25,7 +25,7 @@ import { getRegisteredCapabilities } from './rv-component-registry';
 
 /**
  * Auto-filter node collection per component type: every scene node of every
- * component type with a `filterLabel` capability — the exact node set
+ * component type with a `ui.filter` capability — the exact node set
  * AutoFilterRegistry.setVisible toggles. SINGLE SOURCE shared by
  * AutoFilterRegistry.build() and the owner resolver so the two can never
  * drift apart (SOL-R2-1). Types with zero resolvable nodes are omitted.
@@ -36,7 +36,7 @@ export function getAutoFilterNodesByType(
   const out = new Map<string, Object3D[]>();
   if (!nodeRegistry) return out;
   for (const [type, caps] of getRegisteredCapabilities()) {
-    if (!caps.filterLabel) continue;
+    if (!caps.ui.filter) continue;
     const nodes: Object3D[] = [];
     for (const inst of nodeRegistry.getAll(type)) {
       const node = nodeRegistry.getNode(inst.path);

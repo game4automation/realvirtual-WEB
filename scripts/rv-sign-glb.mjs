@@ -23,11 +23,10 @@ import {
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { readGlb, writeGlb } from './lib/rv-glb.mjs';
+
 export const RV_SIG_PLACEHOLDER = `${'A'.repeat(86)}==`;
 export const RV_SIG_ROOT_PUBLIC_KEY_BASE64 = '99rD6Wl3Jsk7w9D+WIN9/jfEXNXns0jDRV5yf4LX48U=';
-const GLB_MAGIC = 0x46546c67;
-const GLB_VERSION = 2;
-const JSON_CHUNK = 0x4e4f534a;
 const encoder = new TextEncoder();
 
 function strictBase64(value, bytes, label) {
@@ -44,20 +43,25 @@ function strictBase64(value, bytes, label) {
   return out;
 }
 
+/**
+ * Container parsing is `scripts/lib/rv-glb.mjs` (plan-587). Two reasons this
+ * stays a thin wrapper instead of calling `readGlb` directly:
+ *
+ * - `verifyGlbBytes` needs the COMPLETE file bytes (it searches the signature
+ *   marker in them and copies them to restore the placeholder), which the
+ *   reader does not hand back;
+ * - `bytes` must be a copy, because `rest` is a view into it.
+ *
+ * The checks are now stricter than the hand-written ones were (version, both
+ * length directions, every chunk length) and the error texts differ — a
+ * non-GLB says "not a GLB" instead of "malformed GLB header". No caller reads
+ * those texts: `verifyGlbBytes` turns any throw into 'invalid', the CLI prints
+ * the message.
+ */
 function parseGlb(input) {
   const bytes = Buffer.from(input);
-  if (bytes.length < 20) throw new Error('malformed GLB');
-  if (bytes.readUInt32LE(0) !== GLB_MAGIC || bytes.readUInt32LE(4) !== GLB_VERSION) {
-    throw new Error('malformed GLB header');
-  }
-  if (bytes.readUInt32LE(8) !== bytes.length) throw new Error('malformed GLB length');
-  const jsonLength = bytes.readUInt32LE(12);
-  if (bytes.readUInt32LE(16) !== JSON_CHUNK || jsonLength === 0 || 20 + jsonLength > bytes.length) {
-    throw new Error('malformed GLB JSON chunk');
-  }
-  const jsonText = bytes.subarray(20, 20 + jsonLength).toString('utf8').replace(/ +$/u, '');
-  const json = JSON.parse(jsonText);
-  return { bytes, json, jsonLength, restOffset: 20 + jsonLength };
+  const { json, rest } = readGlb(bytes);
+  return { bytes, json, rest };
 }
 
 /** Normative file-global extras path shared with the browser verifier. */
@@ -74,23 +78,6 @@ export function getDefaultSceneExtras(json, create = false) {
     return null;
   }
   return scene.extras;
-}
-
-function rebuildJsonChunk(parsed) {
-  const compact = Buffer.from(JSON.stringify(parsed.json), 'utf8');
-  const paddedLength = (compact.length + 3) & ~3;
-  const jsonChunk = Buffer.alloc(paddedLength, 0x20);
-  compact.copy(jsonChunk);
-  const rest = parsed.bytes.subarray(parsed.restOffset);
-  const out = Buffer.alloc(20 + paddedLength + rest.length);
-  out.writeUInt32LE(GLB_MAGIC, 0);
-  out.writeUInt32LE(GLB_VERSION, 4);
-  out.writeUInt32LE(out.length, 8);
-  out.writeUInt32LE(paddedLength, 12);
-  out.writeUInt32LE(JSON_CHUNK, 16);
-  jsonChunk.copy(out, 20);
-  rest.copy(out, 20 + paddedLength);
-  return out;
 }
 
 function rawPublicKey(key) {
@@ -175,7 +162,7 @@ export function signGlbBytes(input, signing) {
   else delete extras.rv_key;
   extras.rv_sig = RV_SIG_PLACEHOLDER;
 
-  const canonical = rebuildJsonChunk(parsed);
+  const canonical = writeGlb(parsed.json, parsed.rest);
   const marker = Buffer.from(`"rv_sig":"${RV_SIG_PLACEHOLDER}"`, 'ascii');
   const markerOffset = canonical.indexOf(marker);
   if (markerOffset < 0 || canonical.indexOf(marker, markerOffset + 1) >= 0) {

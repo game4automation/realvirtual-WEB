@@ -59,7 +59,7 @@ describe('§9.1 — the internals filter', () => {
   });
 });
 
-describe('§9.1 — one walk, three lists', () => {
+describe('§9.1 — one walk, four lists', () => {
   it('classifies by ENDING, not by folder', () => {
     const listing = classifyProjectFiles([
       'models/Plant.glb',
@@ -72,7 +72,25 @@ describe('§9.1 — one walk, three lists', () => {
     ]);
     expect(listing.configs).toEqual(['device.connect.json', 'connect/dev.connect.json']);
     expect(listing.knowledge).toEqual(['notes.knowledge.md']);
+    expect(listing.scripts).toEqual([]);
     expect(listing.plainFiles).toEqual(['models/Plant.glb', 'docs/bom.pdf']);
+  });
+
+  it('takes the project own code out of plainFiles (plan-479 Phase 1)', () => {
+    const listing = classifyProjectFiles([
+      'plugins/index.ts',
+      'plugins/hmi/deep/panel.tsx',
+      'plugins/README.md',       // prose about the code — knowledge, not code
+      'plugins/types.d.ts',      // declares types, exports no module
+      'models/helper.ts',        // right ending, wrong place
+      'models/Plant.glb',
+    ]);
+    expect(listing.scripts).toEqual(['plugins/index.ts', 'plugins/hmi/deep/panel.tsx']);
+    expect(listing.knowledge).toEqual(['plugins/README.md']);
+    // Everything the script bucket did not claim still has a row — a
+    // reclassification that made files vanish would be worse than none.
+    expect(listing.plainFiles)
+      .toEqual(['plugins/types.d.ts', 'models/helper.ts', 'models/Plant.glb']);
   });
 
   it('prefers listAllFiles — ONE traversal instead of one per ending', async () => {
@@ -105,7 +123,7 @@ describe('§9.1 — one walk, three lists', () => {
     const listing = await listProjectFiles({
       listAllFiles: async () => { throw new Error('grant revoked'); },
     });
-    expect(listing).toEqual({ configs: [], knowledge: [], plainFiles: [] });
+    expect(listing).toEqual({ configs: [], knowledge: [], scripts: [], plainFiles: [] });
   });
 });
 

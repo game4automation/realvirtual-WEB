@@ -24,6 +24,12 @@ document, and this document changes only together with the client and its stub.*
   the server minted for that user. Nothing else — no storage key, no project id,
   no service account (`upload_NoCredentialsInClient`).
 
+- **Encrypted `?glb=` links are backend-independent (plan-560).** An RVE1 envelope
+  shared through `npm run share:encrypt` lives on the realvirtual fileshare (or any
+  CORS-enabled host) and is opened in the viewer with password + `#k=`. It never
+  touches this API — no route here needs to know about encryption. See
+  `doc-deploy.md` § *Encrypted share link*.
+
 ---
 
 ## 1. Magic-link sign-in (F9)

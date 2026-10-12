@@ -14,6 +14,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { McpBridgePlugin } from '../src/plugins/mcp-bridge-plugin';
 import { buildMultiDispatcher } from '../src/core/engine/rv-mcp-tools';
+import { clearCacheOutcomes, recordCacheOutcome } from '../src/core/engine/rv-asset-cache-outcomes';
 import {
   DELTA_PROBES,
   _resetInFlightForTest,
@@ -79,6 +80,11 @@ function createMockViewer() {
     mus: [],
     sources: [],
     sinks: [],
+    // Iterated by web_transport_status since TransportStopper landed; the real
+    // manager always has the collection, so a double without it is not a
+    // smaller manager, just an impossible one.
+    stoppers: [],
+    zones: [],
     totalSpawned: 5,
     totalConsumed: 3,
   };
@@ -196,6 +202,28 @@ describe('McpBridgePlugin - Message Dispatch', () => {
     expect(payload.fps).toBe(60);
     expect(payload.driveCount).toBe(1);
     expect(payload.signalCount).toBe(2);
+  });
+
+  it('web_status carries the asset-cache block: outcomes, counts, storage (plan-508 F6)', async () => {
+    clearCacheOutcomes();
+    for (let i = 0; i < 30; i++) {
+      recordCacheOutcome({ bucket: 'rv-assets-glb-v2', url: `/library/a${i}.glb`, outcome: i === 29 ? 'hash-mismatch' : 'hit', bytes: 12, ms: 1 });
+    }
+    const { plugin } = setupPlugin();
+    const { handleMessage, sent } = createMessageHandler(plugin);
+
+    await handleMessage(JSON.stringify({ type: 'call', id: 71, tool: 'web_status', arguments: {} }));
+    const cache = JSON.parse(JSON.parse(sent[0]).result).cache;
+    expect(cache.outcomes).toHaveLength(20); // default
+    expect(cache.outcomes.at(-1)).toMatchObject({ url: '/library/a29.glb', outcome: 'hash-mismatch' });
+    expect(cache.counts).toMatchObject({ hit: 29, 'hash-mismatch': 1, miss: 0 });
+    expect(cache.total).toBe(30);
+    expect('storage' in cache).toBe(true);
+    expect('persisted' in cache).toBe(true);
+
+    await handleMessage(JSON.stringify({ type: 'call', id: 72, tool: 'web_status', arguments: { cacheLast: 5 } }));
+    expect(JSON.parse(JSON.parse(sent[1]).result).cache.outcomes).toHaveLength(5);
+    clearCacheOutcomes();
   });
 
   it('dispatches web_drive_list and returns drive data', async () => {

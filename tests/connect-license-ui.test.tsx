@@ -10,6 +10,7 @@ import connectionsSectionSource from '../src/core/hmi/rv-connections-section.tsx
 import {
   ConnectDownloadLinks,
   ConnectOpener,
+  ConnectCapabilities,
   SignalBudgetIndicator,
   SignalLimitNotice,
   interfaceDotColor,
@@ -184,14 +185,16 @@ describe('CONNECT license gate UI integration', () => {
   it('renders the acquisition opener as an offer, not a fault', () => {
     render(themed(<ConnectOpener failedUrl="http://localhost:5100" />));
     // Value proposition + the one primary CTA (Download), Connect stays secondary.
-    expect(screen.getByText('Live PLC data in this viewer')).toBeTruthy();
+    expect(screen.getByText('Connect this viewer to real automation')).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Download realvirtual CONNECT' }).getAttribute('href'))
       .toBe(CONNECT_STABLE_DOWNLOAD_URL);
     expect(screen.getByText('Already installed? Start CONNECT on that machine, then press Connect.')).toBeTruthy();
-    // Capability rows fill the formerly empty space (Thomas: signals, VIBN, real PLCs).
+    // Capability rows say what CONNECT is FOR (Thomas: signals, VIBN, PLC interfaces, FMU, AI).
     expect(screen.getByText('Live signals')).toBeTruthy();
     expect(screen.getByText('Virtual commissioning')).toBeTruthy();
-    expect(screen.getByText('Real controllers')).toBeTruthy();
+    expect(screen.getByText('PLC and robot interfaces')).toBeTruthy();
+    expect(screen.getByText('FMU co-simulation')).toBeTruthy();
+    expect(screen.getByText('AI integration')).toBeTruthy();
     // Technical cause stays a quiet mono line, without the http:// noise.
     expect(screen.getByText('no gateway at localhost:5100')).toBeTruthy();
     // Free tier is stated once, as a fact - never a plea ("for free" x2 was the old copy).
@@ -201,9 +204,19 @@ describe('CONNECT license gate UI integration', () => {
     expect(connectPanelSource).toContain('snap.errorMessage && !gatewaySetupNeeded');
   });
 
+  it('explains what CONNECT is for on the failed-connect error path too, not only in the opener', () => {
+    render(themed(<ConnectCapabilities heading />));
+    expect(screen.getByText('What realvirtual CONNECT adds')).toBeTruthy();
+    for (const title of ['Live signals', 'Virtual commissioning', 'PLC and robot interfaces', 'FMU co-simulation', 'AI integration']) {
+      expect(screen.getByText(title)).toBeTruthy();
+    }
+    // The error branch renders it whenever no gateway is connected.
+    expect(connectPanelSource).toMatch(/!isConnected && !unreachable[\s\S]{0,200}<ConnectCapabilities heading \/>/);
+  });
+
   it('omits the failed-url line before any connect attempt', () => {
     render(themed(<ConnectOpener failedUrl={null} />));
-    expect(screen.getByText('Live PLC data in this viewer')).toBeTruthy();
+    expect(screen.getByText('Connect this viewer to real automation')).toBeTruthy();
     expect(screen.queryByText(/no gateway at/)).toBeNull();
   });
 

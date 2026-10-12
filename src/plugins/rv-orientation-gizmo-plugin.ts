@@ -18,6 +18,7 @@ import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVViewer } from '../core/rv-viewer';
 import { getAppConfig } from '../core/rv-app-config';
+import { gizmoFallbackDistance, type ScaleLike } from '../core/engine/rv-scale-constants';
 import { isCompactWidth } from '../hooks/use-mobile-layout';
 import {
   getProjectsDashboardSnapshot,
@@ -679,16 +680,24 @@ export class OrientationGizmoPlugin implements RVViewerPlugin {
     return new Vector3(0, 0, Math.sign(camUp.z) || 1);
   }
 
+  /**
+   * Minimum distance of an axis view, derived from the scene scale (plan-515
+   * F10): the pre-515 `d > 0.5 ? 2d : 5` with the 5 m floor capped at
+   * `2 · radius` (at least 1 mm). Without content the old 5 m / `2d` stays.
+   */
   private _modelFallbackDistance(): number {
     const viewer = this._viewer;
-    if (!viewer) return 5;
+    if (!viewer) return gizmoFallbackDistance(null, 0);
+    const scale = (viewer as unknown as { sceneScale?: { get(): ScaleLike } }).sceneScale?.get() ?? null;
     const root = (viewer as unknown as { currentModel: Object3D | null }).currentModel;
-    if (!root) return 5;
-    const v = new Vector3();
-    root.updateMatrixWorld(true);
-    root.getWorldPosition(v);
-    const d = v.distanceTo(viewer.controls.target);
-    return d > 0.5 ? d * 2 : 5;
+    let d = 0;
+    if (root) {
+      const v = new Vector3();
+      root.updateMatrixWorld(true);
+      root.getWorldPosition(v);
+      d = v.distanceTo(viewer.controls.target);
+    }
+    return gizmoFallbackDistance(scale, d);
   }
 
   // ─── Label ─────────────────────────────────────────────────────────

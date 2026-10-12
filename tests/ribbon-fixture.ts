@@ -35,7 +35,7 @@
  * NOT a `.test.ts` file, so vitest does not collect it.
  */
 
-import { BufferAttribute, BufferGeometry, Mesh, MeshStandardMaterial, Object3D, Scene, Vector3 } from 'three';
+import { BufferAttribute, BufferGeometry, Line, Mesh, MeshStandardMaterial, Object3D, Scene, Vector3 } from 'three';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
@@ -47,6 +47,8 @@ import type { RVRibbonPath } from '../src/core/engine/rv-ribbon-path';
 import type { RVRibbonDancer } from '../src/core/engine/rv-ribbon-dancer';
 import type { RVDrive } from '../src/core/engine/rv-drive';
 import { MM_TO_METERS } from '../src/core/engine/rv-constants';
+import { RibbonEditorPreview } from '../src/core/engine/rv-ribbon-editor-preview';
+import type { GizmoOptions } from '../src/core/engine/rv-gizmo-manager';
 
 /** rad -> deg. */
 const RAD_TO_DEG = 180 / Math.PI;
@@ -62,6 +64,16 @@ export class FakeDrive {
   targetPosition = 0;
   jogForward = false;
   jogBackward = false;
+  /**
+   * deg/s — the set-point. `RibbonWinder.SpeedControl` WRITES this, and a roller
+   * marked `drive.follow(name)` integrates its position from it, which is what
+   * closes the control loop inside the fixture.
+   */
+  targetSpeed = 0;
+  /** The three things `RibbonWinder` asks before it commands an axis. */
+  positionOverwrite = false;
+  liveControlled = false;
+  readonly driveBehaviors: unknown[] = [];
   /** Rotational unless a test says otherwise (a linear drive must be refused). */
   isRotary = true;
   /** Local drive axis, `ReverseDirection` already folded in (as `RVDrive.getAxis`). */
@@ -86,6 +98,7 @@ export class FakeDrive {
   reset(): void {
     this.currentPosition = 0;
     this.currentSpeed = 0;
+    this.targetSpeed = 0;
     this.jogForward = false;
     this.jogBackward = false;
   }
@@ -104,6 +117,8 @@ export class RibbonWebDriver {
   readonly drives = new Map<string, FakeDrive>();
   /** Driven roller name -> commanded surface speed in mm/s. */
   private readonly _targets = new Map<string, number>();
+  /** Rollers that follow their own drive set-point — see {@link follow}. */
+  private readonly _selfDriven = new Set<string>();
   private _default = 0;
 
   constructor(private readonly _radiusOf: (name: string) => number) {}
@@ -120,6 +135,20 @@ export class RibbonWebDriver {
     this._targets.set(name, vMmPerS);
   }
 
+  /**
+   * Hand one roller's speed over to its own drive SET-POINT, the way a real
+   * jogging `RVDrive` behaves: `omega = targetSpeed`, integrated per tick.
+   *
+   * This is what a test needs to exercise `RibbonWinder.SpeedControl` — the
+   * control writes `targetSpeed` and reads the result back out of the position
+   * on the next tick, so a fixture that keeps commanding a surface speed itself
+   * would simply overwrite the thing under test.
+   */
+  follow(name: string): void {
+    this._selfDriven.add(name);
+    this._targets.delete(name);
+  }
+
   /** mm/s — the surface speed currently commanded for `name`. */
   targetOf(name: string): number {
     return this._targets.get(name) ?? this._default;
@@ -133,10 +162,14 @@ export class RibbonWebDriver {
   /** Advance every driven roller's drive by `omega * dt` degrees. */
   tick(dt: number): void {
     for (const [name, drive] of this.drives) {
-      const r = this._radiusOf(name);
-      if (!(r > 0)) continue;
-      const v = this.targetOf(name);
-      const omegaDegPerS = (v / r) * RAD_TO_DEG;
+      let omegaDegPerS: number;
+      if (this._selfDriven.has(name)) {
+        omegaDegPerS = drive.targetSpeed;
+      } else {
+        const r = this._radiusOf(name);
+        if (!(r > 0)) continue;
+        omegaDegPerS = (this.targetOf(name) / r) * RAD_TO_DEG;
+      }
       drive.currentSpeed = omegaDegPerS;
       drive.jogForward = omegaDegPerS > 0;
       drive.jogBackward = omegaDegPerS < 0;
@@ -147,6 +180,7 @@ export class RibbonWebDriver {
   reset(): void {
     this._default = 0;
     this._targets.clear();
+    this._selfDriven.clear();
     for (const drive of this.drives.values()) drive.reset();
   }
 }
@@ -174,6 +208,8 @@ export interface RollerSpec {
 }
 
 export interface RibbonHarness {
+  /** Install a (usually stubbed) gizmo host BEFORE `buildPath` — plan-471 E7. */
+  useGizmoManager(manager: unknown): void;
   scene: Scene;
   root: Object3D;
   /** The node that carries the `RibbonPath` rv_extras. */
@@ -203,6 +239,95 @@ export interface RibbonHarness {
   addDrive(name: string, axis?: [number, number, number]): FakeDrive;
   /** Remove the `Drive` from a roller node again. */
   removeDrive(name: string): void;
+}
+
+interface StubEntry {
+  node: Object3D;
+  opts: GizmoOptions;
+  root: Object3D;
+  disposed: boolean;
+}
+
+export class RibbonPreviewGizmoStub {
+  private readonly _entries: StubEntry[] = [];
+  private _id = 0;
+
+  get live(): StubEntry[] { return this._entries.filter((e) => !e.disposed); }
+  get visible(): StubEntry[] { return this.live.filter((e) => e.root.visible); }
+
+  create(node: Object3D, opts: GizmoOptions) {
+    const entry: StubEntry = { node, opts: { ...opts }, root: new Object3D(), disposed: false };
+    this._entries.push(entry);
+    return {
+      id: `stub-${++this._id}`,
+      root: entry.root,
+      update: (next: Partial<GizmoOptions>) => { entry.opts = { ...entry.opts, ...next }; },
+      dispose: () => { entry.disposed = true; },
+    };
+  }
+
+  updateLinkLine(): void {}
+  textsOf(kind: string): string[] { return this.live.filter((e) => e.opts.kind === kind).map((e) => e.opts.text ?? ''); }
+  private actual(kind: string, nodeName?: string): Object3D[] {
+    const roots = new Set<Object3D>();
+    for (const entry of this.live) {
+      if (nodeName && entry.node.name !== nodeName) continue;
+      entry.node.traverse((object) => {
+        if (object.userData.ribbonPreviewKind === kind) roots.add(object);
+      });
+    }
+    return [...roots];
+  }
+  countOf(kind: string): number {
+    const managed = this.live.filter((e) => e.opts.kind === kind).length;
+    return managed + this.actual(kind).filter((o) => !this.live.some((e) => e.root === o)).length;
+  }
+  of(kind: string, nodeName?: string): Record<string, unknown> {
+    const entries = this.live.filter((e) => e.opts.kind === kind && (!nodeName || e.node.name === nodeName));
+    if (kind === 'winder-envelope') {
+      const radii = this.actual(kind, nodeName).map((arc) => Number(arc.userData.arcRadius) * MM_TO_METERS).sort((a, b) => a - b);
+      return { coreRadiusMm: radii[0], maxRadiusMm: radii[radii.length - 1] };
+    }
+    if (kind === 'wrap-arc') {
+      const arc = this.actual(kind, nodeName)[0];
+      const line = arc?.children.find((child) => (child as Line).isLine) as Line | undefined;
+      const material = line?.material as { color?: { getHex(): number } } | undefined;
+      return { spanRad: arc?.userData.arcSpan, color: material?.color?.getHex(), root: arc };
+    }
+    if (kind === 'tangent') return { root: entries[0]?.root, position: entries[0]?.root.position.clone() };
+    if (kind === 'dancer-track') {
+      const entry = entries[0];
+      const anchors = entry?.node.parent?.children.filter((child) => child.name === '__rvDancerTravel') ?? [];
+      const offsets = anchors.map((anchor) => (anchor.position.y - entry.node.position.y) * MM_TO_METERS).sort((a, b) => a - b);
+      const home = entries.find((e) => e.root.name === '__rvDancerHome')?.root.position.y ?? 0;
+      return { minMm: offsets[0], maxMm: offsets[offsets.length - 1], homeMm: home * MM_TO_METERS };
+    }
+    return { color: entries[0]?.opts.color, root: entries[0]?.root };
+  }
+}
+
+export function harnessWithPreview(specs: RollerSpec[], options: { mode: string }) {
+  const h = ribbonHarness(specs);
+  const gizmos = new RibbonPreviewGizmoStub();
+  h.useGizmoManager(gizmos);
+  let mode = options.mode;
+  const preview = new RibbonEditorPreview({
+    ribbonManager: h.ribbonManager,
+    get activeMode() { return mode; },
+    markRenderDirty() {},
+    markShadowsDirty() {},
+  });
+  const buildPath = h.buildPath.bind(h);
+  h.buildPath = (overrides = {}) => {
+    const path = buildPath(overrides);
+    preview.onRender(0);
+    return path;
+  };
+  return { h, preview, gizmos, setMode(next: string) { mode = next; } };
+}
+
+export function harnessWithDocument(specs: RollerSpec[]) {
+  return { h: ribbonHarness(specs), doc: { dirty: false } };
 }
 
 /** A box mesh sized so `measureRadiusMm` returns `radiusMm` about the Z axis. */
@@ -304,6 +429,10 @@ export function ribbonHarness(specs: RollerSpec[]): RibbonHarness {
 
   const deps: RuntimeNodeDeps = {
     registry, signalStore, scene, transportManager, ribbonManager, driveHost,
+    // plan-471: an optional overlay host. Left undefined unless a test installs
+    // one through `useGizmoManager`, so every existing fixture user keeps the
+    // no-overlay path it had.
+    gizmoManager: undefined,
   };
 
   // Rollers first: a RibbonPath resolves them through the component instances.
@@ -318,7 +447,6 @@ export function ribbonHarness(specs: RollerSpec[]): RibbonHarness {
         RibbonSide: spec.side ?? 'Left',
         ...(spec.winder
           ? {
-            CoreRadiusMm: 76.2,
             RibbonThicknessMm: 0.1,
             InitialWoundLengthMm: -1,
             RollMesh: transformRef(`Root/${spec.name}/Roll`),
@@ -350,6 +478,9 @@ export function ribbonHarness(specs: RollerSpec[]): RibbonHarness {
 
   return {
     scene, root, path, nodes, drive, registry, signalStore, transportManager, ribbonManager, deps, driveHost,
+    useGizmoManager(manager: unknown) {
+      (deps as { gizmoManager?: unknown }).gizmoManager = manager;
+    },
     buildPath(overrides: Record<string, unknown> = {}) {
       return makePath(path, specs.map((s) => s.name), overrides);
     },

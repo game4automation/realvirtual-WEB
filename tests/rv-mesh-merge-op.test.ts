@@ -28,6 +28,7 @@ import {
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
+import { buildInitContext, type InitContextDeps } from '../src/core/engine/rv-init-context';
 import { AssetDocument, planMergeMesh } from '../src/core/editor/rv-asset-document';
 import {
   assetOpHeader,
@@ -97,6 +98,17 @@ function makeMockViewer(opts?: { runtime?: boolean; groups?: boolean }): MockVie
       : null,
     drives: [] as unknown[],
     logicRunState: 'active',
+    // plan-757 F4: the subtree rebuild starts from the session's ONE init
+    // context (`RVViewer.initContext()`), built the same way as the real one.
+    initContext(this: { registry: NodeRegistry; signalStore: unknown; transportManager: unknown }) {
+      if (!this.registry || !this.signalStore || !this.transportManager) return null;
+      return buildInitContext({
+        registry: this.registry,
+        signalStore: this.signalStore as InitContextDeps['signalStore'],
+        transportManager: this.transportManager as InitContextDeps['transportManager'],
+        scene,
+      });
+    },
     get currentModelRoot() { return model; },
     instancePickIndex: {
       addSubtree() {}, removeSubtree() {}, bumpResolutionEpoch() {},

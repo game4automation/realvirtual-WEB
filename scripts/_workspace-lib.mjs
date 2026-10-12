@@ -6,7 +6,7 @@
  * from allowlisted inputs before a build is allowed to run.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
   closeSync,
@@ -25,10 +25,18 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+//! This module always executes out of the SOURCE repository — a staged workspace is a filtered
+//! COPY, never the thing that gets imported. Its own location is therefore the one reliable
+//! handle on the checkout that still has a `.git`, which is what runBuild() needs to read the
+//! build metadata the staged tree can no longer answer for.
+const SOURCE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 // Neutral FS/glob helpers. They live in their own module so `_rv-guards.mjs`
 // can use them without importing this file back (plan-700 §2.9); there is
@@ -92,7 +100,7 @@ const DELIVERY_CONFIG_KEYS = new Set([
   // repository back, since bundle-rag embeds them into the delivered project-config.json anyway.
   'requestyApiKey', 'requestyBaseUrl',
 ]);
-const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status']);
+const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status', 'loadSideEffects']);
 // Maturity of a delivered feature, independent of its tier. A feature can be fully entitled
 // and still be young; `beta` says so to the customer without withholding it. Absent means
 // `stable`, so every existing registration keeps its meaning unchanged.
@@ -152,6 +160,8 @@ const ALWAYS_DELIVERED_DOCS = [
   // rv-path.ts lives in src/core/engine and `Path` is a normative component in rv-odt.json — so
   // it ships unconditionally rather than behind an entitlement.
   'doc-path-fleet-control.md',
+  'doc-getting-started.md', 'doc-projects.md', 'doc-project-plugin-example.md',
+  'doc-embedding.md', 'doc-migration.md',
   // Unconditional since plan-739. Both used to sit in CONDITIONAL_DELIVERED_DOCS behind the
   // `layout-planner` / `multiuser` entitlements, which gated the DOCUMENT while the code shipped
   // to everyone anyway: the layout planner is statically imported by src/main.ts (see
@@ -226,16 +236,37 @@ const LIBRARY_CATALOG = `${LIBRARY_ROOT}/catalog.json`;
 // today; keying off its presence keeps the coupling honest if that ever changes.
 const LIBRARY_CONSUMER_DIR = 'src/plugins/layout-planner';
 const CORE_SCRIPT_FILES = [
+  'compile-project-scripts.mjs', 'compile-project-scripts.d.mts',
   'install-private-dependencies.mjs', 'patch-occt-memory.mjs',
   'build-local-library-catalog.mjs', 'inject-ga-settings.mjs',
   // vite.config.ts imports this at config-load time — the staged build fails without it.
   '_rv-private-assets.mjs', '_rv-private-assets.d.mts',
+  // vite.config.ts imports this at config-load time too (plan-553 F8: the cinematic loose assets).
+  '_rv-cinematic-assets.mjs', '_rv-cinematic-assets.d.mts',
+  // build-local-library-catalog.mjs imports this (plan-508). Every helper a staged script
+  // reaches by a relative import must be listed here — tests/bunny-deploy.node.test.ts
+  // walks those imports and fails on a missing one before a deploy does.
+  'lib/rv-hash.mjs',
+  // vite.config.ts imports this at config-load time (plan-508) — the staged vite build
+  // fails with "Could not resolve ./scripts/lib/rv-fs.mjs" without it.
+  'lib/rv-fs.mjs',
+  // The third-party notices plugin and its core (plan-544): vite.config.ts and
+  // vite.embed.config.ts import the plugin at config-load time, and every staged build —
+  // Bunny, customer workspace, CONNECT webui — emits THIRD-PARTY-NOTICES.txt through it.
+  'vite-plugin-third-party-notices.mjs', 'vite-plugin-third-party-notices.d.mts',
+  'lib/rv-third-party-notices.mjs', 'lib/rv-third-party-notices.d.mts',
 ];
 // Directories outside src/ and public/ that staged source imports (schema/v1/rv-odt.json
 // via src/core/engine/rv-component-registry.ts) — the build fails without them.
 // The MCP help guides used to be listed here too; they now live under
 // src/plugins/mcp-bridge/help/ and travel with src/ like any other source file.
-const CORE_DIRS = ['schema'];
+// `third-party` holds the licence policy, the manual component list and the canonical licence
+// texts the notices plugin reads at build time (plan-544) — the staged build needs them.
+const CORE_DIRS = ['schema', 'examples', 'third-party'];
+// The customer's own licence-policy file (plan-544 F3). Never shipped by us — a dev checkout that
+// happens to carry one must not leak it into a delivery — and never overwritten by a delivery
+// (applySnapshot keeps the customer's copy).
+const CUSTOMER_POLICY_FILE = 'third-party/license-policy.customer.json';
 // Recipes authored as real Markdown in the core repo's `recipes/` and copied verbatim into the
 // workspace, rather than generated as template literals below. Used for runbooks that are long,
 // code-block-heavy and identical for every customer, and that double as the canonical source for
@@ -298,7 +329,11 @@ const sharedCloneFolder = () => SHARED_REPO;
 //! The name a delivery may be called BY in generated, delivered text. It is the customer's
 //! display name in their own repository, and the neutral product name in the shared one.
 function deliveryDisplayName(delivery) {
-  return delivery?.sharedRepo === true ? SHARED_DISPLAY_NAME : delivery.project;
+  // `delivery?.project`, not `delivery.project`: `writeGeneratedDeliveryManifest()`
+  // reaches this with a null delivery (a staging run with no delivery profile at
+  // all, e.g. the documentation-tree test), where the manifest falls back to its
+  // own neutral name.
+  return delivery?.sharedRepo === true ? SHARED_DISPLAY_NAME : delivery?.project;
 }
 
 function isWithin(root, candidate) {
@@ -402,7 +437,16 @@ export function loadTierManifest(manifestPathOrPrivateRoot) {
     if (!REGISTRATION_STATUSES.includes(status)) {
       throw new Error(`${feature}.status must be one of ${REGISTRATION_STATUSES.join(', ')}.`);
     }
-    registrations[feature] = { adapter: registration.adapter, requires: [...requires], status };
+    // plan-598: `loadSideEffects: true` marks an adapter whose module graph
+    // registers something at module top level. Such a feature is never
+    // prefetched — its import stays inside the ordered register pass.
+    if (registration.loadSideEffects !== undefined && typeof registration.loadSideEffects !== 'boolean') {
+      throw new Error(`${feature}.loadSideEffects must be a boolean.`);
+    }
+    registrations[feature] = {
+      adapter: registration.adapter, requires: [...requires], status,
+      loadSideEffects: registration.loadSideEffects === true,
+    };
   }
 
   const rules = manifest.rules.map((rule, index) => {
@@ -873,17 +917,39 @@ function selectedDocumentation(manifest, profile) {
 }
 
 //! Generates the customer-specific private plugin entry point without any internal import.
+//!
+//! plan-598: the same contract as the checked-in private entry and the community
+//! stub (`src/core/rv-private-features.ts`) — `prefetchPrivateFeatures()` starts the
+//! imports of the entitled, side-effect-free features early; `registerPrivatePlugins()`
+//! registers every entitled feature in manifest order and consumes those imports.
+//! Every adapter is imported DYNAMICALLY (one chunk per feature, nothing welded into
+//! the entry), and only the entitled ones appear at all.
 export function generateCustomerPrivatePlugins(manifest, profile) {
   const features = selectedFeatures(manifest, profile);
-  const imports = features.map((feature, index) =>
-    `import { register as registerFeature${index} } from '${manifest.registrations[feature].adapter}';`);
-  const calls = features.map((_feature, index) => `  await registerFeature${index}(viewer);`);
+  const loader = (feature) => `() => import('${manifest.registrations[feature].adapter}')`;
+  const prefetched = features.filter((feature) => manifest.registrations[feature].loadSideEffects !== true);
+  const prefetchRows = prefetched.map((feature) => `  ['${feature}', ${loader(feature)}],`);
+  const calls = features.map((feature) =>
+    `  await registerPrivateFeature(viewer, '${feature}', ${loader(feature)}, mods);`);
   return [
     `import type { RVViewer } from '../../realvirtual-web/src/core/rv-viewer';`,
-    ...imports,
+    'import {',
+    '  registerPrivateFeature,',
+    '  startPrivateFeatureImports,',
+    '  type PrivateFeatureLoader,',
+    '  type PrivateFeatureModules,',
+    `} from '../../realvirtual-web/src/core/rv-private-features';`,
     '',
-    'export async function registerPrivatePlugins(viewer: RVViewer): Promise<void> {',
-    ...(calls.length ? calls : ['  void viewer;']),
+    'const PREFETCH_LOADERS: ReadonlyArray<readonly [string, PrivateFeatureLoader]> = [',
+    ...prefetchRows,
+    '];',
+    '',
+    'export function prefetchPrivateFeatures(): PrivateFeatureModules {',
+    '  return startPrivateFeatureImports(PREFETCH_LOADERS);',
+    '}',
+    '',
+    'export async function registerPrivatePlugins(viewer: RVViewer, mods?: PrivateFeatureModules): Promise<void> {',
+    ...(calls.length ? calls : ['  void viewer;', '  void mods;']),
     '}',
     '',
   ].join('\n');
@@ -1290,13 +1356,26 @@ function stableDocumentIdOf(path) {
 //! target is the demo PROJECT, resolved as a project rather than smuggled in as
 //! this project's start document.
 function writeGeneratedDeliveryManifest(coreOutput, delivery) {
-  const customer = String(delivery?.customer ?? '').trim();
+  // NO customer identity in the shared repository — the same rule, and the same
+  // reason, as the `connectLicensePrefill` guard in `generatedSettings()`
+  // (plan-434 §2.7). `deliver-release.mjs` collapses all standard customers into
+  // one target and drives the build with `shared.customers[0]`, so whichever slug
+  // sorts first stamped its name into a file EVERY standard customer receives:
+  // `rv-commercial/realvirtual-commercial` shipped `prj_delivery_hs-heilbronn` /
+  // "Hochschule Heilbronn" to all of them (observed on a customer install
+  // 2026-09-12). Blanking the customer here routes the identity through this
+  // function's own neutral fallbacks — `prj_delivery_standard` / `delivery` — and
+  // through `deliveryDisplayName()` for the name, which already answers
+  // `SHARED_DISPLAY_NAME` for this channel. The guard is on `sharedRepo`, not on
+  // the value, so a resolvable customer still is not written.
+  const shared = delivery?.sharedRepo === true;
+  const customer = shared ? '' : String(delivery?.customer ?? '').trim();
   const slug = customer.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   const manifest = {
     _generated: GENERATED_MANIFEST_NOTICE,
     schemaVersion: 2,
     id: `prj_delivery_${slug || 'standard'}`,
-    name: String(delivery?.project ?? '').trim() || 'realvirtual WEB',
+    name: String(deliveryDisplayName(delivery) ?? '').trim() || 'realvirtual WEB',
     canonicalName: slug || 'delivery',
     // `customer`, not the `delivery` this used to write (plan-739 F14). There is no `delivery`
     // kind: `PROJECT_KINDS` in scripts/_rv-guards.mjs is `customer | demo | internal`, and
@@ -1405,24 +1484,26 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
     if (!includePublicDemoContent) {
       if (normalized === 'scenes' || normalized.startsWith('scenes/')) return false;
       if (normalized === 'aasx' || normalized.startsWith('aasx/')) return false;
-      // The demo is ONE FOLDER since plan-737, so it is ONE RULE — the same
-      // subdirectory shape as `scenes/` and `aasx/` above, which is exactly why
-      // the move was worth making.
+      // The demo used to be filtered out here as well, one rule alongside
+      // `scenes/` and `aasx/`, on the argument that a customer gets it as a
+      // PROJECT (`projects/demo-realvirtual/`, `copyDemoRealvirtualFolder()`)
+      // and must not ALSO carry it on their deploy root.
       //
-      // What stood here before was three rules for three shapes of the same
-      // thing: a `project.json` line (a top-level FILE, which every
-      // subdirectory rule sailed past), a `DELIVERED_DEMO_MODEL_FILES` line,
-      // and a catch-all "no loose .glb at the root of public/" line. Each was a
-      // patch for the demo living at the deploy root rather than in a place of
-      // its own.
+      // THAT RULE IS GONE, because the place it sent the demo to is not served.
+      // A delivered workspace serves `realvirtual-web/` and nothing above it,
+      // so `projects/` is reachable through the File System Access picker only,
+      // and nothing pre-links it (`rv-project/linked` is written by the user's
+      // Add/relink flows alone since plan-743). Meanwhile the dashboard lists
+      // the `DemoRealvirtual` row UNCONDITIONALLY, "because a deploy serves it
+      // over HTTP" — so filtering the folder off the deploy root left every
+      // standard customer with a demo row that 404s on click.
       //
-      // A customer does still get the demo — as a PROJECT, staged into
-      // `projects/demo-realvirtual/` by `copyDemoRealvirtualFolder()`. What must
-      // not happen is it ALSO landing on their deploy root, where
-      // `BundledBackend` would read `demo-realvirtual/project.json` beside their
-      // own manifest and the delivery would ship the demo twice.
-      if (normalized === DEMO_PROJECT_FOLDER
-        || normalized.startsWith(`${DEMO_PROJECT_FOLDER}/`)) return false;
+      // Shipping it at the deploy root cannot hijack their boot: the
+      // `deployedManifest && hasDeployedManifest` branch in `ProjectStore`
+      // outranks the demo branch precisely so that "a customer deploy carries
+      // both" resolves to the customer's own project. The cost is the demo's
+      // bytes twice in the workspace (here and under `projects/`), accepted by
+      // user decision 2026-09-12 in exchange for a demo that opens.
     }
     // The bundled component library is delivered by copyDemoAssetsIntoCore, which filters it
     // to DELIVERED_LIBRARY_CATEGORIES and writes a matching reduced catalog. Copying the tree
@@ -1434,12 +1515,17 @@ function copyCore(coreRoot, outputRoot, deliveredDocs, publicModels = new Set(),
   });
   for (const name of CORE_DIRS) {
     const source = join(coreRoot, name);
-    if (existsSync(source)) copyTree(source, join(outputRoot, name));
+    if (existsSync(source)) {
+      copyTree(source, join(outputRoot, name), (rel) => `${name}/${rel}` !== CUSTOMER_POLICY_FILE);
+    }
   }
   mkdirSync(join(outputRoot, 'scripts'), { recursive: true });
   for (const name of CORE_SCRIPT_FILES) {
     const source = join(coreRoot, 'scripts', name);
-    if (existsSync(source)) copyFileSync(source, join(outputRoot, 'scripts', name));
+    if (!existsSync(source)) continue;
+    const target = join(outputRoot, 'scripts', name);
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(source, target);
   }
 }
 
@@ -1452,6 +1538,8 @@ function sourceAllowed(resolved, profile) {
 // The private package pulls NVIDIA's Omniverse library from NVIDIA's own registry. A customer has
 // neither the entitlement nor the registry credentials, so every trace of it is pruned out of the
 // delivered manifest and lockfile.
+//! Private asset folders (`<private>/assets/<folder>`) staged together with their feature (plan-550 F12).
+const PRIVATE_FEATURE_ASSET_DIRS = [['cinematic-render', 'oidn'], ['cinematic-render', 'envmaps']];
 const PRUNED_PRIVATE_SCOPE = '@nvidia/';
 const LOCK_DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 
@@ -1731,7 +1819,7 @@ function generateReadme(delivery, projectKey, model, features, projectPlugins = 
       `### Use your own machine model\n\n` +
       `Export the machine as a GLB file from Unity with the GLB export in realvirtual Professional, then place it in \`${projectPath}/models/\`. If the new file has the same name as the existing model, no configuration change is required. If it has a different name, update \`defaultModel\` in \`realvirtual-web/public/settings.json\`. GLB models are tracked with Git LFS.\n\n` +
       `### Custom development\n\n` +
-      `Create project-specific Viewer code only in \`${projectPath}/plugins/\`. Add a plugin file there, export and register it from \`${projectPath}/plugins/index.ts\`, then restart the development server so Vite discovers the changed project entry point. See [Extending realvirtual WEB](realvirtual-web/doc-extending-webviewer.md) and [Scripting](realvirtual-web/doc-scripting.md). Before opening a pull request, run \`npx tsc --noEmit\` and \`npm run build\` from \`realvirtual-web/\`.\n\n`) +
+      `Create project-specific Viewer code only in \`${projectPath}/plugins/\`. Add a plugin file there, bind the document's PLUGIN slot to it (\`documents[].scriptRef\`), and compile it with \`npm run build:project-scripts -- ../${projectPath}\` from \`realvirtual-web/\`. See [Extending realvirtual WEB](realvirtual-web/doc-extending-webviewer.md) and [Scripting](realvirtual-web/doc-scripting.md). Before opening a pull request, run \`npx tsc --noEmit\` and \`npm run build\` from \`realvirtual-web/\`.\n\n`) +
     `### AI-assisted development (optional)\n\n` +
     `The workspace includes \`CLAUDE.md\` and an MCP bridge. If you start Claude Code, or another MCP-capable assistant, in the workspace folder, it can inspect and modify the running scene through the \`web_*\` MCP tools. This requires your own subscription with the respective provider; realvirtual supplies the integration, not an assistant licence.\n\n` +
     // The delivery channel, stated once and differently for the two relationships (§2.2).
@@ -2321,7 +2409,7 @@ function generateWorkspaceGuide(projectKey, deliveredDocs) {
       ? `- \`projects/${projectKey}/\` is the customer-owned development area. Edit project models, documentation, and plugins only there.\n`
       : `- \`projects/\` is the customer-owned development area and starts out empty. Create \`projects/<your-project>/\` and edit models, documentation, and plugins only there.\n`) +
     `- \`realvirtual-web/\`, \`realvirtual-web-pro/\`, \`connect/\`, and delivery manifests are delivery-managed and are replaced by the next delivery.\n\n` +
-    `The project plugin entry point is \`${projectPath}/plugins/index.ts\`. Put new plugin files in the same directory and register them from that entry point. Restart the development server after changing registration.\n\n` +
+    `Put project plugin modules under \`${projectPath}/plugins/\`, export registerModelPlugins and unregisterModelPlugins, and bind each document through its PLUGIN slot (\`documents[].scriptRef\`). Compile the JavaScript sibling with \`npm run build:project-scripts -- ../${projectPath}\` from \`realvirtual-web/\`. A collecting index.ts is optional.\n\n` +
     `## Commands\n\n` +
     `Start the workspace from its root. realvirtual CONNECT serves the Viewer at http://localhost:5100 and starts the development server itself, so there is one address in every setup:\n\n` +
     `\`\`\`bash\npowershell -NoProfile -ExecutionPolicy Bypass -File .\\start.ps1\n\`\`\`\n\n` +
@@ -2598,8 +2686,42 @@ export function assertNoBrokenDocLinks(stagingRoot) {
   });
 }
 
+//! True when `RV_KEEP_STAGING=1` asks every staging owner to leave its temp workspace behind,
+//! so a failed deploy or delivery stays forensically inspectable (plan-487).
+export function keepStagingRequested(env = process.env) {
+  return String(env.RV_KEEP_STAGING ?? '').trim() === '1';
+}
+
+//! Runs `action` and removes `stagingRoot` if it throws — the cleanup belongs to whoever
+//! CREATED the temp directory, because a caller whose call failed never received a handle to
+//! remove it. Before this, every deploy that failed while copying or building left an
+//! `rv-customer-workspace-*` directory in the system temp folder (855 of them by 2026-09-15).
+//! `RV_KEEP_STAGING=1` keeps the directory and says where it is.
+export function withStagingCleanup(stagingRoot, action) {
+  try {
+    return action();
+  } catch (error) {
+    if (keepStagingRequested()) {
+      console.warn(`[staging] kept after failure (RV_KEEP_STAGING=1): ${stagingRoot}`);
+    } else {
+      // A node_modules junction into the shared build cache is unlinked, not followed.
+      try { rmSync(stagingRoot, { recursive: true, force: true }); } catch { /* the original error wins */ }
+    }
+    throw error;
+  }
+}
+
 //! Creates an allowlisted source tree in the flat customer workspace layout.
+//! With no `destinationRoot` the tree goes into a fresh temp directory that is removed again
+//! when staging itself fails (see withStagingCleanup); a caller-owned `destinationRoot` is
+//! left to its owner.
 export function stageFilteredSourceTree(options) {
+  if (options.destinationRoot) return stageFilteredSourceTreeAt(options, resolve(options.destinationRoot));
+  const created = mkdtempSync(join(tmpdir(), 'rv-customer-workspace-'));
+  return withStagingCleanup(created, () => stageFilteredSourceTreeAt(options, created));
+}
+
+function stageFilteredSourceTreeAt(options, destinationRoot) {
   const coreRoot = resolve(options.coreRoot);
   const privateRoot = resolve(options.privateRoot);
   // `projectKey` is the PRIMARY project: the one the generated README, settings,
@@ -2619,9 +2741,6 @@ export function stageFilteredSourceTree(options) {
   const manifest = existsSync(manifestPath)
     ? loadTierManifest(manifestPath)
     : { defaults: 'internal', rules: [], registrations: {}, path: manifestPath };
-  const destinationRoot = options.destinationRoot
-    ? resolve(options.destinationRoot)
-    : mkdtempSync(join(tmpdir(), 'rv-customer-workspace-'));
   if (existsSync(destinationRoot) && readdirSync(destinationRoot).length > 0) {
     throw new Error(`Destination must be empty: ${destinationRoot}`);
   }
@@ -2709,6 +2828,22 @@ export function stageFilteredSourceTree(options) {
     };
     writeFileSync(join(privateOutput, 'tier-manifest.json'), JSON.stringify(deliveredManifest, null, 2) + '\n');
     writePrunedPrivatePackage(privateRoot, privateOutput);
+    // The Private licence policy travels with the private tree (plan-544 F12): the staged build
+    // reads it from `<private>/third-party/` exactly like the dev checkout does, and a customer
+    // workspace keeps it so the customer's own `npm run build` judges the same package set.
+    const privatePolicy = join(privateRoot, 'third-party', 'license-policy.json');
+    if (existsSync(privatePolicy)) {
+      mkdirSync(join(privateOutput, 'third-party'), { recursive: true });
+      copyFileSync(privatePolicy, join(privateOutput, 'third-party', 'license-policy.json'));
+    }
+    // Vendored runtime assets of delivered features (plan-550 F12): the private package has no
+    // `public/`, so a feature's loose files live in `assets/<name>/` and a Vite plugin serves /
+    // emits them (`cinematicAssetsPlugin` → `<base>oidn/`, `<base>envmaps/`). Staged only with their feature.
+    for (const [feature, folder] of PRIVATE_FEATURE_ASSET_DIRS) {
+      const source = join(privateRoot, 'assets', folder);
+      if (!existsSync(source) || !selectedFeatures(manifest, profile).includes(feature)) continue;
+      copyTree(source, join(privateOutput, 'assets', folder));
+    }
     // `rag/` holds the embedded form of this project's document corpus - a build INPUT of
     // bundle-rag.mjs, versioned next to the documents it was computed from (LFS, hundreds of
     // MB). The customer receives its filtered OUTPUT as connect/rag.zip and has no use for the
@@ -2955,12 +3090,46 @@ function runNpm(args, options) {
   return execFileSync(['npm.cmd', ...args.map(quoteNpmArg)].join(' '), { ...options, shell: true });
 }
 
-function buildProfileKey(workspaceRoot, coreRoot) {
+// ─── Shared build cache (plan-487) ────────────────────────────────────────
+//
+// `<RV_BUILD_CACHE|tmp>/rv-build-cache/<profileKey>/node_modules` is shared by every local
+// `--fast` build on the machine: two deploys (or a deploy and a delivery) with the same
+// profile key read the same directory, a restored build even reads it through a junction for
+// the whole Vite run. Deleting a profile is therefore only safe when nobody reads it, and
+// that is what the reader/writer protection below decides:
+//
+// - READERS register a lease file (`rv-build-cache.locks/leases/<profileKey>/<pid>-<uuid>.lease`)
+//   before they restore, and remove it only when their build has ended — including the
+//   failure path.
+// - WRITERS (restore-failure discard, pruning, publishing a freshly populated profile) take the
+//   short-lived writer lock (`rv-build-cache.locks/writer`, an atomic `mkdirSync`) and delete
+//   a profile only when no live lease names it. Deletion is a rename into a trash folder under
+//   the lock and the slow `rmSync` after it, so the lock is never held for gigabytes of I/O.
+//
+// The locks live NEXT TO the cache directory rather than inside it, so the cache directory
+// keeps listing nothing but profiles. A lease or writer lock whose process is gone is stale and
+// ignored: a crashed build must not pin a profile forever.
+
+const BUILD_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const BUILD_CACHE_LOCK_WAIT_MS = 10 * 60 * 1000;
+const BUILD_CACHE_LOCK_CLAIM_GRACE_MS = 30 * 1000;
+const BUILD_CACHE_PROFILE_NAME = /^[0-9a-f]{64}$/;
+const BUILD_CACHE_LEFTOVER_NAME = /^\.rv-build-(?:trash|profile)-/;
+
+//! The runtime a node_modules tree was installed for: Node major, module ABI, platform and CPU
+//! architecture. Part of the profile key, because native modules built for one ABI do not load
+//! under another — and a local Node update changes none of the lockfiles.
+export function buildRuntimeIdentity() {
+  return `node-${process.versions.node.split('.')[0]}|abi-${process.versions.modules}|${process.platform}-${process.arch}`;
+}
+
+function buildProfileKey(workspaceRoot, coreRoot, runtimeIdentity = buildRuntimeIdentity()) {
   const lockfiles = [['realvirtual-web/package-lock.json', join(coreRoot, 'package-lock.json')]];
   const proLock = join(workspaceRoot, 'realvirtual-web-pro', 'package-lock.json');
   if (existsSync(proLock)) lockfiles.push(['realvirtual-web-pro/package-lock.json', proLock]);
   try {
     const hash = createHash('sha256');
+    hash.update('runtime'); hash.update('\0'); hash.update(String(runtimeIdentity)); hash.update('\0');
     for (const [label, path] of lockfiles) {
       if (!existsSync(path)) return null;
       hash.update(label); hash.update('\0'); hash.update(readFileSync(path)); hash.update('\0');
@@ -2970,6 +3139,183 @@ function buildProfileKey(workspaceRoot, coreRoot) {
     console.warn(`[build-cache] Lockfile hash unavailable; running npm ci: ${error?.message ?? error}`);
     return null;
   }
+}
+
+//! Installs the private package's dependencies into a staged workspace — the step the core's
+//! `postinstall` performs after `npm ci`, needed again after a build-cache hit that skips it.
+//! No-op without a staged private package or without the script.
+function runPrivateDependencyInstall(workspaceRoot, coreRoot, env) {
+  const script = join(coreRoot, 'scripts', 'install-private-dependencies.mjs');
+  if (!existsSync(join(workspaceRoot, 'realvirtual-web-pro', 'package.json')) || !existsSync(script)) return;
+  execFileSync(process.execPath, [script], { cwd: coreRoot, env, stdio: 'inherit' });
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function buildCacheLockRoot(cacheBase) {
+  return `${cacheBase}.locks`;
+}
+
+function buildCacheLeaseDir(cacheBase, profileKey) {
+  return join(buildCacheLockRoot(cacheBase), 'leases', profileKey);
+}
+
+function writerLockAbandoned(lockDir) {
+  try {
+    const owner = JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf8'));
+    return !processIsAlive(owner.pid);
+  } catch {
+    // No owner yet: either a claim between mkdir and write, or a crash in exactly that gap.
+    try {
+      return Date.now() - statSync(lockDir).mtimeMs > BUILD_CACHE_LOCK_CLAIM_GRACE_MS;
+    } catch {
+      return false;
+    }
+  }
+}
+
+//! Runs `action` under the machine-wide writer lock of one cache directory. Returns
+//! `{ acquired, value }`; `acquired: false` after `waitMs` means "leave the cache alone".
+function withBuildCacheWriteLock(cacheBase, action, { waitMs = BUILD_CACHE_LOCK_WAIT_MS } = {}) {
+  const lockRoot = buildCacheLockRoot(cacheBase);
+  const lockDir = join(lockRoot, 'writer');
+  mkdirSync(lockRoot, { recursive: true });
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      mkdirSync(lockDir);
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (writerLockAbandoned(lockDir)) {
+        // Rename before removing: of two processes breaking the same stale lock only one wins
+        // the rename, and the other simply retries its mkdir.
+        const grave = `${lockDir}.abandoned-${process.pid}-${randomUUID()}`;
+        try { renameSync(lockDir, grave); rmSync(grave, { recursive: true, force: true }); } catch { /* lost the race */ }
+        continue;
+      }
+      if (Date.now() >= deadline) return { acquired: false, value: undefined };
+      sleepSync(50);
+    }
+  }
+  try {
+    writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, at: Date.now() }));
+    return { acquired: true, value: action() };
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
+// Caller holds the writer lock.
+function registerBuildCacheLease(cacheBase, profileKey) {
+  const dir = buildCacheLeaseDir(cacheBase, profileKey);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${process.pid}-${randomUUID()}.lease`);
+  writeFileSync(path, JSON.stringify({ pid: process.pid, at: Date.now() }));
+  return { cacheBase, profileKey, path };
+}
+
+//! Registers a reader lease on one build-cache profile; null when the writer lock stayed busy.
+//! `runBuild` holds one from before the restore until its build has ended.
+export function acquireBuildCacheLease(cacheBase, profileKey, { waitMs = BUILD_CACHE_LOCK_WAIT_MS } = {}) {
+  const claimed = withBuildCacheWriteLock(cacheBase, () => registerBuildCacheLease(cacheBase, profileKey), { waitMs });
+  return claimed.acquired ? claimed.value : null;
+}
+
+//! Releases a lease from acquireBuildCacheLease (null-safe).
+export function releaseBuildCacheLease(lease) {
+  if (!lease) return;
+  try { rmSync(lease.path, { force: true }); } catch { /* a stale lease is ignored by its pid anyway */ }
+}
+
+// Caller holds the writer lock. Leases of dead processes are removed on the way.
+function liveBuildCacheLeases(cacheBase, profileKey, ownLease = null) {
+  const dir = buildCacheLeaseDir(cacheBase, profileKey);
+  if (!existsSync(dir)) return 0;
+  let live = 0;
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    if (ownLease && resolve(path) === resolve(ownLease.path)) continue;
+    if (processIsAlive(Number.parseInt(name, 10))) live++;
+    else rmSync(path, { force: true });
+  }
+  return live;
+}
+
+// Caller holds the writer lock. Moves one cache entry aside; the caller removes it after unlocking.
+function detachBuildCacheEntry(cacheBase, name) {
+  const trash = join(cacheBase, `.rv-build-trash-${randomUUID()}`);
+  try {
+    renameSync(join(cacheBase, name), trash);
+    return trash;
+  } catch (error) {
+    console.warn(`[build-cache] Could not move ${name} aside; leaving it in place: ${error?.message ?? error}`);
+    return null;
+  }
+}
+
+function removeBuildCacheTrash(paths) {
+  for (const path of paths) {
+    if (!path) continue;
+    try { rmSync(path, { recursive: true, force: true }); } catch (error) {
+      console.warn(`[build-cache] Could not remove ${path}: ${error?.message ?? error}`);
+    }
+  }
+}
+
+// Caller holds the writer lock. Profiles unused for `maxAgeMs` that no live lease names, plus
+// abandoned population/trash folders of the same age. `keepKey` is the caller's own profile.
+function detachAgedBuildCacheProfiles(cacheBase, { keepKey, maxAgeMs = BUILD_CACHE_MAX_AGE_MS, now = Date.now() }) {
+  const trash = [];
+  if (!existsSync(cacheBase)) return trash;
+  for (const entry of readdirSync(cacheBase, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === keepKey) continue;
+    const isProfile = BUILD_CACHE_PROFILE_NAME.test(entry.name);
+    if (!isProfile && !BUILD_CACHE_LEFTOVER_NAME.test(entry.name)) continue;
+    let ageMs;
+    try { ageMs = now - statSync(join(cacheBase, entry.name)).mtimeMs; } catch { continue; }
+    if (ageMs < maxAgeMs) continue;
+    if (isProfile && liveBuildCacheLeases(cacheBase, entry.name) > 0) continue;
+    const detached = isProfile ? detachBuildCacheEntry(cacheBase, entry.name) : join(cacheBase, entry.name);
+    if (!detached) continue;
+    trash.push(detached);
+    if (isProfile) rmSync(buildCacheLeaseDir(cacheBase, entry.name), { recursive: true, force: true });
+  }
+  return trash;
+}
+
+function touchBuildCacheProfile(profileRoot) {
+  const now = new Date();
+  try { utimesSync(profileRoot, now, now); } catch { /* age is a pruning hint, not a correctness input */ }
+}
+
+//! A profile whose restore failed is deleted — but only when no other build reads it right now.
+function discardBrokenBuildCacheProfile(cacheBase, profileKey, ownLease) {
+  const outcome = withBuildCacheWriteLock(cacheBase, () => {
+    const others = liveBuildCacheLeases(cacheBase, profileKey, ownLease);
+    return others > 0 ? { others, trash: null } : { others, trash: detachBuildCacheEntry(cacheBase, profileKey) };
+  });
+  if (!outcome.acquired) {
+    console.warn('[build-cache] Cache lock busy; the unrestorable profile is left in place.');
+    return;
+  }
+  if (outcome.value.others > 0) {
+    console.warn(`[build-cache] Cache restore failed, but ${outcome.value.others} other build(s) read this profile; leaving it in place.`);
+    return;
+  }
+  removeBuildCacheTrash([outcome.value.trash]);
 }
 
 function restoreCachedNodeModules(cacheNodeModules, targetNodeModules) {
@@ -2990,32 +3336,104 @@ function restoreCachedNodeModules(cacheNodeModules, targetNodeModules) {
   }
 }
 
-function populateBuildCache(cacheBase, profileRoot, sourceNodeModules) {
+function populateBuildCache(cacheBase, profileKey, sourceNodeModules, ownLease) {
+  const profileRoot = join(cacheBase, profileKey);
   if (!existsSync(sourceNodeModules)) {
     console.warn('[build-cache] npm ci did not create node_modules; cache was not populated.');
     return false;
   }
   mkdirSync(cacheBase, { recursive: true });
   if (existsSync(join(profileRoot, 'node_modules'))) return true;
-  if (existsSync(profileRoot)) rmSync(profileRoot, { recursive: true, force: true });
+  // The copy is the slow part and runs outside the writer lock, into a private folder; only
+  // the swap into place is locked.
   const temporaryProfile = mkdtempSync(join(cacheBase, '.rv-build-profile-'));
   try {
     cpSync(sourceNodeModules, join(temporaryProfile, 'node_modules'), { recursive: true, force: true });
-    try {
-      renameSync(temporaryProfile, profileRoot);
-    } catch (error) {
-      if (!existsSync(join(profileRoot, 'node_modules'))) throw error;
-      rmSync(temporaryProfile, { recursive: true, force: true });
-    }
-    return true;
   } catch (error) {
-    rmSync(temporaryProfile, { recursive: true, force: true });
+    removeBuildCacheTrash([temporaryProfile]);
     console.warn(`[build-cache] Cache population failed; this build remains valid: ${error?.message ?? error}`);
     return false;
   }
+  const outcome = withBuildCacheWriteLock(cacheBase, () => {
+    // Another build published the same profile while this one was copying.
+    if (existsSync(join(profileRoot, 'node_modules'))) return { installed: true, trash: [temporaryProfile] };
+    const trash = [];
+    if (existsSync(profileRoot)) {
+      // A partial profile (no node_modules). Replacing it is a delete, so the lease rule applies.
+      if (liveBuildCacheLeases(cacheBase, profileKey, ownLease) > 0) {
+        return { installed: false, trash: [temporaryProfile], reason: 'the partial profile is in use' };
+      }
+      const detached = detachBuildCacheEntry(cacheBase, profileKey);
+      if (!detached) return { installed: false, trash: [temporaryProfile], reason: 'the partial profile could not be moved' };
+      trash.push(detached);
+    }
+    try {
+      renameSync(temporaryProfile, profileRoot);
+    } catch (error) {
+      return { installed: false, trash: [...trash, temporaryProfile], reason: error?.message ?? String(error) };
+    }
+    return { installed: true, trash };
+  });
+  if (!outcome.acquired) {
+    removeBuildCacheTrash([temporaryProfile]);
+    console.warn('[build-cache] Cache lock busy; cache was not populated. This build remains valid.');
+    return false;
+  }
+  removeBuildCacheTrash(outcome.value.trash);
+  if (!outcome.value.installed) {
+    console.warn(`[build-cache] Cache population skipped; this build remains valid: ${outcome.value.reason}`);
+    return false;
+  }
+  touchBuildCacheProfile(profileRoot);
+  return true;
+}
+
+//! Local wall-clock time as "YYYY-MM-DD HH:MM". Deliberately not toISOString(), which is UTC
+//! and would read an hour or two off the clock the operator is looking at.
+function localBuildTimestamp(now = new Date()) {
+  const pad = value => String(value).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    + ` ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
+//! The build-metadata environment a staged build cannot work out for itself.
+//!
+//! vite.config.ts asks git for build number, commit and commit date — but a deploy compiles a
+//! FILTERED STAGING TREE that carries no `.git`, so every one of those calls fell back and the
+//! delivered bundle claimed "web build 0" with no commit and today's date. Reading them here,
+//! in the source repository, and handing them over as environment is what makes a delivered
+//! build say the truth. `RV_BUILD_TIME` is the one value git cannot answer: when this build ran.
+//!
+//! Without git (no binary, no repository) only `RV_BUILD_TIME` is returned — the three git
+//! values are simply left out and vite.config.ts behaves exactly as it does today.
+export function buildMetadataEnv(sourceRoot = SOURCE_ROOT, now = new Date()) {
+  const env = { RV_BUILD_TIME: localBuildTimestamp(now) };
+  // stderr is swallowed on purpose: "not a git repository" is an expected answer here, not a
+  // fault, and printing it into a deploy log reads like one.
+  const read = args => {
+    try {
+      const value = execFileSync('git', args, { cwd: sourceRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      return value.trim() || null;
+    } catch {
+      return null;
+    }
+  };
+  const webBuild = read(['rev-list', '--count', 'HEAD']);
+  if (webBuild) env.RV_WEB_BUILD = webBuild;
+  const commit = read(['rev-parse', '--short', 'HEAD']);
+  if (commit) env.RV_COMMIT = commit;
+  const buildDate = read(['log', '-1', '--format=%cd', '--date=short']);
+  if (buildDate) env.RV_BUILD_DATE = buildDate;
+  return env;
 }
 
 //! Runs npm ci and the production build from the filtered workspace core.
+//!
+//! `fast: true` reuses a cached node_modules for an unchanged lockfile/runtime profile and
+//! holds a reader lease on that profile until the build has ended (see "Shared build cache").
+//! Test seams: `npmRunner`, `cacheRestore` (replaces the junction/copy restore),
+//! `runtimeIdentity` (replaces buildRuntimeIdentity()) and `sourceRoot` (the repository the
+//! build metadata is read from).
 export function runBuild(workspaceRoot, options = {}) {
   const candidate = resolve(workspaceRoot);
   const coreRoot = existsSync(join(candidate, 'realvirtual-web', 'package.json')) ? join(candidate, 'realvirtual-web') : candidate;
@@ -3041,7 +3459,18 @@ export function runBuild(workspaceRoot, options = {}) {
   }
   else { delete env.VITE_PUBLIC_BUILD; env.VITE_PRIVATE_BUILD = '1'; }
   if (options.base) env.VITE_BASE = options.base;
+  // Marks this as OUR staged release build for the third-party notices (plan-544 F11): without
+  // RV_NOTICES_MODE the plugin uses the release default (warn until Phase 6, then enforce),
+  // while a customer's own `npm run build` — which never passes through here — stays warn.
+  env.RV_NOTICES_RELEASE_BUILD = '1';
+  // The version line the built bundle shows. Additive: an operator who already set one of
+  // these in the environment keeps their value, and a checkout without git contributes only
+  // the build time.
+  for (const [key, value] of Object.entries(buildMetadataEnv(options.sourceRoot ?? SOURCE_ROOT))) {
+    if (!env[key] || !String(env[key]).trim()) env[key] = value;
+  }
   const npmRunner = options.npmRunner ?? runNpm;
+  const restoreCache = options.cacheRestore ?? restoreCachedNodeModules;
   const targetNodeModules = join(coreRoot, 'node_modules');
   let cacheStatus = options.fast ? 'rebuild' : 'disabled';
   let cacheMethod = null;
@@ -3049,41 +3478,67 @@ export function runBuild(workspaceRoot, options = {}) {
   let installDependencies = true;
   let populateCache = false;
   let cacheBase = null;
-  let profileRoot = null;
-  if (options.fast) {
-    profileKey = buildProfileKey(candidate, coreRoot);
-    if (profileKey) {
-      cacheBase = join(process.env.RV_BUILD_CACHE || tmpdir(), 'rv-build-cache');
-      profileRoot = join(cacheBase, profileKey);
-      const cachedNodeModules = join(profileRoot, 'node_modules');
-      if (existsSync(cachedNodeModules)) {
-        cacheMethod = restoreCachedNodeModules(cachedNodeModules, targetNodeModules);
-        if (cacheMethod) {
-          cacheStatus = 'hit';
-          installDependencies = false;
+  let lease = null;
+  try {
+    if (options.fast) {
+      profileKey = buildProfileKey(candidate, coreRoot, options.runtimeIdentity ?? buildRuntimeIdentity());
+      if (profileKey) {
+        cacheBase = join(process.env.RV_BUILD_CACHE || tmpdir(), 'rv-build-cache');
+        mkdirSync(cacheBase, { recursive: true });
+        // One writer-locked step: register this build as a reader of its profile, and prune
+        // aged profiles nobody reads. The lease stays until the build below has ended.
+        const claimed = withBuildCacheWriteLock(cacheBase, () => ({
+          lease: registerBuildCacheLease(cacheBase, profileKey),
+          trash: detachAgedBuildCacheProfiles(cacheBase, { keepKey: profileKey }),
+        }));
+        if (!claimed.acquired) {
+          console.warn('[build-cache] Cache lock busy; running npm ci without the cache.');
+          cacheBase = null;
         } else {
-          rmSync(profileRoot, { recursive: true, force: true });
+          lease = claimed.value.lease;
+          removeBuildCacheTrash(claimed.value.trash);
+          const profileRoot = join(cacheBase, profileKey);
+          const cachedNodeModules = join(profileRoot, 'node_modules');
+          if (existsSync(cachedNodeModules)) {
+            cacheMethod = restoreCache(cachedNodeModules, targetNodeModules);
+            if (cacheMethod) {
+              cacheStatus = 'hit';
+              installDependencies = false;
+              touchBuildCacheProfile(profileRoot);
+              // The cache holds realvirtual-web/node_modules only. The private package's own
+              // dependencies (realvirtual-web-pro/node_modules, e.g. three-gpu-pathtracer for the
+              // cinematic renderer) come from the core's postinstall — which a cache hit skips with
+              // `npm ci`. Run that step explicitly, so a hit builds exactly what a miss builds
+              // (/dev failed on every hit from 2026-10-04 to 2026-10-09). Idempotent: it installs
+              // only what is missing and does nothing without a private package.
+              (options.privateDepsRunner ?? runPrivateDependencyInstall)(candidate, coreRoot, env);
+            } else {
+              discardBrokenBuildCacheProfile(cacheBase, profileKey, lease);
+            }
+          }
         }
       }
     }
-  }
-  if (installDependencies) {
-    if (existsSync(targetNodeModules) && lstatSync(targetNodeModules).isSymbolicLink()) {
-      rmSync(targetNodeModules, { recursive: true, force: true });
+    if (installDependencies) {
+      if (existsSync(targetNodeModules) && lstatSync(targetNodeModules).isSymbolicLink()) {
+        rmSync(targetNodeModules, { recursive: true, force: true });
+      }
+      npmRunner(['ci'], { cwd: coreRoot, env, stdio: 'inherit' });
+      populateCache = Boolean(options.fast && profileKey && cacheBase);
     }
-    npmRunner(['ci'], { cwd: coreRoot, env, stdio: 'inherit' });
-    populateCache = Boolean(options.fast && profileKey && cacheBase && profileRoot);
+    npmRunner(['run', 'build'], { cwd: coreRoot, env, stdio: 'inherit' });
+    if (populateCache) populateBuildCache(cacheBase, profileKey, targetNodeModules, lease);
+    const distDir = join(coreRoot, 'dist');
+    writeFileSync(join(distDir, '.rv-build-provenance.json'), JSON.stringify({
+      sourceTreeSha256: hashTree(candidate, ['realvirtual-web/dist/**', '**/node_modules/**']),
+      mode: options.mode ?? 'private',
+      project: options.projectKey ?? null,
+      fast: Boolean(options.fast),
+    }, null, 2) + '\n');
+    return { coreRoot, distDir, dryRun: false, cacheStatus, cacheMethod, profileKey };
+  } finally {
+    releaseBuildCacheLease(lease);
   }
-  npmRunner(['run', 'build'], { cwd: coreRoot, env, stdio: 'inherit' });
-  if (populateCache) populateBuildCache(cacheBase, profileRoot, targetNodeModules);
-  const distDir = join(coreRoot, 'dist');
-  writeFileSync(join(distDir, '.rv-build-provenance.json'), JSON.stringify({
-    sourceTreeSha256: hashTree(candidate, ['realvirtual-web/dist/**', '**/node_modules/**']),
-    mode: options.mode ?? 'private',
-    project: options.projectKey ?? null,
-    fast: Boolean(options.fast),
-  }, null, 2) + '\n');
-  return { coreRoot, distDir, dryRun: false, cacheStatus, cacheMethod, profileKey };
 }
 
 //! Rejects a build directory without matching generated provenance.
@@ -3508,6 +3963,10 @@ export function applySnapshot(stagedRoot, cloneRoot, options = {}) {
   }
 
   // ── 1. The core: everything outside projects/ ─────────────────────────
+  // The customer's licence-policy file (plan-544 F3) lives in the core tree but belongs to the
+  // customer: saved before the core is wiped and restored after the copy, never overwritten.
+  const customerPolicyPath = join(clone, 'realvirtual-web', ...CUSTOMER_POLICY_FILE.split('/'));
+  const customerPolicy = existsSync(customerPolicyPath) ? readFileSync(customerPolicyPath) : null;
   for (const entry of readdirSync(clone, { withFileTypes: true })) {
     if (entry.name === '.git' || entry.name === 'projects') continue;
     rmSync(join(clone, entry.name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -3518,6 +3977,10 @@ export function applySnapshot(stagedRoot, cloneRoot, options = {}) {
     // it makes the customer-owned folder exist in a repository that cannot carry
     // an empty directory. Everything below it is decided in step 2.
     && (!rel.startsWith('projects/') || rel === 'projects/.gitkeep'));
+  if (customerPolicy) {
+    mkdirSync(dirname(customerPolicyPath), { recursive: true });
+    writeFileSync(customerPolicyPath, customerPolicy);
+  }
 
   // ── 2. projects/ — the customer's territory ───────────────────────────
   const seeded = [];

@@ -88,7 +88,16 @@ import {
   isEmptyClassification,
   type DocumentClassification,
 } from '../../project/rv-document-classification';
-import { RV_NODE_ID_KEY, ROOT_SOURCE_KEY } from '../../engine/rv-node-id';
+import {
+  RV_DOCUMENT_INFO_KEY,
+  documentInfoPayload,
+  isEmptyDocumentInfo,
+  type DocumentInfo,
+} from '../../project/rv-document-info';
+import { RV_NODE_ID_KEY, ROOT_SOURCE_KEY, getNodeId } from '../../engine/rv-node-id';
+import { reportPlacementNameEmpty } from '../problems-store';
+import { getAssetReference } from '../../engine/rv-asset-reference';
+import { isPlacementRoot } from '../../engine/rv-placement-instancer';
 import type { NodeRegistry } from '../../engine/rv-node-registry';
 import type { ComposedFrame } from '../../engine/rv-glb-compose';
 
@@ -135,15 +144,34 @@ export class ReferencedFileWriteError extends Error {
  * "cannot be stored as an override" told the user nothing they could act on).
  */
 export class UnwritableTransformError extends Error {
-  constructor(public readonly paths: string[]) {
-    super(
-      `${paths.length} moved part(s) sit inside an asset that is itself referenced by another `
-      + 'asset, so this file has nowhere to record the move: '
-      + paths.slice(0, 8).join(', ')
-      + (paths.length > 8 ? `, … (+${paths.length - 8} more)` : '')
-      + '.\nOpen the referenced asset (double-click it) and move the part there — '
-      + 'the change then applies to every instance. Or undo the move and save again.',
-    );
+  /**
+   * @param paths   every moved node that could not be written, in op order
+   * @param unknown the subset the resolver could not place AT ALL — not nested,
+   *   simply absent from the file being written. A different fault with a
+   *   different way out, so it gets its own sentence: telling the user to open
+   *   a referenced asset that does not exist sent them looking for nothing.
+   */
+  constructor(public readonly paths: string[], public readonly unknown: readonly string[] = []) {
+    const list = (items: readonly string[]): string =>
+      items.slice(0, 8).join(', ') + (items.length > 8 ? `, … (+${items.length - 8} more)` : '');
+    const nested = paths.filter((path) => !unknown.includes(path));
+    const parts: string[] = [];
+    if (nested.length > 0) {
+      parts.push(
+        `${nested.length} moved part(s) sit inside an asset that is itself referenced by another `
+        + `asset, so this file has nowhere to record the move: ${list(nested)}`
+        + '.\nOpen the referenced asset (double-click it) and move the part there — '
+        + 'the change then applies to every instance. Or undo the move and save again.',
+      );
+    }
+    if (unknown.length > 0) {
+      parts.push(
+        `${unknown.length} moved part(s) are not part of the file being written: ${list(unknown)}`
+        + '.\nThe part was added in this session in a way this save cannot store. '
+        + 'Use "Download .glb" to keep the work, and report this — it is a defect, not a limit.',
+      );
+    }
+    super(parts.join('\n'));
     this.name = 'UnwritableTransformError';
   }
 }
@@ -199,11 +227,15 @@ export interface BakeResolver {
   locate(nodePath: string): BakeLocation | null;
   /**
    * The planner placement id of a LIVE placement root at `nodePath` (null =
-   * not a live placement). Placements added in the CURRENT session have no
+   * not a live placement root). Placements added in the CURRENT session have no
    * composition frame and no base gltf node, so `locate` cannot see them —
    * but their rv_extras overrides (e.g. an Agv's PathId/ServiceTime, plan-921)
-   * belong INSIDE the placement extras this very bake writes. Optional: a
-   * test resolver without placements simply omits it.
+   * belong INSIDE the placement extras this very bake writes. Since plan-757
+   * Phase 2 (4a) so do the edits INSIDE such a placement: `locate` routes a
+   * content node to `{ kind: 'referenced', referenceNodePath: <its placement
+   * root> }`, and when that root is live the bake asks here for the record
+   * the `AssetOverrides` go into. Exact node, never climbed: what climbs is
+   * `locate`. Optional: a test resolver without placements simply omits it.
    */
   livePlacementIdOf?(nodePath: string): string | null;
 }
@@ -262,6 +294,16 @@ export interface BakeOptions {
    * afterwards ("sidecar follows the bytes", §2.5).
    */
   classification?: DocumentClassification | null;
+  /**
+   * What this document is ABOUT — a one-line summary and a Markdown
+   * description, written as a `DocumentInfo` block beside `Classification`
+   * (plan-506 §2.3).
+   *
+   * Same three states as {@link BakeOptions.classification}, for the same
+   * reason: `undefined` leaves an authored block alone (an unrelated field edit
+   * must not strip a description), `null` removes it, a value replaces it.
+   */
+  documentInfo?: DocumentInfo | null;
 }
 
 export interface BakeResult {
@@ -306,6 +348,11 @@ export interface BakeResult {
    * ordering of §2.5 expressed as a return value.
    */
   classificationWritten: boolean;
+  /**
+   * True when a `DocumentInfo` block was written (false when cleared/omitted),
+   * the plan-506 sibling of {@link classificationWritten}.
+   */
+  documentInfoWritten: boolean;
   /**
    * Placements that already existed in the source as a node with the same
    * `NodeId` and were updated in place instead of added a second time.
@@ -761,6 +808,35 @@ export function writeClassification(
   return true;
 }
 
+// ─── DocumentInfo (plan-506) ────────────────────────────────────────────
+
+/**
+ * Write (or clear) the `DocumentInfo` block in the default scene extras.
+ *
+ * The fourth sister of {@link writeSceneCamera}, {@link writeSceneSettings} and
+ * {@link writeClassification}, identical in shape on purpose. Only the OWN key
+ * is replaced or deleted: a block of an unknown future version written by a
+ * newer viewer sits under the same key and is replaced only when the user
+ * actually writes a description here — never touched by a bake that had no
+ * opinion (`undefined`). An empty block is `null`, so "never described" and
+ * "described as nothing" stay one state on disk.
+ */
+export function writeDocumentInfo(
+  json: Record<string, unknown>,
+  info: DocumentInfo | null | undefined,
+): boolean {
+  if (info === undefined) return false;
+  if (info === null || isEmptyDocumentInfo(info)) {
+    const rv = defaultSceneExtras(json)?.realvirtual;
+    if (isPlainObject(rv)) delete rv[RV_DOCUMENT_INFO_KEY];
+    return false;
+  }
+  const sceneExtras = ensureDefaultSceneExtras(json);
+  const rv = (sceneExtras.realvirtual ??= {}) as Record<string, unknown>;
+  rv[RV_DOCUMENT_INFO_KEY] = documentInfoPayload(info);
+  return true;
+}
+
 // ─── File-level pass (shared by both paths) ─────────────────────────────
 
 /** Everything that belongs to the FILE rather than to one node. */
@@ -768,12 +844,18 @@ function writeFileLevel(
   json: Record<string, unknown>,
   edits: MaterialisedEdits,
   options: BakeOptions,
-): { cameraWritten: boolean; settingsWritten: boolean; classificationWritten: boolean } {
+): {
+  cameraWritten: boolean;
+  settingsWritten: boolean;
+  classificationWritten: boolean;
+  documentInfoWritten: boolean;
+} {
   const cameraWritten = writeSceneCamera(json, edits, options.clearCameraWhenUnset === true);
   writeConnections(json, edits.connections, edits.connectionTypes);
   const settingsWritten = writeSceneSettings(json, options.settings);
   const classificationWritten = writeClassification(json, options.classification);
-  return { cameraWritten, settingsWritten, classificationWritten };
+  const documentInfoWritten = writeDocumentInfo(json, options.documentInfo);
+  return { cameraWritten, settingsWritten, classificationWritten, documentInfoWritten };
 }
 
 /**
@@ -939,16 +1021,22 @@ function writeNodeLevel(
   // `materialise` keys it by nodePath — so moving one part ten times produces
   // one override, not ten.
   const unwritable: string[] = [];
+  /** The subset of `unwritable` that is absent from the file rather than nested. */
+  const unknown: string[] = [];
   /** Reference node index → `trsByNodeId` block to merge into its overrides. */
   const routedTrs = new Map<number, Record<string, Record<string, number[]>>>();
   let transforms = 0;
   let referenceTransforms = 0;
   for (const entry of edits.nodeTransforms) {
     const location = resolver.locate(entry.nodePath);
-    if (!location) { unwritable.push(entry.nodePath); continue; }
+    if (!location) { unwritable.push(entry.nodePath); unknown.push(entry.nodePath); continue; }
 
     if (location.kind === 'root') {
-      if (!gltfNodes[location.index]) { unwritable.push(entry.nodePath); continue; }
+      if (!gltfNodes[location.index]) {
+        unwritable.push(entry.nodePath);
+        unknown.push(entry.nodePath);
+        continue;
+      }
       if (expected && gltfNodes[location.index].name !== expected[location.index]) {
         throw new ModelSourceChangedError(
           `node ${location.index} is now "${gltfNodes[location.index].name ?? '<unnamed>'}" `
@@ -986,7 +1074,7 @@ function writeNodeLevel(
     routedTrs.set(owner.index, block);
     referenceTransforms++;
   }
-  if (unwritable.length > 0) throw new UnwritableTransformError(unwritable);
+  if (unwritable.length > 0) throw new UnwritableTransformError(unwritable, unknown);
 
   for (const [index, block] of routedTrs) {
     applyRoutedTransformOverrides(gltfNodes[index], block);
@@ -1097,13 +1185,28 @@ function placementExtras(placement: PlacedComponent): Record<string, unknown> {
  * come back visible on the next load. (`objectToGlb` passes `onlyVisible:false`,
  * which is what keeps it in the file at all.)
  */
+/**
+ * The reference node's name IS the record's name (plan-758: record is the
+ * truth, `label === node.name` at every creation path). The fallback exists
+ * only so a record that somehow reached the save nameless does not produce an
+ * unloadable file — and it is LOUD, because every producer is supposed to have
+ * made this impossible. Shared by the full bake and the incremental re-save.
+ */
+function placementNodeName(placement: PlacedComponent, fallbackName: string): string {
+  const name = placement.label?.trim();
+  if (name) return name;
+  console.error(`[SceneSave] placement ${placement.id} has an empty name — writing "${fallbackName}"`);
+  reportPlacementNameEmpty({ placementId: placement.id, fallback: fallbackName });
+  return fallbackName;
+}
+
 function buildPlacementNode(
   placement: PlacedComponent,
   fallbackName: string,
   patch?: Record<string, Record<string, unknown>>,
 ): Object3D {
   const node = new Object3D();
-  node.name = placement.label?.trim() || fallbackName;
+  node.name = placementNodeName(placement, fallbackName);
   node.position.set(placement.position[0], placement.position[1], placement.position[2]);
   node.quaternion.setFromEuler(new Euler(
     placement.rotation[0] * DEG_TO_RAD,
@@ -1131,12 +1234,40 @@ function mergePlacementPatch(
   patch: Record<string, Record<string, unknown>>,
 ): void {
   for (const [componentType, fields] of Object.entries(patch)) {
+    // plan-757 Phase 2 (4a): the routed `AssetOverrides` of a live placement
+    // merge PER NODE ID (byNodeId per component, trsByNodeId last-write-wins)
+    // into what the node already carries — a shallow assign would drop every
+    // override of a node the patch does not mention.
+    if (componentType === RV_ASSET_OVERRIDES_KEY) {
+      rv[componentType] = mergeAssetOverrides(rv[componentType], fields);
+      continue;
+    }
     const target = isPlainObject(rv[componentType])
       ? { ...(rv[componentType] as Record<string, unknown>) }
       : {};
     Object.assign(target, fields);
     rv[componentType] = target;
   }
+}
+
+/** `AssetOverrides` ⊕ patch: `byNodeId` per id per component, `trsByNodeId` per id, everything else replaced. */
+function mergeAssetOverrides(existing: unknown, patch: Record<string, unknown>): Record<string, unknown> {
+  const base = isPlainObject(existing) ? { ...(existing as Record<string, unknown>) } : {};
+  const byNodeId = isPlainObject(base.byNodeId)
+    ? { ...(base.byNodeId as Record<string, Record<string, Record<string, unknown>>>) }
+    : {};
+  for (const [nodeId, components] of Object.entries((patch.byNodeId as Record<string, Record<string, Record<string, unknown>>> | undefined) ?? {})) {
+    const slot = { ...(byNodeId[nodeId] ?? {}) };
+    mergePatchInto(slot, components);
+    byNodeId[nodeId] = slot;
+  }
+  const trsByNodeId = {
+    ...(isPlainObject(base.trsByNodeId) ? (base.trsByNodeId as Record<string, unknown>) : {}),
+    ...((patch.trsByNodeId as Record<string, unknown> | undefined) ?? {}),
+  };
+  const out: Record<string, unknown> = { ...base, ...patch, byNodeId };
+  if (Object.keys(trsByNodeId).length > 0) out.trsByNodeId = trsByNodeId;
+  return out;
 }
 
 /** An op-created node becomes an ordinary glTF node with its components. */
@@ -1191,7 +1322,7 @@ function reconcilePlacements(
     const node = byNodeId.get(placement.id);
     if (!node) { remaining.push(placement); continue; }
 
-    node.name = placement.label?.trim() || fallbackName;
+    node.name = placementNodeName(placement, fallbackName);
 
     const quaternion = new Quaternion().setFromEuler(new Euler(
       placement.rotation[0] * DEG_TO_RAD,
@@ -1252,12 +1383,51 @@ export async function bakeIntoGlb(
   const placementPatches = new Map<string, Record<string, Record<string, unknown>>>();
   if (resolver.livePlacementIdOf) {
     for (const nodePath of Object.keys(edits.overlay.nodes)) {
-      if (resolver.locate(nodePath)) continue;
-      const placementId = resolver.livePlacementIdOf(nodePath);
+      const location = resolver.locate(nodePath);
+      if (!location) {
+        const placementId = resolver.livePlacementIdOf(nodePath);
+        if (!placementId) continue;
+        placementPatches.set(placementId, edits.overlay.nodes[nodePath]);
+        delete edits.overlay.nodes[nodePath];
+        continue;
+      }
+      // plan-757 Phase 2 (4a): an edit INSIDE a live placement — `locate`
+      // climbed to the placement root, which has no gltf node yet. It goes
+      // into that placement's `AssetOverrides.byNodeId`, exactly where the
+      // same edit lands for a placement the file already holds
+      // (`applyRoutedOverrides`), and where `applyOverrides` reads it back.
+      // An owner that is itself a nested reference (`locate` non-null, not
+      // root) is left to `splitOverlay`, which refuses it by name (4b).
+      if (location.kind !== 'referenced' || resolver.locate(location.referenceNodePath)) continue;
+      const placementId = resolver.livePlacementIdOf(location.referenceNodePath);
       if (!placementId) continue;
-      placementPatches.set(placementId, edits.overlay.nodes[nodePath]);
+      const patch = placementPatches.get(placementId) ?? {};
+      const overrides = (patch[RV_ASSET_OVERRIDES_KEY] ??= {}) as Record<string, unknown>;
+      const byNodeId = (overrides.byNodeId ??= {}) as Record<string, Record<string, Record<string, unknown>>>;
+      mergePatchInto(byNodeId[location.nodeId] ??= {}, edits.overlay.nodes[nodePath]);
+      placementPatches.set(placementId, patch);
       delete edits.overlay.nodes[nodePath];
     }
+    // The same routing for a moved node inside a live placement (4a, TRS):
+    // `AssetOverrides.trsByNodeId` on the placement, the sibling block
+    // `applyRoutedTransformOverrides` writes for an in-file owner.
+    const keptTransforms: typeof edits.nodeTransforms = [];
+    for (const entry of edits.nodeTransforms) {
+      const location = resolver.locate(entry.nodePath);
+      const placementId = location?.kind === 'referenced' && !resolver.locate(location.referenceNodePath)
+        ? resolver.livePlacementIdOf(location.referenceNodePath)
+        : null;
+      if (!placementId || location?.kind !== 'referenced') { keptTransforms.push(entry); continue; }
+      const patch = placementPatches.get(placementId) ?? {};
+      const overrides = (patch[RV_ASSET_OVERRIDES_KEY] ??= {}) as Record<string, unknown>;
+      const trsByNodeId = (overrides.trsByNodeId ??= {}) as Record<string, Record<string, number[]>>;
+      trsByNodeId[location.nodeId] = {
+        position: [entry.position[0], entry.position[1], entry.position[2]],
+        quaternion: [entry.quaternion[0], entry.quaternion[1], entry.quaternion[2], entry.quaternion[3]],
+      };
+      placementPatches.set(placementId, patch);
+    }
+    if (keptTransforms.length !== edits.nodeTransforms.length) edits.nodeTransforms = keptTransforms;
   }
 
   const counts = writeNodeLevel(chunks, edits, resolver, options);
@@ -1291,6 +1461,7 @@ export async function bakeIntoGlb(
       cameraWritten: fileLevel.cameraWritten,
       settingsWritten: fileLevel.settingsWritten,
       classificationWritten: fileLevel.classificationWritten,
+      documentInfoWritten: fileLevel.documentInfoWritten,
       signatureDropped,
       warnings: [],
     };
@@ -1300,10 +1471,19 @@ export async function bakeIntoGlb(
   // categories are already in `chunks`, so the re-parse below sees them.
   const intermediate = rebuildGlbWithJson(chunks);
 
-  const [{ gltfLoader }, { objectToGlb }] = await Promise.all([
+  const [{ gltfLoader }, { objectToGlb, sceneMirroringLoad }, binaryResourcesModule] = await Promise.all([
     import('../../engine/rv-glb-parse'),
     import('../../import/rv-import-object'),
+    import('../../engine/rv-binary-resources'),
   ]);
+  // plan-498: FMU packages of the scene document's OWN `Fmu` nodes are glTF
+  // bufferViews nothing in the node graph references — the exporter below
+  // would drop them. They are taken from the SOURCE bytes here and appended
+  // again after the export by the same writer the asset editor uses.
+  const sourceFmuBytes = new Map<string, Uint8Array>();
+  for (const res of binaryResourcesModule.extractGlbBufferViews(
+    source, binaryResourcesModule.collectFmuEmbeds(chunks.json),
+  )) sourceFmuBytes.set(res.sha256, res.bytes);
 
   const gltf = await gltfLoader.parseAsync(
     intermediate.buffer.slice(
@@ -1337,11 +1517,26 @@ export async function bakeIntoGlb(
   }
   if (missingParents.length > 0) throw new NodeNotFoundError(missingParents);
 
-  const exported = await objectToGlb(tree);
+  // Save is the exact inverse of load (plan-752 F4): `tree` IS the file's
+  // scene, so it is exported as one — its name becomes the scene name and its
+  // children become the file's nodes. Without this the exporter made `tree`
+  // itself a node under an invented `AuxScene` and every save added a level.
+  let exported = await objectToGlb(sceneMirroringLoad(tree));
+  const fmu = binaryResourcesModule.embedFmuBufferViews(
+    exported,
+    (sha) => sourceFmuBytes.get(sha) ?? binaryResourcesModule.binaryResources.get(sha)?.bytes,
+  );
+  exported = fmu.glb;
+  for (const sha of fmu.missing) {
+    warnings.push(`FMU package ${sha.slice(0, 12)}… not found in the source file — saved without its bytes (bufferView -1).`);
+  }
 
-  // The exporter wraps a Group in its own `AuxScene`, so file-level data written
-  // before the export would come back one level BELOW the scene root and never
-  // be found again. Writing it after the export puts it where it belongs.
+  // File-level data is written AFTER the export. With `sceneMirroringLoad` the
+  // extras would now land on the scene correctly by themselves, but the carry
+  // stays until the wrapper is proven gone for every input — including the one
+  // case that still produces a node level, a `tree` with a real transform. The
+  // merge below is write-if-absent, so it is a no-op when the export already
+  // put them there.
   const outChunks = parseGlbChunks(exported);
   const outSceneExtras = ensureDefaultSceneExtras(outChunks.json);
   for (const [key, value] of Object.entries(carriedSceneExtras)) {
@@ -1369,12 +1564,21 @@ export async function bakeIntoGlb(
     cameraWritten: fileLevel.cameraWritten,
     settingsWritten: fileLevel.settingsWritten,
     classificationWritten: fileLevel.classificationWritten,
+    documentInfoWritten: fileLevel.documentInfoWritten,
     signatureDropped,
     warnings,
   };
 }
 
 // ─── Production wiring ──────────────────────────────────────────────────
+
+/** The nearest placement root strictly ABOVE `node` — a planner record's root or a nested one. */
+function placementRootAbove(node: Object3D): Object3D | null {
+  for (let cur: Object3D | null = node.parent; cur; cur = cur.parent) {
+    if (isPlacementRoot(cur)) return cur;
+  }
+  return null;
+}
 
 /**
  * The resolver the running viewer uses: `NodeRegistry` for the index, the
@@ -1408,20 +1612,43 @@ export function makeRegistryBakeResolver(
       if (!node) return null;
 
       const frame = frameOf.get(node);
-      if (!frame) return location ? { kind: 'root', index: location.index } : null;
+      if (frame) {
+        const nodeId = (node.userData?.realvirtual as Record<string, unknown> | undefined)
+          ?.[RV_NODE_ID_KEY];
+        if (typeof nodeId !== 'string' || !nodeId) return null;
 
-      const nodeId = (node.userData?.realvirtual as Record<string, unknown> | undefined)
-        ?.[RV_NODE_ID_KEY];
-      if (typeof nodeId !== 'string' || !nodeId) return null;
+        const referenceNodePath = registry.getPathForNode(frame.referenceNode);
+        if (!referenceNodePath) return null;
 
-      const referenceNodePath = registry.getPathForNode(frame.referenceNode);
+        return {
+          kind: 'referenced',
+          referenceNodePath,
+          nodeId,
+          sourceKey: frame.sourceKey,
+        };
+      }
+
+      // plan-757 Phase 2 (4a/4b): a node INSIDE a placement instance. The
+      // instance is a clone of the asset's template, NodeIds included, so the
+      // node is addressed exactly as a composed frame's: by the NodeId it has
+      // in the referenced file, on the reference node that owns it — the
+      // NEAREST placement root above it. A top-level placement root is a node
+      // of the file being written (or a live record the pre-pass routes); a
+      // NESTED placement root (`_layoutNestedOf`) resolves here again, one
+      // level up, so `splitOverlay` / `writeNodeLevel` see an owner that is
+      // not in this file and refuse by name (ReferencedFileWriteError /
+      // UnwritableTransformError, 4b) — never a silent drop.
+      const owner = placementRootAbove(node);
+      if (!owner) return location ? { kind: 'root', index: location.index } : null;
+      const nodeId = getNodeId(node);
+      if (!nodeId) return null;
+      const referenceNodePath = registry.getPathForNode(owner);
       if (!referenceNodePath) return null;
-
       return {
         kind: 'referenced',
         referenceNodePath,
         nodeId,
-        sourceKey: frame.sourceKey,
+        sourceKey: getAssetReference(owner)?.assetId ?? '',
       };
     },
 

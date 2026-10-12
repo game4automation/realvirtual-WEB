@@ -47,6 +47,7 @@ function snapshot(
     redundant: false,
     channels,
     joints: [],
+    externalLoadN: [],
   };
 }
 

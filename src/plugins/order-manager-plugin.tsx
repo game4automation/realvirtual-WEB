@@ -48,6 +48,7 @@ import type {
   OrderManagerConfig,
 } from '../core/types/plugin-types';
 import { loadAasxById, type AasParsedData } from './aas-link-parser';
+import { getActiveAasSource } from '../core/aas/rv-aas-source';
 import { isAasNodeVisible } from './aas-resolution';
 import {
   parseTags,
@@ -411,7 +412,7 @@ export class OrderManagerPlugin implements RVViewerPlugin, OrderManagerPluginAPI
             // Try AAS first
             const aas = target.node.userData?._rvAasLink as { aasId: string; description?: string } | undefined;
             if (aas?.aasId && isAasNodeVisible(target.node)) {
-              loadAasxById(aas.aasId).then(parsed => {
+              loadAasxById(aas.aasId, getActiveAasSource()).then(parsed => {
                 const orderData = extractOrderData(parsed);
                 this.addItem(
                   orderData.aasId ?? aas.aasId,

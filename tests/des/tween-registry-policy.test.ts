@@ -8,6 +8,25 @@ function target(): DriveTweenTarget & { values: number[] } {
   return { values: [], setPosition(value) { this.values.push(value); } };
 }
 
+describe('TweenRegistry onRender reports writes (on-demand render loop)', () => {
+  // The DES runner marks the frame dirty from this return value. Without it a
+  // DES animation (AGVs, MUs) froze on screen until the user touched the view.
+  it('returns true while a tween writes, false once nothing is left', () => {
+    const registry = new TweenRegistry(4);
+    const drive = target();
+    registry.addDrive(drive, 0, 100, 0, 10);
+    expect(registry.onRender(5, 'animated', false)).toBe(true);
+    expect(registry.onRender(10, 'animated', false)).toBe(true); // final write
+    expect(registry.onRender(11, 'animated', false)).toBe(false);
+  });
+
+  it('returns false for a running tween FastForward does not write', () => {
+    const registry = new TweenRegistry(4);
+    registry.addDrive(target(), 0, 100, 0, 10);
+    expect(registry.onRender(5, 'fastforward', true)).toBe(false);
+  });
+});
+
 describe('TweenRegistry writePolicy + ease + settle reasons', () => {
   it('finalOnly suppresses intermediate writes in FF drain slices and writes at the end', () => {
     const registry = new TweenRegistry(4);

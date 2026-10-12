@@ -32,6 +32,7 @@ import {
 import { join, resolve } from 'node:path';
 // @ts-expect-error — plain JavaScript workspace helper has no declaration file.
 import { stageFilteredSourceTree } from './scripts/_workspace-lib.mjs';
+import { createThirdPartyNotices, defaultPolicySpecs } from './scripts/vite-plugin-third-party-notices.mjs';
 
 const SOURCE_ROOT = __dirname;
 const PRIVATE_ROOT = resolve(SOURCE_ROOT, '..', 'realvirtual-WebViewer-Private~');
@@ -176,12 +177,27 @@ function embedPublicAssetsPlugin() {
   };
 }
 
+/**
+ * Third-party licence notices (plan-544). The embed build is always the PUBLIC tier (stub
+ * aliases, no private tree) and only ever built by us, so it uses the release-build mode default
+ * (F11) and the public policy (+ an optional customer file, never present here). Main and worker
+ * passes share one collector — the signature-verify worker is a separate Rollup pass.
+ */
+const thirdPartyNotices = createThirdPartyNotices({
+  rootDir: SOURCE_ROOT,
+  policies: defaultPolicySpecs(SOURCE_ROOT, null),
+  manualComponents: resolve(SOURCE_ROOT, 'third-party/manual-components.json'),
+  tier: 'public',
+  releaseBuild: true,
+});
+
 export default defineConfig({
   root: BUILD_ROOT,
   base: './',
   plugins: [
     embedDracoDecoderPlugin(),
     embedPublicAssetsPlugin(),
+    thirdPartyNotices.plugin(),
     filteredStageCleanupPlugin(),
   ],
   // Do NOT copy public/ (models, presets, pdf worker, …) into the lib output —
@@ -216,6 +232,7 @@ export default defineConfig({
   // worker in rv-sig-verify.ts) code-split and thus require the ES format.
   worker: {
     format: 'es',
+    plugins: () => [thirdPartyNotices.workerPlugin()],
   },
   build: {
     target: 'esnext',

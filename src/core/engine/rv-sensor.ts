@@ -4,12 +4,9 @@
 import {
   Object3D,
   Mesh,
-  BoxGeometry,
-  CylinderGeometry,
   MeshBasicMaterial,
   MeshStandardMaterial,
   DoubleSide,
-  EdgesGeometry,
   LineSegments,
   LineBasicMaterial,
   Vector3,
@@ -25,8 +22,17 @@ import { NodeRegistry } from './rv-node-registry';
 import { unityPositionToGltf } from './rv-coordinate-utils';
 import { debug } from './rv-debug';
 import { MM_TO_METERS } from './rv-constants';
+import { RV_SENSOR_BEAM_KEY, type PreBakedSensorBeam } from './rv-pre-bake-keys';
 import { RVTransportSurface } from './rv-transport-surface';
 import { createSignalWriter } from './rv-signal-store';
+import {
+  acquireRayTubeGeometry,
+  acquireSensorBoxGeometry,
+  acquireSensorEdgesGeometry,
+  releaseSharedVizGeometry,
+} from './rv-shared-viz-geometry';
+import { syncColliderGizmo } from './rv-collider-gizmo-sync';
+import { isSensorRuntimeVizName } from './rv-sensor-viz-names';
 
 // Shared materials (reused across all sensors to save GPU resources)
 const YELLOW = 0xffcc00;
@@ -51,6 +57,14 @@ const matRed = new MeshBasicMaterial({
 
 const wireYellow = new LineBasicMaterial({ color: YELLOW, transparent: true, opacity: 0.6 });
 const wireRed = new LineBasicMaterial({ color: RED, transparent: true, opacity: 0.8 });
+
+/** Drop visualisation children a file saved before the `_sensorRay` export
+ *  prune carries. Detached only, not disposed: after the bake's dedup or a
+ *  placement clone their geometry may be shared with the template. */
+function removePersistedSensorViz(node: Object3D): void {
+  const stale = node.children.filter((c) => isSensorRuntimeVizName(c.name));
+  for (const child of stale) child.removeFromParent();
+}
 
 // ─── Ray-AABB intersection (slab method) ─────────────────────────────
 
@@ -211,6 +225,22 @@ export class RVSensor implements RVComponent {
 
   // Properties — exact C# Inspector field names
   UseRaycast = false;
+  /** Detects only MUs with this tag or name; empty detects all MUs. */
+  LimitSensorToTag = '';
+
+  accepts(mu: RVMovingUnit | InstancedMovingUnit): boolean {
+    return !this.LimitSensorToTag || mu.node.userData.tag === this.LimitSensorToTag || mu.getName() === this.LimitSensorToTag;
+  }
+  /** Displays the detection volume in the web viewer without affecting detection. */
+  private showGizmo = true;
+  get ShowGizmo(): boolean { return this.showGizmo; }
+  set ShowGizmo(value: boolean) {
+    this.showGizmo = value;
+    if (this.visMesh) this.visMesh.visible = value;
+    if (this.visEdges) this.visEdges.visible = value;
+    if (this.rayTube) this.rayTube.visible = value;
+    syncColliderGizmo(this.node);
+  }
   RayCastDirection: Vector3 | { x: number; y: number; z: number } = { x: -1, y: 0, z: 0 };
   RayCastLength = 1000;
   /** When true, the ray beam is auto-derived from the node bounding box (convention sensors). */
@@ -251,6 +281,12 @@ export class RVSensor implements RVComponent {
   occupied = false;
   /** The MU currently occupying this sensor (first one found) */
   occupiedMU: (RVMovingUnit | InstancedMovingUnit) | null = null;
+
+  /** The ACTIVE MU list whose passive load trees a tag-limited sensor also
+   *  checks (plan-516 F6). Injected by the transport manager every tick
+   *  (self-healing, like the surfaces' accumulation provider); null =
+   *  standalone, loads are not seen. */
+  loadRoots: readonly (RVMovingUnit | InstancedMovingUnit)[] | null = null;
 
   /** Planner Signal Linking: when live-controlled, the AABB/raycast detection is
    *  skipped and `occupied` is driven by the CONNECT relay (overrideOccupied
@@ -353,7 +389,11 @@ export class RVSensor implements RVComponent {
       this.autoConfigureRay();
     }
 
-    // Create sensor visualization
+    // Create sensor visualization — on a clean node. A repeated init must not
+    // stack a second beam on the first, and a file saved before the export
+    // pruned `_sensorRay` still carries copies of earlier beams as children.
+    this.releaseVisualization();
+    removePersistedSensorViz(this.node);
     if (this.UseRaycast) {
       this.createRayVisualization();
     } else if (this.boxColliderData) {
@@ -391,13 +431,36 @@ export class RVSensor implements RVComponent {
     debug('sensor', `Sensor: ${this.node.name} mode=${this.mode} dir=${this.UseRaycast ? JSON.stringify(this.RayCastDirection) : 'N/A'} len=${this.RayCastLength}mm${sensorOccupiedAddr ? ` → ${sensorOccupiedAddr}` : ''}`);
   }
 
-  /** Run subscriptions cleanup. The scene loader calls this when reloading. */
+  /** Run subscriptions cleanup and release the visualisation helpers. The
+   *  scene loader calls this when reloading. The viz geometries are SHARED
+   *  across sensors with identical parameters (rv-shared-viz-geometry) and the
+   *  tree dispose helpers skip them — this is the one place that releases
+   *  this sensor's reference; the geometry is freed with the last user. */
   dispose(): void {
     if (this._layoutUnsub) {
       this._layoutUnsub();
       this._layoutUnsub = null;
     }
     this.feedbackListeners.length = 0;
+    this.releaseVisualization();
+  }
+
+  private releaseVisualization(): void {
+    if (this.rayTube) {
+      this.rayTube.removeFromParent();
+      releaseSharedVizGeometry(this.rayTube.geometry);
+      this.rayTube = null;
+    }
+    if (this.visMesh) {
+      this.visMesh.removeFromParent();
+      releaseSharedVizGeometry(this.visMesh.geometry);
+      this.visMesh = null;
+    }
+    if (this.visEdges) {
+      this.visEdges.removeFromParent();
+      releaseSharedVizGeometry(this.visEdges.geometry);
+      this.visEdges = null;
+    }
   }
 
   // ─── Collision-mode visualization (box) ────────────────────────────
@@ -413,19 +476,22 @@ export class RVSensor implements RVComponent {
     const sz = halfSize.z * 2;
     if (sx < 0.0001 && sy < 0.0001 && sz < 0.0001) return;
 
-    const geo = new BoxGeometry(sx, sy, sz);
+    // Shared per (sx, sy, sz) — see rv-shared-viz-geometry; released in dispose().
+    const geo = acquireSensorBoxGeometry(sx, sy, sz);
     this.visMesh = new Mesh(geo, matYellow);
     this.visMesh.position.set(localCenter.x, localCenter.y, localCenter.z);
     this.visMesh.renderOrder = 999; // render on top of scene geometry
     this.visMesh.name = `${this.node.name}_sensorViz`;
 
-    const edgesGeo = new EdgesGeometry(geo);
+    const edgesGeo = acquireSensorEdgesGeometry(geo);
     this.visEdges = new LineSegments(edgesGeo, wireYellow);
+    this.visEdges.name = `${this.node.name}_sensorViz_edges`;
     this.visEdges.position.copy(this.visMesh.position);
     this.visEdges.renderOrder = 999;
 
     this.node.add(this.visMesh);
     this.node.add(this.visEdges);
+    this.ShowGizmo = this.showGizmo;
   }
 
   // ─── Raycast-mode visualization (tube) ──────────────────────────────
@@ -451,18 +517,13 @@ export class RVSensor implements RVComponent {
 
     const maxDist = this.RayCastLength / MM_TO_METERS;
     const radius = 0.002; // 2mm radius — visible but not obtrusive
-    const indexedGeo = new CylinderGeometry(radius, radius, maxDist, 6, 1);
-    // CylinderGeometry is along Y by default; we orient it along the
-    // sensor's LOCAL +Z forward (the geometry's intrinsic direction after
-    // the rotation below) and let Three.js' scene graph carry the rest.
-    indexedGeo.translate(0, maxDist / 2, 0); // pivot at bottom (origin = ray start)
-    indexedGeo.rotateX(Math.PI / 2); // point along +Z as default forward
-
-    // Convert to non-indexed to avoid WebGPU index buffer format issues
-    const geo = indexedGeo.toNonIndexed();
-    indexedGeo.dispose();
+    // One geometry per (radius, length) shared by every sensor with the same
+    // beam — pivot at the ray origin, pointing along the sensor's LOCAL +Z;
+    // the scene graph carries the rest. Released in dispose().
+    const geo = acquireRayTubeGeometry(radius, maxDist, 6);
 
     this.rayTube = new Mesh(geo, RVSensor.rayMatBlue);
+    this.rayTube.visible = this.ShowGizmo;
     this.rayTube.renderOrder = 999;
     this.rayTube.frustumCulled = false;
     this.rayTube.name = `${this.node.name}_sensorRay`;
@@ -539,7 +600,19 @@ export class RVSensor implements RVComponent {
    *  Prefers a child named "Ray" as the bounds source and hides that marker. */
   private autoConfigureRay(): void {
     const rayNode = findRayChild(this.node);
-    const beam = computeBeamFromBounds(this.node, rayNode);
+    // plan-754 D18: the destructive bake merges the sensor's own source meshes
+    // into a chunk, so the fallback bounds walk finds nothing. The `Sensor`
+    // pre-bake hook computed the beam while the sources were still there and
+    // stamped it as plain data; prefer it. Non-baking loads have no stamp and
+    // derive the beam live, exactly as before.
+    const stored = this.node.userData?.[RV_SENSOR_BEAM_KEY] as PreBakedSensorBeam | undefined;
+    const beam = stored && Array.isArray(stored.originOffset)
+      ? {
+          originOffset: new Vector3(stored.originOffset[0], stored.originOffset[1], stored.originOffset[2]),
+          direction: stored.direction,
+          lengthMm: stored.lengthMm,
+        }
+      : computeBeamFromBounds(this.node, rayNode);
     if (!beam) return;
     this.rayOriginOffset.copy(beam.originOffset);
     this.RayCastDirection = beam.direction;
@@ -590,14 +663,74 @@ export class RVSensor implements RVComponent {
     let foundMU: (RVMovingUnit | InstancedMovingUnit) | null = null;
 
     for (const mu of mus) {
-      if (mu.markedForRemoval) continue;
+      if (mu.markedForRemoval || !this.accepts(mu)) continue;
       if (this.aabb.overlaps(mu.aabb)) {
         foundMU = mu;
         break; // First overlap is enough
       }
     }
+    if (!foundMU && this.LimitSensorToTag) foundMU = this.findTaggedLoad(-1);
 
     this.applyResult(foundMU);
+  }
+
+  // ─── Passive loads (plan-516 F6) ──────────────────────────────────
+
+  /** Scratch for the load-tree ray test (hit distance). */
+  private _loadHitDist = 0;
+
+  /**
+   * A tag-limited sensor also detects PASSIVE loads (they are not in the
+   * ticked MU list): walk every active MU's load tree, on demand and
+   * independent of the transport AABB of the carrier. `rayMax < 0` = box
+   * overlap, else a ray test up to `rayMax` (the nearest hit wins).
+   * Only tag-limited sensors pay for it — an unlimited sensor already sees
+   * the carrier.
+   */
+  private findTaggedLoad(rayMax: number): RVMovingUnit | null {
+    const roots = this.loadRoots;
+    if (!roots) return null;
+    this._loadHitDist = rayMax;
+    let found: RVMovingUnit | null = null;
+    for (let i = 0; i < roots.length; i++) {
+      const r = roots[i];
+      if (r.isInstanced || r.markedForRemoval) continue;
+      const carrier = r as RVMovingUnit;
+      if (carrier.loadedMus.length === 0) continue;
+      const hit = this.findInLoadTree(carrier, rayMax);
+      if (hit) {
+        found = hit;
+        if (rayMax < 0) break;
+      }
+    }
+    return found;
+  }
+
+  private findInLoadTree(carrier: RVMovingUnit, rayMax: number): RVMovingUnit | null {
+    let found: RVMovingUnit | null = null;
+    const loads = carrier.loadedMus;
+    for (let i = 0; i < loads.length; i++) {
+      const load = loads[i];
+      if (this.accepts(load)) {
+        load.updateAABB();
+        if (rayMax < 0) {
+          if (this.aabb.overlaps(load.aabb)) return load;
+        } else {
+          const { origin, dir } = this.computeRay();
+          const d = rayIntersectsAABB(
+            origin.x, origin.y, origin.z, dir.x, dir.y, dir.z,
+            this._loadHitDist, load.aabb.min, load.aabb.max,
+          );
+          if (d >= 0 && d < this._loadHitDist) { this._loadHitDist = d; found = load; }
+        }
+      }
+      const inner = this.findInLoadTree(load, rayMax);
+      if (inner) {
+        if (rayMax < 0) return inner;
+        found = inner;
+      }
+    }
+    return found;
   }
 
   /** Raycast mode: ray-AABB intersection against all MUs. */
@@ -608,7 +741,7 @@ export class RVSensor implements RVComponent {
     let hitDist = maxDist;
 
     for (const mu of mus) {
-      if (mu.markedForRemoval) continue;
+      if (mu.markedForRemoval || !this.accepts(mu)) continue;
       const d = rayIntersectsAABB(
         origin.x, origin.y, origin.z,
         dir.x, dir.y, dir.z,
@@ -620,13 +753,28 @@ export class RVSensor implements RVComponent {
         foundMU = mu;
       }
     }
+    if (!foundMU && this.LimitSensorToTag) foundMU = this.findTaggedLoad(maxDist);
 
     this.applyResult(foundMU);
     this.updateRayTube();
   }
 
+  /**
+   * Simulation reset: back to "nothing detected" THROUGH the change pipeline, so a
+   * bound SensorOccupied / SensorNotOccupied signal follows. Writing `occupied`
+   * directly left such a signal at its pre-reset value: the re-evaluation after the
+   * reset then saw "free → free" and fired nothing (plan-569, engine gap 2).
+   */
+  resetDetection(): void {
+    this.applyResult(null);
+    this.occupiedMU = null;
+  }
+
   /** Apply detection result and fire callback if state changed. */
   private applyResult(foundMU: (RVMovingUnit | InstancedMovingUnit) | null): void {
+    if (foundMU && !this.accepts(foundMU)) foundMU = null;
+    // The nearest part can change while the occupied boolean stays true.
+    this.occupiedMU = foundMU;
     const rawOccupied = foundMU !== null;
     const newOccupied = this.invertSignal ? !rawOccupied : rawOccupied;
 
@@ -689,13 +837,12 @@ registerComponent({
   needsAABB: true,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    hoverable: true,
-    selectable: true,
-    tooltipType: 'sensor',
-    badgeColor: '#66bb6a',
-    filterLabel: 'Sensors',
-    hoverEnabledByDefault: true,
-    exclusiveHoverGroup: true,
+    pick: 'select',
+    // bake stays 'merge': only the `_sensorViz` ray mesh must survive as an
+    // individual mesh, and that is a MESH-level exclusion (isExcludedMesh in
+    // rv-bake-pipeline.ts). A type-level 'keep' would pull the whole sensor
+    // housing out of the arenas.
+    ui: { tooltip: 'sensor', badge: '#66bb6a', filter: 'Sensors', category: 'sensors' },
   },
   create: (node, aabb) => new RVSensor(node, aabb!),
   afterCreate: (_inst, node) => { node.userData._rvType = 'Sensor'; },

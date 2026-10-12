@@ -47,6 +47,8 @@ const ALLOWED_WITHOUT_TEARDOWN: Record<string, string> = {
     'onModelLoaded only stores the viewer reference — no resources, no slots (Group D)',
   'plugins/models/model-option-plugin.ts':
     'One-shot application of a model option into node.userData; there is no previous state to return to (Group D)',
+  'plugins/prompt-task-plugin.tsx':
+    'onModelLoaded only re-points the prompt queue at the open project id; no model-scoped resources, dispose() removes the menu and key listener',
 };
 
 const HAS_MODEL_LOADED = /^\s*(?:override\s+|public\s+|async\s+)*onModelLoaded\s*\??\s*\(/m;

@@ -10,7 +10,8 @@
  *    (no scan while 'stopped', scans while 'running').
  *  - 'simulation-reset' → COLD runner reset (program memory restarts).
  *  - onModelLoaded() picks up an existing PLCProgram node into the editor
- *    store WITHOUT auto-starting (v1 trust gate: never auto-run).
+ *    store and auto-starts it when `Active` (like LogicStep roots);
+ *    `Active: false` only loads the code; a model clear cancels a pending start.
  *  - onModelCleared() stops scanning and empties the watch.
  *  - dispose() unregisters the PlcControl and releases the tick callback.
  *
@@ -19,7 +20,7 @@
  * (imports `@rv-private` — private build only, like the other plc tests).
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Object3D } from 'three';
 import { PlcPlugin } from '@rv-private/plugins/plc/plc-plugin';
 import { resetPlcEditorStore, getPlcEditorState } from '@rv-private/plugins/plc/plc-editor-store';
@@ -99,24 +100,48 @@ describe('PlcPlugin wiring', () => {
     expect(store.getInt('CountOut')).toBe(1); // mem was rebuilt: 0 + 1
   });
 
-  it('onModelLoaded() loads an existing PLCProgram into the editor store, but never auto-starts', () => {
+  /** Puts a scene with one PLC node carrying a PLCProgram into the viewer. */
+  function loadScene(active: boolean): void {
     const root = new Object3D();
     root.name = 'Scene';
     const plcNode = new Object3D();
     plcNode.name = 'PLC';
     plcNode.userData.realvirtual = {
-      PLCProgram: { Active: true, Language: 'st', Name: 'Main', Code: COUNTER_PROGRAM },
+      PLCProgram: { Active: active, Language: 'st', Name: 'Main', Code: COUNTER_PROGRAM },
     };
     root.add(plcNode);
     (viewer as unknown as { scene: Object3D }).scene = root;
-
     plugin.onModelLoaded({} as LoadResult, viewer as unknown as RVViewer);
+  }
+
+  it('onModelLoaded() loads an Active PLCProgram into the editor store and auto-starts it', async () => {
+    loadScene(true);
 
     const state = getPlcEditorState();
     expect(state.nodePath).toBe('PLC');
     expect(state.code).toBe(COUNTER_PROGRAM);
-    // Trust gate v1: Active=true in the scene must NOT start the PLC.
+    await vi.waitFor(() => expect(getPlcControl()!.state).toBe('running'));
+    viewer._tickOnce(DT);
+    viewer._tickOnce(DT);
+    expect(store.getInt('CountOut')).toBe(2);
+  });
+
+  it('onModelLoaded() with Active: false only loads the code — no start', async () => {
+    loadScene(false);
+
+    expect(getPlcEditorState().code).toBe(COUNTER_PROGRAM);
+    await new Promise((resolve) => setTimeout(resolve, 200));
     expect(getPlcControl()!.state).toBe('stopped');
+    viewer._tickOnce(DT);
+    expect(store.getInt('CountOut')).toBe(0);
+  });
+
+  it('a model clear while the auto-start deploys cancels the start', async () => {
+    loadScene(true);
+    plugin.onModelCleared(viewer as unknown as RVViewer);
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(getPlcControl()!.state).not.toBe('running');
     viewer._tickOnce(DT);
     expect(store.getInt('CountOut')).toBe(0);
   });

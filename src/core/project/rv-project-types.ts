@@ -32,6 +32,7 @@
  */
 
 import type { DocumentClassification } from './rv-document-classification';
+import type { DocumentInfo } from './rv-document-info';
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -196,6 +197,26 @@ export interface RvDocumentEntry {
   name: string;
   /** Cache of the GLB's own classification. The file wins on conflict (§2.5). */
   classification?: DocumentClassification;
+  /**
+   * Cache of the GLB's own `DocumentInfo` block (plan-506 F3) — summary and
+   * Markdown description. The truth lives in the file; when the two disagree
+   * this field is REPLACED by what the file says, never merged, exactly like
+   * {@link classification}. Absent means "no description".
+   */
+  documentInfo?: DocumentInfo;
+  /**
+   * Which generation of the byte scan produced this row's cached extras
+   * (plan-506 F13).
+   *
+   * The `(size, mtime, sha)` pre-filter skips a file whose stats still match —
+   * but a row whose stats were recorded by the classification-only scan never
+   * had its `DocumentInfo` read, and the pre-filter would hide it forever.
+   * `2` says "the stats on this row were recorded by a scan that read
+   * Classification AND DocumentInfo"; only then does the pre-filter skip the
+   * read. A row without it is read (header only) on every open until the next
+   * regular manifest write persists the marker — opening stays a read.
+   */
+  extrasScan?: 2;
   // `section?: 'scenes' | 'models' | 'library'` stood here until plan-736.
   //
   // It named which storage surface held the bytes, and that is what it was
@@ -412,6 +433,27 @@ export interface RvProject {
 
   /** External catalog subscriptions that travel with the project (§2.6.3). */
   libraries?: RvProjectLibraryRef[];
+
+  /**
+   * Which documents the welcome screen's demo links open (plan-744 F8).
+   *
+   * Values are document IDS. The WelcomeModal used to pick them by SECTION —
+   * "the first document under `models/`" for the HMI demo, "the first under
+   * `scenes/`" for the planner — which made a folder name part of the
+   * product's behaviour and broke the moment the demo project stopped using
+   * those folders. A project that wants to advertise particular documents
+   * says so here, once, and nothing has to guess.
+   *
+   * Both halves are optional and so is the field: with nothing stated the
+   * modal falls back to the project's start document and its first document
+   * respectively, which is what an ordinary project wants.
+   */
+  demos?: {
+    /** Opened by "3D HMI demo". Falls back to the project's start document. */
+    hmi?: string;
+    /** Opened by "Layout planner demo", in planner mode. */
+    planner?: string;
+  };
 
   /**
    * The document this project was last left on — **a live resume mechanism, not

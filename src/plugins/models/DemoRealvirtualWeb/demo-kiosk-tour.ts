@@ -61,7 +61,7 @@ export const demoKioskTour: TourFn = async (t, signal) => {
 
     // ───── Step 5: Hierarchy filter ─────
     t.instruction('Filter the hierarchy by component type', { style: 'banner' });
-    t.filter({ typeFilter: 'drives' });
+    t.filter({ typeFilter: 'cat:drives' });
     await t.dwell(4);
     t.closeFilter();
     if (signal.aborted) return;

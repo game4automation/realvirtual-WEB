@@ -25,7 +25,7 @@ import {
   writeSceneGlbFile,
   writeSettingsFile,
 } from '../src/core/project/rv-project-storage';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import { LegacyFormatError } from '../src/core/project/rv-legacy-format';
 import {
   RV_PROJECT_SCHEMA_VERSION,
@@ -274,7 +274,10 @@ describe('mergeManifest — documents[] entry-level forward compatibility', () =
       scenes: [{ id: 'scn_a', name: 'A', path: 'scenes/a-a.scene.glb' }],
     });
     expect(docs(merged).map(e => e.id)).toEqual(['scn_a']);
-    expect(docs(merged)[0].section).toBe('scenes');
+    // No `section` stamp (plan-744 Phase 2) — the row says where it is with
+    // its path and with nothing else.
+    expect(docs(merged)[0].section).toBeUndefined();
+    expect(docs(merged)[0].path).toBe('scenes/a-a.scene.glb');
   });
 });
 

@@ -19,7 +19,9 @@ import {
 } from '@mui/material';
 import { DragNumberField } from './DragNumberField';
 import { InspectorRow } from './rv-inspector-row';
-import { type FieldType, ENUM_FIELDS } from './rv-inspector-helpers';
+import { isCompleteDecimal, isInvalidDecimalDraft, parseDecimal } from './rv-number-format';
+import { ACCENT, DIVIDER, ERROR, FS, ICON_SIZE, INK_LOW, SUCCESS, inspectorInputSx } from './shared-sx';
+import { type FieldType, ENUM_FIELDS, colorToHex, hexToColor } from './rv-inspector-helpers';
 
 // ── Direction fallback (used when ENUM_FIELDS lookup returns undefined) ───
 
@@ -39,24 +41,62 @@ export interface FieldEditorProps {
   editable?: boolean;
   /** Optional unit suffix rendered inside number inputs (e.g. "mm", "mm/s"). */
   unit?: string;
+  /** Enum choices from the component schema (wire values). When given they win
+   *  over the name-keyed `ENUM_FIELDS` fallback, which only knows a handful of
+   *  legacy fields (Direction, Active, CollisionRole ...). */
+  options?: string[];
 }
 
 // ── NumberEditor ──────────────────────────────────────────────────────────
 
-// Match a "complete" numeric literal — no trailing dot, no lone minus, no
-// empty string. Used to gate live commits during typing so that mid-edit
-// drafts like "1." or "-" don't snap the value to a premature parse result.
-const COMPLETE_NUMBER_RE = /^-?\d+(\.\d+)?$/;
+// Live commits while typing are gated by `isCompleteDecimal` (rv-number-format):
+// mid-edit drafts like "1.", "1," or "-" don't snap the value to a premature
+// parse result. Comma and dot are both decimal separators (plan-510).
 
-export function NumberEditor({ value, onChange, unit }: { value: number; onChange: (v: number) => void; unit?: string }) {
+/** Props of {@link NumberEditor}. `min`/`max`/`disabled`/`ariaLabel` are optional (plan-502 F8). */
+export interface NumberEditorProps {
+  value: number;
+  onChange: (v: number) => void;
+  unit?: string;
+  /** Inclusive lower bound: drags clamp to it, a typed value is clamped on commit (blur/Enter). */
+  min?: number;
+  /** Inclusive upper bound (see `min`). */
+  max?: number;
+  disabled?: boolean;
+  ariaLabel?: string;
+}
+
+/** Clamp `n` into the optional range. */
+export function clampToRange(n: number, min?: number, max?: number): number {
+  let out = n;
+  if (min !== undefined && Number.isFinite(min) && out < min) out = min;
+  if (max !== undefined && Number.isFinite(max) && out > max) out = max;
+  return out;
+}
+
+/** "0.5…1", "≥ 0", "≤ 10" — the range hint shown next to a bounded field ('' without bounds). */
+export function formatRangeHint(min?: number, max?: number): string {
+  const lo = min !== undefined && Number.isFinite(min);
+  const hi = max !== undefined && Number.isFinite(max);
+  if (lo && hi) return `${min}…${max}`;
+  if (lo) return `≥ ${min}`;
+  if (hi) return `≤ ${max}`;
+  return '';
+}
+
+export function NumberEditor({ value, onChange, unit, min, max, disabled, ariaLabel }: NumberEditorProps) {
   const [draft, setDraft] = useState(String(value));
+  const hint = formatRangeHint(min, max);
+  // The value a clamping commit just sent: its re-synced draft must not fire a
+  // second live commit before the parent's value catches up.
+  const clampedRef = useRef<number | null>(null);
 
   // Re-sync draft when the external value changes from outside (gizmo drag,
   // reset, live signal, polling tick). We compare numerically against the
   // parsed draft so the user's in-progress typing is not clobbered.
   useEffect(() => {
-    const parsed = parseFloat(draft);
-    if (!Number.isFinite(parsed) || parsed !== value) {
+    const parsed = parseDecimal(draft);
+    if (parsed === null || parsed !== value) {
       setDraft(String(value));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -68,43 +108,75 @@ export function NumberEditor({ value, onChange, unit }: { value: number; onChang
   // parity. Trailing-dot / lone-minus drafts are skipped so typing "1.5"
   // doesn't briefly snap to 1.
   useEffect(() => {
-    if (!COMPLETE_NUMBER_RE.test(draft)) return;
-    const parsed = parseFloat(draft);
-    if (Number.isFinite(parsed) && parsed !== value) {
+    if (disabled) return;
+    if (!isCompleteDecimal(draft)) return;
+    const parsed = parseDecimal(draft);
+    if (parsed === null) return;
+    // A bounded field commits live only INSIDE its range: clamping mid-typing
+    // would snap "0" (on the way to "0.7") to the minimum and clobber the draft.
+    // Out-of-range drafts are clamped on blur/Enter.
+    if (clampToRange(parsed, min, max) !== parsed) return;
+    if (clampedRef.current !== null && parsed === clampedRef.current) return;
+    clampedRef.current = null;
+    if (parsed !== value) {
       onChange(parsed);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft]);
 
   const commit = useCallback(() => {
-    const parsed = parseFloat(draft);
-    if (Number.isFinite(parsed) && parsed !== value) {
-      onChange(parsed);
-    } else {
+    const parsed = parseDecimal(draft);
+    if (parsed === null) {
       setDraft(String(value));
+      return;
     }
-  }, [draft, value, onChange]);
+    const clamped = clampToRange(parsed, min, max);
+    if (clamped !== parsed) {
+      clampedRef.current = clamped;
+      setDraft(String(clamped));
+    }
+    if (clamped !== value) onChange(clamped);
+    else if (clamped === parsed) setDraft(String(value));
+  }, [draft, value, onChange, min, max]);
 
-  return (
+  const field = (
     <DragNumberField
       compact
       value={draft}
       onValueChange={setDraft}
       onCommit={commit}
-      onDragChange={(n) => { if (n !== value) onChange(n); }}
-      min={-Number.MAX_SAFE_INTEGER}
-      max={Number.MAX_SAFE_INTEGER}
+      onDragChange={(n) => { const c = clampToRange(n, min, max); if (c !== value) onChange(c); }}
+      min={min !== undefined && Number.isFinite(min) ? min : -Number.MAX_SAFE_INTEGER}
+      max={max !== undefined && Number.isFinite(max) ? max : Number.MAX_SAFE_INTEGER}
       step={1}
       fractionDigits={3}
       unit={unit}
+      disabled={disabled}
+      ariaLabel={ariaLabel}
+      error={isInvalidDecimalDraft(draft)}
       sx={{ width: '100%' }}
     />
+  );
+  if (!hint) return field;
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, width: '100%' }} title={`Range ${hint}`}>
+      <Box sx={{ flex: 1, minWidth: 0 }}>{field}</Box>
+      <Typography
+        component="span"
+        data-testid="rv-number-range"
+        sx={{ fontSize: FS.micro, color: INK_LOW, whiteSpace: 'nowrap', fontFamily: 'monospace' }}
+      >
+        {hint}
+      </Typography>
+    </Box>
   );
 }
 
 // ── BooleanEditor ────────────────────────────────────────────────────────
 
-export function BooleanEditor({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+export function BooleanEditor({ value, onChange, disabled, ariaLabel }: {
+  value: boolean; onChange: (v: boolean) => void; disabled?: boolean; ariaLabel?: string;
+}) {
   // Minimal checkbox — the standard property-inspector boolean. Sits at the
   // field column's left edge (alignField="stretch") so it lines up with where
   // the number/enum input boxes begin. Compact padding; primary tint when on.
@@ -112,12 +184,14 @@ export function BooleanEditor({ value, onChange }: { value: boolean; onChange: (
     <Checkbox
       size="small"
       checked={value}
+      disabled={disabled}
+      inputProps={ariaLabel ? { 'aria-label': ariaLabel } : undefined}
       onChange={(_, checked) => onChange(checked)}
       sx={{
         p: 0.125,
-        color: 'rgba(255,255,255,0.35)',
+        color: INK_LOW,
         '&.Mui-checked': { color: 'primary.main' },
-        '& .MuiSvgIcon-root': { fontSize: 16 },
+        '& .MuiSvgIcon-root': { fontSize: ICON_SIZE.md },
       }}
     />
   );
@@ -125,26 +199,27 @@ export function BooleanEditor({ value, onChange }: { value: boolean; onChange: (
 
 // ── EnumEditor ───────────────────────────────────────────────────────────
 
-export function EnumEditor({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: string[] }) {
+export function EnumEditor({ value, onChange, options, disabled, ariaLabel }: {
+  value: string; onChange: (v: string) => void; options: string[]; disabled?: boolean; ariaLabel?: string;
+}) {
   return (
     <Select
       size="small"
       value={value}
+      disabled={disabled}
+      inputProps={ariaLabel ? { 'aria-label': ariaLabel } : undefined}
       onChange={(e) => onChange(e.target.value)}
       sx={{
-        fontSize: 11,
+        fontSize: FS.label,
         fontFamily: 'monospace',
         height: 18,
         width: '100%',
-        bgcolor: 'rgba(255,255,255,0.04)',
+        ...inspectorInputSx,
         '& .MuiSelect-select': { py: 0.25, px: 1 },
-        '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' },
-        '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.15)' },
-        '&.Mui-focused fieldset': { borderColor: 'primary.main' },
       }}
     >
       {options.map((opt) => (
-        <MenuItem key={opt} value={opt} sx={{ fontSize: 11 }}>{opt}</MenuItem>
+        <MenuItem key={opt} value={opt} sx={{ fontSize: FS.label }}>{opt}</MenuItem>
       ))}
     </Select>
   );
@@ -154,6 +229,16 @@ export function EnumEditor({ value, onChange, options }: { value: string; onChan
 
 export function StringEditor({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const [localValue, setLocalValue] = useState(value);
+
+  // Re-sync when the external value changes from outside — a selection change
+  // (the inspector keys sections by component TYPE, so the editor instance is
+  // reused across nodes), undo/redo, a reset. Without it the field kept showing
+  // the first node's text (every `Group` read "axis1") and a blur would have
+  // WRITTEN that stale text into the newly selected node. Mid-typing this does
+  // not fire: `value` only changes on commit.
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
 
   const handleBlur = () => {
     if (localValue !== value) onChange(localValue);
@@ -167,16 +252,11 @@ export function StringEditor({ value, onChange }: { value: string; onChange: (v:
       onBlur={handleBlur}
       onKeyDown={(e) => { if (e.key === 'Enter') handleBlur(); }}
       slotProps={{
-        input: { sx: { fontSize: 11, fontFamily: 'monospace', height: 18 } },
+        input: { sx: { fontSize: FS.label, fontFamily: 'monospace', height: 18 } },
       }}
       sx={{
         width: '100%',
-        '& .MuiOutlinedInput-root': {
-          bgcolor: 'rgba(255,255,255,0.04)',
-          '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' },
-          '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.15)' },
-          '&.Mui-focused fieldset': { borderColor: 'primary.main' },
-        },
+        '& .MuiOutlinedInput-root': inspectorInputSx,
       }}
     />
   );
@@ -186,7 +266,7 @@ export function StringEditor({ value, onChange }: { value: string; onChange: (v:
 
 // ── Axis colors ──────────────────────────────────────────────────────────
 
-const AXIS_COLORS = { x: '#ef5350', y: '#66bb6a', z: '#4fc3f7' } as const;
+const AXIS_COLORS = { x: ERROR, y: SUCCESS, z: ACCENT } as const;
 
 /**
  * DragLabel — Unity-style draggable axis label.
@@ -233,7 +313,7 @@ function DragLabel({
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       sx={{
-        fontSize: 9,
+        fontSize: FS.micro,
         fontWeight: 600,
         color: AXIS_COLORS[axis],
         width: 10,
@@ -247,6 +327,63 @@ function DragLabel({
     >
       {axis}
     </Typography>
+  );
+}
+
+// ── ColorEditor ──────────────────────────────────────────────────────────
+
+/**
+ * A Unity Color `{r,g,b,a}` as a swatch with the browser's colour picker and
+ * the hex value. The picker fires continuously while the user drags; the value
+ * is written once, on the input's native `change` (picker closed / committed),
+ * so a colour choice is ONE undoable edit. Alpha is preserved.
+ */
+export function ColorEditor({ value, onChange, disabled, ariaLabel }: {
+  value: { r: number; g: number; b: number; a?: number };
+  onChange: (v: { r: number; g: number; b: number; a: number }) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+}) {
+  const hex = colorToHex(value);
+  const [draft, setDraft] = useState(hex);
+  const ref = useRef<HTMLInputElement | null>(null);
+  const latest = useRef({ value, onChange });
+  latest.current = { value, onChange };
+
+  useEffect(() => { setDraft(hex); }, [hex]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const commit = () => {
+      const next = hexToColor(el.value, latest.current.value);
+      if (next && el.value.toLowerCase() !== colorToHex(latest.current.value)) latest.current.onChange(next);
+    };
+    el.addEventListener('change', commit);
+    return () => el.removeEventListener('change', commit);
+  }, []);
+
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, width: '100%' }}>
+      <Box
+        component="input"
+        type="color"
+        ref={ref}
+        aria-label={ariaLabel ?? 'Colour'}
+        value={draft}
+        disabled={disabled}
+        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setDraft(e.target.value)}
+        sx={{
+          width: 36, height: 18, p: 0, border: `1px solid ${DIVIDER}`, borderRadius: 0.5,
+          bgcolor: 'transparent', cursor: disabled ? 'default' : 'pointer',
+          '&::-webkit-color-swatch-wrapper': { p: 0.125 },
+          '&::-webkit-color-swatch': { border: 'none', borderRadius: 0.5 },
+        }}
+      />
+      <Typography component="span" sx={{ fontSize: FS.label, fontFamily: 'monospace', color: INK_LOW }}>
+        {draft.toUpperCase()}
+      </Typography>
+    </Box>
   );
 }
 
@@ -265,8 +402,8 @@ export function Vector3Editor({ value, onChange }: { value: { x: number; y: numb
   }, [value.x, value.y, value.z]);
 
   const handleBlur = (axis: 'x' | 'y' | 'z') => {
-    const parsed = parseFloat(local[axis]);
-    if (!isNaN(parsed) && parsed !== value[axis]) {
+    const parsed = parseDecimal(local[axis]);
+    if (parsed !== null && parsed !== value[axis]) {
       onChange({ ...value, [axis]: parsed });
     } else {
       setLocal((prev) => ({ ...prev, [axis]: String(value[axis]) }));
@@ -286,18 +423,12 @@ export function Vector3Editor({ value, onChange }: { value: { x: number; y: numb
   const axisStyle = {
     width: '100%',
     '& .MuiOutlinedInput-root': {
-      bgcolor: 'rgba(255,255,255,0.04)',
-      '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' },
-      '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.15)' },
-      '&.Mui-focused fieldset': { borderColor: 'primary.main' },
+      ...inspectorInputSx,
+      '&.Mui-error fieldset': { borderColor: 'error.main' },
     },
     // Tighten MUI's default 14px horizontal input padding so the three axis
-    // cells stay compact in the narrow field column.
-    '& .MuiOutlinedInput-input': { paddingLeft: '5px', paddingRight: '5px' },
-    '& input[type=number]::-webkit-outer-spin-button, & input[type=number]::-webkit-inner-spin-button': {
-      WebkitAppearance: 'none', margin: 0,
-    },
-    '& input[type=number]': { MozAppearance: 'textfield' },
+    // cells stay compact in the narrow field column (0.625 × 8 = 5px).
+    '& .MuiOutlinedInput-input': { px: 0.625 },
   };
 
   return (
@@ -312,14 +443,15 @@ export function Vector3Editor({ value, onChange }: { value: { x: number; y: numb
           />
           <TextField
             size="small"
-            type="number"
+            type="text"
             value={local[axis]}
+            error={isInvalidDecimalDraft(local[axis])}
             onChange={(e) => setLocal((prev) => ({ ...prev, [axis]: e.target.value }))}
             onBlur={() => handleBlur(axis)}
             onKeyDown={(e) => { if (e.key === 'Enter') handleBlur(axis); }}
             slotProps={{
-              input: { sx: { fontSize: 10, fontFamily: 'monospace', height: 18 } },
-              htmlInput: { step: 'any' },
+              input: { sx: { fontSize: FS.micro, fontFamily: 'monospace', height: 18 } },
+              htmlInput: { inputMode: 'decimal', 'aria-label': `${axis} value` },
             }}
             sx={axisStyle}
           />
@@ -387,12 +519,12 @@ export function ObjectEditor({ value, onChange }: {
 }) {
   // Empty arrays — just show []
   if (Array.isArray(value) && value.length === 0) {
-    return <Typography sx={{ fontSize: 10, fontFamily: 'monospace', color: 'text.disabled' }}>[ ]</Typography>;
+    return <Typography sx={{ fontSize: FS.micro, fontFamily: 'monospace', color: 'text.disabled' }}>[ ]</Typography>;
   }
 
   if (Array.isArray(value)) {
     return (
-      <Box sx={{ width: '100%', pl: 0.5, borderLeft: '1px solid rgba(255,255,255,0.06)' }}>
+      <Box sx={{ width: '100%', pl: 0.5, borderLeft: `1px solid ${DIVIDER}` }}>
         {value.map((item, i) => (
           <Box key={i}>
             {typeof item === 'object' && item !== null ? (
@@ -419,7 +551,7 @@ export function ObjectEditor({ value, onChange }: {
   // Object — always expanded, sub-fields inline
   const entries = Object.entries(value);
   return (
-    <Box sx={{ width: '100%', pl: 0.5, borderLeft: '1px solid rgba(255,255,255,0.06)' }}>
+    <Box sx={{ width: '100%', pl: 0.5, borderLeft: `1px solid ${DIVIDER}` }}>
       {entries.map(([k, v]) => (
         <SubFieldRow key={k} label={k} value={v}
           onChange={(nv) => onChange({ ...value, [k]: nv })}
@@ -431,14 +563,23 @@ export function ObjectEditor({ value, onChange }: {
 
 // ── FieldEditor (dispatcher) ─────────────────────────────────────────────
 
-export function FieldEditor({ value, onChange, fieldType, fieldName, editable, unit }: FieldEditorProps) {
+export function FieldEditor({ value, onChange, fieldType, fieldName, editable, unit, options }: FieldEditorProps) {
   switch (fieldType) {
     case 'boolean':
       return <BooleanEditor value={value as boolean} onChange={(v) => onChange(v)} />;
     case 'number':
       return <NumberEditor value={value as number} onChange={(v) => onChange(v)} unit={unit} />;
-    case 'enum':
-      return <EnumEditor value={String(value)} onChange={(v) => onChange(v)} options={ENUM_FIELDS[fieldName] ?? DIRECTION_OPTIONS} />;
+    case 'enum': {
+      const current = String(value);
+      const choices = options ?? ENUM_FIELDS[fieldName] ?? DIRECTION_OPTIONS;
+      // A document may carry a value the schema no longer lists (older export,
+      // hand-edited extras). Keep it selectable rather than letting MUI render
+      // an out-of-range Select, so the user sees what is there and can move off it.
+      const withCurrent = choices.includes(current) ? choices : [current, ...choices];
+      return <EnumEditor value={current} onChange={(v) => onChange(v)} options={withCurrent} />;
+    }
+    case 'color':
+      return <ColorEditor value={value as { r: number; g: number; b: number; a?: number }} onChange={(v) => onChange(v)} disabled={!editable} ariaLabel={fieldName} />;
     case 'vector3':
       return <Vector3Editor value={value as { x: number; y: number; z: number }} onChange={(v) => onChange(v)} />;
     case 'object':

@@ -17,6 +17,7 @@
  * Foundation for future React HMI binding (useSignal hook).
  */
 import { debug } from './rv-debug';
+import type { UnitDef } from './rv-units';
 import {
   deriveSignalActivity,
   type SignalActivity,
@@ -42,11 +43,25 @@ import {
  *   - `address` — protocol address / PLC symbol (e.g. `%I0.0`, `%QW2800`).
  *   - `comment` — free-text comment from the tag table / GLB rv_extras.
  *   - `source`  — origin label (e.g. `MQTT · Data_Q_1`, an interface name).
+ *   - `unit`    — unit of the raw value as its SOURCE names it (plan-512; v1: FMU
+ *                 variables, e.g. `m`, `m/s`). The store never converts — the
+ *                 value stays raw; a binding scales it through its own field.
+ *   - `unitDef` — the resolved definition of `unit` from the same source (FMU
+ *                 `UnitDefinitions`), so two FMUs naming a unit alike but
+ *                 defining it differently never collide.
  */
 export interface SignalMeta {
   address?: string;
   comment?: string;
   source?: string;
+  unit?: string;
+  unitDef?: UnitDef;
+  /**
+   * PLC data type as the SOURCE names it (`BOOL`, `DINT`, `REAL`; plan-589),
+   * read from `rv_extras.<PLC*>.OriginDataType` for a model signal. Purely
+   * descriptive — the store's own type is {@link SignalStore.getType}.
+   */
+  originDataType?: string;
 }
 
 /** Stable classification attached to every named SignalStore writer. */
@@ -210,6 +225,54 @@ export interface SignalStoreStats {
   version: number;
 }
 
+/** Path prefix of an interface-only signal's placeholder registration (base-industrial-interface.ts). */
+export const IFACE_PATH_PREFIX = '__iface__/';
+
+/** One wave of editor-sync catalog changes (plan-589), emitted once per op. */
+export interface SignalCatalogChange {
+  /** Names (re-)registered at a new or changed path. */
+  registered: string[];
+  /** Names that lost one model path but are still owned. */
+  released: string[];
+  /** Names removed from the store entirely (no owner left). */
+  removed: string[];
+  /**
+   * Names whose DESCRIPTIVE metadata changed while the registration stayed the
+   * same — `Comment` / `OriginDataType` set, unset, undone or redone. The
+   * catalog is otherwise identical, but the reconcile report is not, which is
+   * why this needs its own event rather than silence (plan-589 Phase 1).
+   */
+  metaChanged: string[];
+  /**
+   * Names moved by {@link SignalStore.renameSignal} (plan-590): the value,
+   * force pin, listeners, writer telemetry and providers went with them. A
+   * rename also lists `to` in `registered` and `from` in `removed`, so a
+   * consumer that does not know this field still rebuilds correctly.
+   */
+  renamed?: Array<{ from: string; to: string }>;
+}
+
+/** One ended rename — see {@link SignalStore.endRename} (plan-590). */
+export interface SignalRenameEnd {
+  oldName: string;
+  newName: string;
+  outcome: 'commit' | 'abort';
+}
+
+/** Thrown by {@link SignalStore.renameSignal} when the target name is taken. */
+export class SignalRenameCollisionError extends Error {
+  constructor(readonly oldName: string, readonly newName: string) {
+    super(`Cannot rename signal "${oldName}" to "${newName}": a signal named "${newName}" already exists`);
+    this.name = 'SignalRenameCollisionError';
+  }
+}
+
+/** Addresses one subscription across renames (see `subscribe`). */
+interface ListenerRef {
+  name: string;
+  set: Set<(value: boolean | number) => void>;
+}
+
 export class SignalStore {
   /** Canonical value store keyed by name (Signal.Name if set, otherwise node name). */
   private byName = new Map<string, boolean | number>();
@@ -221,6 +284,14 @@ export class SignalStore {
   private metaByName = new Map<string, SignalMeta>();
   /** Per-name listener sets. */
   private listeners = new Map<string, Set<(value: boolean | number) => void>>();
+  /** Unsubscribe refs per name — {@link renameSignal} re-points them (plan-590). */
+  private listenerRefs = new Map<string, Set<ListenerRef>>();
+  /** Renames announced by {@link beginRename} and not yet ended (old → new). */
+  private pendingRenames = new Map<string, string>();
+  /** Reverse index of {@link pendingRenames} (new → old). */
+  private pendingRenameTargets = new Map<string, string>();
+  /** Listeners of {@link onRenameEnded}. */
+  private renameEndListeners = new Set<(end: SignalRenameEnd) => void>();
   /** Cache for resolved path lookups (avoids repeated suffix scans at runtime). */
   private resolveCache = new Map<string, string | null>();
   /** Monotonic version counter — incremented on every actual value change. */
@@ -252,6 +323,17 @@ export class SignalStore {
   private lastUpdateTs = new Map<string, number>();
   /** Reverse index name → path, populated on registration (mirror of `pathToName`). */
   private nameToPath = new Map<string, string>();
+  /**
+   * plan-589 spike: every CANONICAL registration path of a name (`register()`
+   * only — never suffix entries of `buildIndex()` nor `registerPathAlias()`).
+   * A name can have several owners (two `/`-global declarations, or a model
+   * node plus the interface placeholder `__iface__/<name>`); `nameToPath` keeps
+   * only one of them, which is why {@link unregisterPath} needs this set to
+   * decide whether a name is still owned.
+   */
+  private pathsByName = new Map<string, Set<string>>();
+  /** plan-589 spike: listeners of {@link onCatalogChanged}. */
+  private catalogListeners = new Set<(change: SignalCatalogChange) => void>();
   /**
    * Optional connection provider injected by the interface layer (e.g. CONNECT
    * adapter / InterfaceManager). Given a `SignalMeta.source` label it returns
@@ -477,7 +559,25 @@ export class SignalStore {
     if (meta.address !== undefined) merged.address = meta.address;
     if (meta.comment !== undefined) merged.comment = meta.comment;
     if (meta.source !== undefined) merged.source = meta.source;
+    if (meta.unit !== undefined) merged.unit = meta.unit;
+    if (meta.unitDef !== undefined) merged.unitDef = meta.unitDef;
+    if (meta.originDataType !== undefined) merged.originDataType = meta.originDataType;
     this.metaByName.set(name, merged);
+  }
+
+  /**
+   * Remove ONE metadata field (plan-589). {@link setSignalMeta} merges and can
+   * therefore never express "this field is gone" — an unset `Comment` used to
+   * land as `''`, which reads as an empty comment rather than as no comment.
+   * Drops the whole record once nothing is left.
+   */
+  clearSignalMetaField(name: string, field: keyof SignalMeta): void {
+    const existing = this.metaByName.get(name);
+    if (!existing || existing[field] === undefined) return;
+    const next: SignalMeta = { ...existing };
+    delete next[field];
+    if (Object.keys(next).length === 0) this.metaByName.delete(name);
+    else this.metaByName.set(name, next);
   }
 
   /** Get descriptive metadata for a signal, or undefined if none was set. */
@@ -677,7 +777,13 @@ export class SignalStore {
     return true;
   }
 
-  /** Subscribe to value changes by name. Returns unsubscribe function. */
+  /**
+   * Subscribe to value changes by name. Returns unsubscribe function.
+   *
+   * The returned function addresses the subscription through a small ref that
+   * {@link renameSignal} keeps current (plan-590): a subscriber that moved with
+   * a rename is still released, under whatever name it lives now.
+   */
   subscribe(name: string, cb: (value: boolean | number) => void): () => void {
     let subs = this.listeners.get(name);
     if (!subs) {
@@ -685,10 +791,19 @@ export class SignalStore {
       this.listeners.set(name, subs);
     }
     subs.add(cb);
+    const ref: ListenerRef = { name, set: subs };
+    let refs = this.listenerRefs.get(name);
+    if (!refs) { refs = new Set(); this.listenerRefs.set(name, refs); }
+    refs.add(ref);
     return () => {
-      subs!.delete(cb);
-      if (subs!.size === 0) {
-        this.listeners.delete(name);
+      ref.set.delete(cb);
+      const current = this.listenerRefs.get(ref.name);
+      if (current) {
+        current.delete(ref);
+        if (current.size === 0) this.listenerRefs.delete(ref.name);
+      }
+      if (ref.set.size === 0 && this.listeners.get(ref.name) === ref.set) {
+        this.listeners.delete(ref.name);
       }
     };
   }
@@ -1142,6 +1257,19 @@ export class SignalStore {
     if (!this.byName.has(name)) {
       this.byName.set(name, initialValue);
     }
+    // plan-589 spike: a path re-registered under ANOTHER name moves its
+    // ownership — the previous name loses this owner (and is removed when it
+    // was the last one, see `_releaseOwner`). Before, the previous name stayed
+    // behind as a ghost whose `getPath()` pointed at a path that no longer
+    // resolved to it (characterised in spike-589-signal-ist).
+    const previous = this.pathToName.get(path);
+    if (previous !== undefined && previous !== name && this.pathsByName.get(previous)?.has(path)) {
+      this.pathToName.delete(path);
+      this._releaseOwner(previous, path);
+    }
+    let owners = this.pathsByName.get(name);
+    if (!owners) { owners = new Set(); this.pathsByName.set(name, owners); }
+    owners.add(path);
     this.pathToName.set(path, name);
     this.nameToPath.set(name, path);
     if (plcType) this.typeByName.set(name, plcType);
@@ -1219,6 +1347,8 @@ export class SignalStore {
       if (name !== undefined) {
         this.pathToName.delete(oldPath);
         this.pathToName.set(newPath, name);
+        const owners = this.pathsByName.get(name);
+        if (owners?.delete(oldPath)) owners.add(newPath);
         // Keep the reverse index in sync — but only when the remapped entry is
         // the canonical registration (pathToName also holds suffix aliases).
         if (this.nameToPath.get(name) === oldPath) {
@@ -1232,6 +1362,339 @@ export class SignalStore {
       debug('signal', `remapPaths: updated ${updated} signal paths`);
     }
     return updated;
+  }
+
+  // ── Ownership / catalog (plan-589 spike) ──
+
+  /** Canonical registration paths of a name (model nodes and `__iface__/<name>`). */
+  registeredPaths(name: string): readonly string[] {
+    return [...(this.pathsByName.get(name) ?? [])];
+  }
+
+  /**
+   * How many canonical paths own `name` — the allocation-free form of
+   * {@link registeredPaths}`.length`. `registerSignal` asks this for every
+   * signal of every load, where a throwaway array per call would be real GC
+   * pressure (20 000 signals is a realistic model).
+   */
+  ownerPathCount(name: string): number {
+    return this.pathsByName.get(name)?.size ?? 0;
+  }
+
+  /**
+   * True when an industrial interface owns `name`: it advertised the signal as
+   * a provider (`registerSignalProvider`) or registered its placeholder path
+   * `__iface__/<name>` (an interface-only symbol). A model node that shares the
+   * name with an interface keeps NO placeholder (base-industrial-interface.ts
+   * `registerDiscoveredSignals` skips names with a path), so the provider index
+   * is the part that matters there.
+   */
+  hasInterfaceOwner(name: string): boolean {
+    if ((this.providersBySignal.get(name)?.size ?? 0) > 0) return true;
+    for (const p of this.pathsByName.get(name) ?? []) if (p.startsWith(IFACE_PATH_PREFIX)) return true;
+    return false;
+  }
+
+  /**
+   * Release ONE model path from its signal name — the editor-sync primitive.
+   *
+   * Ownership rule: the name itself (value, type, meta, force pin, timestamps,
+   * writer telemetry) is removed only when NO owner is left — neither another
+   * canonical model path nor an interface ({@link hasInterfaceOwner}). An
+   * interface-owned name that loses its last model path falls back to the
+   * interface placeholder path, exactly the state an interface-only symbol has.
+   *
+   * Listener sets are NEVER removed: they belong to the subscribers (a drive,
+   * an HMI widget, the interface's outgoing subscription), not to the signal.
+   * Keeping them is what makes undo symmetric — a restored node re-registers
+   * the name and every existing subscriber is live again without re-binding.
+   *
+   * Suffix entries of `buildIndex()` that pointed at the released path are
+   * dropped unless another remaining owner path still produces them.
+   *
+   * @param expectedName only release when the path is (or was) owned by this
+   *   name — guards against releasing a path a later registration re-used.
+   * @returns `'none'` (nothing owned), `'path'` (name kept), `'name'` (name removed).
+   */
+  unregisterPath(path: string, expectedName?: string): 'none' | 'path' | 'name' {
+    const name = expectedName ?? this.pathToName.get(path);
+    if (name === undefined) return 'none';
+    const owners = this.pathsByName.get(name);
+    const owned = !!owners?.has(path);
+    if (this.pathToName.get(path) === name && (owned || expectedName === undefined)) {
+      this.pathToName.delete(path);
+    }
+    // Suffix entries of the released path go regardless of `owned`: after a
+    // `remapPaths()` the canonical key already moved, but the `buildIndex()`
+    // suffixes of the OLD path are still there (characterised in IST B).
+    this._dropSuffixes(path, name);
+    this.resolveCache.clear();
+    if (!owned) return 'none';
+    return this._releaseOwner(name, path);
+  }
+
+  /**
+   * Add the `buildIndex()` suffix entries of ONE canonical path (first wins,
+   * like `buildIndex`). Lets the editor sync index a re-keyed path without a
+   * full index rebuild.
+   */
+  indexPathSuffixes(path: string): void {
+    const name = this.pathToName.get(path);
+    if (name === undefined) return;
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      const suffix = parts.slice(i).join('/');
+      if (!this.pathToName.has(suffix)) this.pathToName.set(suffix, name);
+    }
+    this.resolveCache.clear();
+  }
+
+  /** Subscribe to catalog changes (names/paths registered or released by the editor sync). */
+  onCatalogChanged(cb: (change: SignalCatalogChange) => void): () => void {
+    this.catalogListeners.add(cb);
+    return () => { this.catalogListeners.delete(cb); };
+  }
+
+  /** Emit ONE catalog change for a whole wave (editor sync calls this once per op). */
+  notifyCatalogChanged(change: SignalCatalogChange): void {
+    for (const cb of this.catalogListeners) {
+      try { cb(change); } catch (e) { console.warn('[signal-store] catalog listener failed:', e); }
+    }
+  }
+
+  // ── Rename (plan-590) ──
+
+  /**
+   * Move a signal from `oldName` to `newName` in EVERY name-keyed index (F3):
+   * value, PLC type, metadata, force pin, liveness timestamp, listeners (their
+   * unsubscribe functions keep working), canonical owner paths and their
+   * `buildIndex()` suffixes, the interface placeholder `__iface__/<name>`,
+   * provider registrations, writer inventory and write conflicts. Nothing is
+   * notified as a value change — the value did not change, only its name.
+   *
+   * Idempotent: `oldName` gone and `newName` present means the rename already
+   * happened → `false`, no-op. Both absent → `false`, no-op.
+   *
+   * @throws SignalRenameCollisionError when both names exist (the target is taken).
+   * @returns true when something was moved; one `onCatalogChanged` with
+   *   `renamed`, `registered: [newName]` and `removed: [oldName]` is emitted then.
+   */
+  renameSignal(oldName: string, newName: string): boolean {
+    if (!oldName || !newName || oldName === newName) return false;
+    const oldKnown = this.byName.has(oldName) || this.pathsByName.has(oldName) || this.typeByName.has(oldName);
+    const newKnown = this.byName.has(newName) || this.pathsByName.has(newName) || this.typeByName.has(newName);
+    if (!oldKnown) return false;
+    if (newKnown) throw new SignalRenameCollisionError(oldName, newName);
+
+    moveKey(this.byName, oldName, newName);
+    moveKey(this.typeByName, oldName, newName);
+    moveKey(this.metaByName, oldName, newName);
+    moveKey(this.lastUpdateTs, oldName, newName);
+    const forced = moveKey(this.forced, oldName, newName);
+
+    // Listeners: the Set object travels (or merges into subscribers that were
+    // already waiting on the new name); every unsubscribe ref is re-pointed.
+    const subs = this.listeners.get(oldName);
+    if (subs) {
+      this.listeners.delete(oldName);
+      const target = this.listeners.get(newName);
+      if (target) for (const cb of subs) target.add(cb);
+      else this.listeners.set(newName, subs);
+      const finalSet = target ?? subs;
+      const refs = this.listenerRefs.get(oldName);
+      if (refs) {
+        this.listenerRefs.delete(oldName);
+        let into = this.listenerRefs.get(newName);
+        if (!into) { into = new Set(); this.listenerRefs.set(newName, into); }
+        for (const ref of refs) {
+          ref.name = newName;
+          if (ref.set === subs) ref.set = finalSet;
+          into.add(ref);
+        }
+      }
+    }
+
+    // Paths: the canonical owners move to the new name; the interface
+    // placeholder is re-keyed to `__iface__/<newName>` so its path keeps
+    // spelling the name it stands for.
+    const owners = this.pathsByName.get(oldName);
+    const oldPlaceholder = `${IFACE_PATH_PREFIX}${oldName}`;
+    const newPlaceholder = `${IFACE_PATH_PREFIX}${newName}`;
+    if (owners) {
+      this.pathsByName.delete(oldName);
+      const moved = new Set<string>();
+      for (const p of owners) moved.add(p === oldPlaceholder ? newPlaceholder : p);
+      this.pathsByName.set(newName, moved);
+    }
+    if (this.pathToName.get(oldPlaceholder) === oldName) {
+      this.pathToName.delete(oldPlaceholder);
+      this.pathToName.set(newPlaceholder, newName);
+    }
+    for (const [p, n] of this.pathToName) if (n === oldName) this.pathToName.set(p, newName);
+    const canonical = this.nameToPath.get(oldName);
+    if (canonical !== undefined) {
+      this.nameToPath.delete(oldName);
+      this.nameToPath.set(newName, canonical === oldPlaceholder ? newPlaceholder : canonical);
+    }
+    this.resolveCache.clear();
+
+    // Providers: every provider key that advertised the old name now advertises the new one.
+    const providers = this.providersBySignal.get(oldName);
+    if (providers) {
+      this.providersBySignal.delete(oldName);
+      let into = this.providersBySignal.get(newName);
+      if (!into) { into = new Set(); this.providersBySignal.set(newName, into); }
+      for (const key of providers) {
+        into.add(key);
+        const signals = this.providerSignals.get(key);
+        if (signals?.delete(oldName)) signals.add(newName);
+      }
+    }
+
+    // Writer telemetry: the entries carry their signal name.
+    const writers = this.writerInventory.get(oldName);
+    if (writers) {
+      this.writerInventory.delete(oldName);
+      const next = new Map<string, WriterInventoryEntry>();
+      for (const [id, entry] of writers) next.set(id, { ...entry, signal: newName });
+      this.writerInventory.set(newName, next);
+    }
+    const conflicts = this.writeConflicts.get(oldName);
+    if (conflicts) {
+      this.writeConflicts.delete(oldName);
+      for (const reasons of conflicts.values()) {
+        for (const [reason, entry] of reasons) reasons.set(reason, { ...entry, slotId: newName });
+      }
+      this.writeConflicts.set(newName, conflicts);
+    }
+
+    this._version++;
+    debug('signal', `rename "${oldName}" -> "${newName}"`);
+    // The force PIN moved to another name — badges must re-read it. The force
+    // sink is NOT told: the gateway moves its own force with its own rename.
+    if (forced) this._notifyForce();
+    this.notifyCatalogChanged({
+      registered: [newName], released: [], removed: [oldName], metaChanged: [],
+      renamed: [{ from: oldName, to: newName }],
+    });
+    return true;
+  }
+
+  /**
+   * Announce a rename that is about to happen (plan-590 Rename-/Sync-Vertrag).
+   * While it is open, the editor sync turns "node snapshot `oldName`, desired
+   * `newName`" into {@link renameSignal} instead of register + release, and
+   * interface rediscovery neither registers `newName` nor unregisters
+   * `oldName`. The reverse phase is the same call with the names swapped.
+   */
+  beginRename(oldName: string, newName: string): void {
+    if (!oldName || !newName || oldName === newName) return;
+    this.pendingRenames.set(oldName, newName);
+    this.pendingRenameTargets.set(newName, oldName);
+  }
+
+  /**
+   * Close a rename opened by {@link beginRename}. `abort` restores NOTHING —
+   * taking a rename back is always a reverse phase (`beginRename(new, old)`).
+   * Notifies {@link onRenameEnded} so deferred catalog work can run now.
+   */
+  endRename(oldName: string, newName: string, outcome: 'commit' | 'abort' = 'commit'): void {
+    if (this.pendingRenames.get(oldName) !== newName) return;
+    this.pendingRenames.delete(oldName);
+    if (this.pendingRenameTargets.get(newName) === oldName) this.pendingRenameTargets.delete(newName);
+    const end: SignalRenameEnd = { oldName, newName, outcome };
+    for (const cb of this.renameEndListeners) {
+      try { cb(end); } catch (e) { console.warn('[signal-store] rename-end listener failed:', e); }
+    }
+  }
+
+  /** The target of the open rename of `oldName`, or undefined. */
+  pendingRenameOf(oldName: string): string | undefined {
+    return this.pendingRenames.get(oldName);
+  }
+
+  /** True while `name` is the old OR the new name of an open rename. */
+  isRenamePending(name: string): boolean {
+    return this.pendingRenames.size > 0
+      && (this.pendingRenames.has(name) || this.pendingRenameTargets.has(name));
+  }
+
+  /** True while any rename is open. */
+  get hasPendingRename(): boolean {
+    return this.pendingRenames.size > 0;
+  }
+
+  /** Subscribe to {@link endRename}. Returns an unsubscribe function. */
+  onRenameEnded(cb: (end: SignalRenameEnd) => void): () => void {
+    this.renameEndListeners.add(cb);
+    return () => { this.renameEndListeners.delete(cb); };
+  }
+
+  /**
+   * Withdraw ONE signal from one provider key (plan-590 F4): the interface no
+   * longer lists it. The provider key itself stays known while it has signals.
+   */
+  unregisterSignalProviderSignal(source: SignalSourceRef): void {
+    const key = signalProviderKey(source);
+    const signals = this.providerSignals.get(key);
+    if (signals?.delete(source.signal) && signals.size === 0) this.providerSignals.delete(key);
+    const providers = this.providersBySignal.get(source.signal);
+    if (providers?.delete(key) && providers.size === 0) this.providersBySignal.delete(source.signal);
+  }
+
+  /** Drop `path` from the owners of `name`; remove or re-point the name per the ownership rule. */
+  private _releaseOwner(name: string, path: string): 'path' | 'name' {
+    const owners = this.pathsByName.get(name);
+    owners?.delete(path);
+    if (owners && owners.size > 0) {
+      if (this.nameToPath.get(name) === path || !this.nameToPath.has(name)) {
+        // Prefer a model path over the interface placeholder.
+        let next: string | undefined;
+        for (const p of owners) { if (!p.startsWith(IFACE_PATH_PREFIX)) { next = p; break; } }
+        this.nameToPath.set(name, next ?? owners.values().next().value!);
+      }
+      return 'path';
+    }
+    if (this.hasInterfaceOwner(name)) {
+      const placeholder = `${IFACE_PATH_PREFIX}${name}`;
+      let set = owners;
+      if (!set) { set = new Set(); this.pathsByName.set(name, set); }
+      set.add(placeholder);
+      this.pathToName.set(placeholder, name);
+      this.nameToPath.set(name, placeholder);
+      return 'path';
+    }
+    this.pathsByName.delete(name);
+    this.byName.delete(name);
+    this.nameToPath.delete(name);
+    this.typeByName.delete(name);
+    this.metaByName.delete(name);
+    this.lastUpdateTs.delete(name);
+    this.writerInventory.delete(name);
+    this.writeConflicts.delete(name);
+    for (const [p, n] of [...this.pathToName]) if (n === name) this.pathToName.delete(p);
+    this.resolveCache.clear();
+    if (this.forced.delete(name)) {
+      this.forceSink?.(name, null);
+      this._notifyForce();
+    }
+    this._version++;
+    return 'name';
+  }
+
+  /** Remove suffix entries of `path` mapped to `name` that no remaining owner path produces. */
+  private _dropSuffixes(path: string, name: string): void {
+    const owners = this.pathsByName.get(name);
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      const suffix = parts.slice(i).join('/');
+      if (this.pathToName.get(suffix) !== name) continue;
+      let stillProduced = false;
+      for (const p of owners ?? []) {
+        if (p !== path && (p === suffix || p.endsWith('/' + suffix))) { stillProduced = true; break; }
+      }
+      if (!stillProduced) this.pathToName.delete(suffix);
+    }
   }
 
   // ── Utility ──
@@ -1313,9 +1776,11 @@ export class SignalStore {
     for (const name of removed) {
       this.byName.delete(name);
       this.nameToPath.delete(name);
+      this.pathsByName.delete(name);
       this.typeByName.delete(name);
       this.metaByName.delete(name);
       this.listeners.delete(name);
+      this.listenerRefs.delete(name);
       this.forced.delete(name);
       this.lastUpdateTs.delete(name);
       this.writerInventory.delete(name);
@@ -1355,9 +1820,13 @@ export class SignalStore {
     this.byName.clear();
     this.pathToName.clear();
     this.nameToPath.clear();
+    this.pathsByName.clear();
     this.typeByName.clear();
     this.metaByName.clear();
     this.listeners.clear();
+    this.listenerRefs.clear();
+    this.pendingRenames.clear();
+    this.pendingRenameTargets.clear();
     this.resolveCache.clear();
     this.forced.clear();
     this.lastUpdateTs.clear();
@@ -1421,4 +1890,13 @@ export function createSignalWriter(
       }
     },
   };
+}
+
+/** Move one map entry to another key; returns whether something moved. */
+function moveKey<V>(map: Map<string, V>, from: string, to: string): boolean {
+  if (!map.has(from)) return false;
+  const value = map.get(from) as V;
+  map.delete(from);
+  map.set(to, value);
+  return true;
 }

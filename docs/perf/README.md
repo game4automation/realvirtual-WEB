@@ -64,12 +64,80 @@ A cell or a soak is **supported** when all of these hold in the measurement wind
 | Frame time p99 | ≤ 66 ms | individual hitches visible but rare |
 | Lost simulation time | ≤ 0.1 % of runtime | beyond that the display drifts away from PLC time |
 | Signal jitter p95 (CONNECT cell) | ≤ `PublishIntervalMs` + 50 ms over the running minimum | coalescing window plus one frame |
-| Stationarity | over ≥ 5 min: live MUs within ±10 % of target **and** source rate ≥ 0.9× configured **and** sink rate ≥ 0.9× source rate | occupancy alone would call a completely stalled line perfect |
+| **Run validity** (plan-473 F4) | four conditions, each reported individually: live MUs within ±10 % of target; source rate **> 0** and within ±15 % of a REFERENCE run's rate (`--refrate`); sink rate within ±15 % of the source rate; lost simulation time ≤ 5 % of the window | see below — this REPLACES the old `stationary` flag |
 | Heap trend (soak, after GC) | ≤ 5 MiB/h, and no monotonic growth in pools / MUs / listeners | leak indicator |
 | `renderer.info.memory` | geometries and textures ±1 % start vs end | GPU-side leaks |
 
 A cell that breaks one limit is **not supported in that configuration**. The matrix
 report names the last supported cell per axis, and names which criterion broke.
+
+### Run validity: did the run measure what it claims to? (plan-473 F4)
+
+Validity is not a performance criterion — it is the question of whether a run's
+percentiles mean anything at all. It is reported in its own section of every
+Markdown report, one line per run, with each of the four conditions separately.
+
+The criterion it replaces graded the source against the rate the configuration
+ASKS for (`lanes / sourceIntervalS`, e.g. 100 MU/s) while the line physically
+tops out around 59 MU/s, because `RVSource` emits at most one part per fixed step
+and the spawn point stays blocked until the previous part cleared it. Every cell
+therefore printed FAIL and the flag became unreadable — it said nothing about the
+run either way.
+
+What changed:
+
+- **Source throughput is graded against an ACHIEVABLE rate**, taken from a
+  reference run of the same configuration and handed in with `--refrate <MU/s>`.
+  Without it the gate can only require `> 0` and says so, in the report and in
+  the JSON (`validity.referenceMissing`).
+- **A standstill is explicitly invalid.** `source = sink = 0` on a full belt used
+  to satisfy an occupancy-only reading of steady state; `spawnRate > 0` is now a
+  hard precondition of the source condition.
+- **Lost simulation time enters the validity verdict** (≤ 5 % of the window), not
+  just the support verdict. A run that spent a fifth of its window catching up
+  measured a stalled tab, whatever its percentiles say.
+
+A run that fails any condition must not be quoted. This is not theoretical: in
+the plan-473 campaign the gate invalidated whole cells that another process on
+the machine had starved — runs whose frame percentiles looked merely mediocre but
+whose source rate had collapsed to 36 MU/s with 23 s of lost simulation time.
+
+**Establishing the reference rate:** run the cell once without `--refrate`, read
+the source rate from the run-validity section (or `stationarity.spawnRate` in the
+JSON), and pass that number to every later run of the same configuration.
+
+**Known limit:** small cells (`--mu 100` on the default geometry) settle at ~120
+live MUs against a target of 100 and can therefore never satisfy the occupancy
+condition. That is a property of the line builder's fill control, not of the gate;
+pick a target the configuration actually holds.
+
+### The draw-call metric (plan-473 F4)
+
+`draws` in the cell table is **not** a snapshot any more. It has a defined pass
+scope and a defined temporal aggregation, both printed in the report header:
+
+- **Scope `frame-all-passes`** — every draw call issued inside one render
+  callback: main pass, shadow pass and every post-processing pass together.
+  `renderer.info.autoReset` is turned off for the run and `info.reset()` is
+  called exactly once per render callback; otherwise three.js zeroes the counters
+  at the start of each `renderer.render()` and the last pass wins by accident.
+- **Aggregation `median-over-window`** — a per-frame histogram over the whole
+  measurement window; the quoted figure is its p50 (`drawMetric.calls.p50` in the
+  JSON, which also carries p95/p99/max and the frame count).
+- **No hooks required.** Unlike the main/shadow split (`renderPasses`), the draw
+  metric is installed for every run that has a renderer, so it is available in the
+  `--hooks off` runs that acceptance figures must come from. It costs one
+  `info.reset()` and two counter reads per FRAME.
+
+Figures produced before plan-473 used the end-state snapshot and are **not**
+comparable; re-measure the reference with the current metric.
+
+### Ambient occlusion and shadows in the header
+
+Both are now in the report header and in the JSON (`env.aoMode`, `env.shadows`).
+AO is a default-ON screen-space pass (`gtao` under WebGL, TSL-GTAO under WebGPU),
+and until plan-473 it was not protocolled at all — two reports could differ by a
+whole post pass without saying so.
 
 ---
 
@@ -195,6 +263,112 @@ so is part of the claim.
 
 ---
 
+## Transport-step attribution (plan-469)
+
+The matrix runner can additionally attribute the transport fixed step to the
+phases it is built from, and price minimal optimisation prototypes against the
+very same cell. Everything here is **dev-only**: in production
+`RVTransportManager.regionHooks` and `probeCounters` are `null` and every
+prototype switch is `false`, so the whole mechanism reduces to a handful of null
+checks and boolean tests.
+
+### Regions
+
+`RVPerfProbe` installs an {@link RVRegionTimer} on the manager for the duration
+of a run. The manager brackets each phase with `enter`/`leave`; the timer keeps a
+small stack, so a **nested** region is subtracted from its parent automatically.
+Every reported number is therefore **exclusive**, and the regions sum to at most
+the step.
+
+| Region | What it covers |
+|---|---|
+| `sources` | step 1, source spawning |
+| `surfaceGrid` | step 2, surface AABB update + grid re-index (+ any rebuild) |
+| `pick` | `_pickDrivingSurface`, per MU, summed over the tick |
+| `transportExcl` | the per-MU transport body MINUS `accumulation` and `adjacency` |
+| `accumulation` | `queryLeadingMU`, nested inside the transport body |
+| `muAabbGrid` | step 4, MU AABB update + MU-grid re-index |
+| `sensors` / `sinks` / `removal` | steps 5, 6, 7 |
+| `poolMatrices` | step 8, instance-matrix compose |
+| `adjacency` | a dead-end adjacency cache REBUILD (cold, nested) |
+| `growth` | `MUInstancePool._grow()` (cold; measured in `rv-mu.ts`, charged per tick) |
+
+Regions that run per MU are entered N times per tick and **accumulate** — the
+report shows the per-tick SUM, never a per-MU value.
+
+`coverage` = `sum(exclusive regions) / total`. The plan wants >= 90 %; the
+remainder is honestly reported as unattributed rather than assumed to be GC.
+**GC is never inferred from missing attribution** — it is measured separately,
+either with `--js-flags=--trace-gc` or from a CDP profile's `(garbage collector)`
+share, and the report says which method was used.
+
+### Long steps
+
+Every transport step above **100 ms** produces a record with its exclusive
+regions and three flags — `poolGrew`, `adjacencyRebuilt`, `surfaceGridRebuilt` —
+so a 400 ms outlier names its own cause instead of being guessed at. Records are
+capped at 200 per run; the report states how many were dropped.
+
+### Hit rates (F1b)
+
+| Probe | Meaning |
+|---|---|
+| pick fast-path | fraction of MUs per tick for which the REAL fast-path predicates (i)-(vi) hold — membership, non-radial, XZ overlap, active, band against the cell upper bound. Not "rule 1 would apply": a tall non-overlapping surface in the same cell raises `cellMaxTopY` and blocks the fast path (SOL R2#3). |
+| accum span stable | fraction of accumulation queries whose cell span is unchanged AND none of whose cells changed since the last query (the exact validity condition of the stage-1 union cache). |
+| clone share | share of MU-AABB updates on clone MUs (the only ones that walk the world matrix); instanced MUs read typed arrays and are unaffected by F4. |
+
+While the probe is on, the `pick` region **also contains** the fast-path
+predicate evaluation, so it slightly over-states the reference cost. The honest
+price of the fast path is the A/B cell, not that over-estimate.
+
+### Switches
+
+```bash
+# Baseline WITH attribution
+node scripts/perf-scale-matrix.mjs --mu 100,500,2400 --sensors 1 --load none \
+  --renderer webgl --keepmodel off --shadows on --duration 300 --runs 3 \
+  --hooks on --out <date>-plan469-baseline
+
+# Instrumentation overhead: same cell, hooks uninstalled
+node scripts/perf-scale-matrix.mjs --mu 2400 ... --runs 1 --hooks off
+
+# One A/B pair against the same cell: reference side, then production side
+node scripts/perf-scale-matrix.mjs --mu 2400 ... --runs 3 --proto refslowpick,refaabb
+node scripts/perf-scale-matrix.mjs --mu 2400 ... --runs 3 --refrate 59
+```
+
+`--proto` and `--hooks` are **not axes**: one setting per invocation, so an A/B
+pair is two runs of the runner and the report names which side it is (the `proto`
+and `hooks` columns of the per-run table come from the page's own `env`, not from
+the command line, so a typo cannot be mistaken for a measurement).
+
+Switch names (plan-473 revised the inventory):
+
+| Name | Kind | What it does |
+|---|---|---|
+| `refslowpick` | reference | turns the **production** sticky-ownership fast path OFF, restoring the full surface-pick slow path. This is the comparison side of an F3 A/B pair. |
+| `refaabb` | reference | turns the **production** instanced AABB cache OFF, restoring the unconditional rotated-extent recompute. Comparison side of an F2 A/B pair. |
+| `walk` | prototype | one world-matrix walk for clone MUs (plan-469 F4). |
+| `bounds` | prototype | pool extents in the compose loop (plan-469 F5). |
+
+Comma-separating them arms them together, so
+`--proto refslowpick,refaabb` is the full pre-plan-473 reference path and no
+`--proto` at all is production.
+
+`fastpath` and `union` are **gone**: plan-473 made the fast path production and
+deleted the cell-union cache (it was slower than its reference in both plan-469
+campaigns). A reference switch is the inverse of a prototype switch, and that
+inversion is deliberate: the comparison side of a parity test or an A/B pair must
+not be able to run the very code under test.
+
+### Comparing runs
+
+The runner grades and reports **every** run, not only the median-by-frame-p95 one
+(SOL #8), and prints the live-MU occupancy of each. Two cells are only comparable
+while their occupancy spread is <= 5 % — the per-run table says so explicitly.
+
+---
+
 ## Files
 
 | Path | What |
@@ -204,7 +378,14 @@ so is part of the claim.
 | `scripts/perf-soak.mjs` | the soak runner |
 | `scripts/perf-signal-load.mjs` | the signal-rate runner |
 | `src/core/engine/perf/rv-synthetic-line.ts` | the line builder (dev-only) |
-| `src/core/engine/perf/rv-perf-probe.ts` | per-frame/per-step probe, histograms, latency clock (dev-only) |
+| `src/core/engine/perf/rv-perf-probe.ts` | per-frame/per-step probe, histograms, latency clock, transport-step region attribution, simulation stages, main/shadow render split, world-matrix counters (dev-only) |
+| `src/core/engine/perf/rv-synthetic-assets.ts` | realistic-scene ingredients: library conveyors, library MU template, robot farm (dev-only, plan-469 Phase 0d) |
+| `src/core/engine/perf/rv-sim-stage-hooks.ts` | the `ContinuousRunner.tick()` stage seam (holder only; `null` in production) |
+| `tests/perf/synthetic-realistic-scene.test.ts` | realistic-scene generator: defaults unchanged, robot determinism, topology untouched, dispose (plan-469 Phase 0d) |
+| `tests/perf/sim-stage-hooks.test.ts` | stage seam inert with hooks null; enter/leave order; `RVStageTimer` |
+| `tests/perf/accumulation-candidate-count.test.ts` | measured candidate-count distribution of the accumulation query |
+| `tests/perf/transport-phase-timing.test.ts` | region attribution: hooks neutral, accumulation exclusive, long-step flags (plan-469 §9.1) |
+| `tests/rv-transport-prototype-switches-off.test.ts` | prototype switches off == reference path; switch-on parity (plan-469 §9.2) |
 | `src/interfaces/synthetic-load-interface.ts` | in-browser load generator (dev-only) |
 | `Assets/realvirtual-Connect~/tools/mqtt-test/publish-load-plcs.py` | the multi-PLC MQTT load source |
 
@@ -218,9 +399,31 @@ so is part of the claim.
 | `2026-09-06-control-100.*` | **before fix — not citable.** Same four defects. |
 | `2026-09-06-soak-100-6min.*` | **before fix — not citable.** Same four defects. |
 | `2026-09-06-sweep-after-fix.*` | first report taken with the corrected harness. |
+| `2026-09-07-plan469-*` | Phase 0 baseline, A/B prototype pairs and the GC profile. The `ab-*` pairs are only comparable WITHIN a near-in-time pair — the reference cell drifted from 9,25 to 14,50 ms step p95 over that evening. |
+| `2026-09-08-plan469-realistic-*` | Phase 0d realistic scene (library conveyors + CartonBox MU + 100 robots), ladder S0-S4 in both directions, robot-scaling axis and the `hooks=off` price. Window is **120 s**, not the 300 s of §1.3. `2026-09-08-plan469-realistic-campaign.sh` is the exact invocation list. |
 
 They are kept rather than deleted because the plan's own record of what went
 wrong is worth more than a clean directory — but no number in them may be quoted.
 
 Everything under `src/core/engine/perf/` and the load interface is behind
 `import.meta.env.DEV` and contributes 0 KB to a production build.
+
+### Realistic-scene axes (plan-469 Phase 0d)
+
+`--geometry primitive|library` draws real `RollConveyor-*.glb` on every belt as
+`InstancedMesh` (the transport topology is identical either way);
+`--muasset primitive|cartonbox` swaps the MU template for `CartonBox.glb`;
+`--robots <N>` with `--robotmotion static|erratic` adds six-axis robots beside the
+lanes that never touch the material flow. All four default to the plan-465 cell, so
+an existing invocation measures exactly what it measured before.
+
+Two properties of the numbers these produce:
+
+* **`--hooks off` is the only production-like frame time.** The world-matrix
+  wrappers intercept > 6 000 calls per frame; measured price on 2026-09-08 was
+  ~4,7 ms step p95 and 25-45 ms frame p95.
+* **A library asset is not automatically a usable MU.** `CartonBox.glb` carries a
+  ~1,7 m geometry offset from its own node origin; the generator bakes the
+  transform into cloned geometry and turns the long horizontal axis onto X, because
+  otherwise the MUs sit beside the belt (sink rate 0) or measure only 134 mm along
+  the belt (occupancy off by 11 %).

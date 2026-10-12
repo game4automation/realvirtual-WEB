@@ -61,9 +61,12 @@ import {
   AutoAwesome,
   Close,
   ContentCopy,
+  CheckCircle,
   Delete,
   DriveFileRenameOutline,
+  Extension,
   FileDownload,
+  Link as LinkIcon,
   MenuBookOutlined,
   MoreVert,
   SaveAlt,
@@ -153,6 +156,45 @@ export interface DocumentCardProps {
    * model, same drag-to-assign contract, book icon instead of the connector.
    */
   knowledge?: DocumentCardRefSlot | null;
+  /**
+   * The document's plugin binding (`documents[].scriptRef`, plan-479 F1/F2).
+   *
+   * The third slot, same model and same drag-to-assign contract as the two
+   * above — with one thing neither of them has: a RUNTIME verdict
+   * ({@link DocumentCardRefSlot.status}). A CONNECT config and a knowledge file
+   * are inert data; a plugin is code that either loaded or did not, and "bound"
+   * alone would let the card claim a plugin is working when it never ran.
+   *
+   * The slot is labelled PLUGIN, not Script: a WebComponent script inside the
+   * GLB is a different thing edited in a different editor, and two different
+   * things must not wear one name. The manifest field keeps its name.
+   */
+  plugin?: DocumentCardRefSlot | null;
+  /**
+   * The keyboard route to the three bindings (plan-479 F7).
+   *
+   * Drag-and-drop is a mouse gesture and nothing else — a user on the keyboard,
+   * or on a touch device where the HTML drag API does not fire at all, has no
+   * way to reach the reference slots. WAI-ARIA is explicit that a widget one
+   * can drag must also be operable from the keyboard, so every slot gets an
+   * entry in the card's own kebab menu, which is already a keyboard surface.
+   *
+   * These are entries, not writers: each `onSelect` is handed straight back to
+   * the mount that supplied it, so the menu route and the drop route end in the
+   * SAME `assign(field, ref)` call. A second way into the store is how the two
+   * routes would start disagreeing about containment or read-only.
+   */
+  bindActions?: readonly DocumentCardBindAction[];
+}
+
+/** One "Bind …" entry in the card menu — the keyboard twin of a drop. */
+export interface DocumentCardBindAction {
+  /** Stable id, used for the `data-testid` — the manifest field name. */
+  id: string;
+  /** Menu label, e.g. "Bind plugin…". */
+  label: string;
+  /** Open the mount's candidate picker for this field. */
+  onSelect: () => void;
 }
 
 /** One hero reference chip — bound (with name) or the empty slot. */
@@ -163,6 +205,19 @@ export type DocumentCardRefSlot =
       label: string;
       /** The file the binding names is not in the project. */
       missing?: boolean;
+      /**
+       * What actually happened to this binding at run time (plan-479 F4/F6).
+       *
+       * Absent means "bound, nothing known yet" — the honest state before a
+       * model is loaded, and the only state the CONNECT and knowledge slots
+       * ever have. `no-exports` is the source-scan verdict (the file carries no
+       * `registerModelPlugins`/`unregisterModelPlugins` pair) and reads as a
+       * warning, not a failure: the scan is a regex and may be wrong, and the
+       * runtime verdict overrides it the moment the module really loads.
+       */
+      status?: 'loaded' | 'no-exports' | 'failed';
+      /** The reason behind `status`, for the tooltip. One sentence. */
+      statusDetail?: string;
       /** Ping: reveal + select the referenced file in the dashboard. */
       onReveal?: () => void;
       /** Clear the binding. Absent = read-only. */
@@ -225,8 +280,25 @@ function RefSlotTile({ fieldLabel, what, Icon, slot, accent, flash, testId }: {
 }) {
   const a = (alpha: number) => `rgba(${accent}, ${alpha})`;
   const bound = slot.kind === 'bound';
+  const status = bound ? slot.status : undefined;
+  // The six states of §3.1, in the order a chip may claim them. `missing` and
+  // `failed` are the two hard verdicts and outrank the soft `no-exports`: a
+  // file that is not there cannot also be "a file without the right exports".
   const missing = bound && slot.missing === true;
-  const ink = missing ? 'rgba(255,167,38,0.95)' : bound ? a(0.95) : 'rgba(255,255,255,0.45)';
+  const failed = bound && !missing && status === 'failed';
+  const warned = bound && !missing && !failed && status === 'no-exports';
+  const loaded = bound && !missing && status === 'loaded';
+  // Orange is the established "look at this" (`missing` has been orange since
+  // plan-718); red is reserved for code that actually threw.
+  const WARN_INK = 'rgba(255,167,38,0.95)';
+  const FAIL_INK = 'rgba(229,115,115,0.95)';
+  const ink = missing || warned ? WARN_INK
+    : failed ? FAIL_INK
+      : bound ? a(0.95) : 'rgba(255,255,255,0.45)';
+  const off = missing || warned || failed;
+  const offInk = failed ? FAIL_INK : WARN_INK;
+  /** The one-word state under the name, or nothing when all is well. */
+  const stateWord = missing ? 'missing' : failed ? 'error' : warned ? 'no plugin' : null;
   const clickable = bound && !!slot.onReveal;
   return (
     <Box
@@ -249,7 +321,11 @@ function RefSlotTile({ fieldLabel, what, Icon, slot, accent, flash, testId }: {
         title={bound
           ? (missing
             ? `The ${what} this document references is missing from the project`
-            : `Show this ${what} in the project`)
+            : off
+              ? (slot.statusDetail ?? `This ${what} did not load`)
+              : loaded
+                ? `${slot.statusDetail ?? `This ${what} is loaded`} — click to show it in the project`
+                : `Show this ${what} in the project`)
           : (slot.kind === 'empty' && slot.droppable
             ? `Drag a ${what} from the project onto this card to bind it`
             : `No ${what} referenced`)}
@@ -267,12 +343,16 @@ function RefSlotTile({ fieldLabel, what, Icon, slot, accent, flash, testId }: {
           justifyContent: 'center',
           gap: 0.5,
           cursor: clickable ? 'pointer' : 'default',
-          bgcolor: missing ? 'rgba(255,167,38,0.08)' : bound ? a(0.1) : 'rgba(255,255,255,0.02)',
-          border: missing
-            ? '1px solid rgba(255,167,38,0.5)'
+          bgcolor: off
+            ? (failed ? 'rgba(229,115,115,0.08)' : 'rgba(255,167,38,0.08)')
+            : bound ? a(0.1) : 'rgba(255,255,255,0.02)',
+          border: off
+            ? `1px solid ${failed ? 'rgba(229,115,115,0.5)' : 'rgba(255,167,38,0.5)'}`
             : bound ? `1px solid ${a(0.55)}` : '1px dashed rgba(255,255,255,0.25)',
           '&:hover': clickable ? {
-            bgcolor: missing ? 'rgba(255,167,38,0.15)' : a(0.18),
+            bgcolor: off
+              ? (failed ? 'rgba(229,115,115,0.15)' : 'rgba(255,167,38,0.15)')
+              : a(0.18),
           } : {},
           '&:focus-visible': {
             outline: `1px solid ${a(1)}`,
@@ -289,7 +369,17 @@ function RefSlotTile({ fieldLabel, what, Icon, slot, accent, flash, testId }: {
           }),
         }}
       >
-        <Icon sx={{ fontSize: 26, color: bound || missing ? ink : 'rgba(255,255,255,0.3)' }} />
+        <Icon sx={{ fontSize: 26, color: bound ? ink : 'rgba(255,255,255,0.3)' }} />
+        {loaded && (
+          // The one state the other two slots cannot have: the code RAN. A
+          // tick rather than a colour, because the bound colour is already
+          // taken and a second blue would say nothing.
+          <CheckCircle
+            data-testid={`${testId}-loaded`}
+            titleAccess="loaded"
+            sx={{ position: 'absolute', top: 3, left: 3, fontSize: 13, color: ink }}
+          />
+        )}
         <Typography
           component="span"
           sx={{
@@ -305,9 +395,13 @@ function RefSlotTile({ fieldLabel, what, Icon, slot, accent, flash, testId }: {
         >
           {bound ? slot.label : 'None'}
         </Typography>
-        {missing && (
-          <Typography component="span" sx={{ fontSize: 9, lineHeight: 1, color: ink }}>
-            missing
+        {stateWord && (
+          <Typography
+            component="span"
+            data-testid={`${testId}-state`}
+            sx={{ fontSize: 9, lineHeight: 1, color: offInk }}
+          >
+            {stateWord}
           </Typography>
         )}
         {bound && slot.onClear && (
@@ -338,6 +432,8 @@ export function DocumentCard({
   onReveal,
   connect = null,
   knowledge = null,
+  plugin = null,
+  bindActions = [],
 }: DocumentCardProps) {
   const viewer = useOptionalViewer();
   const version = useSyncExternalStore(
@@ -380,7 +476,10 @@ export function DocumentCard({
     const bump = () => setModelTick(t => t + 1);
     const offLoad = viewer.on('model-loaded', bump);
     const offClear = viewer.on('model-cleared', bump);
-    return () => { offLoad(); offClear(); };
+    // The model facts (drives, signals, referenced assets) are complete only
+    // once the placed references materialised (scene-ready contract).
+    const offReady = viewer.on('placements-materialized', bump);
+    return () => { offLoad(); offClear(); offReady(); };
   }, [variant, viewer]);
 
   /**
@@ -423,6 +522,7 @@ export function DocumentCard({
    */
   const connectFlash = usePulseOnChange(connect?.kind === 'bound' ? connect.label : null);
   const knowledgeFlash = usePulseOnChange(knowledge?.kind === 'bound' ? knowledge.label : null);
+  const pluginFlash = usePulseOnChange(plugin?.kind === 'bound' ? plugin.label : null);
 
   const closeMenu = useCallback(() => setMenuAnchor(null), []);
 
@@ -591,7 +691,11 @@ export function DocumentCard({
   const hero = variant === 'hero';
   const saveLabel = view.saveVerb === 'save-into-project' ? 'Save into project' : 'Save';
   const menu = view.actions.menu ?? [];
-  const hasMenu = menu.length > 0 || !!view.actions.share || !!view.actions.exportGlb;
+  // The bind entries count towards the menu EXISTING (F7): on a document whose
+  // mode publishes no verbs at all the kebab would otherwise never render, and
+  // the keyboard route would be missing precisely where it is the only route.
+  const hasMenu = menu.length > 0 || bindActions.length > 0
+    || !!view.actions.share || !!view.actions.exportGlb;
 
   // Instrument Blue only when the click would DO something: unsaved changes,
   // a save in flight, or the read-only copy (which materialises a document
@@ -822,9 +926,9 @@ export function DocumentCard({
               )}
               <Box sx={{ flex: 1, minHeight: 10 }} />
               {/* The reference slot wells (Unity object fields): drop to bind,
-                  click to ping, × to clear. Green = CONNECT, pink = knowledge
-                  (user decision 2026-08-19). A hairline, not a box, carries
-                  the grouping. */}
+                  click to ping, × to clear. Green = CONNECT, blue = plugin,
+                  pink = knowledge (user decision 2026-08-19, plan-479). A
+                  hairline, not a box, carries the grouping. */}
               <Box
                 sx={{
                   display: 'flex', alignItems: 'flex-start', gap: 1.5,
@@ -841,6 +945,17 @@ export function DocumentCard({
                     accent="102, 187, 106"
                     flash={connectFlash}
                     testId="document-card-connect"
+                  />
+                )}
+                {plugin && (
+                  <RefSlotTile
+                    fieldLabel="Plugin"
+                    what="project plugin"
+                    Icon={Extension}
+                    slot={plugin}
+                    accent="79, 195, 247"
+                    flash={pluginFlash}
+                    testId="document-card-plugin"
                   />
                 )}
                 {knowledge && (
@@ -896,6 +1011,21 @@ export function DocumentCard({
 
       {hasMenu && (
         <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={closeMenu}>
+          {/* F7 first, because it is the route that has no alternative: the
+              verbs below are all reachable by other means, a binding is not. */}
+          {bindActions.map((action) => (
+            <MenuItem
+              key={action.id}
+              data-testid={`document-card-bind-${action.id}`}
+              onClick={() => { closeMenu(); action.onSelect(); }}
+            >
+              <ListItemIcon sx={{ minWidth: 28 }}><LinkIcon sx={{ fontSize: 16 }} /></ListItemIcon>
+              <ListItemText primaryTypographyProps={{ fontSize: 13 }}>{action.label}</ListItemText>
+            </MenuItem>
+          ))}
+          {bindActions.length > 0
+            && (menu.length > 0 || view.actions.share || view.actions.exportGlb)
+            && <Divider />}
           {menu.map((verb) => {
             const Icon = VERB_ICONS[verb.id];
             return (

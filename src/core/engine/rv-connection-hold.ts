@@ -21,7 +21,7 @@
  * (documented limitation, plan-259 O1).
  *
  * All holds are idempotent per MU id; `releaseHold` only releases what THIS
- * controller acquired (owner rule O1b — grip-held MUs are never touched).
+ * controller acquired (owner rule O1b — grip- or zone-held MUs are never touched).
  */
 
 import type { RVDrive } from './rv-drive';
@@ -65,10 +65,28 @@ export class ConnectionHoldController {
     return this.holds.has(muId);
   }
 
+  /** The hold mode currently applied to `muId` ('none' when not held by a connection). */
+  holdKind(muId: number): HoldMode {
+    return this.holds.get(muId)?.kind ?? 'none';
+  }
+
+  /**
+   * The MU with `muId` leaves the simulation by hand (plan-567 delete / move):
+   * release its hold — a single-MU hold clears the owner tag, a belt stop drops
+   * its drive refcount and restarts the belt once the last stopper is gone.
+   * Returns the mode that was released ('none' when nothing was held).
+   */
+  releaseForRemoval(muId: number): HoldMode {
+    const kind = this.holdKind(muId);
+    if (kind !== 'none') this.release(muId);
+    return kind;
+  }
+
   /**
    * Hold the MU with engine id `muId`. Idempotent. Returns the applied hold
-   * mode ('none' when the MU is unknown or already grip-held by another
-   * subsystem — a grip-held MU is never re-owned, plan-259 O1b).
+   * mode ('none' when the MU is unknown or already held by another
+   * subsystem — a grip- or zone-held MU is never re-owned, plan-259 O1b /
+   * plan-521).
    */
   hold(muId: number, lookup: MuLookup): HoldMode {
     const existing = this.holds.get(muId);
@@ -86,7 +104,9 @@ export class ConnectionHoldController {
     // surfaces). Instanced MUs cannot be held individually (O1).
     if (!mu.isInstanced && accumulate) {
       const clone = mu as RVMovingUnit;
-      if (clone.heldBy === 'grip') return 'none'; // grip owns it — never steal
+      // Any foreign owner (grip, zone — plan-521 SOL R2 #4) keeps it: never
+      // steal. Only a free MU becomes a connection hold.
+      if (clone.heldBy !== null) return 'none';
       clone.heldBy = 'connection';
       this.holds.set(muId, { kind: 'held', mu, drive: null });
       return 'held';

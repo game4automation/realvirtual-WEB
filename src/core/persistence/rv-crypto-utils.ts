@@ -43,6 +43,16 @@ const IV_BYTES = 12;
 const KDF_PBKDF2 = 0;
 /** Header flag: payload is split into multiple chunks. */
 const FLAG_CHUNKED = 0x01;
+/** AES-GCM authentication tag length in bytes (WebCrypto default, 128 bit). */
+const GCM_TAG_BYTES = 16;
+/**
+ * Upper bound on the PBKDF2 iterations a SHARED envelope may demand (plan-560).
+ * The header of a `?glb=` file is written by whoever hosts it, and its
+ * iteration count (up to 2^31-1) is work this tab would do before it can even
+ * say "wrong password". The share CLI writes {@link DEFAULT_ITERATIONS}; above
+ * this limit the share path refuses without deriving anything.
+ */
+export const MAX_SHARE_KDF_ITERATIONS = 1_000_000;
 
 // ─── base64url ─────────────────────────────────────────────────────────────
 
@@ -180,14 +190,36 @@ export interface EnvelopeHeader {
   headerHash: Uint8Array;
 }
 
+/** Fixed plaintext of the key probe a hosted deploy writes into settings.json (plan-759 F5). */
+export const PROBE_PLAINTEXT = 'realvirtual-key-probe-v1';
+/** `hkdfInfo` of the probe envelope — never a file path. */
+export const PROBE_INFO = 'probe';
+
+/**
+ * The header's `hkdfInfo` field (plan-759 F6b). Key derivation ignores it —
+ * {@link deriveMasterKey} always uses the constant `HKDF_INFO`, so one key
+ * opens every file of a publish — but the field is part of the header hash and
+ * therefore of every chunk's AAD. A hosted deploy writes each file's `p/`-
+ * relative path here, which makes chunks of two files under the same key
+ * structurally non-interchangeable. `undefined` keeps the plan-267 constant
+ * (and the frozen golden vector). Max 255 bytes (one length byte).
+ */
+export function hkdfInfoBytes(info: string | Uint8Array | undefined | null): Uint8Array {
+  if (info === undefined || info === null) return HKDF_INFO;
+  const bytes = typeof info === 'string' ? new TextEncoder().encode(info) : info;
+  if (bytes.length > 255) throw new Error(`hkdfInfo must be at most 255 bytes, got ${bytes.length}`);
+  return bytes;
+}
+
 function buildHeaderBytes(
   flags: number,
   iterations: number,
   salt: Uint8Array,
   chunkSize: number,
   chunkCount: number,
+  info: Uint8Array = HKDF_INFO,
 ): Uint8Array {
-  const len = 4 + 1 + 1 + 4 + 1 + salt.length + 1 + HKDF_INFO.length + 4 + 4;
+  const len = 4 + 1 + 1 + 4 + 1 + salt.length + 1 + info.length + 4 + 4;
   const out = new Uint8Array(len);
   const dv = new DataView(out.buffer);
   let o = 0;
@@ -197,8 +229,8 @@ function buildHeaderBytes(
   dv.setUint32(o, iterations, true); o += 4;
   out[o++] = salt.length;
   out.set(salt, o); o += salt.length;
-  out[o++] = HKDF_INFO.length;
-  out.set(HKDF_INFO, o); o += HKDF_INFO.length;
+  out[o++] = info.length;
+  out.set(info, o); o += info.length;
   dv.setUint32(o, chunkSize, true); o += 4;
   dv.setUint32(o, chunkCount, true); o += 4;
   return out;
@@ -262,6 +294,8 @@ export interface EncryptOptions {
   chunkSize?: number;
   /** Test/deterministic use ONLY — explicit per-chunk IVs. Production omits (random IVs). */
   ivs?: Uint8Array[];
+  /** Header `hkdfInfo` (plan-759 F6b): the file's deploy-relative path. Omitted = plan-267 constant. */
+  hkdfInfo?: string | Uint8Array;
 }
 
 /**
@@ -283,7 +317,7 @@ export async function encryptToEnvelope(
   const chunkCount = chunked ? Math.max(1, Math.ceil(data.length / step)) : 1;
   const flags = chunked ? FLAG_CHUNKED : 0x00;
 
-  const header = buildHeaderBytes(flags, iterations, salt, chunkSize, chunkCount);
+  const header = buildHeaderBytes(flags, iterations, salt, chunkSize, chunkCount, hkdfInfoBytes(opts.hkdfInfo));
   const headerHash = new Uint8Array(await crypto.subtle.digest('SHA-256', bs(header)));
 
   const parts: Uint8Array[] = [header];
@@ -316,25 +350,42 @@ export async function decryptEnvelope(data: ArrayBuffer | Uint8Array, key: Crypt
   const header = await parseEnvelopeHeader(data);
   const b = asBytes(data);
   const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-  let o = header.headerLength;
   const fail = (): never => { throw new Error('malformed envelope'); };
-  const plainChunks: Uint8Array[] = [];
+
+  // Pass 1 — framing only: validate the structure and size the output, so the
+  // plaintext is written into ONE pre-allocated buffer instead of a list of
+  // chunks plus a concatenated copy (plan-560: peak ~2× + 1 chunk, was ~3×).
+  const frames: { iv: number; ct: number; ctLen: number }[] = [];
+  let total = 0;
+  let o = header.headerLength;
   for (let i = 0; i < header.chunkCount; i++) {
     if (o + 1 > b.length) fail();
     const ivLen = b[o++];
     if (ivLen !== IV_BYTES || o + IV_BYTES + 4 > b.length) fail();
-    const iv = b.slice(o, o + IV_BYTES); o += IV_BYTES;
+    const ivAt = o; o += IV_BYTES;
     const ctLen = dv.getUint32(o, true); o += 4;
-    if (o + ctLen > b.length) fail();
-    const ct = b.slice(o, o + ctLen); o += ctLen;
-    const aad = computeAad(i, header.chunkCount, header.headerHash);
-    const pt = new Uint8Array(
-      await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bs(iv), additionalData: bs(aad) }, key, bs(ct)),
-    );
-    plainChunks.push(pt);
+    if (o + ctLen > b.length || ctLen < GCM_TAG_BYTES) fail();
+    frames.push({ iv: ivAt, ct: o, ctLen });
+    total += ctLen - GCM_TAG_BYTES;
+    o += ctLen;
   }
   if (o !== b.length) fail(); // trailing bytes => tampering
-  return concatBytes(plainChunks).buffer as ArrayBuffer;
+
+  // Pass 2 — decrypt every chunk straight into its slot of the output.
+  const out = new Uint8Array(total);
+  let w = 0;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    const aad = computeAad(i, header.chunkCount, header.headerHash);
+    const pt = new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: bs(b.subarray(f.iv, f.iv + IV_BYTES)), additionalData: bs(aad) },
+      key,
+      bs(b.subarray(f.ct, f.ct + f.ctLen)),
+    ));
+    out.set(pt, w);
+    w += pt.length;
+  }
+  return out.buffer as ArrayBuffer;
 }
 
 /**

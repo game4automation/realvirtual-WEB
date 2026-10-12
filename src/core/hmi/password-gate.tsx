@@ -25,7 +25,13 @@ import {
   deriveMasterKey,
   verifyKey,
   decryptEnvelope,
+  PROBE_PLAINTEXT,
+  MAX_SHARE_KDF_ITERATIONS,
 } from '../persistence/rv-crypto-utils';
+import { getSessionKey, setSessionKey } from '../persistence/rv-served-bytes';
+import type { RVAppConfig } from '../rv-app-config';
+import { ShareDecryptError } from '../share/rv-share-decrypt';
+import { INK_MID } from './shared-sx';
 
 // ─── Fragment secret (URL factor) ──────────────────────────────────────────
 
@@ -139,9 +145,19 @@ function IncompleteOverlay() {
 
 interface PasswordOverlayProps {
   onSubmit: (password: string) => Promise<{ ok: boolean; msg?: string }>;
+  /** Overlay headline; defaults to the plan-267 model wording. */
+  title?: string;
+  /** Overlay explanation; defaults to the plan-267 model wording. */
+  subtitle?: string;
+  /** When set, a Cancel button (and Escape) abandons the gate — usable while unlocking (plan-560). */
+  onCancel?: () => void;
+  /** Submit button label; defaults to "Unlock". */
+  submitLabel?: string;
+  /** Submit button label while the key is derived; defaults to "Unlocking…". */
+  busyLabel?: string;
 }
 
-function PasswordOverlay({ onSubmit }: PasswordOverlayProps) {
+function PasswordOverlay({ onSubmit, title, subtitle, onCancel, submitLabel, busyLabel }: PasswordOverlayProps) {
   const [pass, setPass] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -159,15 +175,18 @@ function PasswordOverlay({ onSubmit }: PasswordOverlayProps) {
     // On success the orchestrator unmounts this overlay.
   }, [busy, pass, onSubmit]);
 
-  const onKey = useCallback((e: KeyboardEvent) => { if (e.key === 'Enter') void submit(); }, [submit]);
+  const onKey = useCallback((e: KeyboardEvent) => {
+    if (e.key === 'Enter') void submit();
+    else if (e.key === 'Escape' && onCancel) onCancel();
+  }, [submit, onCancel]);
 
   return (
     <GateShell>
       <Typography sx={{ color: 'rgba(255,255,255,0.92)', fontWeight: 600, fontSize: 18 }}>
-        Password protected
+        {title ?? 'Password protected'}
       </Typography>
       <Typography sx={{ color: 'rgba(255,255,255,0.6)', fontSize: 14, textAlign: 'center' }}>
-        This model is encrypted. Enter the password to open it.
+        {subtitle ?? 'This model is encrypted. Enter the password to open it.'}
       </Typography>
       <TextField
         type={show ? 'text' : 'password'} label="Password" value={pass} autoFocus fullWidth size="small" sx={fieldSx}
@@ -192,38 +211,183 @@ function PasswordOverlay({ onSubmit }: PasswordOverlayProps) {
       {error && (
         <Typography sx={{ color: '#ff6b6b', fontSize: 13, alignSelf: 'flex-start' }}>{error}</Typography>
       )}
-      <Button
-        variant="contained" fullWidth onClick={() => void submit()} disabled={busy || !pass}
-        sx={{ mt: 1, bgcolor: '#4fc3f7', '&:hover': { bgcolor: '#29b6f6' }, color: '#08121b', fontWeight: 700 }}
-      >
-        {busy ? 'Unlocking…' : 'Unlock'}
-      </Button>
+      <Box sx={{ display: 'flex', gap: 1, width: '100%', mt: 1 }}>
+        {onCancel && (
+          <Button
+            variant="text" fullWidth onClick={onCancel}
+            sx={{ color: INK_MID, fontWeight: 600 }}
+          >
+            Cancel
+          </Button>
+        )}
+        <Button
+          variant="contained" fullWidth onClick={() => void submit()} disabled={busy || !pass}
+          sx={{ bgcolor: '#4fc3f7', '&:hover': { bgcolor: '#29b6f6' }, color: '#08121b', fontWeight: 700 }}
+        >
+          {busy ? (busyLabel ?? 'Unlocking…') : (submitLabel ?? 'Unlock')}
+        </Button>
+      </Box>
     </GateShell>
   );
 }
 
 // ─── Orchestration ─────────────────────────────────────────────────────────
 
+export { ShareDecryptError } from '../share/rv-share-decrypt';
+
+/** Options of {@link decryptModelData}. */
+export interface DecryptModelDataOptions {
+  /**
+   * Opt-in for the `?glb=` share path (plan-560): a missing `#k=` rejects with
+   * `ShareDecryptError('link-incomplete')` instead of mounting the terminal
+   * "incomplete link" overlay, and the overlay offers Cancel (also while the key
+   * is being derived), which rejects with `ShareDecryptError('cancelled')`.
+   */
+  cancellable?: boolean;
+}
+
 /**
  * Show the password gate and return the decrypted model bytes. Blocks the model
- * load until the correct password is entered. When the link is missing `#k=`,
- * shows a terminal "incomplete link" overlay and rejects. Wrong password keeps
- * the gate open with an error; a valid password but corrupt/tampered payload
- * surfaces a distinct "damaged data" message (plan-267 §10.4).
+ * load until the correct password is entered.
+ *
+ * Contract (plan-267, hardened by plan-560):
+ * - a wrong password — or a damaged FIRST chunk, which cannot be told apart —
+ *   keeps the gate open with "Wrong password or damaged file.";
+ * - a structurally broken header, a header demanding more than
+ *   {@link MAX_SHARE_KDF_ITERATIONS} iterations (checked before any derivation)
+ *   and a later chunk failing authentication reject with
+ *   `ShareDecryptError('damaged')`;
+ * - a gate that is already open rejects a second call at once with
+ *   `ShareDecryptError('cancelled', 'gate busy')` instead of hanging;
+ * - without `#k=` the link is incomplete: with `cancellable` that is a typed
+ *   rejection without overlay, without it the terminal overlay as before;
+ * - the overlay is unmounted on every outcome.
  */
-export async function decryptModelData(data: ArrayBuffer): Promise<ArrayBuffer> {
+export async function decryptModelData(
+  data: ArrayBuffer,
+  opts: DecryptModelDataOptions = {},
+): Promise<ArrayBuffer> {
   const bytes = new Uint8Array(data);
   if (!isEncryptedEnvelope(bytes)) return data; // defensive — caller pre-checks
+  const cancellable = opts.cancellable === true;
+
+  if (_root) throw new ShareDecryptError('cancelled', 'gate busy');
+
+  const fragment = getFragmentSecret();
+  if (!fragment) {
+    if (!cancellable) mountGate(<IncompleteOverlay />);
+    throw new ShareDecryptError('link-incomplete', 'Encrypted model: link is missing the #k= secret');
+  }
+
+  let header: Awaited<ReturnType<typeof parseEnvelopeHeader>>;
+  try {
+    header = await parseEnvelopeHeader(bytes);
+  } catch (e) {
+    throw new ShareDecryptError('damaged', `Encrypted model: ${(e as Error)?.message ?? 'malformed envelope'}`);
+  }
+  if (header.iterations > MAX_SHARE_KDF_ITERATIONS) {
+    throw new ShareDecryptError('damaged', 'key derivation limit exceeded');
+  }
+  // A second call may have opened a gate while the header was being hashed.
+  if (_root) throw new ShareDecryptError('cancelled', 'gate busy');
+
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    let settled = false;
+    const finish = (outcome: () => void) => {
+      if (settled) return;
+      settled = true;
+      unmountGate();
+      outcome();
+    };
+
+    const onSubmit = async (password: string): Promise<{ ok: boolean; msg?: string }> => {
+      let key: CryptoKey;
+      try {
+        key = await deriveMasterKey(password, fragment, header.salt, header.iterations);
+      } catch {
+        if (settled) return { ok: true };
+        return { ok: false, msg: 'Unlock failed.' };
+      }
+      // Cancelled while deriving: the late key is dropped and nothing loads.
+      if (settled) return { ok: true };
+      if (!(await verifyKey(bytes, key))) {
+        if (settled) return { ok: true };
+        return { ok: false, msg: 'Wrong password or damaged file.' };
+      }
+      if (settled) return { ok: true };
+      // Correct password — the full payload may still be corrupt in a later chunk.
+      let plain: ArrayBuffer;
+      try {
+        plain = await decryptEnvelope(bytes, key);
+      } catch {
+        finish(() => reject(new ShareDecryptError('damaged', 'Model data is damaged or was tampered with.')));
+        return { ok: true };
+      }
+      finish(() => resolve(plain));
+      return { ok: true };
+    };
+
+    const onCancel = cancellable
+      ? () => finish(() => reject(new ShareDecryptError('cancelled', 'Opening was cancelled.')))
+      : undefined;
+
+    mountGate(
+      <PasswordOverlay
+        onSubmit={onSubmit}
+        onCancel={onCancel}
+        {...(cancellable ? {
+          title: 'Encrypted model',
+          subtitle: 'Enter the password you received separately.',
+          submitLabel: 'Open',
+          busyLabel: 'Decrypting…',
+        } : {})}
+      />,
+    );
+  });
+}
+
+// ─── Boot gate of a hosted deploy (plan-759 F5) ────────────────────────────
+
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/**
+ * The password gate of a hosted deploy, BEFORE the dashboard: resolves at once
+ * when the deploy is not encrypted or the key for its publish is already held;
+ * otherwise mounts the overlay and resolves only after the typed password,
+ * combined with the `#k=` fragment, opens the `encryption.probe` of
+ * settings.json. The verified key is then held per salt for every document
+ * fetch of this tab ({@link setSessionKey}); a reload asks again (a CryptoKey
+ * does not survive it — accepted, D7).
+ *
+ * A link without `#k=` shows the terminal "incomplete link" overlay and never
+ * resolves: without the fragment there is nothing this page could show.
+ */
+export async function requireHostedPassword(cfg: RVAppConfig): Promise<void> {
+  const probeB64 = cfg.encryption?.enabled ? cfg.encryption.probe : undefined;
+  if (!probeB64) return;
+  let probe: Uint8Array;
+  let header: Awaited<ReturnType<typeof parseEnvelopeHeader>>;
+  try {
+    probe = base64ToBytes(probeB64);
+    header = await parseEnvelopeHeader(probe);
+  } catch (e) {
+    throw new Error(`This deploy's settings.json carries an unreadable encryption probe: ${(e as Error)?.message ?? e}`);
+  }
+  if (getSessionKey(header.salt)) return;
 
   const fragment = getFragmentSecret();
   if (!fragment) {
     mountGate(<IncompleteOverlay />);
-    throw new Error('Encrypted model: link is missing the #k= secret');
+    return new Promise<void>(() => { /* terminal: the card is the answer */ });
   }
 
-  const header = await parseEnvelopeHeader(bytes);
-
-  return new Promise<ArrayBuffer>((resolve) => {
+  const projectName = typeof document !== 'undefined' ? (document.title || '').trim() : '';
+  return new Promise<void>((resolve) => {
     const onSubmit = async (password: string): Promise<{ ok: boolean; msg?: string }> => {
       let key: CryptoKey;
       try {
@@ -231,19 +395,26 @@ export async function decryptModelData(data: ArrayBuffer): Promise<ArrayBuffer> 
       } catch {
         return { ok: false, msg: 'Unlock failed.' };
       }
-      if (!(await verifyKey(bytes, key))) {
+      if (!(await verifyKey(probe, key))) {
         return { ok: false, msg: 'Wrong password.' };
       }
-      // Correct password — the full payload may still be corrupt in a later chunk.
       try {
-        const plain = await decryptEnvelope(bytes, key);
-        unmountGate();
-        resolve(plain);
-        return { ok: true };
+        const plain = new TextDecoder().decode(await decryptEnvelope(probe, key));
+        if (plain !== PROBE_PLAINTEXT) return { ok: false, msg: 'This deploy is damaged: its key probe does not verify.' };
       } catch {
-        return { ok: false, msg: 'Model data is damaged or was tampered with.' };
+        return { ok: false, msg: 'This deploy is damaged: its key probe does not verify.' };
       }
+      setSessionKey(header.salt, key);
+      unmountGate();
+      resolve();
+      return { ok: true };
     };
-    mountGate(<PasswordOverlay onSubmit={onSubmit} />);
+    mountGate(
+      <PasswordOverlay
+        onSubmit={onSubmit}
+        title={projectName ? `${projectName}` : 'Password protected'}
+        subtitle="This project is password protected. Enter the password to open it."
+      />,
+    );
   });
 }

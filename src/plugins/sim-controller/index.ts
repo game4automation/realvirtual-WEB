@@ -31,6 +31,8 @@ import { modeContext } from '../../core/rv-mode-manager';
 import { USER_PAUSE_REASON } from '../../core/engine/rv-constants';
 import { SimControllerToolbar } from './SimControllerToolbar';
 import { ModeSwitchNotice } from './ModeSwitchNotice';
+import { commandRegistry } from '../../core/hmi/rv-command-registry';
+import { ensureSimCommandsRegistered, registerRuntimeInspectorActions } from './sim-commands';
 
 /** The pause-reason key used by this plugin. Exported so tests + adjacent
  *  modules (e.g. config helpers) can reference it without typo risk.
@@ -55,7 +57,7 @@ export class SimControllerPlugin implements RVViewerPlugin {
     // (Play/Pause + Reset + Speed) live at the very start of the TopBar, right
     // after the realvirtual logo / online indicator.
     //
-    // Visible only in the Planner workspace. Hidden in:
+    // Visible in the Planner, Commissioning and Viewer workspaces. Hidden in:
     //   • DES (`mode:des`)  — the DESControllerToolbar (registered by
     //     DESWorkspacePlugin) takes this slot instead, so the leading controls
     //     reflect the active DES execution kernel.
@@ -71,13 +73,13 @@ export class SimControllerPlugin implements RVViewerPlugin {
       // Also hidden in the Editor workspace — its runtime is detached, so there
       // is no continuous sim to hold; the AssetEditorPlugin owns this slot there
       // and puts the in-place test run in it (reusing the segments below once a
-      // run is live) — and in the Viewer (plan-387), which is a pure spectator:
-      // the kinematics run, but nobody drives them from here.
+      // run is live). The Viewer (plan-387) keeps the controls: it is a
+      // spectator surface without authoring, but its kinematics DO run, and
+      // holding / restarting them is part of watching — the same Play/Pause,
+      // Reset and speed segments as Commissioning and the Editor's test run
+      // (2026-09-26, Thomas).
       visibilityRule: {
-        hiddenIn: [
-          modeContext('des'), modeContext('hmi'),
-          modeContext('editor'), modeContext('viewer'),
-        ],
+        hiddenIn: [modeContext('des'), modeContext('hmi'), modeContext('editor')],
       },
     },
     // Always-mounted overlay (no visibility rule) so it catches every workspace
@@ -100,6 +102,10 @@ export class SimControllerPlugin implements RVViewerPlugin {
     // Default to enabled. App-level config can override by passing an explicit
     // value via `new SimControllerPlugin({ shortcuts: false })` in main.ts.
     this._shortcutsEnabled = opts.shortcuts ?? true;
+    // plan-499: the runtime commands (sim, speed, drive jog/stop, signal set)
+    // and their inspector views exist as soon as the core plugin does.
+    ensureSimCommandsRegistered();
+    registerRuntimeInspectorActions();
   }
 
   onModelLoaded(_result: unknown, viewer: RVViewer): void {
@@ -159,16 +165,19 @@ export class SimControllerPlugin implements RVViewerPlugin {
       const viewer = this._viewer;
       if (!viewer) return;
 
+      // plan-499: the guards stay HERE (editable target, modifiers, repeat);
+      // behind them the key is a view of the same command as the toolbar
+      // segment and the MCP tool — one enabled() rule, one execution path.
       // Space — toggle Play/Pause
       if (e.code === 'Space' && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
         const userPaused = viewer.simulationPauseReasons.includes(SIM_CONTROLLER_PAUSE_REASON);
-        viewer.setSimulationPaused(SIM_CONTROLLER_PAUSE_REASON, !userPaused);
+        void commandRegistry.execute('sim.playPause', { paused: !userPaused }, { origin: 'shortcut', viewer });
         e.preventDefault();
         return;
       }
       // Shift+R — Reset. Use Shift to avoid hijacking Ctrl+R / Cmd+R (browser reload).
       if (e.code === 'KeyR' && e.shiftKey && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) {
-        viewer.resetSimulation();
+        void commandRegistry.execute('sim.reset', {}, { origin: 'shortcut', viewer });
         e.preventDefault();
         return;
       }

@@ -1,5 +1,9 @@
 # Signal Architecture — GLB Import to React UI
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 This document describes the complete signal data flow in realvirtual WEB: how signals are imported from GLB files, wired between components, driven by behavior models, updated by external interfaces, and bound to React UI components.
 
 Signal references authored in Unity are stored as node paths. How those paths are written, how
@@ -591,6 +595,226 @@ and not `MC0401I00W`.
 > reported as orphaned — fail-closed, no data loss, no crash — and has to be re-bound once. The
 > raw name is the correct one; the old binding pointed at a name that never worked.
 
+### 2.4 The symbol IS the key — local name vs. runtime name
+
+A PLC signal is identified by its **symbol name** (`DB_FG01.Conveyor.Start`). That name is the
+primary key for the user, for the HMI, for the logic and for the coupling to an interface. The
+**communication address** (an S7 `DB10.DBX4.1`, a Modbus `HR40001`, an MQTT process-image `%IW13`,
+an OPC-UA NodeId) is **not** part of the model: it lives in CONNECT as
+`SignalConfig.ProtocolAddress` and is never written into a GLB.
+
+There are two spellings of a signal's name, and keeping them apart is what makes a placed asset
+behave:
+
+| | What it is | Where it lives |
+|---|---|---|
+| **local name** | the asset-local symbol, exactly as authored | persisted in `rv_extras.<PLC*>.Name` |
+| **runtime name** | the SignalStore key, what CONNECT couples to | computed at registration |
+
+One function computes both — `resolveSignalName(node, sigData, override)` in
+`rv-signal-construction.ts`, used by the loader (`registerSignal`), by `addSignal()`, by
+`registerBehaviorSignals()` and by the editor sync, so a name is scoped **exactly once** no matter
+where the node came from:
+
+```typescript
+resolveSignalName(node, sigData, override)
+  → { local: string; runtime: string; generated: boolean }
+
+local    = sigData.Name || override || node.name
+generated = sigData.Generated === true
+runtime  = generated ? scopeSignalName(instanceScope(node), local) : local
+```
+
+- **Authored signals stay raw.** A signal a human put into the asset keeps its name verbatim in
+  every placement — a leading `/` of a global included. This is a deliberate compatibility
+  promise: an existing CONNECT configuration addresses those names, and placing an asset must not
+  rename them underneath it.
+- **Generated signals are scoped once.** Signals the runtime creates — `addSignal()`, behavior
+  signals — are instance-scoped (`Cell.Flow.Run`), so two placed copies of the same asset never
+  collide on a name nobody typed. They persist the **local** name plus `Generated: true`, so a
+  reload re-derives the same runtime name instead of scoping an already-scoped one.
+
+**`Generated` is provenance, and it is persistent.** The flag sits in `rv_extras.<PLC*>` next to
+`Comment` and `OriginDataType` (`rv-extras-validator.ts`) and survives the GLB export; absent =
+authored. Legacy assets carry no flag: the loader registers their leaf raw, the generator runs again
+on load and writes name plus flag, and `register()` moves the path's ownership so the raw name is
+released — the "ghost registration after reload" that behaviour used to leave behind is gone.
+
+**Identical placements of an authored signal collide on purpose.** Two copies of the same asset
+share the raw name, so the second registration meets a name that already has a model path. That is
+reported — one `signal-name-collision` warning per name in the Problems panel, with the paths in its
+detail — instead of being silently renamed.
+
+> **The name is not a plain field.** `editor.signalSetField` still refuses `Name`: the store
+> registration, every by-name reference and every CONNECT entry couple by it. A rename is a
+> refactoring with preview, journal and undo — `editor.signalRename` (§2.6, plan-590).
+
+### 2.5 Editor edits reach the store — the editor sync
+
+The loader registers signals once. Editor mutations — add/remove a `PLC*` component, delete or
+restore a parent subtree, rename, reparent, edit a field, and every undo/redo branch of those —
+used to leave the store untouched, so a signal created in the editor did not exist for the HMI, the
+behaviors or a live interface until the next reload.
+
+`rv-signal-editor-sync.ts` closes that gap, and its identity is the **node object**, not the path:
+
+- `registerSignal` records a snapshot per node (`trackedSignalOf` / `setTrackedSignal`, a `WeakMap`
+  per store) holding `{type, name, path, override?, comment?, originDataType?}`.
+- After a mutation the executor calls `syncSignalSubtree(host, root)` on the subtree it touched.
+  The desired state is derived from what is true **now** — the node is live (the NodeRegistry has a
+  path for it), it carries a `PLC*` record, and its runtime name is `resolveSignalName(…)` — and
+  diffed against the snapshot. The snapshot holds the **old** path, which is exactly why rename and
+  delete need no pre-mutation hook: the old path can no longer be computed, but it was recorded.
+  A trashed subtree is unregistered, so it is never re-registered by the sync.
+- New identity first, old one released second, so a pure path move (renaming or reparenting an
+  ancestor) keeps value, force pin and subscribers.
+- `syncSignalSubtree` is idempotent, and `setSignalEditorSyncEnabled(false)` is the kill switch.
+
+**Ownership rule — a name outlives its path.** Removal is the store's job,
+`SignalStore.unregisterPath(path, expectedName?)` → `'none' | 'path' | 'name'`, backed by the index
+`pathsByName: Map<name, Set<canonical path>>`:
+
+- The **name** (value, type, meta, force pin, timestamps, writer telemetry) is dropped only when no
+  owner is left — no other model path (two `/`-global declarations are two owners) and no interface
+  (a provider entry, or the placeholder path `__iface__/<name>`).
+- An interface-owned name that loses its last model path falls back to `__iface__/<name>`, which is
+  precisely the state an interface-only symbol has. So deleting a bound model node does not delete
+  the PLC's signal.
+- **Listener sets are never removed.** They belong to the subscribers — a drive, an HMI widget, an
+  interface's outgoing subscription — and keeping them is what makes undo symmetric: a restored
+  node re-registers the name and every existing subscriber is live again without re-binding.
+- `register()` **moves** path ownership: registering a path under a different name takes that owner
+  away from the old name.
+- There is deliberately no public `unregister(name)`.
+
+**One event per edit.** `applyForward` / `applyInverse` wrap each op in
+`beginSignalSyncWave` / `endSignalSyncWave`, so a composite op that touches a hundred nodes emits
+**one** `SignalStore.onCatalogChanged(change)` carrying four lists:
+
+```typescript
+interface SignalCatalogChange {
+  registered: string[];   // (re-)registered at a new or changed path
+  released:   string[];   // lost one model path, still owned
+  removed:    string[];   // no owner left, gone from the store
+  metaChanged: string[];  // Comment / OriginDataType set, unset, undone or redone
+}
+```
+
+`metaChanged` exists because a descriptive change leaves the catalog identical but the reconcile
+report (§6.5) different. Live interfaces listen to the same event: they rebuild their descriptors
+and subscriptions and purge `pendingIncoming` / `dirtyOutgoing` for names that are gone, rather than
+moving listeners around.
+
+### 2.6 Renaming a signal — planner, coordinator, journal (plan-590)
+
+A rename changes `rv_extras.<PLC*>.Name` of ONE signal node and carries every reference that
+couples **by name** along. The node is never renamed, so every reference **by path**
+(`ComponentReference`: WebVisibility, ConnectSignal, Zone, Lamp, LogicStep, Drive, recordings)
+stays valid by construction and is only counted in the preview.
+
+**Where it starts.** The inspector's **Signal** section: the name row is no inline editor — a click
+on the name (or its rename button) opens `SignalRenameDialog`, a view of the command
+`editor.signalRename {path, newName, dryRun?, confirmWireChange?}`. The MCP tool
+`web_editor_signal_rename` is the other view of the same command. The command has scope `none`:
+it runs in the asset editor (the `AssetDocument` is the model document, there is no overlay) and in
+the scene (the `SceneStore` is model and overlay document) — `signalRenameEnvironmentFor`
+(`src/core/hmi/signal-rename-wiring.ts`) decides per call. A signal inside a placement is renamed in
+the asset that defines it, never in the placement.
+
+**1 — Plan (side-effect free).** `planSignalRename(viewer, path, newName, env)`
+(`src/core/engine/rv-signal-rename.ts`) produces `SignalRenamePlan {oldName, newName, steps,
+wireChanges, warnings, blockers, renameRevision, owners, scope, connect, counts,
+requiresWireConfirmation, ok}`. The only call out is the CONNECT dry run. One step per write,
+grouped by kind (the dialog shows one row per kind with its count; `dryRun` returns the same
+preview without the step payloads, `summarizeSignalRenamePlan`):
+
+| Step kind | What is rewritten | Undone through |
+|---|---|---|
+| `signal-name` | `rv_extras.<PLC*>.Name` of the node | the document entry |
+| `string-field` | legacy by-name fields (`WebSensor`, `ConnectSignal`) whose value IS the old name | the document entry |
+| `operator-panel` | the signal fields of `WebOperatorPanel.Config`, format kept | the document entry |
+| `metadata` | `<signal>` tags in `RuntimeMetadata.content` | the document entry |
+| `plc-program` | the ST declaration's pragma `(* @signal: … *)` — replaced or appended; identifiers in the body stay (private PLC seam, compiled and checked before the write) | the document entry |
+| `signal-link` | overlay `SignalLinks.Mappings` (`signal`, `carrierSignalName`) | the overlay entry |
+| `placed-mapping` | planner placements' `signalMappings` | the journal |
+| `historian` | the trend selection (a NEW series under the new name — no data migration) | the journal |
+| `connect` | every interface / topic signal list and both sides of `Mappings[]` in CONNECT | the journal (inverse rename) |
+| `path-reference` | nothing — informational count | — |
+
+**Blockers** (fail closed; any blocker locks the dialog's Rename button and refuses the command):
+an empty / white-space / control-character name, the current name, a name that is taken, a
+generated signal (`Generated: true` — behaviors, material flow), an FMU signal, a signal inside a
+placement, more than one model owner of the old name (plan-589 allows colliding raw authored names
+— the dialog lists the paths), a rename already pending, an operator panel whose config cannot be
+parsed, ST that would not compile or is ambiguous, CONNECT unreachable, an old CONNECT without the
+endpoint whose configuration uses the name, a CONNECT name collision.
+
+**Wire changes** — a name that travels on the wire: an MQTT `Json` key, the name used as address on
+PLCSIM Advanced / SHM / WebSocket Realtime / ABB / WINMOD / PVI when the address is empty, a mirror
+topic, mirror membership entered or left — come from the CONNECT dry run and need
+`confirmWireChange` (the dialog's mandatory "I understand").
+
+**Completeness scope** — stated in every preview: the open document, its scene overlay, planner
+bindings, the historian selection and the active CONNECT configuration. Assets that are not loaded,
+other scenes, other projects and inactive CONNECT profiles are not searched (an inactive profile
+that still uses the name produces a warning).
+
+**2 — Apply (the coordinator).** `SignalRenameCoordinator`
+(`src/core/engine/rv-signal-rename-coordinator.ts`, one per viewer via
+`signalRenameCoordinatorFor`) runs a plan in this order:
+
+1. journal entry `{state:'started', before:{history heads, redo branches, placements, historian}}`
+   — BEFORE the first side effect;
+2. `signalStore.beginRename(old, new)` — the rename/sync contract below;
+3. CONNECT `POST /config/signals/rename` with the plan's `renameRevision` and a fresh
+   `operationId`. 409 → nothing changed, journal `aborted`. No answer → `GET
+   /config/signals/rename/{operationId}` until the outcome is known; if it stays unknown the
+   journal is `unknown`, further renames are locked and a Problems error with **Re-check**
+   (`editor.signalRenameRecheck`) appears;
+4. per document ONE transaction tagged `meta.journalId` containing every persisted change of that
+   document (the name first — the editor sync moves the store with it — then fields, panels,
+   metadata, ST code via the private PLC seam's `writePlcCode`, overlay mappings);
+5. placements and historian selection (journal only); `endRename(commit)`, journal `committed`.
+
+A failure after step 3 runs the **reverse phase**: `beginRename(new, old)` first (so the editor
+sync migrates back instead of releasing and re-registering — value, force, listeners and writers
+stay), every committed document entry is replayed backwards (`RvDocument.replayHistory`, no new
+history) and its redo branch restored from the journal, placements and historian come back from
+`before`, and CONNECT gets the inverse rename with a NEW operation id. A reverse step that fails
+leaves the entry `inconsistent` with a Problems error `signal-rename-inconsistent` and **Repair**
+(`editor.signalRenameRepair`), which retries what is still pending (CONNECT, placements,
+historian).
+
+**Rename/sync contract.** `SignalStore.renameSignal(old, new)` migrates every name-keyed map
+(value, type, meta, listeners, forces, timestamps, providers, writer inventory, conflicts) and
+fires `onCatalogChanged`; it is idempotent and throws on a taken name. While a rename is announced
+(`beginRename`), the editor sync turns "snapshot `old`, desired `new`" into `renameSignal` instead
+of register + release, interface rediscovery skips both names (`isRenamePending`), and a gateway
+`catalog_changed` arriving in the middle is applied after `endRename`. `endRename('abort')` restores
+nothing by itself — taking a rename back is always the reverse phase.
+
+**3 — Undo / redo.** The coordinator is the **history interceptor** of every document it writes to
+(`RvDocument.setHistoryInterceptor`). `installSignalRenameWiring(viewer)` (called once in
+`main.ts`) also attaches it to the scene document and to every asset document the editor OPENS, so
+a tagged entry from a reloaded session — whose journal is gone — is **refused** instead of being
+undone model-only. Undoing a tagged entry from any of its documents runs the reverse phase as a
+whole (CONNECT, all documents, placements, historian) after checking that every involved document
+still has the rename on top with the journal's head; the stacks of all documents move exactly once
+on success. A refused undo / redo leaves every stack as it was and is said as a toast, read from
+`RvDocument.lastHistoryInterception` (`{journalId, direction, verdict}`). Redo is the forward phase
+over `replayHistory(…, 'redo')`.
+
+**4 — Save / reload.** The rename is ordinary document state: the new `Name`, the rewritten by-name
+fields and the untouched path references are exported with the GLB and register the new name at the
+same node path on the next load (`tests/signal-rename-save-reload.test.ts`). The journal itself is
+session state and is not persisted — which is exactly why an orphaned tagged entry is refused.
+
+Tests: `signal-rename-plan`, `-owners`, `-plan.perf` (planner); `signal-store-rename.node`,
+`signal-rename-sync.node`, `signal-rename-live` (store, interfaces); `signal-rename-coordinator`,
+`-rollback`, `-history`, `-wiring` (coordinator, journal, undo); `browser/signal-rename-dialog`
+(dialog); `../realvirtual-WebViewer-Private~/tests/signal-rename-commands` and `plc-signal-rename`
+(commands, ST seam). CONNECT side: `doc-connect-interfaces.md` § *Signal rename*.
+
 ---
 
 ## 3. SignalStore — Central Signal Bus
@@ -1076,6 +1300,77 @@ CONNECT + PLC:   PLC → CONNECT → WebSocket v2 → realvirtual WEB
 ```
 
 Same protocol, same SignalStore, same React hooks, same behavior models.
+
+### 6.5 Model ↔ gateway reconcile report
+
+The model knows symbols, the gateway knows symbols **and** addresses. The reconcile report
+(`src/core/import/rv-signal-reconcile.ts`) answers one question per signal place of one interface
+and per model signal: is this coupled, and if not, what is in the way. It is pure — no React, no
+store, no fetch — and it **never writes**, not the model and not CONNECT. Every repair is a separate
+action the user clicks.
+
+An interface does not hold one flat signal list, so the unit it works on is a **signal place**:
+
+```typescript
+interface IfaceSignalSlot {      // rv-iface-signal-slots.ts
+  interfaceId: string;
+  topic?: string;                // absent = the interface-level `signals` container
+  mode?: 'Single' | 'Json' | 'ProcessImage';   // the topic's payload mode
+  name: string; type: string; dataType?: string; protocolAddress?: string;
+}
+```
+
+`collectInterfaceSlots(iface)` yields the flat container first, then one block per topic, and
+deliberately does **not** de-duplicate by name: the same name in two MQTT topics is two distinct
+places, and collapsing them is the bug the type exists to prevent. The same slot is what the signal
+dialog and the inspector read and write, which is how `topics[].signals` became editable at all.
+
+The categories:
+
+| Category | Meaning |
+|----------|---------|
+| `mapped` | identical name on both sides, type compatible, address where one is required |
+| `name-variant` | only a quoting variant matches (`"DB".Member` against `DB.Member`) — never a coupling, carries the other spelling as a suggestion |
+| `missing-in-plc` | a model signal no place of this interface carries |
+| `plc-only` | a place of this interface no model signal claims |
+| `type-mismatch` | same name, incompatible direction, value kind or data type |
+| `no-address` | same name, but the gateway requires an address this place has not got |
+
+Two rules make the report trustworthy:
+
+- **`mapped` is exact equality only.** The model signal's runtime name equals `SignalConfig.Name`
+  character for character. Nothing is ever matched through a normalisation — the gateway couples by
+  that exact string, so a normalised "match" would claim a data flow that does not exist. That is
+  what `name-variant` is for.
+- **The gateway decides about addresses.** `no-address` is raised only where
+  `addressRuleFor(slot, schema) === 'required'` and the place carries no address. The rule comes
+  from `GET /interface-types` (`addressRule`, per container and per MQTT topic mode:
+  `required` | `name-fallback` | `container-topic` | `none`). **An absent rule — any older gateway —
+  means "never said": no requirement, no warning.** It is not a synonym for `none`, which is a
+  stated fact about an MQTT Json topic.
+
+`signalTypeCompat` answers `ok` | `mismatch` | `unknown`. It compares direction and value kind, and
+the data type **only when both sides state one**, through its own equivalence table (`DINT`/`UDINT`/
+`WORD` → Int, `REAL`/`LREAL` → Float, `BOOL` → Bool, `STRING`/`WSTRING` → Text) — a model `DINT`
+against a CONNECT `Int` is the normal case and must not warn. A missing type is never a mismatch.
+
+Triggers live in `connect-plugin.tsx` and are debounced by `RECONCILE_DEBOUNCE_MS = 250`, running
+only over the interfaces that actually changed: model loaded, `layout-content-added` (placements
+bypass the model-loaded hooks), connect-store changes (interface list, signals, topics) and
+`SignalStore.onCatalogChanged`. Results land in `connect-store.reconcileReports` keyed by interface
+id, as a badge on the interface card, and in the Problems panel under the code `signal-reconcile` —
+**one entry per (interface, category)** with the count and the list in its detail, not one entry per
+signal. An entry may carry an `action`, which the panel executes as a normal command.
+
+Repairs are explicit commands, each with its MCP tool:
+
+| Command | MCP tool | What it does |
+|---------|----------|--------------|
+| `editor.signalSetField` | `web_editor_signal_set_field` | `Comment`, `OriginDataType`, type — never `Name` |
+| `editor.signalSetBinding` | `web_editor_signal_set_binding` | set, change or remove the address/dataType of one slot, written into that slot's own container |
+| `editor.signalsCreateFromInterface` | `web_editor_signals_create_from_interface` | creates model signals for `plc-only` rows, taking the CONNECT name **verbatim** as an authored signal, so the result is exactly `mapped`. A CONNECT Text/String place the model cannot register is marked `unsupported type` and not created |
+| — | `web_signal_reconcile` | read-only: the report itself, per interface or for all of them |
+| "Adopt legacy addresses" (`applyAutoMap`) | `web_signal_automap` (`mode: apply`) | the legacy behaviour as an explicit, merge-only action: addresses proposed from a `Comment` prefix (`"<address> · <text>"`) or the Unity `Metadata`, never overwriting an existing CONNECT entry, offered only on the interface types where it applies |
 
 ---
 

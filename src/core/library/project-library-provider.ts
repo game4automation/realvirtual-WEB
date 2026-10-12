@@ -25,7 +25,6 @@
 
 import { getProjectStore } from '../project/project-store';
 import type { ProjectBackend } from '../project/backends/project-backend';
-import { documentOfAssetEntry } from '../project/rv-project-documents';
 import type { RvDocumentEntry } from '../project/rv-project-types';
 import type { LibraryCatalogEntry } from './library-types';
 import {
@@ -35,6 +34,7 @@ import {
   type ResolvePurpose,
   type ResolvedAsset,
 } from './library-source-registry';
+import { isSha256, resolvedAssetKey, setAssetHash } from './rv-asset-hash-registry';
 
 /** Stable provider id — a project switch REPLACES this provider, never adds one. */
 export const PROJECT_LIBRARY_PROVIDER_ID = 'project';
@@ -106,24 +106,27 @@ function toCatalogEntry(doc: RvDocumentEntry): LibraryCatalogEntry {
     // without. It is the second key this source answers to; see
     // `LibraryCatalogEntry.documentId`.
     documentId: typeof doc.id === 'string' && doc.id.trim() !== '' ? doc.id : undefined,
+    // plan-508 F4: the manifest's own content hash, passed through. It keys the
+    // decoded/baked caches of this entry (via the registry, see `_refresh`) and
+    // never resolves anything.
+    ...(isSha256(doc.sha256) ? { sha256: doc.sha256 } : {}),
+    ...(isSha256(doc.sha256) && typeof doc.sizeBytes === 'number' ? { sizeBytes: doc.sizeBytes } : {}),
   };
 }
 
 /**
  * Every document of a project backend — the catalog feed (F7).
  *
- * `listDocuments()` is the one list and the only call this needs. The
- * `listLibrary()` fallback below is not politeness towards old backends: the
- * test doubles in this repo implement the surface they exercise and nothing
- * more, and a provider that hard-required the newer method would fail them for
- * a reason that has nothing to do with what they test. A backend that answers
- * only the older call still gets its `library/` half, which is exactly what it
- * had before.
+ * `listDocuments()` is the one list and the only call this makes. The
+ * `listLibrary()` fallback that used to stand here is gone with the method
+ * (plan-744 F1); what it was really covering — a test double that implements
+ * less than the interface — is covered where it belongs, by the double
+ * answering `listDocuments()`, and by this guard, which keeps a partial stub
+ * from throwing rather than quietly halving the catalog.
  */
 async function listProjectDocuments(backend: ProjectBackend): Promise<RvDocumentEntry[]> {
-  if (typeof backend.listDocuments === 'function') return backend.listDocuments();
-  const legacy = await backend.listLibrary();
-  return legacy.map(e => documentOfAssetEntry(e, 'library'));
+  if (typeof backend.listDocuments !== 'function') return [];
+  return backend.listDocuments();
 }
 
 /**
@@ -194,6 +197,16 @@ class ProjectLibraryProvider implements LibrarySourceProvider {
     const byId = new Map<string, LibraryCatalogEntry>();
     for (const e of entries) if (e.documentId) byId.set(e.documentId, e);
     for (const e of entries) byId.set(e.id, e);
+    // plan-508 F4: a project document has no stable url (its bytes come as a
+    // fresh `blob:` per resolve), so its hash is registered under the ModelCache
+    // key the placement instancer derives for it — for both ids it answers to.
+    for (const [assetId, e] of byId) {
+      if (!e.sha256) continue;
+      setAssetHash(resolvedAssetKey(PROJECT_LIBRARY_PROVIDER_ID, sourceId, assetId), {
+        sha256: e.sha256,
+        ...(typeof e.sizeBytes === 'number' ? { sizeBytes: e.sizeBytes } : {}),
+      });
+    }
     const source: LibrarySource = {
       id: sourceId,
       label: project.name,
@@ -212,7 +225,11 @@ class ProjectLibraryProvider implements LibrarySourceProvider {
         }
         const blob = await backend.readDocumentUrl(entry.localPath);
         if (!blob) throw new Error(`Asset "${entry.localPath}" could not be read.`);
-        return { url: blob.url, revokeUrl: () => blob.release() };
+        // `sha256` rides along for the ModelCache (plan-508 F4): the expected
+        // content of this resolve, compared before the decode.
+        const resolved: ResolvedAsset & { sha256?: string } = { url: blob.url, revokeUrl: () => blob.release() };
+        if (entry.sha256) resolved.sha256 = entry.sha256;
+        return resolved;
       },
       refresh: () => this._refresh(),
     };

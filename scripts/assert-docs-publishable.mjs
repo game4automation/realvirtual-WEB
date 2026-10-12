@@ -29,6 +29,9 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const WARN_ONLY = process.argv.includes('--warn-only');
+// Development validation includes new files without changing the Git index.
+// The default remains the exact tracked publication payload.
+const WORKING_TREE = process.argv.includes('--working-tree');
 
 const RESET = '\x1b[0m';
 const RED = '\x1b[31m';
@@ -50,7 +53,7 @@ const DIM = '\x1b[2m';
  */
 const MIRROR_PUBLIC_ON_PURPOSE = new Map([
   ['doc-deploy.md', 'Self-hosters need the build/deploy story; credentials live in a gitignored .env.'],
-  ['doc-plc-programming.md', 'Documents a commercial tier honestly, incl. its own "internal tier only" banner; '
+  ['doc-plc-programming.md', 'Documents the commercial beta PLC with an explicit Community exclusion; '
     + 'the public control surface src/core/plc-control.ts is part of the community edition.'],
 ]);
 
@@ -62,7 +65,7 @@ function neverDeliveredDocs() {
 }
 
 const tracked = new Set(
-  execFileSync('git', ['ls-files', '-z'], { cwd: ROOT })
+  execFileSync('git', ['ls-files', '-z', ...(WORKING_TREE ? ['--cached', '--others', '--exclude-standard'] : [])], { cwd: ROOT })
     .toString('utf8').split('\0').filter(Boolean).map((p) => p.replace(/\\/g, '/')),
 );
 
@@ -74,7 +77,7 @@ const LINK_RE = /\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
 /** Blank out fenced code blocks — a link-shaped string in a sample is not a link. */
 function stripCodeBlocks(text) {
-  return text.replace(/^```[\s\S]*?^```/gm, '').replace(/`[^`\n]*`/g, '');
+  return text.replace(/^```[\s\S]*?^```/gm, '');
 }
 
 // Recipes are authored for the DELIVERED customer workspace, where the core sits

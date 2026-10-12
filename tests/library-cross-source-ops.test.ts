@@ -186,6 +186,16 @@ async function sourceDocuments(): Promise<RvDocumentEntry[]> {
   return (await readManifest(asDirHandle(srcDir)))?.project.documents ?? [];
 }
 
+/** Bytes of a file at the directory's ROOT — where a transfer arrives. */
+async function rootFileBytes(dir: FakeDir, name: string): Promise<Uint8Array | null> {
+  try {
+    const file = await dir.getFileHandle(name);
+    return new Uint8Array(await (await file.getFile()).arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
 async function fileBytes(dir: FakeDir, sub: string, name: string): Promise<Uint8Array | null> {
   try {
     const folder = await dir.getDirectoryHandle(sub);
@@ -207,7 +217,8 @@ describe('copyDocumentAcrossSources', () => {
 
     expect(result.kind).toBe('ok');
     const before = await fileBytes(srcDir, LIBRARY_FOLDER, 'belt.glb');
-    const after = await fileBytes(dstDir, LIBRARY_FOLDER, 'belt.glb');
+    // The arrival sits at the target's ROOT — no `library/` folder is invented.
+    const after = await rootFileBytes(dstDir, 'belt.glb');
     expect(after).not.toBeNull();
     expect([...after!]).toEqual([...before!]);
   });
@@ -254,6 +265,7 @@ describe('copyDocumentAcrossSources', () => {
     // And no second home is created for either. The transfer used to mirror both
     // into a `library.json` beside the bytes; that write is deleted, which is
     // what makes the row the one answer a downstream reader can trust.
+    expect(await dstDir.readText(SIDECAR_FILENAME)).toBeNull();
     expect(await dstDir.readTextAt(LIBRARY_FOLDER, SIDECAR_FILENAME)).toBeNull();
   });
 
@@ -274,7 +286,8 @@ describe('copyDocumentAcrossSources', () => {
 
     expect(second.kind).toBe('ok');
     if (second.kind !== 'ok') return;
-    expect(second.path).toBe(`${LIBRARY_FOLDER}/belt 2.glb`);
+    // At the target's ROOT — a transfer no longer invents a `library/` folder.
+    expect(second.path).toBe('belt 2.glb');
     const rows = await targetDocuments();
     expect(rows.map(r => r.name).sort()).toEqual(['Belt', 'belt 2']);
   });
@@ -291,7 +304,7 @@ describe('copyDocumentAcrossSources', () => {
     expect(result.kind).toBe('error');
     expect(result.kind === 'error' && result.message).toContain('read-only');
     expect(await targetDocuments()).toHaveLength(0);
-    expect(dstDir.has(LIBRARY_FOLDER)).toBe(false);
+    expect(dstDir.has('belt.glb')).toBe(false);
   });
 
   it('refuses a transfer into the same backend', async () => {
@@ -405,7 +418,7 @@ describe('a torn transfer', () => {
     expect(result.warning).toContain('exists in both');
     // Both copies are there. That is the intended outcome of this ordering.
     expect(await fileBytes(srcDir, LIBRARY_FOLDER, 'belt.glb')).not.toBeNull();
-    expect(await fileBytes(dstDir, LIBRARY_FOLDER, 'belt.glb')).not.toBeNull();
+    expect(await rootFileBytes(dstDir, 'belt.glb')).not.toBeNull();
     // And the source still lists it, so the state is visible rather than lost.
     expect(await sourceDocuments()).toHaveLength(1);
   });
@@ -421,7 +434,7 @@ describe('a torn transfer', () => {
     );
 
     expect(result.kind).toBe('error');
-    expect(await fileBytes(dstDir, LIBRARY_FOLDER, 'belt.glb')).toBeNull();
+    expect(await rootFileBytes(dstDir, 'belt.glb')).toBeNull();
     expect(await targetDocuments()).toHaveLength(0);
     // The source is untouched — a failed copy costs nothing.
     expect(await fileBytes(srcDir, LIBRARY_FOLDER, 'belt.glb')).not.toBeNull();
@@ -433,7 +446,7 @@ describe('a torn transfer', () => {
       s => copyDocumentAcrossSources(s, { ...beltDoc, path: `${LIBRARY_FOLDER}/ghost.glb` }),
     );
     expect(result.kind).toBe('error');
-    expect(dstDir.has(LIBRARY_FOLDER)).toBe(false);
+    expect(dstDir.has('belt.glb')).toBe(false);
   });
 });
 
@@ -500,7 +513,7 @@ describe('DocumentTransferSession', () => {
     expect(result.kind).toBe('ok');
     expect(result.kind === 'ok' && result.manifestSkipped).toBe(true);
     // The bytes still arrived — the manifest is a cache of them (§2.5).
-    expect(await fileBytes(dstDir, LIBRARY_FOLDER, 'belt.glb')).not.toBeNull();
+    expect(await rootFileBytes(dstDir, 'belt.glb')).not.toBeNull();
   });
 });
 

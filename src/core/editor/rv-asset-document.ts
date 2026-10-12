@@ -69,10 +69,10 @@ import {
   assetOpHeader,
   dedupeComponentKey,
 } from './rv-asset-ops';
-import { RvDocument, type RvDocumentCore } from '../ops/rv-document';
+import { RvDocument, type RvDocumentCore, type RvHistoryInterceptor } from '../ops/rv-document';
 import { RvUnifiedExecutor } from '../ops/rv-unified-executors';
 import { needsRecomposeToUndo, undoViaRecompose } from '../ops/rv-document-projection';
-import { makeAssetComposite } from '../ops/rv-unified-ops';
+import { journalIdOf, makeAssetComposite } from '../ops/rv-unified-ops';
 import type { RvOp, RvAssetOp, RvAssetPrimitiveOp } from '../ops/rv-unified-ops';
 import type { AssetDraft, AssetDraftBase } from './rv-asset-draft-storage';
 import {
@@ -85,11 +85,16 @@ import {
 } from '../ops/rv-document-drafts';
 import type { CadImportResult } from './rv-cad-provider';
 import { putCadGlb } from '../import/rv-cad-glb-cache';
+import { weldImportedGlb } from '../import/rv-glb-weld';
 import { parseGlbSubtree } from '../engine/rv-glb-parse';
 import { NodeRegistry } from '../engine/rv-node-registry';
+import { siblingNames, uniqueName } from '../engine/rv-node-naming';
 import { captureMaterialPrev } from './rv-asset-material';
 import { guardReferenceOp } from '../ops/rv-reference-guard';
 import { outermostReference } from '../engine/rv-reference-scope';
+import { binaryResources } from '../engine/rv-binary-resources';
+import { fmuDocumentResourceId, fmuShasOfOps, restoreFmuPackagesForOps } from '../ops/rv-fmu-ops';
+import { deleteDraftFmuPackage } from './rv-asset-draft-storage';
 
 /** Where the document started from. */
 export type AssetBase = AssetDraftBase;
@@ -504,7 +509,10 @@ export class AssetDocument {
   async undo(): Promise<void> {
     this._assertUnlocked('Undo');
     const newest = this._doc.ops[this._doc.opCount - 1];
-    if (this._bound && newest && this._reprojectTree
+    // A journaled entry (plan-590 signal rename) is never taken back by
+    // re-projection: its undo belongs to the history interceptor, which the
+    // document asks inside `undo()` below.
+    if (this._bound && newest && this._reprojectTree && !journalIdOf(newest)
         && needsRecomposeToUndo(newest, this._doc.mode)) {
       const outcome = await undoViaRecompose({
         doc: this._doc,
@@ -552,6 +560,16 @@ export class AssetDocument {
     await this._doc.redo();
   }
 
+  /**
+   * Route undo/redo of journaled entries (`meta.journalId`, plan-590 signal
+   * rename) to `interceptor` — the signal-rename coordinator. `undo`/`redo`
+   * above reach it through {@link RvDocument.undo} / {@link RvDocument.redo},
+   * before anything is applied. `null` removes it.
+   */
+  setHistoryInterceptor(interceptor: RvHistoryInterceptor | null): void {
+    this._doc.setHistoryInterceptor(interceptor);
+  }
+
   // ─── Base swap gate (plan-710 §2.4) ──────────────────────────────────
 
   /**
@@ -588,22 +606,30 @@ export class AssetDocument {
    * Attach freshly imported CAD geometry as an undoable op. Returns the root path.
    * `opts.name` overrides the root node name (re-import keeps the old name).
    *
-   * The GLB bytes are cached under `(Sha256, Quality)` BEFORE the op is recorded,
+   * The GLB bytes are cached under `(Sha256, Quality, Converter)` BEFORE the op is recorded,
    * so a later replay of that op always finds them. The tree that enters the
    * scene is parsed FROM those bytes — never from the importer's intermediate
    * representation — which is what guarantees import and reload agree on node
    * names, materials and transforms.
    *
+   * The bytes are welded first (`rv-glb-weld`): this is the one sink every editor
+   * import passes — whatever the format, and whether the conversion ran in the
+   * browser or in CONNECT — so cache and scene both get the welded form.
+   *
    * `opts.root` lets a caller that already parsed `result.glb` (CADLink
    * re-import, which needs the tree to diff against the old revision) hand it
    * over instead of paying for a second parse. It MUST be the result of
-   * `parseGlbSubtree(result.glb)` — passing any other tree silently breaks the
-   * import-equals-reload invariant. Its local transform is what gets recorded.
+   * `parseGlbSubtree(weldImportedGlb(result.glb))` — passing any other tree
+   * silently breaks the import-equals-reload invariant. Its local transform is
+   * what gets recorded.
    */
   async importCad(result: CadImportResult, opts?: { name?: string; root?: Object3D }): Promise<string> {
     this._assertUnlocked('Importing CAD');
-    const { Sha256, Quality } = result.cadlink;
-    const tier = await putCadGlb(Sha256, Quality, result.glb);
+    const { Sha256, Quality, Converter } = result.cadlink;
+    const glb = weldImportedGlb(result.glb, result.cadlink.File);
+    // plan-561: the converter is part of the key — a CONNECT import never overwrites the
+    // browser entry an older draft of the same file replays from.
+    const tier = await putCadGlb(Sha256, Quality, glb, Converter);
     if (tier === 'none') {
       console.warn(
         `[asset-editor] "${result.cadlink.File}" could not be cached — it will NOT survive a reload. ` +
@@ -611,7 +637,7 @@ export class AssetDocument {
       );
     }
 
-    const root = opts?.root ?? await parseGlbSubtree(result.glb);
+    const root = opts?.root ?? await parseGlbSubtree(glb);
     const assetRoot = this.viewer.currentModelRoot;
     const rootName = uniqueChildName(assetRoot, opts?.name ?? (stripExtension(result.cadlink.File) || 'CAD'));
     const rootPath = assetRoot ? childPath(assetRoot, rootName) : rootName;
@@ -1050,9 +1076,10 @@ export class AssetDocument {
    * Split a mesh into its connected islands (or its material groups), replacing
    * it with a same-named Group that carries the parts.
    *
-   * `preview` is the result the confirmation dialog already computed — handed to
+   * One step, on the main thread: the partition is computed here and handed to
    * the executor under the op's id via the same mechanism `importCad` uses for
-   * its parsed tree, so the apply does not repeat the analysis. The executor
+   * its parsed tree, so the apply does not repeat the analysis. `preview` lets a
+   * caller that already holds a partition pass it in instead. The executor
    * validates it against the live geometry and recomputes if it went stale;
    * replay finds no payload and always recomputes.
    *
@@ -1178,7 +1205,21 @@ export class AssetDocument {
   /** Replay a recovered draft's ops onto the freshly loaded base. */
   async replayOps(ops: readonly RvOp[]): Promise<void> {
     this._assertUnlocked('Replaying ops');
+    // plan-498 F13: an `attach-fmu` in the log carries only its package SHA —
+    // put the bytes back (draft side-store) BEFORE the op constructs the RVFmu.
+    await restoreFmuPackagesForOps(ops, this.id);
     await this._doc.replayOps(ops);
+  }
+
+  /**
+   * The `userData.realvirtual` record of a node, or null (plan-498): what the
+   * editor verbs (`rv-fmu-ops.ts`) read to dedupe keys and capture the inverse
+   * payload of a `removeComponent`.
+   */
+  nodeExtras(nodePath: string): Record<string, unknown> | null {
+    const node = this.viewer.registry?.getNode(nodePath);
+    const rv = node?.userData?.realvirtual;
+    return rv && typeof rv === 'object' ? rv as Record<string, unknown> : null;
   }
 
   toDraft(): AssetDraft {
@@ -1436,6 +1477,11 @@ export class AssetDocument {
     this._assertUnlocked('Marking the document saved');
     this._base = base;
     this.executor.flushTrash();
+    // plan-498 F13: a package the save just embedded lives in the file now —
+    // its draft side-store copy (only there for a reload BEFORE the first
+    // save) goes with the draft. Read before the re-base empties the log; a
+    // package the save could not embed (not in the store) is kept.
+    const savedFmuShas = fmuShasOfOps(this._doc.ops).filter((sha) => binaryResources.has(sha));
     // Re-base the op log. This notifies, which schedules an autosave — so the
     // cancel below MUST come after it, or the debounced write would overwrite
     // the cleared draft with the stale pre-save log.
@@ -1444,7 +1490,8 @@ export class AssetDocument {
     const draftDone = clearDocumentDraft(this._draftFrame);
     this._snapshot = null;
     for (const fn of this._listeners) fn();
-    return draftDone;
+    if (savedFmuShas.length === 0) return draftDone;
+    return Promise.all([draftDone, ...savedFmuShas.map((sha) => deleteDraftFmuPackage(sha))]).then(() => undefined);
   }
 
   /** Wait for all queued ops to finish (save pipeline calls this first). */
@@ -1494,6 +1541,9 @@ export class AssetDocument {
     this._lockGeneration++;
     this._autosave.dispose();
     this._unsubDoc();
+    // plan-498: the document's FMU packages were held for Undo while it was
+    // open; a package another document (or the loaded model) holds survives.
+    binaryResources.releaseDocument(fmuDocumentResourceId(this.id));
     this._detachCommitHook?.();
     this._detachCommitHook = null;
     if (this._bound) {
@@ -1667,24 +1717,14 @@ export function planMergeMesh(viewer: RVViewer, rootPath: string): MergeMeshPlan
   };
 }
 
-function uniqueName(taken: Set<string>, base: string): string {
-  if (!taken.has(base)) return base;
-  for (let n = 1; ; n++) {
-    const name = `${base}_${n}`;
-    if (!taken.has(name)) return name;
-  }
-}
+// `uniqueName` is the shared helper of `rv-node-naming` (plan-758): the same
+// `Name, Name_1, Name_2 …` rule the planner assigns to placements. It never
+// strips, so the `_part${i}` / `_merged` bases below keep their digits.
 
 /** Unique child name under a parent (Name, Name_1, Name_2 …). */
 function uniqueChildName(parent: Object3D | null, base: string): string {
   const sane = base.replace(/[^\w\- ]+/g, '_').trim() || 'CAD';
-  if (!parent) return sane;
-  const taken = new Set(parent.children.map((c) => c.name));
-  if (!taken.has(sane)) return sane;
-  for (let n = 1; ; n++) {
-    const name = `${sane}_${n}`;
-    if (!taken.has(name)) return name;
-  }
+  return uniqueName(siblingNames(parent), sane);
 }
 
 // A child's registry path MUST equal what NodeRegistry.computeNodePath() will

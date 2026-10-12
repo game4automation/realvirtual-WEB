@@ -27,12 +27,57 @@ import { forwardRef, type ReactNode } from 'react';
 import { Box, Typography, Tooltip } from '@mui/material';
 import {
   TimerOutlined, Landscape, MenuBookOutlined, PrecisionManufacturingOutlined,
-  SettingsEthernet,
+  SettingsEthernet, PictureAsPdfOutlined, SlideshowOutlined, MovieOutlined,
+  ImageOutlined, TableChartOutlined, DescriptionOutlined, InsertDriveFileOutlined,
+  ArchiveOutlined, CategoryOutlined,
 } from '@mui/icons-material';
 import type { LibraryCatalogEntry } from './library-types';
 
 /** Matches `CatalogBrowserVariant`; kept structural to avoid a circular import. */
 export type AssetCardVariant = 'compact' | 'comfortable';
+
+/** The stated tiles — see {@link AssetCardProps.glyph}. */
+export type AssetCardGlyph = 'connect' | 'knowledge' | `file:${string}`;
+
+/** The `file:<ext>` glyph of a path, from its extension — `file:` when it has none. */
+export function fileGlyphOf(path: string): AssetCardGlyph {
+  const leaf = String(path ?? '').split('/').pop() ?? '';
+  const dot = leaf.lastIndexOf('.');
+  return `file:${dot > 0 ? leaf.slice(dot + 1).toLowerCase() : ''}`;
+}
+
+/**
+ * The CAD exchange and native formats the dashboard tells apart from other
+ * files: they are geometry, the raw material an asset is made from, so their
+ * tile gets its own colour and the primitive-shapes glyph rather than the
+ * document look (user decision 2026-09-10). Lower-case, dot-less.
+ */
+const CAD_EXTENSIONS = new Set([
+  'step', 'stp', 'iges', 'igs', 'jt', 'stl', 'obj', 'fbx', '3ds', 'dae',
+  'dxf', 'dwg', 'sat', 'x_t', 'x_b', 'ipt', 'iam', 'sldprt', 'sldasm',
+  'prt', 'asm', 'catpart', 'catproduct', '3dxml', 'vrml', 'wrl', 'ply',
+]);
+
+/** Is this extension one of the CAD formats? */
+export function isCadExtension(ext: string): boolean {
+  return CAD_EXTENSIONS.has(ext.toLowerCase());
+}
+
+/** The icon a `file:<ext>` tile shows above its label — by family, generic otherwise. */
+function fileGlyphIcon(ext: string, sx: object): ReactNode {
+  if (isCadExtension(ext)) return <CategoryOutlined sx={sx} />;
+  switch (ext) {
+    case 'pdf': return <PictureAsPdfOutlined sx={sx} />;
+    case 'ppt': case 'pptx': case 'key': case 'odp': return <SlideshowOutlined sx={sx} />;
+    case 'mp4': case 'webm': case 'mov': case 'avi': case 'mkv': return <MovieOutlined sx={sx} />;
+    case 'png': case 'jpg': case 'jpeg': case 'gif': case 'webp': case 'svg': case 'bmp':
+      return <ImageOutlined sx={sx} />;
+    case 'xls': case 'xlsx': case 'csv': case 'ods': return <TableChartOutlined sx={sx} />;
+    case 'doc': case 'docx': case 'odt': case 'rtf': case 'txt': return <DescriptionOutlined sx={sx} />;
+    case 'zip': case '7z': case 'rar': case 'gz': case 'tar': return <ArchiveOutlined sx={sx} />;
+    default: return <InsertDriveFileOutlined sx={sx} />;
+  }
+}
 
 /**
  * Which layer of the two-level model an entry came from (§2.3).
@@ -69,8 +114,15 @@ export interface AssetCardProps {
    * A stated glyph tile for an entry that has no picture BY NATURE — a CONNECT
    * configuration or knowledge file, for instance — rather than one whose
    * picture merely has not arrived. Takes precedence over the thumbnail slot.
+   *
+   * `file:<ext>` is the tile of any other project file — PDF, slides, video,
+   * whatever the folder holds: the extension in capitals is the whole label.
+   * Only two families carry a colour on the icon and label — Markdown in
+   * magenta, CAD geometry in amber; every other media file is neutral grey,
+   * as is the tile itself (user decision 2026-09-10). The knowledge tile says
+   * `MD`.
    */
-  glyph?: 'connect' | 'knowledge';
+  glyph?: AssetCardGlyph;
   /** Tooltip body (usually the component's behaviour description). */
   tooltip?: ReactNode;
   /** Controlled tooltip visibility — suppressed while dragging. */
@@ -99,6 +151,9 @@ const NEUTRAL = 'rgba(255, 255, 255';
 // knowledge is realvirtual Magenta — same hues as the hero card's slot wells.
 const CONNECT = 'rgba(102, 187, 106';
 const KNOWLEDGE = 'rgba(233, 64, 120';
+// CAD geometry is amber: distinct from the blue asset accent, the green CONNECT
+// and the magenta document family it would otherwise disappear into.
+const CAD = 'rgba(255, 167, 38';
 
 export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function AssetCard(
   {
@@ -130,9 +185,26 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
     <GlyphTile
       accent={KNOWLEDGE}
       icon={<MenuBookOutlined sx={{ fontSize: s.glyph, color: `${KNOWLEDGE}, 0.6)` }} />}
-      label="Knowledge"
+      label="MD"
       labelSize={s.glyphLabel}
     />
+  ) : glyph?.startsWith('file:') ? (
+    (() => {
+      const ext = glyph.slice(5);
+      // CAD keeps its amber; every other media file (PDF, slides, video, …)
+      // is neutral grey like the empty tile — only MD and CAD are coloured
+      // (user decision 2026-09-10).
+      const accent = isCadExtension(ext) ? CAD : NEUTRAL;
+      const alpha = accent === NEUTRAL ? 0.45 : 0.6;
+      return (
+        <GlyphTile
+          accent={accent}
+          icon={fileGlyphIcon(ext, { fontSize: s.glyph, color: `${accent}, ${alpha})` })}
+          label={ext || 'File'}
+          labelSize={s.glyphLabel}
+        />
+      );
+    })()
   ) : entry.thumbnailUrl ? (
     <Box
       component="img"
@@ -309,7 +381,14 @@ export const AssetCard = forwardRef<HTMLDivElement, AssetCardProps>(function Ass
   );
 });
 
-/** Dashed placeholder tile for entries that have no GLB to render. */
+/**
+ * Placeholder tile for entries that have no GLB to render.
+ *
+ * The tile itself is the same neutral grey as the empty preview square; only
+ * the icon and the label carry the type colour (user decision 2026-09-10). A
+ * grid of tinted squares read as a colour chart, and the accent was doing its
+ * job twice — once on the glyph, once again behind it.
+ */
 function GlyphTile({ accent, icon, label, labelSize }: {
   accent: string; icon: ReactNode; label: string; labelSize: number;
 }) {
@@ -319,8 +398,8 @@ function GlyphTile({ accent, icon, label, labelSize }: {
         width: '100%',
         aspectRatio: '1',
         borderRadius: 0.5,
-        bgcolor: `${accent}, 0.08)`,
-        border: `1px dashed ${accent}, 0.3)`,
+        bgcolor: `${NEUTRAL}, 0.05)`,
+        border: `1px dashed ${NEUTRAL}, 0.12)`,
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
@@ -329,7 +408,7 @@ function GlyphTile({ accent, icon, label, labelSize }: {
       }}
     >
       {icon}
-      <Typography sx={{ fontSize: labelSize, color: `${accent}, 0.5)`, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+      <Typography sx={{ fontSize: labelSize, color: `${accent}, 0.7)`, textTransform: 'uppercase', letterSpacing: 0.5 }}>
         {label}
       </Typography>
     </Box>

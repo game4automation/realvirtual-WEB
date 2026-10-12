@@ -2,11 +2,13 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { Vector3 } from 'three';
+import { Object3D, Vector3 } from 'three';
 import { CameraStartPosPlugin } from '../src/plugins/camera-startpos-plugin';
 import { saveStartPos } from '../src/core/hmi/camera-startpos-store';
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
 import type { RVViewer } from '../src/core/rv-viewer';
+import { setSceneCamera } from '../src/core/engine/rv-asset-reference';
+import { readCameraStartFromScene } from '../src/core/hmi/scene/rv-scene-glb-read';
 
 function mockViewerWithSceneExtras(url: string, extras: any): RVViewer {
   return {
@@ -117,5 +119,76 @@ describe('CameraStartPosPlugin — GLB rv_extras via viewer.scene', () => {
     } as any;
     new CameraStartPosPlugin().onModelLoaded({} as LoadResult, viewer);
     expect(viewer.animateCameraTo).toHaveBeenCalledOnce();
+  });
+});
+
+// plan-498 Nachkorrektur: the document's own `SceneCamera` (scenes[0].extras on
+// the model root) must apply on the FIRST open — before SceneStore's adoption has
+// copied it into localStorage, which only happens after onModelLoaded.
+describe('CameraStartPosPlugin — SceneCamera from the model root', () => {
+  beforeEach(() => localStorage.clear());
+
+  const FILE_CAM = { px: 5, py: 6, pz: 7, tx: 1, ty: 2, tz: 3, duration: 0.5, source: 'user' as const };
+
+  function viewerWithSceneCamera(url: string, rvCameraStart?: unknown): RVViewer {
+    const root = new Object3D();
+    setSceneCamera(root, FILE_CAM);
+    const viewer = mockViewerWithSceneExtras(url, rvCameraStart ? { rv_camera_start: rvCameraStart } : {});
+    (viewer as unknown as { currentModelRoot: Object3D }).currentModelRoot = root;
+    return viewer;
+  }
+
+  it('applies the file SceneCamera on the first open (empty browser storage)', () => {
+    const viewer = viewerWithSceneCamera('/models/FirstOpen.glb');
+    const plugin = new CameraStartPosPlugin();
+    plugin.onModelLoaded({} as LoadResult, viewer);
+    expect(viewer.animateCameraTo).toHaveBeenCalledOnce();
+    const [pos, tgt, duration] = (viewer.animateCameraTo as any).mock.calls[0];
+    expect(pos.toArray()).toEqual([5, 6, 7]);
+    expect(tgt.toArray()).toEqual([1, 2, 3]);
+    expect(duration).toBe(0.5);
+    // The loader asks the same question to decide against fit-to-content.
+    expect(plugin.resolvePreset(viewer)).toMatchObject({ px: 5, tx: 1 });
+  });
+
+  it('a camera the user saved in this browser beats the file SceneCamera', () => {
+    saveStartPos('BrowserWins', { px: 99, py: 98, pz: 97, tx: 0, ty: 1, tz: 0 });
+    const viewer = viewerWithSceneCamera('/models/BrowserWins.glb');
+    new CameraStartPosPlugin().onModelLoaded({} as LoadResult, viewer);
+    const [pos] = (viewer.animateCameraTo as any).mock.calls[0];
+    expect(pos.toArray()).toEqual([99, 98, 97]);
+  });
+
+  it('the file SceneCamera beats the Unity rv_camera_start author default', () => {
+    const viewer = viewerWithSceneCamera('/models/FileBeatsUnity.glb', {
+      CameraTransformPos: { x: 2, y: 3, z: 4 },
+      TargetPos:          { x: 1, y: 0, z: 0 },
+    });
+    new CameraStartPosPlugin().onModelLoaded({} as LoadResult, viewer);
+    const [pos] = (viewer.animateCameraTo as any).mock.calls[0];
+    expect(pos.toArray()).toEqual([5, 6, 7]);
+  });
+
+  it('the later adoption (localStorage copy) resolves to the same preset and animates nothing', () => {
+    const viewer = viewerWithSceneCamera('/models/Adopt.glb');
+    const plugin = new CameraStartPosPlugin();
+    plugin.onModelLoaded({} as LoadResult, viewer);
+    const before = plugin.resolvePreset(viewer);
+    // What SceneStore._adoptFromLoadedGlb does after onModelLoaded.
+    const root = (viewer as unknown as { currentModelRoot: Object3D }).currentModelRoot;
+    saveStartPos('Adopt', readCameraStartFromScene(root)!);
+    expect(plugin.resolvePreset(viewer)).toMatchObject({
+      px: before!.px, py: before!.py, pz: before!.pz, tx: before!.tx, ty: before!.ty, tz: before!.tz,
+    });
+    expect(viewer.animateCameraTo).toHaveBeenCalledOnce();
+  });
+
+  it('ignores a SceneCamera with a non-finite coordinate', () => {
+    const root = new Object3D();
+    root.userData.realvirtual = { SceneCamera: { px: NaN, py: 0, pz: 0, tx: 0, ty: 0, tz: 0 } };
+    const viewer = mockViewerWithSceneExtras('/models/NaNCam.glb', {});
+    (viewer as unknown as { currentModelRoot: Object3D }).currentModelRoot = root;
+    new CameraStartPosPlugin().onModelLoaded({} as LoadResult, viewer);
+    expect(viewer.animateCameraTo).not.toHaveBeenCalled();
   });
 });

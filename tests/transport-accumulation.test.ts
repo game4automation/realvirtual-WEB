@@ -16,10 +16,14 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { Object3D, Vector3, Scene, BoxGeometry, MeshBasicMaterial, Quaternion } from 'three';
+import { RVTransportStopper } from '../src/core/engine/rv-transport-stopper';
+import { RVWaitForSensor, StepState } from '../src/core/engine/rv-logic-step';
+import type { RVSensor } from '../src/core/engine/rv-sensor';
 import { AABB } from '../src/core/engine/rv-aabb';
 import { RVMovingUnit, InstancedMovingUnit, MUInstancePool } from '../src/core/engine/rv-mu';
 import { RVTransportSurface } from '../src/core/engine/rv-transport-surface';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
+import { RVDrive, DriveDirection } from '../src/core/engine/rv-drive';
 
 // ─── Helpers (setup pattern from rv-transport.test.ts) ────────────
 
@@ -269,6 +273,28 @@ describe('MU accumulation — edge cases', () => {
     expect(lane2.blocked).toBe(false);
   });
 
+  for (const path of ['array', 'grid'] as const) {
+    it(`MU on a belt on another level never blocks (${path} path)`, () => {
+      const manager = createManager();
+      if (path === 'grid') manager.bruteForceThreshold = 0;
+      // Return belt under a main belt: the lower MU runs +X straight under a
+      // parked MU on the stopped upper belt — same XZ lane, different level.
+      const lower = createSurface(0, 0, 0, new Vector3(1, 0.1, 0.5), new Vector3(1, 0, 0), 1000);
+      const upper = createSurface(0, 0.35, 0, new Vector3(1, 0.1, 0.5), new Vector3(1, 0, 0), 0);
+      manager.surfaces.push(lower, upper);
+
+      const moving = createMU('moving', -0.6, 0, 0);
+      const parked = createMU('parked', -0.2, 0.35, 0);
+      manager.mus.push(moving, parked);
+
+      run(manager, 30); // 0.5 s at 1 m/s → +0.5 m, passing under the parked MU
+
+      expect(moving.getPosition().x).toBeCloseTo(-0.1, 2);
+      expect(moving.blocked).toBe(false);
+      expect(parked.getPosition().x).toBeCloseTo(-0.2, 5);
+    });
+  }
+
   it('rotated conveyor (45deg world yaw) accumulates via direction projection', () => {
     const manager = createManager();
     // Belt rotated 45° about Y: local +X transport → world (√½, 0, -√½). The
@@ -390,6 +416,46 @@ describe('MU accumulation — edge cases', () => {
 
 // ─── API contracts ────────────────────────────────────────────────
 
+describe('belt driven by DriveTo (signed speed)', () => {
+  function beltWithDrive(): { manager: RVTransportManager; drive: RVDrive; mu: RVMovingUnit } {
+    const manager = createManager();
+    const surface = createSurface(0, 0, 0, new Vector3(1, 0.1, 0.5), new Vector3(1, 0, 0), 0);
+    const drive = new RVDrive(new Object3D());
+    drive.Direction = DriveDirection.LinearX;
+    drive.UseAcceleration = false;
+    drive.TargetSpeed = 1000;
+    drive.initDrive();
+    drive.targetSpeed = 1000;
+    surface.drive = drive;
+    manager.surfaces.push(surface);
+    const mu = createMU('mu', 0, 0, 0);
+    manager.mus.push(mu);
+    return { manager, drive, mu };
+  }
+
+  it('DriveTo toward a lower position transports backward, currentSpeed stays a magnitude', () => {
+    const { manager, drive, mu } = beltWithDrive();
+    drive.startMove(-2000);
+    for (let i = 0; i < 30; i++) { drive.update(DT); manager.update(DT); }
+
+    expect(drive.currentSpeed).toBeGreaterThan(0);      // plan-281 contract unchanged
+    expect(drive.signedSpeed).toBeLessThan(0);
+    expect(mu.getPosition().x).toBeCloseTo(-0.5, 2);    // 0.5 s at 1 m/s backward
+  });
+
+  it('DriveTo forward after a backward move transports forward again', () => {
+    const { manager, drive, mu } = beltWithDrive();
+    drive.startMove(-100);
+    for (let i = 0; i < 30; i++) { drive.update(DT); manager.update(DT); }
+    const x0 = mu.getPosition().x;
+    drive.startMove(2000);
+    for (let i = 0; i < 30; i++) { drive.update(DT); manager.update(DT); }
+
+    expect(drive.signedSpeed).toBeGreaterThan(0);
+    expect(mu.getPosition().x).toBeCloseTo(x0 + 0.5, 2);
+  });
+});
+
 describe('MU accumulation — API contracts', () => {
   it('radial surface skips clamp (v1 exclusion)', () => {
     const manager = createManager();
@@ -496,5 +562,60 @@ describe('MU accumulation — performance', () => {
     console.log(`[perf] 500-MU transport tick with accumulation: ${msPerTick.toFixed(3)} ms`);
     expect(msPerTick).toBeLessThan(5);
     expect(manager.mus.length).toBe(500); // nothing vanished/broke during the run
+  });
+});
+
+
+describe('transport stopper contact', () => {
+  it.each([1, -1])('holds at contact on a running belt and releases when raised (direction %s)', sign => {
+    const manager = createManager();
+    const belt = createSurface(0, 0, 0, new Vector3(3, 0.1, 0.5), new Vector3(sign, 0, 0), 500);
+    manager.surfaces.push(belt);
+    const mu = createMU('box', 0, 0.15, 0);
+    manager.mus.push(mu);
+    const axis = new Object3D();
+    axis.position.set(sign * 0.5, 0.15, 0);
+    const stopper = new RVTransportStopper(axis);
+    stopper.Size.set(20, 100, 200);
+    manager.stoppers.add(stopper);
+    const sensor = { occupied: true, occupiedMU: mu, node: new Object3D() } as unknown as RVSensor;
+    const wait = new RVWaitForSensor(sensor, true, true);
+    wait.start();
+    expect(wait.state).toBe(StepState.Waiting);
+    run(manager, 180);
+    expect(mu.getPosition().x).toBeCloseTo(sign * 0.4399, 4);
+    expect(mu.blocked).toBe(true);
+    expect(belt.speed).toBe(500);
+    wait.fixedUpdate(DT);
+    expect(wait.state).toBe(StepState.Finished);
+    const stopped = mu.getPosition().x;
+    run(manager, 90); // opening, filling, closing: no travel while blocked
+    expect(mu.getPosition().x).toBe(stopped);
+    axis.position.y += 0.2;
+    run(manager, 60);
+    expect(mu.getPosition().x * sign).toBeGreaterThan(0.8);
+    expect(mu.blocked).toBe(false);
+  });
+
+  it('sweeps through long timesteps, ignores another lane, and follows rotated scaled parents', () => {
+    const parent = new Object3D();
+    const node = new Object3D();
+    parent.add(node);
+    parent.position.set(0.5, 0.15, 0);
+    parent.rotation.y = Math.PI / 2;
+    parent.scale.setScalar(2);
+    const stopper = new RVTransportStopper(node);
+    stopper.Size.set(200, 100, 20);
+    stopper.updateBounds();
+    const mu = createMU('fast box', 0, 0.15, 0);
+    const dir = new Vector3(1, 0, 0);
+    expect(stopper.clampTravel(mu.aabb, dir, 2)).toBeCloseTo(0.4299, 4);
+    parent.position.z = 1;
+    stopper.updateBounds();
+    expect(stopper.clampTravel(mu.aabb, dir, 2)).toBe(2);
+    parent.position.z = 0;
+    stopper.Enabled = false;
+    stopper.updateBounds();
+    expect(stopper.clampTravel(mu.aabb, dir, 2)).toBe(2);
   });
 });

@@ -147,6 +147,7 @@ describe('FIX #10a — live-MU safety cap holds sources at the ceiling', () => {
     return {
       node: new Object3D(),
       update: (_dt: number, enabled: boolean) => { record(enabled); return null; },
+      drainGenerated: () => [],
     } as unknown as never;
   }
 

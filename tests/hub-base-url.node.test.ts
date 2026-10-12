@@ -112,7 +112,10 @@ describe.skipIf(!HAS_PRIVATE)('hub base URL — one constant (F6)', () => {
     // this test would pass for the OLD reason and prove nothing.
     expect(existsSync(join(PRIVATE_ROOT, 'delivery'))).toBe(false);
 
-    const slugs = listCustomerSlugs(PRIVATE_ROOT);
+    // Only customers with a git delivery have a hub remote; a hosted-link customer (plan-759,
+    // e.g. gernbauer) is skipped exactly like T15b does.
+    const deliverable = new Set(listCustomers(PRIVATE_ROOT).filter(c => !undeliverableReason(c)).map(c => c.customer));
+    const slugs = listCustomerSlugs(PRIVATE_ROOT).filter(s => deliverable.has(s));
     expect(slugs.length).toBeGreaterThan(0);
 
     const resolved: Record<string, string> = {};
@@ -170,7 +173,7 @@ describe.skipIf(!HAS_PRIVATE)('hub base URL — one constant (F6)', () => {
 });
 
 describe.skipIf(!HAS_PRIVATE)('legacy secret files — deleted, not emptied (F7)', () => {
-  it('T17 keeps the three secret field names out of every tracked file but customers/*.secrets.json', () => {
+  it('T17 keeps the secret field names out of every tracked file but the register entries', () => {
     // ONE `git grep` over the whole index, the way `assert-public-safe.mjs` scans:
     // the private repository carries hundreds of megabytes of tracked geometry, and
     // opening every file from Node turns a guard into a minute of waiting.
@@ -189,12 +192,17 @@ describe.skipIf(!HAS_PRIVATE)('legacy secret files — deleted, not emptied (F7)
     } catch {
       hits = []; // exit code 1 = no match, which is the wanted state
     }
-    // The gitignored secrets files are the ONE legitimate home — and being
-    // gitignored they are not in the index at all, so a hit on that path would
-    // itself be the finding.
-    const offenders = hits.filter(path => !/^customers\/[a-z0-9-]+\.secrets\.json$/.test(path));
+    // The register entries are the ONE legitimate home since 2026-09-13:
+    // `inference.requestyApiKey` / `requestyBaseUrl` live there, and
+    // rv-customers-registry.node.test.ts checks that nothing ELSE in those
+    // files is credential-shaped. A hit anywhere else is still the finding —
+    // including on a `customers/<slug>.secrets.json`, which would mean the
+    // retired sidecar mechanism came back AND escaped the .gitignore.
+    const isRegisterEntry = (path: string) => path.startsWith('customers/')
+      && path.endsWith('.json') && !path.endsWith('.secrets.json');
+    const offenders = hits.filter(path => !isRegisterEntry(path));
     expect(offenders).toEqual([]);
-  });
+  }, 60_000); // one git grep over the whole private index takes ~6 s
 
   it('T17b asserts the two legacy paths do not exist — emptying them is not enough', () => {
     for (const path of DELETED_LEGACY_PATHS) {

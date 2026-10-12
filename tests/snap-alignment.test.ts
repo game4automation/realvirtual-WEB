@@ -145,6 +145,49 @@ describe('computeSnapAlignedWorldMatrix', () => {
     expect(out.z).toBeCloseTo(1, 4);
   });
 
+  it('the target snap inside NESTED placement content aligns against the RECORD root, not the nested root (plan-757 Phase 2, F5)', () => {
+    // Record root at the origin; a nested placement root (a reference node
+    // inside the placed asset — `_layoutNestedOf`, never `_layoutId`) sits at
+    // z = −2 inside it; the snap sits at +0.5 in the nested root's frame.
+    // Relative to the NESTED root the snap is at +Z (outward +Z); relative to
+    // the RECORD root it is at z = −1.5 (outward −Z). The planner moves the
+    // record, so the record's reading is the right one: the moving asset's
+    // outward must end up anti-parallel to −Z, i.e. +Z.
+    const record = new Object3D();
+    record.userData._layoutId = 'rec';
+    const nested = new Object3D();
+    nested.position.set(0, 0, -2);
+    nested.userData._layoutObject = true;
+    nested.userData._layoutNestedOf = 'rec';
+    record.add(nested);
+    const targetSnap = new Object3D();
+    targetSnap.position.set(0, 0, 0.5);
+    nested.add(targetSnap);
+    record.updateMatrixWorld(true);
+
+    const obj = new Object3D();
+    obj.position.set(4, 0, 4);
+    obj.userData._layoutId = 'mov';
+    const movingSnap = new Object3D();
+    movingSnap.position.set(0, 0, 0.5);
+    obj.add(movingSnap);
+    obj.updateMatrixWorld(true);
+
+    const M = computeSnapPivotAlignedWorldMatrix(
+      targetSnap, obj, movingSnap,
+      { axis: 'Z', sign: 'P', code: 'ZP' },
+      { axis: 'Z', sign: 'P', code: 'ZP' },
+    );
+    applyMatrix(obj, M);
+    movingSnap.updateMatrixWorld(true);
+
+    const got = movingSnap.getWorldPosition(new Vector3());
+    expect(got.x).toBeCloseTo(0, 4);
+    expect(got.z).toBeCloseTo(-1.5, 4);
+    const out = new Vector3(0, 0, 1).applyQuaternion(obj.getWorldQuaternion(new Quaternion()));
+    expect(out.z, 'anti-parallel to the RECORD reading (−Z) → +Z; the nested reading would give −Z').toBeCloseTo(1, 4);
+  });
+
   it('flipMatrixForAxis is identity (current convention has no flip)', () => {
     // Opposite-sign snaps already face each other when their world matrices
     // align; same-sign mates would need a flip but the matcher prohibits them.

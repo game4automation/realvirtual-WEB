@@ -47,17 +47,14 @@ import {
   type NodeKnowledgeExtras,
 } from '../engine/rv-node-knowledge';
 import { LazyMarkdown } from './rv-markdown-lazy';
+import { FIELD_BG, FIELD_BORDER, FIELD_BORDER_HOVER, FS, INK_HIGH, INK_LOW, INK_MID, LINK, MONO, WARN } from './shared-sx';
 
-// ── Local ink / metric constants (same convention as rv-component-section) ──
+// ── Design values (plan-514: all from shared-sx, no local literals) ──
 
-const INK_HIGH = 'rgba(255,255,255,0.92)';
-const INK_MID = 'rgba(255,255,255,0.70)';
-const INK_LOW = 'rgba(255,255,255,0.45)';
-const RULE = 'rgba(255,255,255,0.14)';
+/** Hairline of the note box, quotes, rules and table cells. */
+const RULE = FIELD_BORDER_HOVER;
 /** Warning tone for a note that is a guess rather than a measurement. */
-const INK_WARN = '#ffa726';
-const LINK = '#64b5f6';
-const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const INK_WARN = WARN;
 
 /** Ceiling of the note box, scroll inside. Originally a fixed 320px (grill
  *  decision plan-431); revised 2026-08-22 on user feedback: a long note left
@@ -120,7 +117,7 @@ function confidenceColor(confidence: string): string {
 const CELL = {
   border: `1px solid ${RULE}`,
   padding: '2px 6px',
-  fontSize: 11,
+  fontSize: FS.label,
   whiteSpace: 'nowrap' as const,
   textAlign: 'left' as const,
 };
@@ -129,14 +126,14 @@ const CELL = {
 const MD_COMPONENTS: Record<string, any> = {
   // Notes are written with their own H1; inside the inspector it must not
   // outshout the section header above it.
-  h1: (p: any) => <Typography {...p} component="div" sx={{ fontSize: 12, fontWeight: 700, color: INK_HIGH, mt: 0.75, mb: 0.25 }} />,
-  h2: (p: any) => <Typography {...p} component="div" sx={{ fontSize: 11.5, fontWeight: 700, color: INK_HIGH, mt: 0.75, mb: 0.25 }} />,
-  h3: (p: any) => <Typography {...p} component="div" sx={{ fontSize: 11, fontWeight: 700, color: INK_MID, mt: 0.5, mb: 0.25 }} />,
-  h4: (p: any) => <Typography {...p} component="div" sx={{ fontSize: 11, fontWeight: 600, color: INK_MID, mt: 0.5, mb: 0.25 }} />,
-  p: (p: any) => <Typography {...p} component="div" sx={{ fontSize: 11, color: INK_MID, lineHeight: 1.5, my: 0.4, overflowWrap: 'anywhere' }} />,
-  ul: (p: any) => <Box {...p} component="ul" sx={{ fontSize: 11, color: INK_MID, pl: 2, my: 0.4 }} />,
-  ol: (p: any) => <Box {...p} component="ol" sx={{ fontSize: 11, color: INK_MID, pl: 2, my: 0.4 }} />,
-  li: (p: any) => <Box {...p} component="li" sx={{ fontSize: 11, lineHeight: 1.5, overflowWrap: 'anywhere' }} />,
+  h1: (p: any) => <Typography {...p} component="div" sx={{ fontSize: FS.body, fontWeight: 700, color: INK_HIGH, mt: 0.75, mb: 0.25 }} />,
+  h2: (p: any) => <Typography {...p} component="div" sx={{ fontSize: FS.label, fontWeight: 700, color: INK_HIGH, mt: 0.75, mb: 0.25 }} />,
+  h3: (p: any) => <Typography {...p} component="div" sx={{ fontSize: FS.label, fontWeight: 700, color: INK_MID, mt: 0.5, mb: 0.25 }} />,
+  h4: (p: any) => <Typography {...p} component="div" sx={{ fontSize: FS.label, fontWeight: 600, color: INK_MID, mt: 0.5, mb: 0.25 }} />,
+  p: (p: any) => <Typography {...p} component="div" sx={{ fontSize: FS.label, color: INK_MID, lineHeight: 1.5, my: 0.4, overflowWrap: 'anywhere' }} />,
+  ul: (p: any) => <Box {...p} component="ul" sx={{ fontSize: FS.label, color: INK_MID, pl: 2, my: 0.4 }} />,
+  ol: (p: any) => <Box {...p} component="ol" sx={{ fontSize: FS.label, color: INK_MID, pl: 2, my: 0.4 }} />,
+  li: (p: any) => <Box {...p} component="li" sx={{ fontSize: FS.label, lineHeight: 1.5, overflowWrap: 'anywhere' }} />,
   strong: (p: any) => <Box {...p} component="strong" sx={{ color: INK_HIGH, fontWeight: 700 }} />,
   blockquote: (p: any) => <Box {...p} component="blockquote" sx={{ borderLeft: `2px solid ${RULE}`, pl: 1, ml: 0, my: 0.4, color: INK_LOW }} />,
   hr: () => <Box sx={{ height: '1px', bgcolor: RULE, my: 0.75, border: 0 }} />,
@@ -144,13 +141,13 @@ const MD_COMPONENTS: Record<string, any> = {
   // own scroller instead of letting it widen the inspector.
   table: (p: any) => (
     <Box sx={{ overflowX: 'auto', maxWidth: '100%', my: 0.5 }}>
-      <Box {...p} component="table" sx={{ borderCollapse: 'collapse', fontSize: 11, color: INK_MID }} />
+      <Box {...p} component="table" sx={{ borderCollapse: 'collapse', fontSize: FS.label, color: INK_MID }} />
     </Box>
   ),
-  th: (p: any) => <Box {...p} component="th" sx={{ ...CELL, fontWeight: 700, color: INK_HIGH, bgcolor: 'rgba(255,255,255,0.04)' }} />,
+  th: (p: any) => <Box {...p} component="th" sx={{ ...CELL, fontWeight: 700, color: INK_HIGH, bgcolor: FIELD_BG }} />,
   td: (p: any) => <Box {...p} component="td" sx={{ ...CELL }} />,
-  code: (p: any) => <Box {...p} component="code" sx={{ fontFamily: MONO, fontSize: 10.5, bgcolor: 'rgba(255,255,255,0.06)', px: 0.4, borderRadius: 0.5 }} />,
-  pre: (p: any) => <Box {...p} component="pre" sx={{ fontFamily: MONO, fontSize: 10.5, overflowX: 'auto', maxWidth: '100%', bgcolor: 'rgba(255,255,255,0.05)', p: 0.75, borderRadius: 0.5, my: 0.5 }} />,
+  code: (p: any) => <Box {...p} component="code" sx={{ fontFamily: MONO, fontSize: FS.micro, bgcolor: FIELD_BORDER, px: 0.4, borderRadius: 0.5 }} />,
+  pre: (p: any) => <Box {...p} component="pre" sx={{ fontFamily: MONO, fontSize: FS.micro, overflowX: 'auto', maxWidth: '100%', bgcolor: FIELD_BG, p: 0.75, borderRadius: 0.5, my: 0.5 }} />,
   // F9: a note is untrusted text. External targets never get a handle on this
   // window (`noopener`) and never leak the viewer URL (`noreferrer`).
   a: (p: any) => <Box {...p} component="a" target="_blank" rel="noopener noreferrer" sx={{ color: LINK, overflowWrap: 'anywhere' }} />,
@@ -173,7 +170,7 @@ function RawNote({ text }: { text: string }) {
     <Typography
       component="div"
       data-testid="rv-knowledge-raw"
-      sx={{ fontSize: 11, color: INK_MID, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', lineHeight: 1.5 }}
+      sx={{ fontSize: FS.label, color: INK_MID, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', lineHeight: 1.5 }}
     >
       {text}
     </Typography>
@@ -225,7 +222,7 @@ function ProvenanceHeader({ entry }: { entry: NodeKnowledgeExtras }) {
         <Typography
           component="span"
           data-testid="rv-knowledge-stamp"
-          sx={{ fontSize: 10, color: INK_LOW, cursor: 'help' }}
+          sx={{ fontSize: FS.micro, color: INK_LOW, cursor: 'help' }}
         >
           {age ?? 'date unknown'}
         </Typography>
@@ -233,7 +230,7 @@ function ProvenanceHeader({ entry }: { entry: NodeKnowledgeExtras }) {
       <Chip
         label={entry.Author}
         size="small"
-        sx={{ height: 16, fontSize: 9, color: INK_MID, bgcolor: 'rgba(255,255,255,0.07)', '& .MuiChip-label': { px: 0.6 } }}
+        sx={{ height: 16, fontSize: FS.micro, color: INK_MID, bgcolor: FIELD_BORDER, '& .MuiChip-label': { px: 0.6 } }}
       />
       <Tooltip title={CONFIDENCE_TOOLTIP[entry.Confidence] ?? entry.Confidence} placement="top">
         <Chip
@@ -241,7 +238,7 @@ function ProvenanceHeader({ entry }: { entry: NodeKnowledgeExtras }) {
           size="small"
           sx={{
             height: 16,
-            fontSize: 9,
+            fontSize: FS.micro,
             cursor: 'help',
             color: confidenceColor(entry.Confidence),
             border: `1px solid ${confidenceColor(entry.Confidence)}55`,

@@ -97,16 +97,16 @@ describe('resolveActiveProject with a root manifest (F9, F14)', () => {
   // as a root fact, or these tests would be silently exercising the demo
   // probe — which answers true on nearly every channel and would make every
   // assertion below vacuous.
-  it('F9: the workspace demo folder is not even consulted', async () => {
+  it('F9: the linked demo folder is not even consulted', async () => {
     const spy = vi.fn(async () => null);
-    (store as unknown as Record<string, unknown>)._resolveWorkspaceDemoProject = spy;
+    (store as unknown as Record<string, unknown>)._resolveLinkedDemoProject = spy;
     await store.resolveActiveProject({ rootBackend: serving(DEMO_MANIFEST), bundledBackend: bare() });
     expect(spy).not.toHaveBeenCalled();
   });
 
   it('F9 control: without a root manifest it still is', async () => {
     const spy = vi.fn(async () => null);
-    (store as unknown as Record<string, unknown>)._resolveWorkspaceDemoProject = spy;
+    (store as unknown as Record<string, unknown>)._resolveLinkedDemoProject = spy;
     await store.resolveActiveProject({ rootBackend: bare(), bundledBackend: bare() });
     expect(spy).toHaveBeenCalled();
   });
@@ -117,7 +117,7 @@ describe('resolveActiveProject with a root manifest (F9, F14)', () => {
   // is the case that would have silently stopped working — on every channel.
   it('F9: a demo folder alone does not count as a root manifest', async () => {
     const spy = vi.fn(async () => null);
-    (store as unknown as Record<string, unknown>)._resolveWorkspaceDemoProject = spy;
+    (store as unknown as Record<string, unknown>)._resolveLinkedDemoProject = spy;
     await store.resolveActiveProject({ rootBackend: bare(), bundledBackend: serving(DEMO_MANIFEST) });
     expect(spy).toHaveBeenCalled();
   });

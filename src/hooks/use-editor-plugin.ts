@@ -31,7 +31,8 @@ function getEmptySnapshot(): ExtrasEditorState {
     panelWidth: HIERARCHY_DEFAULT_WIDTH,
     inspectorWidth: INSPECTOR_PANEL_WIDTH,
     overlay: null,
-    editableNodes: [],
+    structureVersion: 0,
+    selectedNode: null,
     selectedNodePath: null,
     revealPath: null,
     revealCollapseOthers: false,
@@ -57,8 +58,8 @@ export function useEditorPlugin() {
  *
  * ```ts
  * const panelOpen = useEditorState(s => s.panelOpen);
- * const { editableNodes, overlay } = useEditorState(s => ({
- *   editableNodes: s.editableNodes,
+ * const { structureVersion, overlay } = useEditorState(s => ({
+ *   structureVersion: s.structureVersion,
  *   overlay: s.overlay,
  * }));
  * ```

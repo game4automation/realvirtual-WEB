@@ -54,6 +54,33 @@ export function parseGlbParam(raw: string): ShareTarget {
   return { kind: 'url', url: validateShareUrl(value).href };
 }
 
+/** Host of the realvirtual fileshare (plan-560). */
+export const FILESHARE_HOST = 'files.realvirtual.io';
+
+/**
+ * Point a bare fileshare link at its bytes (plan-560).
+ *
+ * `https://files.realvirtual.io/dl/<token>` is the human landing PAGE (HTML);
+ * only `…/dl/<token>/file` delivers the file. A link pasted from a mail is
+ * usually the former, so exactly that shape — host `files.realvirtual.io`,
+ * path `/dl/<token>` with nothing after the token — gets `/file` appended.
+ * Every other URL, including `/dl/<token>/file` itself and any other host,
+ * comes back unchanged; query and fragment survive.
+ */
+export function normalizeFileshareUrl(url: string): string {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return url;
+  }
+  if (u.host !== FILESHARE_HOST) return url;
+  const m = /^\/dl\/([^/]+)\/?$/.exec(u.pathname);
+  if (!m) return url;
+  u.pathname = `/dl/${m[1]}/file`;
+  return u.href;
+}
+
 /**
  * Build the link the sender copies (§2.1, `share_OpaqueId_DoesNotLeakStorageUrl`).
  *
@@ -122,7 +149,7 @@ export function hasShareIdResolver(): boolean {
  */
 export async function resolveShareTarget(raw: string): Promise<string> {
   const target = parseGlbParam(raw);
-  if (target.kind === 'url') return target.url;
+  if (target.kind === 'url') return normalizeFileshareUrl(target.url);
 
   if (!resolver) {
     throw new ShareFetchError(

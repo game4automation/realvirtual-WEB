@@ -43,7 +43,7 @@
  * ## Why a new type instead of `RuntimeMetadata`
  *
  * `RuntimeMetadata` is Unity-mirrored (`loadSchemaFromSpec('RuntimeMetadata')`)
- * and `hoverable: true, tooltipType: 'metadata'` — an agent note in its
+ * and `pick: 'select', ui: { tooltip: 'metadata' }` — an agent note in its
  * `content` would have become a visible hover tooltip and would have collided
  * with real authored metadata on the same node.
  *
@@ -208,13 +208,8 @@ const NODE_KNOWLEDGE_BADGE_COLOR = '#8d6e63';
 // Schema + capabilities, NO create-factory. See the module note.
 registerComponentSchema(NODE_KNOWLEDGE_TYPE, NODE_KNOWLEDGE_SCHEMA, {
   authorable: true,
-  hoverable: false,      // unlike RuntimeMetadata: no tooltip, no HMI surface
-  selectable: false,
-  tooltipType: null,
-  inspectorVisible: true,
-  hierarchyVisible: true,
-  badgeColor: NODE_KNOWLEDGE_BADGE_COLOR,
-  filterLabel: null,
+  pick: 'none',          // unlike RuntimeMetadata: no tooltip, no HMI surface
+  ui: { tooltip: null, badge: NODE_KNOWLEDGE_BADGE_COLOR, filter: null },
 });
 
 /**

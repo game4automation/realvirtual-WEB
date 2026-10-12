@@ -25,10 +25,12 @@
  * layout-planner plugin; a missing planner is a hard, visible error.
  */
 
+import { Matrix4, Scene } from 'three';
 import type { Object3D, Mesh, BufferGeometry } from 'three';
 import type { LibraryCatalogEntry } from '../../plugins/layout-planner/rv-layout-store';
 import type { ImportResultItem } from './rv-import-provider';
 import { persistImportedGlb } from './rv-import-persistence';
+import { weldImportedGlb } from './rv-glb-weld';
 
 // ─── Minimal structural contracts (test-friendly, no hard viewer dep) ───
 
@@ -115,6 +117,90 @@ function treeStats(root: Object3D): { triangles: number; meshes: number } {
     else if (geo?.attributes?.position) triangles += geo.attributes.position.count / 3;
   });
   return { triangles: Math.round(triangles), meshes };
+}
+
+const EXPORT_IDENTITY = new Matrix4();
+
+/**
+ * True when the node's local TRS is the identity — i.e. there is nothing at
+ * this level that would be lost by exporting its children one level up.
+ *
+ * `updateMatrix()` only where three.js would run it anyway. A node with
+ * `matrixAutoUpdate === false` has an authored `matrix` that no longer follows
+ * position/quaternion/scale (the layout planner and every frozen drive subtree
+ * are in that state), and recomputing it here would silently overwrite the real
+ * transform of a LIVE scene mid-export.
+ */
+function hasIdentityTransform(node: Object3D): boolean {
+  if (node.matrixAutoUpdate) node.updateMatrix();
+  return node.matrix.equals(EXPORT_IDENTITY);
+}
+
+/**
+ * Wrap a loaded document root as the FILE'S SCENE, so that saving is the exact
+ * inverse of loading (plan-752 F4).
+ *
+ * The growth this removes. `GLTFLoader` always hands back a `Group` for the
+ * file's scene (`GLTFLoader.js:4436`) — the scene itself is not a node and has
+ * nowhere else to go. The exporter is asymmetric: `processSceneAsync`
+ * (`GLTFExporter.js:2700`) turns only `scene.children` into nodes and never the
+ * scene, and a plain `Object3D` handed to `parse()` is wrapped in a synthetic
+ * `AuxScene` first (`:2724`). So round-tripping a document through both put the
+ * loaded root back as a NODE under a fresh scene — one extra level per save,
+ * for ever.
+ *
+ * Mirroring the load closes the loop: the root's **name becomes the scene
+ * name** and the root's **children become the file's nodes**. A freshly saved
+ * document is then a FIXPOINT: save → load → save no longer changes its shape.
+ *
+ * An EXISTING phantom chain is KEPT, not healed — it only stops growing.
+ * Measured against the old save (which added one level per round) that is one
+ * level less per save, but nothing is peeled off on load and nothing collapses
+ * on save, so the level the document already carries stays exactly where it is.
+ * A grown document is therefore stable and fully resolvable, not repaired.
+ * Pinned by `tests/scene-glb-roundtrip-fixpoint.test.ts` ("stops growing — and
+ * is deliberately NOT healed"), which holds `depth(root) === grownDepth`.
+ * Healing is left out on purpose: it would take `collapseWrapperChain` (see
+ * below), which would tear up stored child paths (plan-752 R7).
+ *
+ * Child paths are untouched by construction: every path in this code base is
+ * resolved root-EXCLUSIVE (`findByScenePath`), and node-id overrides key on a
+ * persistent `userData.realvirtual.id` rather than on a path.
+ *
+ * **A root with a real transform stays a node.** A glTF scene cannot carry a
+ * transform, so flattening one away would move the whole document. That case
+ * re-stabilises after a single save (the reload then has an identity wrapper
+ * above it) and is the reason this is a branch and not a rule.
+ *
+ * Deliberately NOT `collapseWrapperChain` (`rv-asset-glb-export.ts:290`): that
+ * descends through the WHOLE wrapper chain in one step and would tear up stored
+ * child paths. This function only ever removes the single topmost level — the
+ * one the exporter invents.
+ *
+ * Children are **borrowed, not re-parented**: `Object3D.add()` detaches from the
+ * current parent, and callers hand in the live model root. Pushing onto
+ * `children` directly is what three.js itself does in `processObjectsAsync` and
+ * for the same reason; the exporter only reads `children` and each node's LOCAL
+ * matrix, so a borrowed child serialises identically.
+ */
+export function sceneMirroringLoad(root: Object3D): Scene {
+  const scene = new Scene();
+  // glTF scene `extras` are flattened onto the loaded Group's userData by
+  // `assignExtrasToUserData`, so the inverse is to put them back on the scene.
+  scene.userData = { ...(root.userData as Record<string, unknown>) };
+  if (hasIdentityTransform(root)) {
+    scene.name = root.name;
+    scene.children.push(...root.children);
+  } else {
+    // The root stays a node, and the scene above it is left ANONYMOUS on
+    // purpose. `GLTFLoader` draws scene and node names from one namespace, so
+    // naming the scene after the root would make the loader dedup the node
+    // itself to `<name>_1` — renaming the very level every stored path starts
+    // from. An unnamed scene costs nothing (the level is a phantom in this
+    // branch anyway) and keeps the node's own name intact.
+    scene.children.push(root);
+  }
+  return scene;
 }
 
 /**
@@ -219,7 +305,9 @@ export async function importObject(
     // as a regular catalog asset (no second export pass, no format branch).
     const name = options?.name ?? item.suggestedName;
 
-    const persistResult = await persistImportedGlb(name, item.bytes);
+    // Welded first (`rv-glb-weld`), like the editor sink — the stored catalog
+    // asset is the small form, whichever provider or route produced the bytes.
+    const persistResult = await persistImportedGlb(name, weldImportedGlb(item.bytes, name));
     if (!persistResult.persisted) {
       outcome.persisted = false;
       if (persistResult.warning) outcome.warnings.push(persistResult.warning);

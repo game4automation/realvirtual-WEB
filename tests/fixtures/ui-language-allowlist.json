@@ -1,0 +1,42 @@
+[
+  {
+    "file": "src/core/engine/rv-glb-compose.ts",
+    "text": "Referenztiefe überschritten (reference depth exceeded, max "
+  },
+  {
+    "file": "src/core/hmi/NewsDialog.tsx",
+    "text": "News schließen"
+  },
+  {
+    "file": "src/core/hmi/NewsDialog.tsx",
+    "text": "Schließen"
+  },
+  {
+    "file": "src/core/hmi/scene/rv-scene-glb-bake.ts",
+    "text": "Referenzzyklus beim Speichern (reference cycle on save): "
+  },
+  {
+    "file": "src/core/hmi/search-ai-store.ts",
+    "text": "Nicht in der Dokumentation gefunden."
+  },
+  {
+    "file": "src/plugins/layout-planner/LayoutLibraryPanel.tsx",
+    "text": "Splat konnte nicht platziert werden: "
+  },
+  {
+    "file": "src/plugins/layout-planner/LayoutLibraryPanel.tsx",
+    "text": "Preview konnte nicht erzeugt werden — Schreibrechte verweigert oder GLB-Ladefehler"
+  },
+  {
+    "file": "src/plugins/layout-planner/PendingLoadMessage.tsx",
+    "text": " konnte nicht geladen werden"
+  },
+  {
+    "file": "src/plugins/layout-planner/PendingLoadMessage.tsx",
+    "text": "Entfernen"
+  },
+  {
+    "file": "src/plugins/signal-bind/first-link-notice.ts",
+    "text": "Externes Signal verknüpft — interne Steuerung nun nicht mehr aktiv."
+  }
+]

@@ -41,3 +41,22 @@ export const planSetComOverride: any = () => undefined;
 export const planSetDensity: any = () => undefined;
 export const planSetMassOverride: any = () => undefined;
 export const runMechanismPlan: any = () => undefined;
+// plan-729 — Cartesian paths for mechanisms.
+export type WaypointInterpolation = any;
+export const WAYPOINT_INTERPOLATIONS: any[] = [];
+export const MECHANISM_PATH_TYPE = 'MechanismPath';
+export const MECHANISM_TARGET_TYPE = 'MechanismTarget';
+export const planCreateTarget: any = () => undefined;
+export const planCreatePath: any = () => undefined;
+export const planAddWaypoint: any = () => undefined;
+export const planRemoveWaypoint: any = () => undefined;
+export const planReorderWaypoints: any = () => undefined;
+export const readWaypointPaths: any = () => [];
+// plan-501 — inertia override + drive-sizing trajectory.
+export type CreateTrajectoryOptions = any;
+export const MECHANISM_TRAJECTORY_TYPE = 'MechanismTrajectory';
+export const planSetInertiaOverride: any = () => undefined;
+export const planCreateTrajectory: any = () => undefined;
+export const planSetTrajectorySamples: any = () => undefined;
+export const planSetTrajectoryField: any = () => undefined;
+export const planSetPathField: any = () => undefined;

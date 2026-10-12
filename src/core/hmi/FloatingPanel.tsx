@@ -11,14 +11,15 @@
  * expand/collapse toggle, MUI Paper glassmorphism styling.
  */
 
-import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react';
+import { useState, useRef, useEffect, useCallback, useSyncExternalStore, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Box, IconButton, Typography, Paper } from '@mui/material';
-import { Close, UnfoldMore, UnfoldLess, DragIndicator } from '@mui/icons-material';
+import { Close, UnfoldMore, UnfoldLess, DragIndicator, ExpandLess, ExpandMore } from '@mui/icons-material';
 import { BOTTOM_BAR_HEIGHT } from './layout-constants';
 import { useMobileLayout } from '../../hooks/use-mobile-layout';
 import { getRecentAnchorPoint, placeAdjacentToAnchor, getCSSViewportSize, clientToCSS } from './panel-anchor-store';
 import { getFloatingPanelRoot } from './HMIShell';
+import { isContextActive, _subscribe as subscribeUiContext } from './ui-context-store';
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -26,7 +27,13 @@ const MIN_W_DESKTOP = 400;
 const MIN_W_MOBILE = 280;
 const MIN_H = 200;
 const BOTTOM_MARGIN = BOTTOM_BAR_HEIGHT + 12;
+/** px of the panel that must stay on screen so it can always be grabbed again. */
+const TITLE_BAR_KEEP = 40;
+/** px of a too-wide panel that must stay on screen, for the same reason. */
+const EDGE_KEEP = 120;
 const LS_PREFIX = 'rv-panel-geo:';
+/** Collapsed state of a `collapsible` panel — plan-477 F2/F16. */
+const LS_COLLAPSED_PREFIX = 'rv-panel-collapsed:';
 const DBLCLICK_MS = 350;
 
 // Open-order stack of mounted panels so Escape closes only the most
@@ -55,6 +62,35 @@ function savePanelGeometry(panelId: string, geo: PanelGeometry): void {
   try { localStorage.setItem(LS_PREFIX + panelId, JSON.stringify(geo)); } catch { /* quota */ }
 }
 
+/** Persisted collapsed state, or null when the panel has never been collapsed. */
+function loadPanelCollapsed(panelId: string): boolean | null {
+  try {
+    const raw = localStorage.getItem(LS_COLLAPSED_PREFIX + panelId);
+    if (raw === '1') return true;
+    if (raw === '0') return false;
+  } catch { /* unavailable */ }
+  return null;
+}
+
+function savePanelCollapsed(panelId: string, collapsed: boolean): void {
+  try { localStorage.setItem(LS_COLLAPSED_PREFIX + panelId, collapsed ? '1' : '0'); } catch { /* quota */ }
+}
+
+/**
+ * Is the kiosk context active? (plan-477 F14.)
+ *
+ * A subscription rather than a read, so a panel folds away the moment a tour
+ * starts. Only `collapsible` panels consult it — the 21 pre-existing panels are
+ * not collapsible and therefore cannot be affected by it.
+ */
+function useKioskContext(): boolean {
+  return useSyncExternalStore(
+    subscribeUiContext,
+    () => isContextActive('kiosk'),
+    () => false,
+  );
+}
+
 /** Tags that should NOT trigger drag when clicked. */
 const INTERACTIVE_TAGS = new Set(['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SVG', 'PATH']);
 
@@ -70,6 +106,11 @@ export function isInteractive(el: HTMLElement): boolean {
     if (cur.classList?.contains('MuiToggleButton-root')) return true;
     if (cur.classList?.contains('MuiIconButton-root')) return true;
     if (cur.classList?.contains('MuiChip-root')) return true;
+    // A slider is dragged with the same gesture the panel is — without this the
+    // title-bar/handle drag swallows the grab and the window moves instead of
+    // the thumb (plan-477 F9).
+    if (cur.classList?.contains('MuiSlider-root')) return true;
+    if (cur.classList?.contains('MuiSlider-thumb')) return true;
     if (cur.dataset?.dragHandle === 'true') break;
     cur = cur.parentElement;
   }
@@ -83,11 +124,26 @@ export function useDrag(
   pos: { x: number; y: number },
   setPos: (p: { x: number; y: number }) => void,
   active = true,
+  /**
+   * Called once after a drag this hook actually owned (plan-477 F3).
+   *
+   * Opt-in and side-effect-free by default: the `pointerup` listener is on
+   * `window`, so it also sees the release of a drag that started anywhere else
+   * on the page. Without the `dragging` guard a click in the 3D scene would
+   * "end a drag" of every mounted panel. The 21 existing callers pass nothing
+   * and are byte-for-byte unaffected.
+   */
+  onEnd?: () => void,
+  host?: HTMLElement | null,
 ) {
   const dragging = useRef(false);
   const offset = useRef({ x: 0, y: 0 });
   const posRef = useRef(pos);
   posRef.current = pos;
+  // In a ref, so passing a fresh closure each render never re-subscribes the
+  // listeners (which would drop an in-flight drag).
+  const onEndRef = useRef(onEnd);
+  onEndRef.current = onEnd;
 
   useEffect(() => {
     if (!active) return;
@@ -116,7 +172,9 @@ export function useDrag(
       });
     };
     const onUp = () => {
+      const wasDragging = dragging.current;
       dragging.current = false;
+      if (wasDragging) onEndRef.current?.();
     };
 
     el.addEventListener('pointerdown', onDown);
@@ -128,7 +186,7 @@ export function useDrag(
       window.removeEventListener('pointerup', onUp);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ref, setPos, active]);
+  }, [ref, setPos, active, host]);
 }
 
 // ─── Resize hook ────────────────────────────────────────────────────────
@@ -140,11 +198,16 @@ export function useResize(
   minW = MIN_W_DESKTOP,
   minH = MIN_H,
   active = true,
+  /** Called once after a resize this hook actually owned — see {@link useDrag}. */
+  onEnd?: () => void,
+  host?: HTMLElement | null,
 ) {
   const resizing = useRef(false);
   const start = useRef({ mx: 0, my: 0, w: 0, h: 0 });
   const sizeRef = useRef(size);
   sizeRef.current = size;
+  const onEndRef = useRef(onEnd);
+  onEndRef.current = onEnd;
 
   useEffect(() => {
     if (!active) return;
@@ -175,7 +238,9 @@ export function useResize(
       });
     };
     const onUp = () => {
+      const wasResizing = resizing.current;
       resizing.current = false;
+      if (wasResizing) onEndRef.current?.();
     };
 
     el.addEventListener('pointerdown', onDown);
@@ -187,18 +252,44 @@ export function useResize(
       window.removeEventListener('pointerup', onUp);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ref, setSize, minW, minH, active]);
+  }, [ref, setSize, minW, minH, active, host]);
 }
 
 // ─── FloatingPanel Component ───────────────────────────────────────────────
 
 export interface FloatingPanelProps {
   open: boolean;
-  onClose: () => void;
+  /** Optional since plan-477: a `closable={false}` panel has nothing to close. */
+  onClose?: () => void;
+  /**
+   * Can the user close this panel? Default `true` — the pre-plan-477 behaviour.
+   *
+   * `false` makes it a permanent fixture: no close button, no Escape entry, and
+   * `open` is treated as `true` everywhere (a consumer that has no way to close
+   * a panel has no way to reopen it either, so a stale `false` would be a dead
+   * window). Its geometry is persisted at the end of each drag/resize instead of
+   * on close, which is the moment a closable panel uses.
+   */
+  closable?: boolean;
+  /** Show the collapse button (title bar only, content unmounted). Default `false`. */
+  collapsible?: boolean;
+  /** Remember the collapsed state under `rv-panel-collapsed:<panelId>`. Default `false`. */
+  persistCollapsed?: boolean;
+  /** Start collapsed when nothing is stored (plan-543 `WebOperatorPanel.StartCollapsed`). Default `false`. */
+  defaultCollapsed?: boolean;
+  /** Take the height from the content instead of `defaultHeight`. Default `false`. */
+  autoHeight?: boolean;
+  /** Render the resize handle. Default `true`. */
+  resizable?: boolean;
+  /** Landmark role. Only set when passed — no default, so the 21 existing panels keep none. */
+  role?: string;
+  'aria-label'?: string;
   title: string;
   titleColor?: string;
   subtitle?: string;
   defaultWidth?: number;
+  /** Content-driven width in CSS pixels. Disables manual resize and expansion. */
+  fixedWidth?: number;
   defaultHeight?: number;
   /** Desktop minimum width (resize floor + restore clamp). Defaults to 400 — set
    *  smaller for compact settings panels so they don't feel bulky. */
@@ -215,10 +306,19 @@ export interface FloatingPanelProps {
 export function FloatingPanel({
   open,
   onClose,
+  closable = true,
+  collapsible = false,
+  persistCollapsed = false,
+  defaultCollapsed = false,
+  autoHeight = false,
+  resizable = true,
+  role,
+  'aria-label': ariaLabel,
   title,
   titleColor = '#4fc3f7',
   subtitle,
   defaultWidth = 700,
+  fixedWidth,
   defaultHeight = 340,
   minWidth,
   defaultPosition,
@@ -227,9 +327,15 @@ export function FloatingPanel({
   toolbar,
   children,
 }: FloatingPanelProps) {
+  // Moving from the inline fallback into the shell portal replaces the DOM
+  // handles. Rebind native drag/resize listeners to the new elements.
+  const portalRoot = getFloatingPanelRoot();
   const isMobile = useMobileLayout();
   const minW = isMobile ? MIN_W_MOBILE : (minWidth ?? MIN_W_DESKTOP);
   const stableId = panelId ?? title;
+  // A panel that cannot be closed is always open (F1). Every place that used
+  // `open` to decide "is this panel alive right now" uses this instead.
+  const effectiveOpen = closable ? open : true;
   // All dimension/position state lives in CSS-px (the coord system of
   // style.left/top inside the zoomed HMIShell). Use getCSSViewportSize()
   // wherever the calc would otherwise read window.innerWidth/Height.
@@ -244,11 +350,22 @@ export function FloatingPanel({
   // there's no need to derive these from a click that may have already
   // fled the freshness window.
   const [expanded, setExpanded] = useState(false);
+  // Collapsed ≠ expanded. `expanded` maximizes and keeps the content visible;
+  // `collapsed` leaves the title bar and unmounts the content (plan-477 §2.4).
+  // Mobile starts collapsed; a stored value wins over that default.
+  const [collapsed, setCollapsed] = useState(() => {
+    if (!collapsible) return false;
+    const stored = persistCollapsed ? loadPanelCollapsed(stableId) : null;
+    return stored ?? (defaultCollapsed || isMobile);
+  });
   const [pos, setPos] = useState(() => defaultPosition ?? {
     x: isMobile ? 8 : 64,
     y: cssVP0.h - defaultHeight - BOTTOM_MARGIN,
   });
-  const [size, setSize] = useState(() => ({ w: initialW, h: defaultHeight }));
+  const [storedSize, setSize] = useState(() => ({ w: initialW, h: defaultHeight }));
+  const size = fixedWidth === undefined
+    ? storedSize
+    : { ...storedSize, w: Math.min(fixedWidth, cssVP0.w - 16) };
 
   const dragRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<HTMLDivElement>(null);
@@ -267,8 +384,41 @@ export function FloatingPanel({
   const preExpandPos = useRef<{ x: number; y: number } | null>(null);
   const preExpandSize = useRef<{ w: number; h: number } | null>(null);
 
-  useDrag(dragRef, pos, setPos, open);
-  useResize(resizeRef, size, setSize, minW, MIN_H, open);
+  // Kiosk forces the panel shut for the duration of the context, WITHOUT
+  // touching the persisted value — leaving a tour restores what the user had
+  // (F14/A1). Only collapsible panels can be affected.
+  const kioskActive = useKioskContext();
+  const effectiveCollapsed = collapsible && (collapsed || kioskActive);
+
+  // The panel element, so `autoHeight` can be clamped against what it actually
+  // measures rather than against the `defaultHeight` it is not using.
+  const panelElRef = useRef<HTMLDivElement>(null);
+  const currentH = useCallback(
+    () => (autoHeight && panelElRef.current ? panelElRef.current.offsetHeight : sizeRef.current.h),
+    [autoHeight],
+  );
+
+  // ── Geometry persistence for a panel that never closes (§2.5) ──
+  // A closable panel writes its geometry in the `!open` branch below; a panel
+  // that never closes never reaches it. So it writes at the end of each drag
+  // and resize — and only the NORMAL geometry: maximized and collapsed are
+  // transient states, and persisting either would restore a window the user
+  // never arranged.
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const collapsedRef = useRef(effectiveCollapsed);
+  collapsedRef.current = effectiveCollapsed;
+  const persistGeometryNow = useCallback(() => {
+    if (closable || isMobile) return;
+    if (expandedRef.current || collapsedRef.current) return;
+    savePanelGeometry(stableId, {
+      x: posRef.current.x, y: posRef.current.y,
+      w: sizeRef.current.w, h: sizeRef.current.h,
+    });
+  }, [closable, isMobile, stableId]);
+
+  useDrag(dragRef, pos, setPos, effectiveOpen, closable ? undefined : persistGeometryNow, portalRoot);
+  useResize(resizeRef, size, setSize, minW, MIN_H, effectiveOpen, closable ? undefined : persistGeometryNow, portalRoot);
 
   /** Clamp (x, y) so the panel is fully inside the viewport. Leaves room
    *  for the left-sidebar ButtonPanel so the panel never covers its own
@@ -278,8 +428,20 @@ export function FloatingPanel({
     const vp = getCSSViewportSize();
     const minX = isMobile ? 4 : 72; // 64px button column + 8 gutter
     const minY = 8;
-    const maxX = Math.max(minX, vp.w - w - 8);
-    const maxY = Math.max(minY, vp.h - h - BOTTOM_MARGIN);
+    // A panel BIGGER than the viewport used to collapse its own travel to a
+    // single value: `Math.max(minY, vp.h - h - BOTTOM_MARGIN)` returns `minY`
+    // once `h` exceeds the screen, so min and max met and the window became
+    // undraggable along that axis. The ControlWindow lost its drag exactly that
+    // way, twice, by growing one group too many — a panel must not stop moving
+    // because of what a project put inside it.
+    //
+    // So the fit value is only a CEILING while it really is one. When it is
+    // not, the panel keeps a real range and travels until its title bar is
+    // about to leave — never past it, or there would be nothing left to grab.
+    const fitX = vp.w - w - 8;
+    const fitY = vp.h - h - BOTTOM_MARGIN;
+    const maxX = fitX >= minX ? fitX : Math.max(minX, vp.w - EDGE_KEEP);
+    const maxY = fitY >= minY ? fitY : Math.max(minY, vp.h - TITLE_BAR_KEEP);
     return {
       x: Math.max(minX, Math.min(x, maxX)),
       y: Math.max(minY, Math.min(y, maxY)),
@@ -291,7 +453,7 @@ export function FloatingPanel({
   // anchor next to the trigger (button, KPI card, context menu item).
   // Falls back to the consumer's defaultPosition prop, then bottom-left.
   useEffect(() => {
-    if (!open) {
+    if (!effectiveOpen) {
       // Persist geometry on close (before resetting expand state).
       if (!isMobile && posRef.current && sizeRef.current) {
         savePanelGeometry(stableId, {
@@ -333,13 +495,13 @@ export function FloatingPanel({
     }
     setPos(clampToViewport(nextPos.x, nextPos.y, w, h));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [effectiveOpen]);
 
   // Keep the panel in frame while the user resizes the browser.
   useEffect(() => {
-    if (!open) return;
+    if (!effectiveOpen) return;
     const onResize = () => {
-      const clamped = clampToViewport(posRef.current.x, posRef.current.y, sizeRef.current.w, sizeRef.current.h);
+      const clamped = clampToViewport(posRef.current.x, posRef.current.y, sizeRef.current.w, currentH());
       if (clamped.x !== posRef.current.x || clamped.y !== posRef.current.y) {
         setPos(clamped);
       }
@@ -347,7 +509,22 @@ export function FloatingPanel({
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [effectiveOpen]);
+
+  // ── Collapse: persist, and leave maximize on the way in (§2.4) ──
+  useEffect(() => {
+    if (!collapsible || !persistCollapsed) return;
+    savePanelCollapsed(stableId, collapsed);
+  }, [collapsible, persistCollapsed, stableId, collapsed]);
+
+  const toggleCollapsed = useCallback(() => {
+    setCollapsed((c) => {
+      // Collapsing leaves maximize — the two states are exclusive, and
+      // restoring a maximized window out of a collapsed one is nobody's intent.
+      if (!c) setExpanded(false);
+      return !c;
+    });
+  }, []);
 
   // Maximize when expanding (full viewport minus margins); restore the
   // pre-expand position on collapse from session refs.
@@ -371,7 +548,10 @@ export function FloatingPanel({
 
   // ── Double-click title bar to maximize/restore ──
   const lastClickTime = useRef(0);
-  const handleTitleBarDoubleClick = useCallback(() => {
+  const handleTitleBarDoubleClick = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    // Same exemption the drag hook applies (F9): two quick taps on the collapse
+    // button are two collapses, never a maximize.
+    if (isInteractive(e.target as HTMLElement)) return;
     const now = Date.now();
     if (now - lastClickTime.current < DBLCLICK_MS) {
       setExpanded(e => !e);
@@ -388,11 +568,14 @@ export function FloatingPanel({
   const escId = useRef<symbol | null>(null);
   if (escId.current === null) escId.current = Symbol('floating-panel-esc');
   useEffect(() => {
-    if (!open) return;
+    // A panel that cannot be closed takes no place on the Escape stack — not
+    // even an inert one, or it would swallow the Escape meant for the panel
+    // below it (F1).
+    if (!effectiveOpen || !closable) return;
     const id = escId.current!;
     escStack.push(id);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && escStack[escStack.length - 1] === id) onClose();
+      if (e.key === 'Escape' && escStack[escStack.length - 1] === id) onClose?.();
     };
     window.addEventListener('keydown', onKey);
     return () => {
@@ -400,9 +583,9 @@ export function FloatingPanel({
       if (i >= 0) escStack.splice(i, 1);
       window.removeEventListener('keydown', onKey);
     };
-  }, [open, onClose]);
+  }, [effectiveOpen, closable, onClose]);
 
-  if (!open) return null;
+  if (!effectiveOpen) return null;
 
   // Width-aware render-time clamp — backstop in case state ever lags
   // behind a viewport resize. Open-effect and resize-listener already
@@ -412,16 +595,30 @@ export function FloatingPanel({
   const clampedX = Math.max(0, Math.min(pos.x, _vpRender.w - size.w - 8));
   const clampedY = Math.max(0, Math.min(pos.y, _vpRender.h - 40));
 
+  const contentId = `rv-panel-content-${stableId.replace(/[^A-Za-z0-9_-]/g, '-')}`;
+
   const panel = (
     <Paper
       elevation={0}
       data-ui-panel
+      ref={panelElRef}
+      {...(role ? { role } : {})}
+      {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}
       sx={{
         position: 'fixed',
         left: clampedX,
         top: clampedY,
         width: size.w,
-        height: size.h,
+        // Collapsed = title bar only; autoHeight = as tall as the content.
+        height: effectiveCollapsed || autoHeight ? 'auto' : size.h,
+        // ...but never taller than the screen it has to be dragged around in.
+        // Without this an `autoHeight` panel grows with whatever a project puts
+        // inside it, and a panel bigger than the viewport can no longer be
+        // positioned freely (see `clampToViewport`) NOR read to the end. The
+        // content area scrolls instead, so the window stays both movable and
+        // complete. Position-independent on purpose: a cap that shrank as the
+        // panel is dragged down would reflow the content under the pointer.
+        maxHeight: Math.max(MIN_H, _vpRender.h - 8 - BOTTOM_MARGIN),
         zIndex,
         display: 'flex',
         flexDirection: 'column',
@@ -442,7 +639,7 @@ export function FloatingPanel({
       <Box
         ref={dragRef}
         data-drag-handle="true"
-        onPointerUp={handleTitleBarDoubleClick}
+        onPointerUp={fixedWidth === undefined ? handleTitleBarDoubleClick : undefined}
         sx={{
           display: 'flex',
           alignItems: 'center',
@@ -472,33 +669,67 @@ export function FloatingPanel({
 
         <Box sx={{ ml: 'auto' }} />
 
-        <IconButton
-          size="small"
-          aria-label={expanded ? 'Collapse window' : 'Expand window'}
-          onClick={() => setExpanded((e) => !e)}
-          sx={{ color: 'rgba(255,255,255,0.5)', p: 0.3, '&:hover': { color: '#fff' } }}
-        >
-          {expanded ? <UnfoldLess sx={{ fontSize: 16 }} /> : <UnfoldMore sx={{ fontSize: 16 }} />}
-        </IconButton>
+        {collapsible && (
+          <IconButton
+            size="small"
+            aria-label={effectiveCollapsed ? 'Expand panel' : 'Collapse panel'}
+            aria-expanded={!effectiveCollapsed}
+            aria-controls={contentId}
+            onClick={toggleCollapsed}
+            sx={{ color: 'rgba(255,255,255,0.5)', p: 0.3, '&:hover': { color: '#fff' } }}
+          >
+            {effectiveCollapsed ? <ExpandMore sx={{ fontSize: 16 }} /> : <ExpandLess sx={{ fontSize: 16 }} />}
+          </IconButton>
+        )}
 
-        <IconButton
-          size="small"
-          aria-label="Close window"
-          onClick={onClose}
-          sx={{ color: 'rgba(255,255,255,0.5)', p: 0.3, '&:hover': { color: '#fff' } }}
-        >
-          <Close sx={{ fontSize: 16 }} />
-        </IconButton>
+        {!effectiveCollapsed && fixedWidth === undefined && (
+          <IconButton
+            size="small"
+            aria-label={expanded ? 'Collapse window' : 'Expand window'}
+            onClick={() => setExpanded((e) => !e)}
+            sx={{ color: 'rgba(255,255,255,0.5)', p: 0.3, '&:hover': { color: '#fff' } }}
+          >
+            {expanded ? <UnfoldLess sx={{ fontSize: 16 }} /> : <UnfoldMore sx={{ fontSize: 16 }} />}
+          </IconButton>
+        )}
+
+        {closable && (
+          <IconButton
+            size="small"
+            aria-label="Close window"
+            onClick={onClose}
+            sx={{ color: 'rgba(255,255,255,0.5)', p: 0.3, '&:hover': { color: '#fff' } }}
+          >
+            <Close sx={{ fontSize: 16 }} />
+          </IconButton>
+        )}
       </Box>
 
-      {/* ── Content area ── */}
-      <Box sx={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-        {children}
-      </Box>
+      {/* ── Content area (unmounted while collapsed — F2) ── */}
+      {!effectiveCollapsed && (
+        <Box
+          id={contentId}
+          sx={{
+            flex: 1,
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            // The overflow the `maxHeight` above creates has to go somewhere.
+            // Only this area scrolls — the title bar stays put, so the drag
+            // handle and the collapse button never scroll out of reach.
+            overflowY: 'auto',
+            overflowX: 'hidden',
+          }}
+        >
+          {children}
+        </Box>
+      )}
 
       {/* ── Resize handle (bottom-right corner) ── */}
+      {resizable && fixedWidth === undefined && !effectiveCollapsed && (
       <Box
         ref={resizeRef}
+        data-resize-handle="true"
         sx={{
           position: 'absolute',
           right: 0,
@@ -520,6 +751,7 @@ export function FloatingPanel({
           },
         }}
       />
+      )}
     </Paper>
   );
 
@@ -530,6 +762,5 @@ export function FloatingPanel({
   // shift the panel by the host Paper's offset — making the top half of
   // the screen unreachable when dragging up. Falls back to inline render
   // if the portal root isn't mounted yet (server / first render race).
-  const portalRoot = getFloatingPanelRoot();
   return portalRoot ? createPortal(panel, portalRoot) : panel;
 }

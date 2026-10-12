@@ -34,10 +34,8 @@ registerComponent({
   type: 'HandleSwitch3D',
   schema: RVHandleSwitch3D.schema,
   capabilities: {
-    hoverable: false,
-    selectable: false,
-    filterLabel: 'Buttons',
-    badgeColor: '#7e57c2',
+    pick: 'action',   // click turns the switch, never selects the node (plan-753 §2.3)
+    ui: { filter: 'Buttons', category: 'hmi', badge: '#7e57c2' },
   },
   create: (node: Object3D) => new RVHandleSwitch3D(node),
   afterCreate: (inst, node) => {

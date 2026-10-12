@@ -37,8 +37,8 @@ import { LegacyFormatError, isLegacyScenePath } from './rv-legacy-format';
 import { migrateProjectDocuments } from './rv-project-documents-migration';
 import {
   documentKeyOf,
-  documentOfSceneEntry,
-  documentsInSection,
+  documentOfEntry,
+  documentsOf,
   fingerprintOf,
   readDocuments,
   withoutLegacyArrays,
@@ -179,7 +179,12 @@ async function finishManifestRead(
  * the same whether one scene is affected or forty.
  */
 function assertNoLegacyScenes(project: RvProject): void {
-  for (const doc of documentsInSection(project, 'scenes')) {
+  // Over the ONE list (plan-744 F3, Review-Fund 1). The section filter this
+  // used to run through was doing nothing the two predicates below do not do
+  // better: `isLegacyScenePath` and `format === 'json'` already identify a
+  // pre-phase-6 body, and the filter could only hide one — a legacy JSON body
+  // at a path the heuristic did not read as a scene.
+  for (const doc of documentsOf(project)) {
     if (isLegacyScenePath(doc.path) || doc.format === 'json') {
       throw new LegacyFormatError('project-scene-json', doc.path);
     }
@@ -269,7 +274,7 @@ export function mergeManifest(original: RvProject, update: ManifestUpdate): RvPr
       byKey.set(key, doc);
     }
     const upserts: RvDocumentEntry[] = [
-      ...(update.scenes ?? []).map(e => documentOfSceneEntry(e)),
+      ...(update.scenes ?? []).map(e => documentOfEntry(e)),
       ...(update.documents ?? []),
     ];
     for (const incoming of upserts) {

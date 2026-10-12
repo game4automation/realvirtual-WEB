@@ -142,12 +142,14 @@ async function runVariant(variant: UnityVariant, dt: number, ticks: number): Pro
   scene.updateMatrixWorld(true);
 
   const drives = result.registry.getAll<RVDrive>('Drive').map((d) => d.instance);
+  const paths = result.registry.getAll<RVRibbonPath>('RibbonPath').map((p) => p.instance);
+  // No drive-direction migration: since the 2026-09-27 re-export the GLBs carry the
+  // contact-aware drive directions RibbonDemoScene.AuthorDriveDirections authors.
   for (let i = 0; i < ticks; i++) {
     for (const drive of drives) drive.update(dt);
     manager.update(dt);
   }
 
-  const paths = result.registry.getAll<RVRibbonPath>('RibbonPath').map((p) => p.instance);
   paths.sort((a, b) => (a.node.name < b.node.name ? -1 : 1));
   return { result, scene, manager, paths };
 }
@@ -207,13 +209,16 @@ describe.skipIf(!DEV_ASSETS)('Unity → GLB → realvirtual WEB roundtrip', () =
     }
   });
 
-  it('every roller reproduces the angle, surface speed, radius and driven flag Unity recorded', () => {
+  it('reproduces captured transport with follower angles corrected for contact', () => {
     for (const [name, variant] of Object.entries(state!.variants)) {
       const run = runs.get(name)!;
       for (const [rollerName, expected] of Object.entries(variant.rollers)) {
-        const entry = run.result.registry.getAll('RibbonRoller')
-          .concat(run.result.registry.getAll('RibbonWinder'))
-          .concat(run.result.registry.getAll('RibbonDancer'))
+        // `getAll` defaults to `unknown`; the lookup only needs the node name, so
+        // that is all it asks for (the full shape is narrowed two lines below).
+        const named = (type: string) => run.result.registry.getAll<{ node: { name: string } }>(type);
+        const entry = named('RibbonRoller')
+          .concat(named('RibbonWinder'))
+          .concat(named('RibbonDancer'))
           .find((e) => e.instance.node.name === rollerName);
         expect(entry, `${name}: the GLB has no roller "${rollerName}"`).toBeTruthy();
         const roller = entry!.instance as unknown as {
@@ -224,6 +229,7 @@ describe.skipIf(!DEV_ASSETS)('Unity → GLB → realvirtual WEB roundtrip', () =
         expectClose(roller.radiusMm, expected.radiusMm, `${name}/${rollerName} radiusMm`);
         expectClose(roller.surfaceSpeedMmPerS, expected.surfaceSpeedMmPerS,
           `${name}/${rollerName} surfaceSpeedMmPerS`);
+        // Since the 2026-09-27 capture Unity records angles in the contact convention too.
         expectClose(roller.angle, expected.angleRad, `${name}/${rollerName} angleRad`);
       }
     }

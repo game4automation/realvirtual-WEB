@@ -42,6 +42,8 @@ import {
   Bone,
   Box3,
   BoxGeometry,
+  BufferAttribute,
+  BufferGeometry,
   Matrix4,
   Mesh,
   MeshBasicMaterial,
@@ -54,7 +56,8 @@ import {
   Float32BufferAttribute,
   Vector3,
 } from 'three';
-import type { BufferGeometry, Material } from 'three';
+import type { Material } from 'three';
+import { TessellateModifier } from 'three/addons/modifiers/TessellateModifier.js';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
 import {
   loadSchemaFromSpec,
@@ -77,7 +80,6 @@ import {
   type StrandEnds,
 } from './rv-energy-chain-assign';
 import {
-  boneArcLengths,
   calibrate,
   chainStatus,
   followerRange,
@@ -110,6 +112,7 @@ interface SourceMeshEntry {
   /** Whether this entry added the skin attributes (so dispose can remove them). */
   addedAttributes: boolean;
   originalVisible: boolean;
+  ownsGeometry: boolean;
 }
 
 // ── Pre-allocated scratch (no GC in the per-frame path) ─────────────
@@ -160,6 +163,7 @@ export class RVEnergyChain implements RVComponent {
   private _proxy?: Mesh;
 
   private _cal?: CalibrationResult;
+  private _triangleCalibration = false;
   /** Bind-frame axis indices and signs mapping bind coords ↔ the (u, v) plane. */
   private _uIndex = 2;
   private _vIndex = 1;
@@ -473,7 +477,23 @@ export class RVEnergyChain implements RVComponent {
     }
 
     // ── 3. Calibrate ──────────────────────────────────────────────
-    const cal = calibrate({ points: cloud, unitsToMm: 1 / MM, axis: this.Axis });
+    const triangles: number[] = [];
+    let vertexOffset = 0;
+    for (const mesh of sources) {
+      const geometry = mesh.geometry;
+      const index = geometry.getIndex();
+      const count = geometry.getAttribute('position').count;
+      if (index) {
+        for (let i = 0; i < index.count; i++) triangles.push(vertexOffset + index.getX(i));
+      } else {
+        for (let i = 0; i < count; i++) triangles.push(vertexOffset + i);
+      }
+      vertexOffset += count;
+    }
+    let cal = calibrate({ points: cloud, triangles: new Uint32Array(triangles), unitsToMm: 1 / MM, axis: this.Axis });
+    this._triangleCalibration = cal.status === 'ok';
+    // Point-cloud/procedural sources may not have usable triangle topology.
+    if (cal.status !== 'ok') cal = calibrate({ points: cloud, unitsToMm: 1 / MM, axis: this.Axis });
     this._cal = cal;
     if (cal.status !== 'ok') {
       this._diagnosis = 'degraded-calibration';
@@ -531,12 +551,14 @@ export class RVEnergyChain implements RVComponent {
     this._assignReferences(cal);
 
     // ── 5. Bones ──────────────────────────────────────────────────
-    const minBones = minimumBoneCount();
+    // The bend travels through material that was straight in the rest pose.
+    // Bound angular spacing over the WHOLE chain, not only its original bend.
+    const minBones = Math.max(minimumBoneCount(), Math.ceil(this._cfg.L / (this._cfg.R * Math.PI / 12)) + 1);
     const requested = Math.max(2, Math.round(this.Bones) || 0);
     const count = Math.max(minBones, requested);
     this._clampedBones = count > requested ? count : 0;
 
-    this._boneS = boneArcLengths(this._cfg, count);
+    this._boneS = Float64Array.from({ length: count }, (_, i) => this._cfg.L * i / (count - 1));
     const container = new Object3D();
     container.name = '__rvEnergyChainBones';
     container.userData._rvGizmo = true;
@@ -752,7 +774,20 @@ export class RVEnergyChain implements RVComponent {
   }
 
   private _buildSkinnedMesh(source: Mesh, meshBind: Matrix4): SourceMeshEntry | null {
-    const geometry = source.geometry as BufferGeometry;
+    let geometry = source.geometry as BufferGeometry;
+    let ownsGeometry = false;
+    // CAD straight faces often consist of only two long triangles. They need
+    // interior vertices when that material enters the travelling bend. Keep
+    // authored geometry intact and subdivide only the runtime skin. Material
+    // arrays retain their authored groups; those are not supported by the
+    // Three.js modifier, so leave such meshes on the existing skinning path.
+    if (this._triangleCalibration && !Array.isArray(source.material)) {
+      _vec.setFromMatrixScale(meshBind);
+      const scale = Math.max(Math.abs(_vec.x), Math.abs(_vec.y), Math.abs(_vec.z));
+      const maxEdge = this._cfg.R / (6 * Math.max(scale, 1e-9));
+      geometry = tessellateKeepingUberAttributes(geometry, maxEdge);
+      ownsGeometry = true;
+    }
     const pos = geometry.getAttribute('position');
     if (!pos) return null;
 
@@ -806,7 +841,7 @@ export class RVEnergyChain implements RVComponent {
     source.userData[RV_CHAIN_SOURCE] = true;
     source.userData[RV_CHAIN_SOURCE_VISIBLE] = originalVisible;
 
-    return { mesh: source, skinned, addedAttributes, originalVisible };
+    return { mesh: source, skinned, addedAttributes, originalVisible, ownsGeometry };
   }
 
   /**
@@ -884,13 +919,8 @@ export class RVEnergyChain implements RVComponent {
    * a bone always follows the same physical link. Recomputing `s_i` per frame
    * would make the bones slide through the geometry.
    *
-   * Consequence worth knowing: the bend-heavy sample grid is optimal for the
-   * REST pose and drifts relative to the bend as the chain travels, so the apex
-   * ends up slightly under-sampled at the ends of the stroke. What does NOT
-   * degrade is the ANGULAR spacing between neighbouring bones — it equals the
-   * (constant) arc-length spacing divided by `R` everywhere on the bend, which
-   * is the quantity linear blend skinning actually cares about. The default of
-   * 24 bones over a minimum of 21 is the reserve for this drift.
+   * Uniform material spacing keeps enough bones inside the bend throughout
+   * travel, including when the bend reaches a formerly straight section.
    */
   private _poseBones(cfg: ChainPathConfig): void {
     const s = this._boneS;
@@ -969,6 +999,7 @@ export class RVEnergyChain implements RVComponent {
   private _teardownRig(): void {
     for (const entry of this._entries) {
       entry.skinned.removeFromParent();
+      if (entry.ownsGeometry) entry.skinned.geometry.dispose();
       if (entry.addedAttributes) {
         entry.skinned.geometry.deleteAttribute('skinIndex');
         entry.skinned.geometry.deleteAttribute('skinWeight');
@@ -1006,6 +1037,73 @@ export class RVEnergyChain implements RVComponent {
 
 // ─── helpers ─────────────────────────────────────────────────────
 
+/**
+ * Subdivide a chain element's geometry for the travelling bend WITHOUT losing
+ * what the uber material reads per vertex.
+ *
+ * `TessellateModifier` copies only position / normal / color / uv / uv1, and
+ * it copies `color` RAW: a baked element carries its colour as a normalized
+ * Uint8 attribute (`rv-uber-material.ts`), so a black link (byte 3) came out
+ * as the float 3.0 — clamped to white — and the `rmPacked` (roughness,
+ * metalness) attribute was dropped altogether, which the shader reads as
+ * roughness 0: a white, mirror-shiny energy chain on every baked model
+ * (Festo, 2026-09-24). Float attributes (an unbaked element with an ordinary
+ * material) pass through unchanged.
+ *
+ * The source geometry is never touched: a shallow copy carries float versions
+ * of `color` and `rmPacked` (the latter travelling as `uv1`, which the
+ * modifier does carry) through the subdivision, and the result gets them back
+ * under their own names. A source that already has `uv1` keeps it; its
+ * `rmPacked` is then re-created flat from vertex 0, which is exact for the
+ * single-material CAD links a chain is made of.
+ */
+export function tessellateKeepingUberAttributes(source: BufferGeometry, maxEdge: number): BufferGeometry {
+  const color = source.getAttribute('color') as BufferAttribute | undefined;
+  const rm = source.getAttribute('rmPacked') as BufferAttribute | undefined;
+  const hasUv1 = source.getAttribute('uv1') !== undefined;
+  const stashRm = !!rm && !hasUv1;
+
+  const input = new BufferGeometry();
+  for (const name of Object.keys(source.attributes)) {
+    if (name === 'rmPacked') continue;
+    if (name === 'color' && color && color.normalized) {
+      input.setAttribute('color', toFloatAttribute(color));
+      continue;
+    }
+    input.setAttribute(name, source.getAttribute(name));
+  }
+  if (stashRm) input.setAttribute('uv1', toFloatAttribute(rm!));
+  if (source.index) input.setIndex(source.index);
+  for (const g of source.groups) input.addGroup(g.start, g.count, g.materialIndex);
+
+  const out = new TessellateModifier(maxEdge, 10).modify(input);
+
+  if (rm) {
+    const count = out.getAttribute('position').count;
+    if (stashRm) {
+      const uv1 = out.getAttribute('uv1') as BufferAttribute;
+      out.setAttribute('rmPacked', new BufferAttribute(uv1.array as Float32Array, 2));
+      out.deleteAttribute('uv1');
+    } else {
+      const flat = new Float32Array(count * 2);
+      const r = rm.getX(0); const m = rm.getY(0);
+      for (let v = 0; v < count; v++) { flat[v * 2] = r; flat[v * 2 + 1] = m; }
+      out.setAttribute('rmPacked', new BufferAttribute(flat, 2));
+    }
+  }
+  return out;
+}
+
+/** Normalized-aware float copy of an attribute (`getX` applies the normalization). */
+function toFloatAttribute(attr: BufferAttribute): BufferAttribute {
+  const n = attr.itemSize;
+  const arr = new Float32Array(attr.count * n);
+  for (let v = 0; v < attr.count; v++) {
+    for (let c = 0; c < n; c++) arr[v * n + c] = attr.getComponent(v, c);
+  }
+  return new BufferAttribute(arr, n);
+}
+
 function asNode(value: unknown): Object3D | null {
   const candidate = value as Object3D | null;
   return candidate && (candidate as unknown as { isObject3D?: boolean }).isObject3D ? candidate : null;
@@ -1033,10 +1131,10 @@ registerComponent({
   schema: RVEnergyChain.schema,
   capabilities: {
     authorable: true,
-    hoverable: true,
-    selectable: true,
-    filterLabel: 'Energy Chains',
-    badgeColor: '#8d6e63',
+    pick: 'select',
+    bake: 'keep',    // the rig re-poses skinned link meshes every tick — never baked
+    dynamicGeometry: true,  // plan-756 F9: the skinned rig moves the same triangles
+    ui: { filter: 'Energy Chains', category: 'transport', badge: '#8d6e63' },
   },
   create: (node) => new RVEnergyChain(node),
   afterCreate: (inst, node) => {

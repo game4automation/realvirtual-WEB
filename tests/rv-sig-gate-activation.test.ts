@@ -11,6 +11,7 @@ import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 import { registerComponent } from '../src/core/engine/rv-component-registry';
 import { initializeComponents, processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 
 afterEach(() => {
   localStorage.clear();
@@ -80,14 +81,7 @@ describe('central signature logic gate', () => {
     const registry = new NodeRegistry();
     const result = processExtras(
       root,
-      registry,
-      new SignalStore(),
-      new RVTransportManager(),
-      scene,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
+      buildInitContext({ registry, signalStore: new SignalStore(), transportManager: new RVTransportManager(), scene }),
       { logicRunState: 'gated' },
     );
     expect(result.componentsCreated).toBe(1);

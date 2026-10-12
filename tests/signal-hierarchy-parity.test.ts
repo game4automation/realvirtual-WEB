@@ -98,7 +98,10 @@ describe('signal-hierarchy parity — synthetic node, userData, registry, store'
     const node = container!.children.find((c) => c.name === 'My.Run');
     expect(node).toBeDefined();
     const rv = (node!.userData.realvirtual as Record<string, unknown>);
-    expect(rv.PLCOutputBool).toMatchObject({ Name: 'Conv.My.Run', Status: { Value: true } });
+    // plan-589: a GENERATED signal persists its ASSET-LOCAL name plus the
+    // `Generated` flag; the scope ('Conv') is re-applied on load by
+    // `resolveSignalName`, so it is never baked into the saved name.
+    expect(rv.PLCOutputBool).toMatchObject({ Name: 'My.Run', Generated: true, Status: { Value: true } });
 
     // Registered in the NodeRegistry (hierarchy badge resolves a path).
     // The NODE path stays `/`-separated (technical address); only the symbol dots.

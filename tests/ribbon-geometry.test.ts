@@ -159,6 +159,137 @@ describe('ribbon-geometry — open path', () => {
   });
 });
 
+describe('ribbon-geometry — end wrap (plan-468)', () => {
+  const DEG = Math.PI / 180;
+
+  /** The wrap angle of the arc, measured back from the segment itself. */
+  function endsAt(arc: ArcSegment2): { x: number; y: number } {
+    const a = arc.a0 + arc.sweep;
+    return { x: arc.cx + arc.r * Math.cos(a), y: arc.cy + arc.r * Math.sin(a) };
+  }
+
+  it('a roller chain without wrapRad produces the plan-459 segment count and kinds', () => {
+    const g = ok(buildRibbonSegments([
+      circle(0, 0, 450, 1),
+      { cx: 1500, cy: 600, r: 100, side: 0 },
+      { cx: 3400, cy: 0, r: 300, side: 0 },
+    ]));
+    expect(g.segments.map((s) => s.kind)).toEqual(['line', 'arc', 'line']);
+  });
+
+  it('wrapRad 0, negative and non-finite are all "no wrap" — the F4 default', () => {
+    const kinds = (wrapRad: number | undefined): string[] => ok(buildRibbonSegments([
+      { cx: 0, cy: 0, r: 400, side: 1, wrapRad },
+      { cx: 2000, cy: 0, r: 150, side: 1, wrapRad },
+    ])).segments.map((s) => s.kind);
+    for (const bad of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(kinds(bad), `wrapRad ${String(bad)}`).toEqual(['line']);
+    }
+  });
+
+  it('a start wrap on side +1 prepends a CCW arc ENDING at the old tangent point', () => {
+    const plain = ok(buildRibbonSegments([circle(0, 0, 400, 1), circle(2000, 0, 150, 1)]));
+    const g = ok(buildRibbonSegments([
+      { cx: 0, cy: 0, r: 400, side: 1, wrapRad: 270 * DEG },
+      circle(2000, 0, 150, 1),
+    ]));
+    expect(g.segments.map((s) => s.kind)).toEqual(['arc', 'line']);
+    const arc = g.segments[0] as ArcSegment2;
+    expect(arc.sweep).toBeCloseTo(270 * DEG, 9);          // CCW: positive
+    expect(arc.lengthMm).toBeCloseTo(400 * 270 * DEG, 6); // r * theta
+    // The arc must END exactly where the path used to START, so the straight run
+    // behind it is untouched — that is what makes the offset a pure index shift.
+    const line = plain.segments[0] as { x0: number; y0: number };
+    expect(endsAt(arc).x).toBeCloseTo(line.x0, 6);
+    expect(endsAt(arc).y).toBeCloseTo(line.y0, 6);
+    expect(g.segments[1]).toEqual(plain.segments[0]);
+  });
+
+  it('an end wrap on side -1 appends a CW arc STARTING at the old tangent point', () => {
+    const plain = ok(buildRibbonSegments([circle(0, 0, 200, -1), circle(2000, 0, 90, -1)]));
+    const g = ok(buildRibbonSegments([
+      circle(0, 0, 200, -1),
+      { cx: 2000, cy: 0, r: 90, side: -1, wrapRad: 270 * DEG },
+    ]));
+    expect(g.segments.map((s) => s.kind)).toEqual(['line', 'arc']);
+    const arc = g.segments[1] as ArcSegment2;
+    expect(arc.sweep).toBeCloseTo(-270 * DEG, 9);         // CW: negative
+    expect(arc.lengthMm).toBeCloseTo(90 * 270 * DEG, 6);  // length is UNSIGNED
+    const line = plain.segments[0] as { x1: number; y1: number };
+    expect(arc.cx + arc.r * Math.cos(arc.a0)).toBeCloseTo(line.x1, 6);
+    expect(arc.cy + arc.r * Math.sin(arc.a0)).toBeCloseTo(line.y1, 6);
+    expect(g.segments[0]).toEqual(plain.segments[0]);
+  });
+
+  it('total length grows by exactly r * wrapRad per wrapped end', () => {
+    const base: Circle2[] = [circle(0, 0, 400, 1), circle(2000, 0, 150, 1)];
+    const a = ok(buildRibbonSegments(base.map((c) => ({ ...c }))));
+    const b = ok(buildRibbonSegments([{ ...base[0], wrapRad: Math.PI }, { ...base[1] }]));
+    expect(b.lengthMm - a.lengthMm).toBeCloseTo(400 * Math.PI, 6);
+    const c = ok(buildRibbonSegments([{ ...base[0] }, { ...base[1], wrapRad: Math.PI / 2 }]));
+    expect(c.lengthMm - a.lengthMm).toBeCloseTo((150 * Math.PI) / 2, 6);
+  });
+
+  it('wraps on both ends add exactly one arc each, first and last', () => {
+    const g = ok(buildRibbonSegments([
+      { cx: 0, cy: 0, r: 400, side: 1, wrapRad: Math.PI },
+      { cx: 1500, cy: 600, r: 100, side: 0 },
+      { cx: 3400, cy: 0, r: 90, side: 1, wrapRad: Math.PI / 2 },
+    ]));
+    expect(g.segments.map((s) => s.kind)).toEqual(['arc', 'line', 'arc', 'line', 'arc']);
+    expect((g.segments[0] as ArcSegment2).lengthMm).toBeCloseTo(400 * Math.PI, 6);
+    expect((g.segments[4] as ArcSegment2).lengthMm).toBeCloseTo((90 * Math.PI) / 2, 6);
+    // The middle arc is the ordinary inner one and is unaffected by either wrap.
+    const plain = ok(buildRibbonSegments([
+      circle(0, 0, 400, 1), { cx: 1500, cy: 600, r: 100, side: 0 }, circle(3400, 0, 90, 1),
+    ]));
+    expect(g.segments[2]).toEqual(plain.segments[1]);
+  });
+
+  it('a wrap beyond a full turn is NOT normalised into [0, 2pi)', () => {
+    // The inner-arc rule folds its sweep into [0, 2pi) because an atan2
+    // difference is only defined modulo a turn. Applying that here would silently
+    // drop a whole lap of paper off a deliberate WrapDeg of 450.
+    const g = ok(buildRibbonSegments([
+      { cx: 0, cy: 0, r: 300, side: -1, wrapRad: 450 * DEG },
+      circle(2500, 400, 120, -1),
+    ]));
+    const arc = g.segments[0] as ArcSegment2;
+    expect(Math.abs(arc.sweep)).toBeCloseTo(450 * DEG, 9);
+    expect(arc.lengthMm).toBeCloseTo(300 * 450 * DEG, 6);
+  });
+
+  it('a wrapRad on an INNER roller is ignored — that roller already has an arc', () => {
+    const plain = ok(buildRibbonSegments([
+      circle(0, 0, 400, 1), { cx: 1500, cy: 600, r: 100, side: 0 }, circle(3400, 0, 90, 1),
+    ]));
+    const g = ok(buildRibbonSegments([
+      circle(0, 0, 400, 1),
+      { cx: 1500, cy: 600, r: 100, side: 0, wrapRad: Math.PI },
+      circle(3400, 0, 90, 1),
+    ]));
+    expect(g.segments).toEqual(plain.segments);
+    expect(g.lengthMm).toBeCloseTo(plain.lengthMm, 9);
+  });
+
+  it('the sampled band follows the wrap arc: every sample sits ON the roll', () => {
+    // The acceptance property in miniature — the first samples must be at the
+    // CONTACT radius of the unwinder, which is what "starts on the roll" means.
+    const g = ok(buildRibbonSegments([
+      { cx: 0, cy: 0, r: 400, side: 1, wrapRad: 270 * DEG },
+      circle(2000, 0, 150, 1),
+    ]));
+    const out = new Float32Array(512 * RIBBON_SAMPLE_STRIDE);
+    const { count, stepMm } = sampleArcLength(g.segments, 20, out);
+    expect(count).toBeGreaterThan(50);
+    const onArc = Math.floor((g.segments[0].lengthMm / stepMm) - 1);
+    expect(onArc).toBeGreaterThan(5);
+    for (let i = 0; i <= onArc; i++) {
+      expect(Math.hypot(out[i * 4], out[i * 4 + 1])).toBeCloseTo(400, 2);
+    }
+  });
+});
+
 describe('ribbon-geometry — sampling', () => {
   it('sampleArcLength writes equidistant samples and returns count', () => {
     const g = ok(buildRibbonSegments([

@@ -139,6 +139,9 @@ export class PostProcessingManager {
   private _bloomIntensity = 0.5;
   private _bloomThreshold = 0.85;
   private _bloomRadius = 0.4;
+  /** Scale of the GTAO/N8AO/Bloom internal buffers relative to the render
+   *  size — {@link PP_SCALE} live, 1.0 during a high-quality video capture. */
+  private _bufferScale = PP_SCALE;
 
   // ── Isolate overlay (semi-transparent wash for group-isolate) ────────
   private _isolateOverlayScene: Scene | null = null;
@@ -307,8 +310,8 @@ export class PostProcessingManager {
     const renderer = this.host.renderer as unknown as WebGLRenderer;
     const w = renderer.domElement.width;
     const h = renderer.domElement.height;
-    const hw = Math.max(1, Math.floor(w * PP_SCALE));
-    const hh = Math.max(1, Math.floor(h * PP_SCALE));
+    const hw = Math.max(1, Math.floor(w * this._bufferScale));
+    const hh = Math.max(1, Math.floor(h * this._bufferScale));
     const composer = new EffectComposer(renderer);
 
     // Enable MSAA on composer render targets to match renderer antialias setting
@@ -350,15 +353,23 @@ export class PostProcessingManager {
     this.applyHalfRes();
   }
 
-  /** Re-apply the half-res size to GTAO/N8AO/Bloom internal buffers. */
-  applyHalfRes(): void {
+  /**
+   * Re-apply the reduced size to GTAO/N8AO/Bloom internal buffers.
+   *
+   * `scale` (plan-537 F11) replaces the buffer scale for this AND every later
+   * resize until it is set again: the video capture's quality mode passes 1.0
+   * (AO/bloom at full render resolution) and restores {@link PP_SCALE} when it
+   * ends. Omitted, the current scale is kept.
+   */
+  applyHalfRes(scale?: number): void {
+    if (scale !== undefined && Number.isFinite(scale) && scale > 0) this._bufferScale = scale;
     if (!this._composer) return;
     // EffectComposer stores CSS dims in _width/_height and scales by pixelRatio
     const c = this._composer as unknown as { _width: number; _height: number; _pixelRatio: number };
     const pw = c._width * c._pixelRatio;
     const ph = c._height * c._pixelRatio;
-    const hw = Math.max(1, Math.floor(pw * PP_SCALE));
-    const hh = Math.max(1, Math.floor(ph * PP_SCALE));
+    const hw = Math.max(1, Math.floor(pw * this._bufferScale));
+    const hh = Math.max(1, Math.floor(ph * this._bufferScale));
     if (this._gtaoPass) this._gtaoPass.setSize(hw, hh);
     if (this._n8aoPass) this._n8aoPass.setSize(hw, hh);
     if (this._bloomPass) this._bloomPass.setSize(hw, hh);
@@ -371,6 +382,37 @@ export class PostProcessingManager {
     this._composer.setSize(w, h);
     this.applyHalfRes();
   }
+
+  /**
+   * Bring an EXISTING composer's pixel ratio in line with the renderer's, and
+   * re-apply the current buffer scale (plan-591 F11).
+   *
+   * A DPR change on the renderer does NOT reach the composer: `EffectComposer`
+   * keeps its own `_pixelRatio` from the moment it was constructed. Without
+   * this, raising the resolution made the beauty pass sharp while the AO and
+   * bloom buffers stayed at the old, coarse size — the quality switch visibly
+   * did not deliver what it promised. `setPixelRatio` resizes the composer's
+   * targets AND every pass to FULL resolution, which is why re-applying the
+   * half-res scale afterwards is not optional (`applyHalfRes` computes from the
+   * composer's own, now updated, ratio).
+   *
+   * Creates nothing: a no-op without a composer — on WebGPU (which never has
+   * one, see {@link ensureComposer}) and before the first pass asked for one.
+   */
+  syncPixelRatio(): void {
+    if (!this._composer) return;
+    const renderer = this.host.renderer as unknown as WebGLRenderer;
+    const target = renderer.getPixelRatio?.();
+    if (typeof target !== 'number' || !Number.isFinite(target) || target <= 0) return;
+    const c = this._composer as unknown as { _pixelRatio: number };
+    if (c._pixelRatio === target) return;
+    this._composer.setPixelRatio(target);
+    this.applyHalfRes();
+    this.host.markRenderDirty();
+  }
+
+  /** Current scale of the AO/bloom internal buffers (see {@link applyHalfRes}). */
+  get bufferScale(): number { return this._bufferScale; }
 
   // ─── AO state ────────────────────────────────────────────────────────
 
@@ -447,8 +489,8 @@ export class PostProcessingManager {
       const c = composer as unknown as { _width: number; _height: number; _pixelRatio: number };
       const pw = c._width * c._pixelRatio;
       const ph = c._height * c._pixelRatio;
-      const hw = Math.max(1, Math.floor(pw * PP_SCALE));
-      const hh = Math.max(1, Math.floor(ph * PP_SCALE));
+      const hw = Math.max(1, Math.floor(pw * this._bufferScale));
+      const hh = Math.max(1, Math.floor(ph * this._bufferScale));
       const pass = new Ctor(this.host.scene, this.host.camera, hw, hh);
       // Seed N8AO config from the shared SSAO sliders so the result looks
       // similar at first glance and the UI sliders keep meaning.

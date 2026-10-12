@@ -29,6 +29,7 @@ import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import { getAppConfig } from '../core/rv-app-config';
 import { RVAssetBlobCache } from '../core/engine/rv-asset-blob-cache';
+import { hashForUrl } from '../core/library/rv-asset-hash-registry';
 import type { SplatRaycastHit } from './layout-planner/gaussian-splat-plugin-type';
 
 /**
@@ -37,9 +38,13 @@ import type { SplatRaycastHit } from './layout-planner/gaussian-splat-plugin-typ
  * In-memory + Cache API ⇒ network fetch happens once per URL per origin.
  * The expensive parse + GPU upload still runs per `addSplatScene` call —
  * the splat library doesn't expose a re-usable parsed mesh.
+ *
+ * plan-508: keyed by url + the catalog's `sha256` when the library catalog
+ * names one (looked up per url in the core hash registry — `loadSplat` and its
+ * callers are unchanged); `-v2` bucket, the old url-keyed one is swept.
  */
-const SPLAT_CACHE_BUCKET = 'rv-planner-splats';
-const _splatBlobCache = new RVAssetBlobCache({ bucket: SPLAT_CACHE_BUCKET });
+const SPLAT_CACHE_BUCKET = 'rv-assets-splat-v2';
+const _splatBlobCache = new RVAssetBlobCache({ bucket: SPLAT_CACHE_BUCKET, legacyBuckets: ['rv-planner-splats'] });
 
 /**
  * Direct DOM loading overlay (bypasses React entirely).
@@ -657,7 +662,7 @@ export class GaussianSplatPlugin implements RVViewerPlugin {
     // skip the network fetch. `blob:` URLs pass through unchanged.
     const loadUrl = url.startsWith('blob:') || url.startsWith('data:')
       ? url
-      : await _splatBlobCache.getObjectUrl(url);
+      : await _splatBlobCache.getObjectUrl(url, { sha256: hashForUrl(url)?.sha256 });
     const revoke = loadUrl !== url;
 
     try {
@@ -688,7 +693,7 @@ export class GaussianSplatPlugin implements RVViewerPlugin {
     // the network fetch. `blob:` / `data:` URLs pass through unchanged.
     const loadUrl = url.startsWith('blob:') || url.startsWith('data:')
       ? url
-      : await _splatBlobCache.getObjectUrl(url);
+      : await _splatBlobCache.getObjectUrl(url, { sha256: hashForUrl(url)?.sha256 });
     const revoke = loadUrl !== url;
 
     try {

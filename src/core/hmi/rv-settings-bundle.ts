@@ -25,6 +25,7 @@ import {
 import type { GroupVisibilitySettings } from './group-visibility-store';
 import type { ModelCameraStart } from './camera-startpos-types';
 import { isValidPreset } from './camera-startpos-store';
+import { downloadTextFile } from './rv-download-text-file';
 
 const CAMERA_START_LS_PREFIX = 'rv-camera-start:';
 
@@ -115,16 +116,7 @@ export function collectSettingsBundle(modelUrl: string | null): RVSettingsBundle
  * Trigger a browser download of the settings bundle.
  */
 export function downloadSettingsBundle(bundle: RVSettingsBundle, filename: string): void {
-  const json = JSON.stringify(bundle, null, 2);
-  const blob = new Blob([json], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadTextFile(JSON.stringify(bundle, null, 2), filename, 'application/json');
 }
 
 // ─── Import ───────────────────────────────────────────────────────────

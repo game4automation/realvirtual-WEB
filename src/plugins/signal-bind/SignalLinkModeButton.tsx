@@ -5,6 +5,7 @@ import { useSyncExternalStore } from 'react';
 import { IconButton, Tooltip } from '@mui/material';
 import SettingsInputComponent from '@mui/icons-material/SettingsInputComponent';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
+import { ICON_SIZE } from '../../core/hmi/shared-sx';
 import {
   getSignalLinkModeSnapshot,
   setSignalLinkModeExplicit,
@@ -36,7 +37,7 @@ export function SignalLinkModeButton({ viewer }: UISlotProps) {
           color: snapshot.explicit ? 'primary.main' : 'text.disabled',
         }}
       >
-        <SettingsInputComponent sx={{ fontSize: 18 }} />
+        <SettingsInputComponent sx={{ fontSize: ICON_SIZE.lg }} />
       </IconButton>
     </Tooltip>
   );

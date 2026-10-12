@@ -1,0 +1,206 @@
+{
+  "fingerprint": {
+    "timestamp": "2026-09-22T09:47:11.494Z",
+    "host": "LAPTOP-6BCB6EOI",
+    "os": "win32 10.0.26100",
+    "cpu": "Intel(R) Core(TM) i9-14900HX",
+    "logicalCpus": 32,
+    "totalMemoryBytes": 68346380288,
+    "freeMemoryBytes": 38540861440,
+    "node": "v24.14.0",
+    "chromium": "145.0.7632.6",
+    "gitCommit": "86c05913b93bbcee6416a8a2a7c4be9220517862",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "hardwareConcurrency": 32,
+    "deviceMemoryGiB": 8,
+    "devicePixelRatio": 1,
+    "viewport": {
+      "width": 1600,
+      "height": 900
+    },
+    "longTaskObserver": true,
+    "preciseHeap": true,
+    "gpu": {
+      "vendor": "Google Inc. (Intel)",
+      "renderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x0000A788) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    }
+  },
+  "variant": "plan757-phase0",
+  "runs": 1,
+  "windowS": 5,
+  "uncapped": false,
+  "localStorage": {},
+  "skipped": [],
+  "models": {
+    "custom": {
+      "url": "C:/Program Files/Git/private-models/mauser3dhmi/mausercagelinenosource.glb",
+      "failed": null,
+      "measuredRuns": 1,
+      "median": {
+        "loadMs": 20,
+        "navToSceneReadyMs": 16504.299999952316,
+        "fps": 18,
+        "frameMs": 55.65,
+        "sceneCalls": 272,
+        "sceneTriangles": 7473436,
+        "heapBytes": 1302428870,
+        "sceneNodes": 18741,
+        "chunkMeshes": 295,
+        "matrixAutoUpdateNodes": 419,
+        "frozenWorldNodes": 13350
+      },
+      "placements": null,
+      "callsPerPlacement": null,
+      "survival": {
+        "assetId": "/private-models/mauser3dhmi/mausercagelinenosource.glb",
+        "counts": {
+          "nodes": 70203,
+          "survivors": 18047,
+          "removed": 52156,
+          "removedMeshes": 36694,
+          "mergedSurvivorMeshes": 2745,
+          "releasableGeometries": 9604,
+          "instancedTriangles": 0,
+          "tagOnlyChunkBoundaries": 28,
+          "unresolvedReferences": 46,
+          "unresolvedByField": {
+            "Grip.SignalPick": 10,
+            "LogicStep_SetSignalBool.Signal": 14,
+            "LogicStep_WaitForSignalBool.Signal": 21,
+            "CustomRuntimeInstruction.signal": 1
+          },
+          "unresolvedClaims": 0
+        },
+        "ms": 623.3999999761581,
+        "removalTopsTotal": 31121,
+        "removalTopsSample": [
+          "MauserCageline30glb/Errors/CUBE",
+          "MauserCageline30glb/Cube",
+          "MauserCageline30glb/Cube (1)",
+          "MauserCageline30glb/Cube (2)",
+          "MauserCageline30glb/Cube (3)",
+          "MauserCageline30glb/Cube (4)",
+          "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5957",
+          "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5958",
+          "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5959",
+          "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp2/Solid1_5966"
+        ],
+        "unresolvedClaims": [],
+        "g1Violations": []
+      },
+      "runs": [
+        {
+          "loadMs": 20,
+          "navToSceneReadyMs": 16504.299999952316,
+          "fps": 18,
+          "fpsSamples": [
+            19,
+            18,
+            18,
+            18,
+            18,
+            18,
+            18,
+            17,
+            18,
+            18
+          ],
+          "frameMs": 55.65,
+          "scene": {
+            "calls": 272,
+            "triangles": 7473436
+          },
+          "total": {
+            "calls": 553,
+            "triangles": 14946890
+          },
+          "heap": 1302428870,
+          "sceneNodes": 18741,
+          "sceneMeshes": 367,
+          "chunkMeshes": 295,
+          "matrixAutoUpdateNodes": 419,
+          "frozenWorldNodes": 13350,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0,
+              "pickBytes": 0,
+              "nodeTableBytes": 0,
+              "nodeTableRows": 0,
+              "segments": 0,
+              "clusters": 0,
+              "geometryBytes": 0,
+              "pickPercent": 0
+            }
+          },
+          "placements": null,
+          "drives": 169,
+          "loadTriangles": 7681013,
+          "loadInfo": {
+            "glbSize": "177.5 MB",
+            "loadTime": "12.2s"
+          },
+          "camera": {
+            "pos": [
+              18.694956368706393,
+              16.315171025858145,
+              14.335145834649516
+            ],
+            "target": [
+              1.1894514930987992,
+              1.7272502961851561,
+              -4.629151113925378
+            ]
+          },
+          "survival": {
+            "assetId": "/private-models/mauser3dhmi/mausercagelinenosource.glb",
+            "counts": {
+              "nodes": 70203,
+              "survivors": 18047,
+              "removed": 52156,
+              "removedMeshes": 36694,
+              "mergedSurvivorMeshes": 2745,
+              "releasableGeometries": 9604,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 28,
+              "unresolvedReferences": 46,
+              "unresolvedByField": {
+                "Grip.SignalPick": 10,
+                "LogicStep_SetSignalBool.Signal": 14,
+                "LogicStep_WaitForSignalBool.Signal": 21,
+                "CustomRuntimeInstruction.signal": 1
+              },
+              "unresolvedClaims": 0
+            },
+            "ms": 623.3999999761581,
+            "removalTopsTotal": 31121,
+            "removalTopsSample": [
+              "MauserCageline30glb/Errors/CUBE",
+              "MauserCageline30glb/Cube",
+              "MauserCageline30glb/Cube (1)",
+              "MauserCageline30glb/Cube (2)",
+              "MauserCageline30glb/Cube (3)",
+              "MauserCageline30glb/Cube (4)",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5957",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5958",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp1/Solid1_5959",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/Separation_MC01/SeparationUp2/Solid1_5966"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        }
+      ]
+    }
+  }
+}

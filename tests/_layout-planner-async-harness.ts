@@ -29,6 +29,7 @@ import type { BufferGeometry, Material, Object3D, Texture } from 'three';
 
 import { LayoutPlannerPlugin } from '../src/plugins/layout-planner';
 import { ModelCache } from '../src/plugins/layout-planner/model-cache';
+import { createPickBuildPort } from '../src/core/engine/rv-pick-build-port';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
@@ -151,7 +152,13 @@ export function createControllableCache(): ControllableCache {
     }),
   };
 
-  const cache = new ModelCache(loader as never);
+  // plan-756: the bake AWAITS its pick-structure builds, so a harness without a
+  // pick port would hand every placement to the shared REAL worker pool — 170 ms
+  // per bake instead of a microtask, which makes every `flush()`-based assertion
+  // here a race. The inline port is the standard suite seam (§2.2).
+  const cache = new ModelCache(loader as never, {
+    pickPort: () => createPickBuildPort({ createWorker: () => null }),
+  });
 
   async function release(url: string, all: boolean): Promise<void> {
     const queue = stalls.get(url);
@@ -410,11 +417,11 @@ export function setupPlanner(opts?: PlannerHarnessOptions): PlannerHarness {
   const plugin = new LayoutPlannerPlugin({ matchMedia: opts?.matchMedia });
   plugin.onModelLoaded?.({ scene: new Group() } as never, viewer as never);
 
-  // Swap in the controllable cache. The plugin builds its own `ModelCache`
-  // around a real GLTFLoader in the constructor; every code path reads the
-  // private field, so replacing it is enough.
+  // Swap in the controllable cache. The `ModelCache` belongs to the placement
+  // instancer (`viewer.placements`; for this duck-typed viewer the plugin's own
+  // fallback instancer) — `setModelCache` is its test seam.
   const cache = createControllableCache();
-  (plugin as unknown as { _modelCache: ModelCache })._modelCache = cache.cache;
+  plugin.placements.setModelCache(cache.cache);
 
   // These two are persisted to localStorage, so a sibling test file could
   // otherwise leak its setting into ours. Pin them.

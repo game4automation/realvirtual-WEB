@@ -44,6 +44,7 @@ import {
 import { CHIP_RADIUS } from './shared-sx';
 import { signalValueColor, signalValueColorForValue } from './signal-colors';
 import { omitUndefined } from './rv-omit-undefined';
+import { ensureSignalUsageWiring } from './use-signal-usages';
 
 const REFRESH_MS = 200;
 /**
@@ -362,6 +363,8 @@ export interface SignalTooltipModel {
   address?: string;
   source?: string;
   comment?: string;
+  /** plan-512 F9: unit of the raw value as the signal's source names it (e.g. "m"). */
+  unit?: string;
   hint: string;
   /** NEW (plan-234): derived liveness state, when resolved. */
   activity?: SignalActivity;
@@ -381,6 +384,8 @@ export interface SignalTooltipModel {
   /** NEW (plan-320): write-authority note ("Force overridden by remote owner",
    *  "A live binding writes this slot", …). Omitted when nothing dominates. */
   authorityNote?: string;
+  /** plan-566 F7: number of places the signal is used (cross-reference list). Omitted when unknown. */
+  usedBy?: number;
 }
 
 /**
@@ -506,10 +511,11 @@ export function buildSignalTooltipModel(args: {
   topic?: string;
   nodePath?: string;
   authorityNote?: string;
+  usedBy?: number;
 }): SignalTooltipModel {
   const {
     name, plcType, direction, shown, forced, meta, hint, boundTo, linkedSlots,
-    activity, activityLabel, interfaceOrigin, topic, nodePath, authorityNote,
+    activity, activityLabel, interfaceOrigin, topic, nodePath, authorityNote, usedBy,
   } = args;
   return {
     name,
@@ -520,6 +526,7 @@ export function buildSignalTooltipModel(args: {
     source: meta?.source ?? undefined,
     comment: meta?.comment ?? undefined,
     hint,
+    ...(meta?.unit ? { unit: meta.unit } : {}),
     ...(boundTo && boundTo.length > 0 ? { boundTo } : {}),
     ...(linkedSlots && linkedSlots.length > 0 ? { linkedSlots } : {}),
     ...(activity !== undefined ? { activity } : {}),
@@ -528,6 +535,7 @@ export function buildSignalTooltipModel(args: {
     ...(topic !== undefined ? { topic } : {}),
     ...(nodePath !== undefined ? { nodePath } : {}),
     ...(authorityNote !== undefined ? { authorityNote } : {}),
+    ...(usedBy !== undefined ? { usedBy } : {}),
   };
 }
 
@@ -685,6 +693,13 @@ function SignalTooltipContent({ model, viewer, fields }: { model: SignalTooltipM
       {fields.value && (
         <Typography component="div" sx={{ fontSize: 10, opacity: 0.85 }}>{valueLine}</Typography>
       )}
+      {/* plan-512 F9: the unit qualifies the VALUE (raw, never converted) — shown
+          whenever the source declares one, like the interface origin below. */}
+      {model.unit && (
+        <Typography component="div" data-testid="signal-unit-line" sx={{ fontSize: 10, opacity: 0.7 }}>
+          Unit · {model.unit}
+        </Typography>
+      )}
       {fields.address && addressLine && (
         <Typography component="div" sx={{ fontSize: 10, opacity: 0.85, fontFamily: 'monospace' }}>
           {addressLine}
@@ -719,6 +734,13 @@ function SignalTooltipContent({ model, viewer, fields }: { model: SignalTooltipM
       {model.authorityNote && (
         <Typography component="div" data-testid="signal-authority-note" sx={{ fontSize: 10, color: FORCE_COLOR }}>
           {model.authorityNote}
+        </Typography>
+      )}
+      {/* plan-566 F7: how many places use this signal — the full list is one
+          click away (hierarchy / CONNECT row chip, inspector "Used by"). */}
+      {model.usedBy !== undefined && (
+        <Typography component="div" data-testid="signal-used-by" sx={{ fontSize: 10, opacity: 0.7 }}>
+          {model.usedBy === 0 ? 'Not used in this model' : `Used by ${model.usedBy}`}
         </Typography>
       )}
       {fields.comment && model.comment && (
@@ -975,8 +997,12 @@ export function SignalBadge({
       label={chipLabel}
       data-testid={relationSource ? 'slot-chain-chip' : undefined}
       // The whole label in plain text, so an ellipsised name is never a dead
-      // end even without the rich tooltip (plan-422 F4).
-      title={label}
+      // end even without the rich tooltip (plan-422 F4). Native `title` ONLY
+      // when the chip stands alone: wrapped in the MUI <Tooltip> below it would
+      // double the tooltip and makes MUI log a dev warning on every render
+      // (plan-498 Nachkorrektur). The accessible name is always the label.
+      title={fc.enabled ? undefined : label}
+      aria-label={label}
       size="small"
       onClick={fc.enabled ? onChipClick : undefined}
       onPointerDown={signalName ? onChipPointerDown : undefined}
@@ -1025,7 +1051,10 @@ export function SignalBadge({
     let interfaceOrigin: string | undefined;
     let topic: string | undefined;
     let nodePath: string | undefined;
+    let usedBy: number | undefined;
     if (tipOpen && viewer && signalName) {
+      // plan-566 F7: read from the lazily built usage index — never per tick.
+      usedBy = ensureSignalUsageWiring(viewer)?.count(signalName);
       const store = viewer.signalStore;
       nodePath = store?.getPath(signalName);
       const refs = viewer.registry?.getComponentsForSignal(signalName, nodePath);
@@ -1075,6 +1104,7 @@ export function SignalBadge({
       topic,
       nodePath,
       authorityNote,
+      usedBy,
     });
     // shown/fc.forced/meta are display inputs; tipOpen gates the heavy lookup.
     // eslint-disable-next-line react-hooks/exhaustive-deps

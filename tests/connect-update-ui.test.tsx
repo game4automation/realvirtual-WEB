@@ -123,6 +123,10 @@ describe('T26 — the ConnectPanel stays free of update polling', () => {
     const viewer = {
       leftPanelManager: lpm,
       signalStore: null,
+      // The panel explains a missing live stream via `connectStreamBlock`, which
+      // reads the load's trust — a real viewer always carries one.
+      loadTrust: { trusted: true },
+      lastLoadResult: null,
       registry: null,
       signalBindingManager: undefined,
       getPlugin: () => undefined,
@@ -146,8 +150,11 @@ describe('T26 — the ConnectPanel stays free of update polling', () => {
       await new Promise((r) => setTimeout(r, 200));
     });
     expect(calls.filter((u) => u.includes('/update/'))).toEqual([]);
-    // The panel is doing its own work, so this is not a silently dead stub.
-    expect(calls.some((u) => u.includes('/status'))).toBe(true);
+    // Not a silently dead stub: the panel really did reach the gateway — just
+    // never for `/update/`. Since plan-562 it owns no `/status` poll either (the
+    // single owner is `ConnectStatusPoll` in connect-plugin.tsx), so the proof
+    // that this fixture is live is the connect handshake itself.
+    expect(calls.some((u) => u.includes('/health'))).toBe(true);
   });
 });
 

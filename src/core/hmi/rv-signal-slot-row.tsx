@@ -66,6 +66,7 @@ import {
   NOT_LINKED_CELL,
   authorityExplanation,
 } from './signal-vocabulary';
+import { ACCENT, FS, ICON_SIZE, INK_HIGH, INK_LOW, WARN } from './shared-sx';
 
 // ── Shared row/picker data shapes (moved here from SignalBindPopover) ────────
 
@@ -176,8 +177,7 @@ export function linkDirToSignalDir(dir: SignalLinkDirection): SignalDirection {
 
 // ── Design tokens (DESIGN.md floors — Label 11px, Ink Low 0.5) ──────────────
 
-const INK_LOW = 'rgba(255,255,255,0.5)';
-const ROW_FONT = 11;
+const ROW_FONT = FS.label;
 /** Minimum interactive hit target (plan-325 A11y floor). */
 const HIT_MIN = 24;
 /**
@@ -200,18 +200,21 @@ const SHRINKABLE_CELL = { display: 'flex', minWidth: 0, overflow: 'hidden' } as 
  * rather than a movement, so the feedback survives for people who switch
  * animation off.
  */
+/** Accent tint of the drop acknowledgement (ACCENT at ~0.28 alpha). */
+const PULSE_BG = `${ACCENT}47`;
+
 function pulseSx(active: boolean): Record<string, unknown> {
   if (!active) return {};
   return {
     borderRadius: 0.5,
     animation: 'rv-binding-pulse 600ms ease-out 1',
     '@keyframes rv-binding-pulse': {
-      '0%': { boxShadow: '0 0 0 0 rgba(79,195,247,0.85)', backgroundColor: 'rgba(79,195,247,0.28)' },
-      '100%': { boxShadow: '0 0 0 6px rgba(79,195,247,0)', backgroundColor: 'transparent' },
+      '0%': { boxShadow: `0 0 0 0 ${ACCENT}d9`, backgroundColor: PULSE_BG },
+      '100%': { boxShadow: `0 0 0 6px ${ACCENT}00`, backgroundColor: 'transparent' },
     },
     '@media (prefers-reduced-motion: reduce)': {
       animation: 'none',
-      backgroundColor: 'rgba(79,195,247,0.28)',
+      backgroundColor: PULSE_BG,
     },
   };
 }
@@ -269,8 +272,7 @@ export const AUTHORITY_REASON_TEXT: Record<string, string> = {
 // no palette of its own: system amber IS the status amber (User decision
 // 29.07.). The lighter #FCC270 that the earlier 4.5:1 target forced is gone.
 
-const STATUS_AMBER = '#ffa726';
-const INK_HIGH = 'rgba(255,255,255,0.92)';
+const STATUS_AMBER = WARN;
 
 /** One resolved status token: what the row shows, in what colour, and why. */
 export interface SlotStatusToken {
@@ -486,7 +488,7 @@ export function SignalSlotRow({
             labelColor={INK_LOW}
             minHeight={HIT_MIN}
             alignField="end"
-            dot={rejectReason ? <LinkOffIcon data-testid={`slot-reject-${row.slot}`} sx={{ fontSize: 12, color: INK_LOW }} /> : undefined}
+            dot={rejectReason ? <LinkOffIcon data-testid={`slot-reject-${row.slot}`} sx={{ fontSize: ICON_SIZE.xs, color: INK_LOW }} /> : undefined}
           >
             <Typography sx={{ fontSize: ROW_FONT, color: INK_LOW, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               Unavailable — {row.reason}
@@ -588,7 +590,7 @@ export function SignalSlotRow({
         <Typography
           className="rv-slot-drop-hint"
           aria-hidden
-          sx={{ fontSize: ROW_FONT, fontWeight: 600, color: '#4fc3f7', whiteSpace: 'nowrap' }}
+          sx={{ fontSize: ROW_FONT, fontWeight: 600, color: ACCENT, whiteSpace: 'nowrap' }}
         >
           Drop here
         </Typography>
@@ -630,7 +632,7 @@ export function SignalSlotRow({
       // The 14 px gutter was reserved and permanently empty on slot rows — the
       // rejection icon costs no space and shifts no layout (plan-341 §2.5).
       dot={rejectReason
-        ? <LinkOffIcon data-testid={`slot-reject-${row.slot}`} sx={{ fontSize: 12, color: INK_LOW }} />
+        ? <LinkOffIcon data-testid={`slot-reject-${row.slot}`} sx={{ fontSize: ICON_SIZE.xs, color: INK_LOW }} />
         : undefined}
     >
       <Box sx={{
@@ -679,7 +681,7 @@ export function SignalSlotRow({
                 color: status.color, whiteSpace: 'nowrap',
               }}
             >
-              <StatusIcon sx={{ fontSize: 12 }} />
+              <StatusIcon sx={{ fontSize: ICON_SIZE.xs }} />
               <Typography sx={{ fontSize: ROW_FONT, fontWeight: 600, color: 'inherit', whiteSpace: 'nowrap' }}>
                 {status.label}
               </Typography>
@@ -692,9 +694,9 @@ export function SignalSlotRow({
               size="small"
               aria-label={`unbind ${displayLabel}`}
               onClick={() => onUnbind?.(row)}
-              sx={{ width: HIT_MIN, height: HIT_MIN, p: 0.5, color: '#4fc3f7' }}
+              sx={{ width: HIT_MIN, height: HIT_MIN, p: 0.5, color: ACCENT }}
             >
-              <LinkOffIcon sx={{ fontSize: 15 }} />
+              <LinkOffIcon sx={{ fontSize: ICON_SIZE.md }} />
             </IconButton>
           </Tooltip>
         ) : (
@@ -703,9 +705,9 @@ export function SignalSlotRow({
               size="small"
               aria-label={`signal for ${displayLabel}`}
               onClick={(e) => openPicker(e.currentTarget)}
-              sx={{ width: HIT_MIN, height: HIT_MIN, p: 0.5, color: INK_LOW, '&:hover': { color: '#4fc3f7' } }}
+              sx={{ width: HIT_MIN, height: HIT_MIN, p: 0.5, color: INK_LOW, '&:hover': { color: ACCENT } }}
             >
-              <LinkIcon sx={{ fontSize: 15 }} />
+              <LinkIcon sx={{ fontSize: ICON_SIZE.md }} />
             </IconButton>
           </Tooltip>
         ))}

@@ -16,7 +16,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { formatPhysicsDiagnostics } from '../src/core/hmi/settings/SimulationTab';
 import {
+  physicsDiagnostics,
   physicsRegistry,
   physicsSettings,
   computePhysicsEnabled,
@@ -33,6 +35,7 @@ import {
   type PhysicsVec3,
   type PhysicsZoneConfig,
 } from '../src/core/engine/rv-physics-registry';
+import { PHYSICS_DEFAULT_MU_MASS_KG } from '../src/core/engine/rv-physics-constants';
 
 const V0: PhysicsVec3 = { x: 0, y: 0, z: 0 };
 const Q_IDENT: PhysicsQuat = { x: 0, y: 0, z: 0, w: 1 };
@@ -80,6 +83,11 @@ class MockPhysicsProvider implements PhysicsProvider {
   getSettledBodies(_maxLinVel: number, _uprightToleranceDeg: number): string[] {
     return [];
   }
+  // plan-467 moving colliders — this mock does not exercise them; the methods
+  // exist so the mock still satisfies the PhysicsProvider contract.
+  addKinematicBody(): void {}
+  setKinematicPose(): void {}
+  forEachContactLoad(): void {}
 }
 
 describe('physicsRegistry — no-op fallback (F1)', () => {
@@ -96,7 +104,7 @@ describe('physicsRegistry — no-op fallback (F1)', () => {
       physicsRegistry.provider?.step(1 / 60);
       physicsRegistry.provider?.syncPoses(() => {});
       physicsRegistry.provider?.removeBody('mu1');
-      physicsRegistry.provider?.addDynamicMU('mu1', POSE, V0, V0);
+      physicsRegistry.provider?.addDynamicMU('mu1', POSE, V0, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     }).not.toThrow();
     expect(physicsRegistry.provider?.getSettledBodies(0.01, 25) ?? []).toEqual([]);
     expect(physicsRegistry.provider?.castRay(V0, { x: 0, y: -1, z: 0 }, 10) ?? null).toBeNull();
@@ -114,7 +122,7 @@ describe('physicsRegistry — no-op fallback (F1)', () => {
     const mock = new MockPhysicsProvider();
     physicsRegistry.register(mock);
     physicsRegistry.provider?.addZone('z1', AABB, ZONE_CFG);
-    physicsRegistry.provider?.addDynamicMU('mu1', POSE, { x: 0.1, y: 0.1, z: 0.1 }, V0);
+    physicsRegistry.provider?.addDynamicMU('mu1', POSE, { x: 0.1, y: 0.1, z: 0.1 }, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     physicsRegistry.provider?.step(1 / 60);
     physicsRegistry.provider?.removeBody('mu1');
     expect(mock.addedMUs).toEqual(['mu1']);
@@ -279,5 +287,38 @@ describe('full-physics gate (F17 — Beta, strict AND with the base gate)', () =
     physicsSettings.full = computeFullPhysics(true);
     expect(physicsSettings.enabled).toBe(false);
     expect(physicsSettings.full).toBe(false);
+  });
+});
+
+
+// ─── plan-467 F13: the kinematic share of the body count ─────────────────────
+//
+// The diagnostics line is the only place a user can see whether the moving
+// machine parts actually made it into the physics world. "17 bodies" alone
+// cannot answer "why does the gripper go through the part" — "17 bodies
+// (0 kinematic)" would, and its absence does too.
+
+describe('plan-467 F13 — physics diagnostics line', () => {
+  const base = { active: true, zones: 2, bodies: 17, kinematicBodies: 0, stepMs: 0.42 };
+
+  it('omits the kinematic parenthesis while no moving part is registered', () => {
+    expect(formatPhysicsDiagnostics(base)).toBe('2 zones / 17 bodies / 0.4 ms step');
+  });
+
+  it('names the kinematic share as soon as moving parts are in the world', () => {
+    expect(formatPhysicsDiagnostics({ ...base, kinematicBodies: 4 }))
+      .toBe('2 zones / 17 bodies (4 kinematic) / 0.4 ms step');
+  });
+
+  it('keeps the singular forms and counts kinematic bodies IN ADDITION', () => {
+    // One dynamic MU plus one moving part — not "2 bodies": the counters are
+    // separate, and the line says so.
+    expect(formatPhysicsDiagnostics({ ...base, zones: 1, bodies: 1, kinematicBodies: 1 }))
+      .toBe('1 zone / 1 body (1 kinematic) / 0.4 ms step');
+  });
+
+  it('the singleton ships zeroed, so a build without physics prints no kinematic share', () => {
+    expect(physicsDiagnostics.kinematicBodies).toBe(0);
+    expect(formatPhysicsDiagnostics(physicsDiagnostics)).not.toContain('kinematic');
   });
 });

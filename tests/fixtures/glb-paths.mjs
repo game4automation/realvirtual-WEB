@@ -61,7 +61,9 @@ export const DEV_GLB = {
   // same machine turned onto the Y axis with TravelAxis X - the two cases where a
   // Unity-to-glTF handedness mistake shows. `ribbonUnityState` is the state Unity
   // recorded while running them, which `ribbon-unity-export.test.ts` replays.
-  ribbonSlitterUnity: `${DEV}/models/DemoRibbonSlitterUnity.glb`,
-  ribbonSlitterUnityAxisY: `${DEV}/models/DemoRibbonSlitterUnityAxisY.glb`,
-  ribbonUnityState: `${DEV}/models/ribbon-unity-state.json`,
+  // Moved from `models/` to `fixtures/` on 2026-09-07: they are test fixtures,
+  // and a `models/` row is listed next to the real demo in the project dashboard.
+  ribbonSlitterUnity: `${DEV}/fixtures/DemoRibbonSlitterUnity.glb`,
+  ribbonSlitterUnityAxisY: `${DEV}/fixtures/DemoRibbonSlitterUnityAxisY.glb`,
+  ribbonUnityState: `${DEV}/fixtures/ribbon-unity-state.json`,
 };

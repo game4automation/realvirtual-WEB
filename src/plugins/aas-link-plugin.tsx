@@ -3,10 +3,12 @@
 
 /**
  * AasLinkPlugin — Links 3D scene objects to Asset Administration Shell data
- * from AASX files served from the viewer's public/aasx/ folder.
+ * from AASX files: the open project's `aasx/` folder over the deploy-wide
+ * `public/aasx/` (plan-596, `getActiveAasSource()`).
  *
  * Two parts:
- * 1. AasLinkPlugin class — Prefetches AASX index on model load.
+ * 1. AasLinkPlugin class — reads the AASX index on model load (metadata only;
+ *    archives are opened on demand by tooltip / detail panel / PDF viewer).
  *    Hover/selection tooltip logic is handled by GenericTooltipController
  *    via the 'aas' data resolver registered at module load.
  * 2. AasTooltipContent — React component that renders Nameplate + TechnicalData
@@ -15,6 +17,14 @@
 
 import { resolveAssetsBase } from '../core/project/rv-project-assets-base';
 import { getProjectStore } from '../core/project/project-store';
+import {
+  getActiveAasSource,
+  getAasSourcesVersion,
+  lookupAas,
+  setAasDeployContext,
+  subscribeAasSources,
+  type AasSource,
+} from '../core/aas/rv-aas-source';
 import { useState, useEffect, useSyncExternalStore, useCallback } from 'react';
 import { Box, Typography, CircularProgress, IconButton, Button, Tooltip as MuiTooltip } from '@mui/material';
 import { OpenInNew, PictureAsPdf, Description, ShoppingCart, WarningAmber } from '@mui/icons-material';
@@ -31,7 +41,7 @@ import { registerCapabilities } from '../core/engine/rv-component-registry';
 import { NodeRegistry } from '../core/engine/rv-node-registry';
 import { FloatingPanel } from '../core/hmi/FloatingPanel';
 import { RV_SCROLL_CLASS } from '../core/hmi/shared-sx';
-import { loadIndex, loadAasxById, getIndexEntry, type AasParsedData, type AasIndexEntry } from './aas-link-parser';
+import { loadIndex, loadAasDetail, type AasParsedData, type AasIndexEntry, type AasDocument } from './aas-link-parser';
 import {
   beginAasLoadGeneration,
   getAasResolution,
@@ -53,16 +63,8 @@ import { openPdfViewer, disposePdfViewer, type PdfLink } from '../core/hmi/pdf-v
 // This runs when the plugin module is imported, BEFORE loadGLB() builds the BVH.
 // Model plugin loading was moved to the pre-load phase in rv-viewer.ts to ensure this.
 registerCapabilities('AASLink', {
-  hoverable: true,
-  selectable: true,
-  inspectorVisible: true,
-  hierarchyVisible: true,
-  tooltipType: 'aas',
-  badgeColor: '#26a69a',
-  filterLabel: 'AAS',
-  hoverEnabledByDefault: true,
-  hoverPriority: 3,
-  pinPriority: 3,
+  pick: 'select',
+  ui: { tooltip: 'aas', badge: '#26a69a', filter: 'AAS', category: 'info', priority: 3 },
 });
 
 // ─── Types ──────────────────────────────────────────────────────────────
@@ -234,6 +236,7 @@ export class AasLinkPlugin implements RVViewerPlugin {
   private viewer: RVViewer | null = null;
   private hoverOff: (() => void) | null = null;
   private unhoverOff: (() => void) | null = null;
+  private sourcesOff: (() => void) | null = null;
   private readonly docHoverTipId = 'tooltip-hover:aas-docmode';
   /** plan-435 §2.10 abort generation — bumped by `onDeactivate`, checked by
    *  the async AASX indexing before it writes anything into the scene. */
@@ -254,71 +257,25 @@ export class AasLinkPlugin implements RVViewerPlugin {
     // Falls back to viewer.projectAssetsPath (set via settings.json in private deploys).
     const aasConfig = result.modelConfig?.pluginConfig?.['aas-link'] as
       { assetsBasePath?: string; pdfLinks?: Record<string, string> } | undefined;
-    // plan-372 Phase 14: the active project's aasx/ directory wins over the
-    // deployment-wide fallback, so switching project cannot keep serving the
-    // previous project's submodels. An explicit per-model path still wins.
-    const assetsBasePath = resolveAssetsBase({
-      explicit: aasConfig?.assetsBasePath,
-      project: getProjectStore().getProject(),
-      kind: 'aasx',
-      fallbackBase: viewer.projectAssetsPath,
-    });
+    // plan-596: ONE active AAS source for every surface: the open project's
+    // aasx/ folder over the deploy-wide directory (an explicit per-model path
+    // still names the deploy directory).
+    setAasDeployContext({ explicitBase: aasConfig?.assetsBasePath ?? null, deployBase: viewer.projectAssetsPath });
+    _activeViewer = viewer;
+    const source = getActiveAasSource();
 
     // Decide ONCE whether each AAS link can be resolved, and mark the nodes.
-    // Runs on the load result's own root — not `viewer.scene` — so a model switch
-    // during the index fetch cannot classify the new model against the old base
-    // path; the load generation drops the stale completion (plan-373 F1/F2b).
-    void resolveAasSubtree(result.root, assetsBasePath, beginAasLoadGeneration());
+    // Runs on the load result's own root, not `viewer.scene`, so a model switch
+    // during the index fetch cannot classify the new model against the old
+    // source; the load generation drops the stale completion (plan-373 F1/F2b).
+    void resolveAasSubtree(result.root, source, beginAasLoadGeneration());
 
-    // Pre-fetch AASX index and pre-parse all AASX files for nodes with AASLink.
-    // Stores searchable text (nameplate + technical data values) on each node's
-    // _rvAasLink.searchText so the search resolver can find them synchronously.
-    loadIndex(assetsBasePath).then(index => {
-      // Abort guard (plan-435 §2.10): the user switched the plugin off while
-      // the index was in flight — nothing below may touch the scene any more.
-      if (generation !== this._generation) return;
-      if (Object.keys(index).length === 0) return;
-
-      // Collect unique AAS IDs from the scene
-      const aasNodes = new Map<string, import('three').Object3D[]>();
-      viewer.scene.traverse(node => {
-        const aas = node.userData?._rvAasLink as { aasId: string } | undefined;
-        if (!aas?.aasId) return;
-        const existing = aasNodes.get(aas.aasId) ?? [];
-        existing.push(node);
-        aasNodes.set(aas.aasId, existing);
-      });
-
-      // Pre-parse each unique AASX and store searchable text + PDF links on nodes
-      for (const [aasId, nodes] of aasNodes) {
-        loadAasxById(aasId, assetsBasePath).then(parsed => {
-          // Combine all property values into one searchable string
-          const values = [
-            ...parsed.nameplate.map(p => p.value),
-            ...parsed.technicalData.map(p => p.value),
-            parsed.idShort,
-          ].filter(Boolean);
-          const searchText = values.join(' ');
-
-          for (const node of nodes) {
-            const aasData = node.userData._rvAasLink as Record<string, unknown>;
-            if (aasData) aasData.searchText = searchText;
-
-            // Populate generic _rvPdfLinks from AASX documents
-            if (parsed.documents.length > 0) {
-              if (!node.userData._rvPdfLinks) node.userData._rvPdfLinks = [];
-              const existing = node.userData._rvPdfLinks as PdfLink[];
-              for (const doc of parsed.documents) {
-                existing.push({
-                  title: doc.title,
-                  source: { type: 'blob', aasId, zipPath: doc.zipPath, basePath: assetsBasePath },
-                });
-              }
-            }
-          }
-        }).catch(() => { /* AASX not available — search just won't include it */ });
-      }
-    });
+    // Search text from the INDEX metadata (idShort, product name, manufacturer)
+    // only. No archive is opened at model start (plan-596 SOL #8): the package
+    // is read when a tooltip or the detail panel asks for it.
+    this._applyIndexMetadata(viewer, generation);
+    this.sourcesOff?.();
+    this.sourcesOff = subscribeAasSources(() => this._applyIndexMetadata(viewer, this._generation));
 
     // --- Standalone PDF matching ---
     // Read pdfLinks from model config: { "Robot/Arm": "pdf/robot-arm-manual.pdf" }
@@ -359,6 +316,34 @@ export class AasLinkPlugin implements RVViewerPlugin {
   }
 
   /**
+   * Write the index metadata of every linked AAS id onto its nodes as search
+   * text, and drop AAS-generated PDF links of ids the index no longer knows.
+   * Results of an older source revision are discarded.
+   */
+  private _applyIndexMetadata(viewer: RVViewer, generation: number): void {
+    const source = getActiveAasSource();
+    const revision = source.revision;
+    loadIndex(source).then(index => {
+      // Abort guard (plan-435 §2.10): switched off while the index was in flight.
+      if (generation !== this._generation) return;
+      // The index changed meanwhile; the change notification re-runs this.
+      if (source.revision !== revision || getActiveAasSource() !== source) return;
+      viewer.scene.traverse(node => {
+        const aas = node.userData?._rvAasLink as Record<string, unknown> | undefined;
+        const aasId = aas?.aasId as string | undefined;
+        if (!aas || !aasId) return;
+        const entry = index[aasId];
+        if (!entry) {
+          delete aas.searchText;
+          replaceAasPdfLinks(node, aasId, [], null);
+          return;
+        }
+        aas.searchText = [entry.productName, entry.manufacturer, entry.idShort].filter(Boolean).join(' ');
+      });
+    }).catch(() => { /* index unavailable: search just won't include it */ });
+  }
+
+  /**
    * plan-435: the hover subscriptions live until `dispose()`, so the fallback
    * would leave the datasheet tooltip alive behind a switched-off plugin.
    * Detach them and cancel the in-flight AASX indexing (§2.10). The scene
@@ -367,6 +352,8 @@ export class AasLinkPlugin implements RVViewerPlugin {
    */
   onDeactivate(): void {
     this._generation++;
+    this.sourcesOff?.();
+    this.sourcesOff = null;
     this.hoverOff?.();
     this.unhoverOff?.();
     this.hoverOff = null;
@@ -382,14 +369,91 @@ export class AasLinkPlugin implements RVViewerPlugin {
 
   dispose(): void {
     this._generation++;
+    this.sourcesOff?.();
+    this.sourcesOff = null;
     this.hoverOff?.();
     this.unhoverOff?.();
     this.hoverOff = null;
     this.unhoverOff = null;
     tooltipStore.hide(this.docHoverTipId);
     disposePdfViewer();
+    if (_activeViewer === this.viewer) _activeViewer = null;
     this.viewer = null;
   }
+}
+
+// ─── Index-driven helpers (plan-596) ────────────────────────────────────
+
+/** The viewer of the last model load — the detail panel has no viewer prop. */
+let _activeViewer: RVViewer | null = null;
+
+/** Marker on PDF links generated from an AASX, so they can be replaced. */
+interface AasPdfLink extends PdfLink { aasGenerated?: string }
+
+/**
+ * Replace the AAS-generated PDF links of `node` for `aasId` with `docs`
+ * (plan-596 SOL #6). Links of other ids and links from other origins
+ * (`pluginConfig.pdfLinks`, docs index) stay untouched.
+ */
+export function replaceAasPdfLinks(node: Object3D, aasId: string, docs: readonly AasDocument[], sourceKey: string | null): void {
+  const existing = (node.userData._rvPdfLinks as AasPdfLink[] | undefined) ?? [];
+  const kept = existing.filter(l => l.aasGenerated !== aasId);
+  const added: AasPdfLink[] = docs.map(doc => ({
+    title: doc.title,
+    source: { type: 'blob', aasId, zipPath: doc.zipPath, ...(sourceKey ? { sourceKey } : {}) },
+    aasGenerated: aasId,
+  }));
+  const next = [...kept, ...added];
+  if (next.length > 0) node.userData._rvPdfLinks = next;
+  else if (node.userData._rvPdfLinks) delete node.userData._rvPdfLinks;
+}
+
+/** Apply the documents of a loaded detail to every node linking `aasId`. */
+function applyAasPdfLinks(viewer: RVViewer | null | undefined, aasId: string, docs: readonly AasDocument[], sourceKey: string): void {
+  const scene = viewer?.scene;
+  if (!scene) return;
+  scene.traverse(node => {
+    const aas = node.userData?._rvAasLink as { aasId?: string } | undefined;
+    if (aas?.aasId === aasId) replaceAasPdfLinks(node, aasId, docs, sourceKey);
+  });
+}
+
+/** Re-render on every AAS source change (useSyncExternalStore). */
+function useAasSourcesVersion(): number {
+  return useSyncExternalStore(subscribeAasSources, getAasSourcesVersion, getAasSourcesVersion);
+}
+
+/**
+ * Load the index entry and the detail of `aasId` from the active source:
+ * lookup first (entry + the source that holds it), then the detail from
+ * exactly that source. Calls `onEntry`/`onDetail` unless cancelled or the
+ * source revision moved on.
+ */
+function loadActiveAas(
+  aasId: string,
+  isCancelled: () => boolean,
+  handlers: {
+    onEntry: (entry: AasIndexEntry | null) => void;
+    onDetail: (parsed: AasParsedData, source: AasSource) => void;
+    onError: (message: string) => void;
+  },
+): void {
+  const source = getActiveAasSource();
+  const revision = source.revision;
+  const stale = () => isCancelled() || source.revision !== revision;
+  lookupAas(source, aasId)
+    .then(async (lookup) => {
+      if (stale()) return;
+      handlers.onEntry(lookup?.entry ?? null);
+      if (!lookup) throw new Error(`AAS ID not found in index: ${aasId}`);
+      const parsed = await loadAasDetail(lookup, aasId);
+      if (stale()) return;
+      handlers.onDetail(parsed, lookup.source);
+    })
+    .catch((err) => {
+      if (stale()) return;
+      handlers.onError(err instanceof Error ? err.message : String(err));
+    });
 }
 
 // ─── Tooltip Content Renderer (React) ───────────────────────────────────
@@ -497,6 +561,9 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
   // for tooltip data built by other callers. Hooks stay above the early return.
   const hidden = data.resolution !== undefined && !isAasVisible(data.resolution);
 
+  // A source change (scan, import) re-runs the load against the new revision.
+  const sourcesVersion = useAasSourcesVersion();
+
   useEffect(() => {
     if (hidden) return;
     if (!data.aasId) {
@@ -508,31 +575,31 @@ export function AasTooltipContent({ data, isPinned, viewer }: TooltipContentProp
     setState('loading');
     let cancelled = false;
 
-    getIndexEntry(data.aasId)
-      .then((entry) => { if (!cancelled) setIndexEntry(entry ?? null); })
-      .catch(() => { /* index unavailable — skip demo banner */ });
-
-    loadAasxById(data.aasId)
-      .then((result) => {
-        if (!cancelled) {
-          setParsed(result);
-          setState('success');
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err));
-          setState('error');
-        }
-      });
+    // The archive is opened here, on demand (plan-596 SOL #8), from the source
+    // that listed the id (SOL #4).
+    loadActiveAas(data.aasId, () => cancelled, {
+      onEntry: (entry) => setIndexEntry(entry),
+      onDetail: (result, source) => {
+        setParsed(result);
+        setState('success');
+        applyAasPdfLinks(viewer, data.aasId, result.documents, source.key);
+      },
+      onError: (message) => {
+        setError(message);
+        setState('error');
+      },
+    });
 
     return () => { cancelled = true; };
-  }, [data.aasId, hidden]);
+  }, [data.aasId, hidden, sourcesVersion, viewer]);
 
-  // Header: use description from rv_extras, or product name from parsed data, or AAS ID
+  // Header: description from rv_extras, else the product name (index metadata
+  // first, it is there before the archive is read), else idShort, else the id.
   const headerText = data.description
+    || indexEntry?.productName
     || parsed?.nameplate.find(p => p.label === 'Manufacturer Product Designation')?.value
     || parsed?.idShort
+    || indexEntry?.idShort
     || data.aasId;
 
   // The whole tile goes — header, error text and "Add to Cart" alike. A tile with
@@ -793,27 +860,35 @@ export function AasDetailPanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const [sourceKey, setSourceKey] = useState<string | null>(null);
+  const sourcesVersion = useAasSourcesVersion();
+
   useEffect(() => {
-    if (!state.open || !state.aasId) { setParsed(null); setIndexEntry(null); return; }
+    if (!state.open || !state.aasId) { setParsed(null); setIndexEntry(null); setSourceKey(null); return; }
 
     setLoading(true);
     setError('');
     let cancelled = false;
 
-    getIndexEntry(state.aasId)
-      .then((entry) => { if (!cancelled) setIndexEntry(entry ?? null); })
-      .catch(() => { /* index unavailable — skip demo banner */ });
-
-    loadAasxById(state.aasId)
-      .then((result) => { if (!cancelled) { setParsed(result); setLoading(false); } })
-      .catch((err) => { if (!cancelled) { setError(err instanceof Error ? err.message : String(err)); setLoading(false); } });
+    loadActiveAas(state.aasId, () => cancelled, {
+      onEntry: (entry) => setIndexEntry(entry),
+      onDetail: (result, source) => {
+        setParsed(result);
+        setSourceKey(source.key);
+        setLoading(false);
+        applyAasPdfLinks(_activeViewer, state.aasId, result.documents, source.key);
+      },
+      onError: (message) => { setError(message); setLoading(false); },
+    });
 
     return () => { cancelled = true; };
-  }, [state.open, state.aasId]);
+  }, [state.open, state.aasId, sourcesVersion]);
 
   const headerText = state.description
+    || indexEntry?.productName
     || parsed?.nameplate.find(p => p.label === 'Manufacturer Product Designation')?.value
     || parsed?.idShort
+    || indexEntry?.idShort
     || state.aasId;
 
   return (
@@ -861,7 +936,7 @@ export function AasDetailPanel() {
                 {parsed.documents.map((doc, i) => (
                   <Box
                     key={`doc-${i}`}
-                    onClick={() => openPdfViewer(doc.title, { type: 'blob', aasId: state.aasId, zipPath: doc.zipPath })}
+                    onClick={() => openPdfViewer(doc.title, { type: 'blob', aasId: state.aasId, zipPath: doc.zipPath, ...(sourceKey ? { sourceKey } : {}) })}
                     sx={{
                       display: 'flex', alignItems: 'center', gap: 1, py: 0.5, px: 0.5,
                       cursor: 'pointer', borderRadius: 0.5,

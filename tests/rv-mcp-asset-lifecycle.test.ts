@@ -306,22 +306,23 @@ describe('plan-736 F7 — the MCP document row names its folder, not a section',
     expect(folderFields('knowledge/Sheet.pdf').folder).toBe('knowledge');
   });
 
-  it('the deprecated `section` alias carries the IDENTICAL value as `folder`', () => {
-    // The alias exists so an agent prompt written against the old field keeps
-    // working for one release. Two fields that are meant to be one value must
-    // never be able to drift, which is what this pins.
+  it('the deprecated `section` alias is GONE (plan-744 F9)', () => {
+    // It carried the identical value as `folder` for one release, which is
+    // exactly why it could go: nothing an agent can read changes, only the
+    // suggestion that the two were different questions. `rg` found no consumer
+    // outside this repo before it was removed — not in CONNECT's C#, not in
+    // `unity_mcp_server.py`.
     for (const path of [
       'models/Press.glb', 'library/Custom/Belt.glb', 'scenes/Line.scene.glb',
       'cad/Imported.step', 'Root.glb', '', 'a/b/c/d.glb',
     ]) {
-      const row = folderFields(path);
-      expect(row.section, path).toBe(row.folder);
+      expect(Object.keys(folderFields(path)), path).toEqual(['folder']);
     }
   });
 
   it('a non-string path is the root, never a crash', () => {
     for (const bad of [null, undefined, 42, {}, []]) {
-      expect(folderFields(bad)).toEqual({ folder: '', section: '' });
+      expect(folderFields(bad)).toEqual({ folder: '' });
     }
   });
 });

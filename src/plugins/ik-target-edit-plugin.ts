@@ -57,6 +57,7 @@ import type { RVDrive } from '../core/engine/rv-drive';
 import type { RVIKTarget } from '../core/engine/rv-ik-target';
 import { isRef, type RVIKPath } from '../core/engine/rv-ik-path';
 import type { ComponentRef } from '../core/engine/rv-node-registry';
+import { assetRelativePath } from '../core/engine/rv-reference-resolver';
 import { ikEditStore, type IKEditController, type IKEditValues, type IKEditActive, type PoseField } from '../core/hmi/ik-edit-store';
 import { popoverStore } from '../core/hmi/popover-store';
 import { persistFieldOp } from '../core/hmi/scene/scene-field-ops';
@@ -1003,7 +1004,11 @@ export class IKTargetEditPlugin implements RVViewerPlugin {
     if (!ikNodePath) return;
     const insertAt = where === 'before' ? idx : idx + 1;
     const nextPath = [...rawPath];
-    nextPath.splice(insertAt, 0, { type: 'ComponentReference', path: nodePath });
+    // plan-757 D12: written ASSET-RELATIVE to the IKPath's own asset (the
+    // enclosing reference scope), read tolerantly — the same file then works
+    // as a document and as a placement.
+    const relativeTarget = assetRelativePath(nodePath, reg.enclosingScope(c.ikPath.node));
+    nextPath.splice(insertAt, 0, { type: 'ComponentReference', path: relativeTarget });
 
     // Order matters: setField(Path) first so addNode's rebuildIKPaths sees the ref.
     void store.withTransaction(where === 'before' ? 'Insert path point' : 'Add path point', async () => {

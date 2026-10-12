@@ -67,7 +67,10 @@ function mockViewer(): RVViewer {
 function mockPlugin() {
   const prefetch = vi.fn();
   const plugin = {
-    modelCache: { prefetch },
+    // The panel warms a card through the plugin, which routes it to the viewer's
+    // placement instancer under its ONE key derivation (plan-753): a url entry
+    // is a decode-only warm-up (`bake: false`).
+    prefetchEntry: prefetch,
     store: { setPlacementMode: vi.fn() },
     setDragEntry: vi.fn(),
     saveThumbnail: vi.fn(async () => null),
@@ -121,7 +124,7 @@ describe('plan-371 T9 — library hover-intent prefetch', () => {
 
     await sleep(PAST_INTENT_MS);
     expect(prefetch).toHaveBeenCalledTimes(1);
-    expect(prefetch).toHaveBeenCalledWith(GLB_URL);
+    expect(prefetch).toHaveBeenCalledWith(GLB_ENTRY, { bake: false });
   });
 
   it('prefetches immediately on pointerdown (the touch stand-in for hover)', () => {
@@ -132,7 +135,7 @@ describe('plan-371 T9 — library hover-intent prefetch', () => {
     // No wait: a touch user gets no hover phase at all, so the tap itself has
     // to start the warm-up if it is to win any of the decode race.
     expect(prefetch).toHaveBeenCalledTimes(1);
-    expect(prefetch).toHaveBeenCalledWith(GLB_URL);
+    expect(prefetch).toHaveBeenCalledWith(GLB_ENTRY, { bake: false });
   });
 
   it('does not double-fire when a rested hover is followed by pointerdown', async () => {

@@ -18,6 +18,7 @@ import { fieldRendererRegistry, type FieldRendererProps } from './rv-field-rende
 import { persistFieldOp } from './scene/scene-field-ops';
 import type { ComponentRef } from '../engine/rv-node-registry';
 import type { RVIKPath } from '../engine/rv-ik-path';
+import { EMPTY_SNAPSHOT } from '../engine/rv-selection-manager';
 
 function lastSeg(p: string): string {
   const i = p.lastIndexOf('/');
@@ -97,8 +98,7 @@ function IKPathTargetsRenderer({ value, fieldName, nodePath, viewer }: FieldRend
 
 // Stable no-op store fns for when viewer is null (keeps hook order stable).
 const noopSubscribe = () => () => {};
-const EMPTY = Object.freeze({ selectedPaths: Object.freeze([]) as ReadonlyArray<string>, primaryPath: null });
-const emptySnapshot = () => EMPTY;
+const emptySnapshot = () => EMPTY_SNAPSHOT;
 
 // ── Self-registration ──
 fieldRendererRegistry.register({

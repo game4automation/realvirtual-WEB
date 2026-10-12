@@ -68,31 +68,26 @@ describe('migrate-delivery-config', () => {
   it('writes nothing on a dry run', () => {
     const root = fixture({ mauser3dhmi: LEGACY });
     const result = migrateDeliveryConfig(root, 'mauser3dhmi', { slug: 'mauser' });
-    expect(result.actions.map(action => action.status)).toEqual(['created', 'created', 'created']);
+    expect(result.actions.map(action => action.status)).toEqual(['created', 'created']);
     expect(existsSync(join(root, 'customers', 'mauser.json'))).toBe(false);
     expect(existsSync(join(root, 'customers', '.gitignore'))).toBe(false);
   });
 
-  it('moves the secret values out of the register and into the secrets file', () => {
+  it('writes every value into the entry and no sidecar at all', () => {
     const root = fixture({ mauser3dhmi: LEGACY });
     migrateDeliveryConfig(root, 'mauser3dhmi', { slug: 'mauser', apply: true });
 
-    const registerText = readFileSync(join(root, 'customers', 'mauser.json'), 'utf8');
-    expect(registerText).not.toContain(syntheticLicenceKey());
-    expect(registerText).not.toContain(syntheticApiKey());
-    expect(registerText).not.toContain('api.example.invalid');
-
-    const secrets = JSON.parse(readFileSync(join(root, 'customers', 'mauser.secrets.json'), 'utf8'));
-    expect(secrets).toEqual({
-      connectLicenseKey: syntheticLicenceKey(),
+    const customer = loadCustomer(root, 'mauser');
+    expect(customer.licensing?.connect).toEqual({ issuer: 'portal', key: syntheticLicenceKey() });
+    expect(customer.inference).toEqual({
       requestyApiKey: syntheticApiKey(),
       requestyBaseUrl: 'https://api.example.invalid/v1',
     });
+    // The sidecar mechanism is gone (2026-09-13), so nothing may appear beside
+    // the entry — a file written "just in case" is a second place to keep in sync.
+    expect(existsSync(join(root, 'customers', 'mauser.secrets.json'))).toBe(false);
+    expect(customer.secretsRef).toBeUndefined();
 
-    // The register keeps only the reference, and the loader accepts the result.
-    const customer = loadCustomer(root, 'mauser');
-    expect(customer.licensing?.connect).toEqual({ issuer: 'portal', keyRef: 'connectLicenseKey' });
-    expect(customer.secretsRef).toBe('customers/mauser.secrets.json');
     expect(customer.delivery.projects).toEqual(['mauser3dhmi']);
     expect(customer.forgejo).toEqual({
       org: 'rv-mauser', repo: 'rv-project-mauser', team: 'members', permission: 'write',

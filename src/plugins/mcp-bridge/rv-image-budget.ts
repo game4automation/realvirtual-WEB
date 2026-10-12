@@ -56,14 +56,23 @@ export const IMAGE_PAYLOAD_BUDGET_BYTES = WS_ENVELOPE_BUDGET_BYTES - ENVELOPE_RE
 
 /**
  * Long-edge guard. Above every dimension the capture paths legitimately produce
- * (screenshot 1400, burst montage width 1600, analyze mosaic 2048×2096), so it does
- * not alter normal output — it exists for the unbounded cases, e.g. a burst montage
- * of portrait crops whose HEIGHT the montage formula does not cap.
+ * (screenshot 1400, burst montage width 1600, analyze mosaic 2048×2096, ortho
+ * mosaic 3072×2048 at the 1024 cell floor), so it does not alter normal output —
+ * it exists for the unbounded cases, e.g. a burst montage of portrait crops whose
+ * HEIGHT the montage formula does not cap.
+ *
+ * Raised from 2400 on 2026-09-14. `web_view_ortho` cells now start at 1024 px, so
+ * a three-wide sheet is 3072 px WIDE BY CONTRACT; leaving the guard at 2400 turned
+ * it from a safety net into a silent downscale of normal output, which made the
+ * tool's `size` parameter a no-op again. The real ceiling was never this number
+ * anyway — it is {@link WS_ENVELOPE_BUDGET_BYTES}, still enforced by the ladder
+ * below, which downscales only when the bytes actually do not fit.
  */
-export const MAX_LONG_EDGE_PX = 2_400;
+export const MAX_LONG_EDGE_PX = 3_200;
 
-/** Total-pixel guard for the same reason (a 4×4 montage of tall crops). */
-export const MAX_TOTAL_PIXELS = 6_000_000;
+/** Total-pixel guard for the same reason (a 4×4 montage of tall crops). Above the
+ *  6.29 MP of a 3072×2048 ortho sheet. */
+export const MAX_TOTAL_PIXELS = 8_000_000;
 
 /** JPEG quality rungs. The first is the historical default — normal images encode once. */
 const QUALITY_LADDER = [0.72, 0.55, 0.4] as const;
@@ -216,6 +225,129 @@ export function encodeRvImageWithinBudget(
       height: lastHeight,
       attempts,
     },
+  });
+}
+
+// ─── Multi-channel envelope (plan-740 D-A1 / D-A2) ──────────────────────
+
+/** One channel on its way into the envelope. */
+export interface BudgetImageChannel {
+  canvas: BudgetImageSource;
+  mime: 'image/png' | 'image/jpeg';
+  /** Channel name — travels with channels 2..n so a client can tell them apart. */
+  channel: string;
+}
+
+/**
+ * Encode SEVERAL aligned images into ONE result envelope that fits the budget.
+ *
+ * THE SHAPE (D-A1). Channel 1 is the ordinary `__rvImage` — carrying the whole
+ * sidecar as its extra fields, exactly as every single-image tool does — and
+ * channels 2..n ride in a top-level `__rvImages` array. The two are DISJOINT:
+ * an earlier draft put channel 1 in both, which meant its base64 crossed the
+ * wire twice for no gain. A bridge that has never heard of `__rvImages` shows
+ * the first image plus the complete sidecar, which is a degraded answer rather
+ * than a broken one — and `channels[]` in the sidecar names what should have
+ * arrived, so the agent can SEE that it lost some.
+ *
+ * THE LADDER (D-A2). The budget is measured on `JSON.stringify` of the WHOLE
+ * envelope, because that is what goes on the wire — budgeting each image
+ * separately would pass five times and blow the frame once. Every channel moves
+ * down the same rung together: the images are pixel-aligned by construction
+ * (one pose, one size) and a per-channel scale would break the one property
+ * that makes a multi-channel answer worth having.
+ *
+ * PNG channels (idmask, edges) keep their format — a lossy ID mask is not an ID
+ * mask, and JPEG ringing on a 1 px line drawing erases the lines. When EVERY
+ * channel is PNG the quality rungs do nothing at all, so the ladder skips
+ * straight to scaling (review finding S9).
+ */
+export function encodeRvImagesWithinBudget(
+  channels: readonly BudgetImageChannel[],
+  extra?: Record<string, unknown>,
+  options: ImageBudgetOptions = {},
+): string {
+  if (channels.length === 0) return JSON.stringify({ error: 'No image channels to encode' });
+  const budget = options.budgetBytes ?? IMAGE_PAYLOAD_BUDGET_BYTES;
+  const resize = options.resize ?? resizeOnCanvas;
+  const maxLongEdge = options.maxLongEdgePx ?? MAX_LONG_EDGE_PX;
+  const maxPixels = options.maxTotalPixels ?? MAX_TOTAL_PIXELS;
+
+  // Dimension guard on the FIRST channel; all channels share a size, so one
+  // scale factor keeps them aligned.
+  const head = channels[0].canvas;
+  const guard = guardScale(head.width, head.height, maxLongEdge, maxPixels);
+  let bases = channels.map((c) => c.canvas);
+  if (guard < 1) {
+    const scaled = bases.map((c) =>
+      resize(c, Math.max(1, Math.round(c.width * guard)), Math.max(1, Math.round(c.height * guard))));
+    if (scaled.every((s): s is BudgetImageSource => s !== null)) bases = scaled;
+  }
+
+  const allPng = channels.every((c) => c.mime === 'image/png');
+  const qualities = allPng ? [QUALITY_LADDER[0]] : QUALITY_LADDER;
+
+  let attempts = 0;
+  let lastBytes = 0;
+  let lastWidth = bases[0].width;
+  let lastHeight = bases[0].height;
+
+  for (const scale of SCALE_LADDER) {
+    let rungs: BudgetImageSource[] = bases;
+    if (scale !== 1) {
+      const scaled = bases.map((c) =>
+        resize(c, Math.max(1, Math.round(c.width * scale)), Math.max(1, Math.round(c.height * scale))));
+      if (!scaled.every((s): s is BudgetImageSource => s !== null)) break;
+      rungs = scaled as BudgetImageSource[];
+    }
+    for (const quality of qualities) {
+      attempts++;
+      const payload = encodeMultiPayload(channels, rungs, quality, extra);
+      const over = exceedsUtf8Budget(payload, budget);
+      if (over === null) return payload;
+      lastBytes = over;
+      lastWidth = rungs[0].width;
+      lastHeight = rungs[0].height;
+    }
+  }
+
+  return JSON.stringify({
+    error:
+      `Image result does not fit the ${budget} byte bridge budget ` +
+      `(${channels.length} channel(s); smallest attempt: ${lastWidth}x${lastHeight} ` +
+      `= at least ${lastBytes} bytes, ${attempts} attempts). ` +
+      'Retry with fewer channels or a smaller size.',
+    imageBudgetExceeded: {
+      budgetBytes: budget,
+      bytesAtLeast: lastBytes,
+      width: lastWidth,
+      height: lastHeight,
+      attempts,
+      channels: channels.map((c) => c.channel),
+    },
+  });
+}
+
+/** Serialize the disjoint `__rvImage` + `__rvImages` envelope at one rung. */
+function encodeMultiPayload(
+  channels: readonly BudgetImageChannel[],
+  rungs: readonly BudgetImageSource[],
+  quality: number,
+  extra?: Record<string, unknown>,
+): string {
+  const block = (i: number): { data: string; mimeType: string; width: number; height: number } => {
+    const src = rungs[i];
+    const mime = channels[i].mime;
+    // `toDataURL` ignores `quality` for PNG; passing it is harmless and keeps
+    // the call shape identical, which is what the ladder spy asserts on.
+    const data = src.toDataURL(mime, quality).split(',')[1] ?? '';
+    return { data, mimeType: mime, width: src.width, height: src.height };
+  };
+  const first = block(0);
+  const rest = channels.slice(1).map((c, i) => ({ ...block(i + 1), channel: c.channel }));
+  return JSON.stringify({
+    __rvImage: { ...first, ...extra },
+    ...(rest.length > 0 ? { __rvImages: rest } : {}),
   });
 }
 

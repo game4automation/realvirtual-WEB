@@ -31,6 +31,8 @@ import {
 } from '../src/core/hmi/projects/ProjectFolderContents';
 import {
   buildProjectTree,
+  canMoveInTree,
+  findTreeNode,
   folderContents,
   folderSubfolders,
   nearestFolderPath,
@@ -111,6 +113,16 @@ function Screen({ roots: input = [PROJECT_ROOT], filter = NO_FILTER, onOpen, onM
       name: node.name,
       holdsSomething: node.hasContent ?? node.children.length > 0,
       onOpen: () => setSelectedPath(node.path!),
+      // The tile as a drop target, wired as the host wires it: the tree's
+      // verdict on drag-over, the tree's move on drop.
+      acceptsDrop: () => !!cardDragPath && canMoveInTree(roots, cardDragPath, node.path!).ok,
+      onDrop: () => {
+        if (!cardDragPath) return;
+        const verdict = canMoveInTree(roots, cardDragPath, node.path!);
+        if (!verdict.ok) return;
+        const moved = findTreeNode(roots, cardDragPath);
+        if (moved) onMove?.(moved, verdict.to);
+      },
     }));
   const cards: FolderCardModel[] = rows
     .filter(row => matchesDocumentFilter(row, filter))
@@ -302,5 +314,54 @@ describe('Lauf 13 — dragging a card onto a folder', () => {
     clickFolder('cat_cloud/conveyors');
     const card = document.querySelector('[data-card-path$="Belt.glb"]')!;
     expect(card.getAttribute('draggable')).toBeNull();
+  });
+});
+
+// ─── 5. Card onto a folder TILE moves too (customer feedback 2026-09-30) ──
+
+/** A project whose `parts/` holds a card AND a subfolder tile side by side. */
+const NESTED_ROOT: ProjectTreeRootInput = {
+  id: 'proj_nested',
+  name: 'Nested',
+  kind: 'project',
+  writable: true,
+  files: [
+    { path: 'parts/Roll2m.glb', documentId: 'doc_roll' },
+    { path: 'parts/spares/Bearing.glb', documentId: 'doc_bearing' },
+  ],
+};
+
+describe('dragging a card onto a folder tile in the grid', () => {
+  function dragCardOntoTile(cardSuffix: string, tilePath: string): { tile: Element; dataTransfer: DataTransfer } {
+    const card = document.querySelector(`[data-card-path$="${cardSuffix}"]`)!;
+    const tile = document.querySelector(`[data-folder-tile="${tilePath}"]`)!;
+    const dataTransfer = new DataTransfer();
+    fireEvent.dragStart(card, { dataTransfer });
+    fireEvent.dragOver(tile, { dataTransfer });
+    fireEvent.drop(tile, { dataTransfer });
+    return { tile, dataTransfer };
+  }
+
+  it('moves the card into the tile\'s folder — same verdict, same move as the tree row', () => {
+    const onMove = vi.fn();
+    render(<Screen roots={[NESTED_ROOT]} onMove={onMove} />);
+    clickFolder('proj_nested/parts');
+    expect(document.querySelector('[data-folder-tile="proj_nested/parts/spares"]')).not.toBeNull();
+
+    dragCardOntoTile('Roll2m.glb', 'proj_nested/parts/spares');
+
+    expect(onMove).toHaveBeenCalledTimes(1);
+    expect(onMove.mock.calls[0][0].documentId).toBe('doc_roll');
+    expect(onMove.mock.calls[0][1]).toBe('parts/spares/Roll2m.glb');
+  });
+
+  it('a drop with nothing dragged does nothing', () => {
+    const onMove = vi.fn();
+    render(<Screen roots={[NESTED_ROOT]} onMove={onMove} />);
+    clickFolder('proj_nested/parts');
+    const tile = document.querySelector('[data-folder-tile="proj_nested/parts/spares"]')!;
+    fireEvent.dragOver(tile, { dataTransfer: new DataTransfer() });
+    fireEvent.drop(tile, { dataTransfer: new DataTransfer() });
+    expect(onMove).not.toHaveBeenCalled();
   });
 });

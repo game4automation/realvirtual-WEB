@@ -80,19 +80,19 @@ describe('defineLibraryComponent — badge registration', () => {
   it('registers the default STANDARD_BADGE capability under <Type>Behavior', () => {
     defineLibraryComponent<FooLocal>(makeDef());
     const caps = getCapabilities('FooBehavior');
-    expect(caps.hierarchyVisible).toBe(true);
+    expect(caps.ui.hidden).toBe(true);
     // plan-200 C1: the stamped marker section is hidden in the inspector; the
-    // hierarchy badge and the 'Behavior' filterLabel gate remain.
-    expect(caps.inspectorVisible).toBe(false);
-    expect(caps.badgeColor).toBe('#7e57c2');
-    expect(caps.filterLabel).toBe('Behavior');
+    // hierarchy badge and the 'Behavior' ui.filter gate remain.
+    expect(caps.pick).toBe('none');
+    expect(caps.ui.badge).toBe('#7e57c2');
+    expect(caps.ui.filter).toBe('Behavior');
   });
 
   it('honours an explicit opts.capabilities override', () => {
     defineLibraryComponent<FooLocal>(makeDef(), {
-      capabilities: { badgeColor: '#112233', filterLabel: 'Custom', hierarchyVisible: true, inspectorVisible: true },
+      capabilities: { ui: { badge: '#112233', filter: 'Custom' } },
     });
-    expect(getCapabilities('FooBehavior').badgeColor).toBe('#112233');
+    expect(getCapabilities('FooBehavior').ui.badge).toBe('#112233');
   });
 
   it('registers the badge exactly once per type — no double-warn on re-define', () => {

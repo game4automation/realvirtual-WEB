@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   HANDLE_KEY_WORKFOLDER,
-  HANDLE_KEY_WORKSPACE,
+  HANDLE_KEY_NEW_PROJECT_PARENT,
   deleteStoredHandle,
   ensureHandlePermission,
   getFolderHandle,
@@ -45,7 +45,7 @@ const stub = (name: string) => ({ name, kind: 'directory' }) as unknown as FileS
 
 const KEYS = [
   HANDLE_KEY_WORKFOLDER,
-  HANDLE_KEY_WORKSPACE,
+  HANDLE_KEY_NEW_PROJECT_PARENT,
   projectHandleKey('prj_a'),
   projectHandleKey('prj_b'),
 ];
@@ -68,10 +68,10 @@ describe('handle store — multi-key', () => {
 
   it('two handles under two keys survive each other', async () => {
     await putHandle(stub('work'), HANDLE_KEY_WORKFOLDER);
-    await putHandle(stub('space'), HANDLE_KEY_WORKSPACE);
+    await putHandle(stub('new-project-parent'), HANDLE_KEY_NEW_PROJECT_PARENT);
 
     expect((await getHandle(HANDLE_KEY_WORKFOLDER))?.name).toBe('work');
-    expect((await getHandle(HANDLE_KEY_WORKSPACE))?.name).toBe('space');
+    expect((await getHandle(HANDLE_KEY_NEW_PROJECT_PARENT))?.name).toBe('new-project-parent');
   });
 
   it('a project pick does NOT clobber the working folder (the bug this prevents)', async () => {
@@ -105,9 +105,9 @@ describe('handle store — multi-key', () => {
   });
 
   it('overwrites in place when the same key is reused', async () => {
-    await putHandle(stub('first'), HANDLE_KEY_WORKSPACE);
-    await putHandle(stub('second'), HANDLE_KEY_WORKSPACE);
-    expect((await getHandle(HANDLE_KEY_WORKSPACE))?.name).toBe('second');
+    await putHandle(stub('first'), HANDLE_KEY_NEW_PROJECT_PARENT);
+    await putHandle(stub('second'), HANDLE_KEY_NEW_PROJECT_PARENT);
+    expect((await getHandle(HANDLE_KEY_NEW_PROJECT_PARENT))?.name).toBe('second');
   });
 
   it('lists the occupied slots', async () => {

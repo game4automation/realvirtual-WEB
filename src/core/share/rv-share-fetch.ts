@@ -43,7 +43,23 @@ export type ShareFetchErrorKind =
   /** Caller-supplied signal aborted the transfer. */
   | 'aborted'
   /** Anything else. */
-  | 'network';
+  | 'network'
+  /** An RVE1 envelope, but this edition has no decryptor installed (plan-560 F5). */
+  | 'encrypted-unsupported'
+  /** An RVE1 envelope, but the link carries no usable `#k=` secret (F6). */
+  | 'link-incomplete'
+  /** The visitor cancelled the password prompt (F7). */
+  | 'decrypt-cancelled'
+  /** The envelope is malformed, tampered with, or exceeds the key-derivation limit. */
+  | 'decrypt-failed';
+
+/** Card sentences of the encrypted-link kinds (plan-560 F5–F7), one place for boot and tests. */
+export const SHARE_DECRYPT_MESSAGES = {
+  'encrypted-unsupported': 'This model is encrypted and cannot be opened in this edition.',
+  'link-incomplete': 'The link is incomplete (missing key).',
+  'decrypt-cancelled': 'Opening was cancelled.',
+  'decrypt-failed': 'The file is damaged or was tampered with.',
+} as const;
 
 /**
  * Why a `410` came back, when the server said (F10a).

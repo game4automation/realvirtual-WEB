@@ -13,6 +13,11 @@
  *
  * `PlcDiagnostic` is intentionally a structural duplicate of the private
  * ST-compiler diagnostic type so this file has zero private imports.
+ *
+ * plan-566 adds two optional seams for the signal cross-reference list:
+ * `PlcRuntime.getSignalUsages()` (where ST programs use a signal) and
+ * `PlcNavigation` (open the PLC editor at a line). Without the private PLC
+ * both are absent and PLC usages simply do not appear / are not clickable.
  */
 
 /** Run state of the virtual PLC. */
@@ -28,6 +33,16 @@ export interface PlcDiagnostic {
   column: number;
   /** Length of the offending source range in characters (when known). */
   length?: number;
+}
+
+/** One IF / CASE branch of the deployed program and whether it ran in the last scan. */
+export interface PlcBranchActivity {
+  /** 1-based line of the branch header (IF / ELSIF / ELSE / CASE label). */
+  startLine: number;
+  /** 1-based last line of the branch body. */
+  endLine: number;
+  /** True when the branch was entered during the last scan. */
+  active: boolean;
 }
 
 /**
@@ -60,23 +75,142 @@ export interface PlcControl {
   /** Human-readable description of the last error, or null. */
   readonly lastError: string | null;
   /**
-   * Online values for the watch panel: all VAR_EXTERNAL values as of the last
-   * scan plus function-block outputs keyed as `<instance>.<output>`
-   * (e.g. `tDelay.Q`, `tDelay.ET`).
+   * Online values for the watch panel: all VAR_EXTERNAL values (plus plain
+   * VAR values while the online view is on) as of the last scan and function-block outputs keyed as
+   * `<instance>.<output>` (e.g. `tDelay.Q`, `tDelay.ET`).
    */
   watch(): ReadonlyMap<string, boolean | number>;
+  /**
+   * Source of the deployed program (null before a successful deploy). The
+   * online view annotates the editor only while its buffer equals this source.
+   */
+  readonly deployedSource?: string | null;
+  /**
+   * Online view on/off (the PLC editor turns it on while open). Only then do
+   * scans report VAR values and branch activity — off costs nothing per scan.
+   */
+  setOnlineView?(enabled: boolean): void;
+  /** IF / CASE branches with their last-scan activity (empty before the first scan and while the online view is off). */
+  branchActivity?(): readonly PlcBranchActivity[];
+}
+
+/** One program of a virtual PLC with several programs. */
+export interface PlcProgramInfo {
+  /** Scene path of the node carrying the PLCProgram ('' = editor buffer without a node yet). */
+  path: string;
+  name: string;
+  /** Scan order: programs run one after another in ascending order within one tick. */
+  order: number;
+  /** True for the program the editor and the single-program API (getPlcControl) address. */
+  selected: boolean;
+  state: PlcRunState;
+  scanTimeMs: number;
+  lastError: string | null;
+}
+
+/** How an ST program line touches a signal (plan-566). */
+export type PlcSignalUsageAccess = 'declaration' | 'read' | 'write' | 'read-write';
+
+/**
+ * One place an ST program uses a signal (plan-566): the VAR_EXTERNAL
+ * declaration or a body line that reads and/or writes the bound identifier.
+ * Structural duplicate of the private scanner result — no private imports here.
+ */
+export interface PlcSignalUsage {
+  /** Scene path of the node carrying the PLCProgram. */
+  programPath: string;
+  programName: string;
+  /** Signal name the identifier binds to (the `@signal` pragma, else the identifier). */
+  signal: string;
+  /** The ST identifier as declared. */
+  identifier: string;
+  /** 1-based source line. */
+  line: number;
+  access: PlcSignalUsageAccess;
+  /** True when this line assigns the signal (`write` / `read-write`). */
+  written?: boolean;
+  /** True when the PLC editor holds unsaved changes for this program — the line may be stale. */
+  unsaved?: boolean;
+}
+
+/**
+ * The virtual PLC with all its programs (one per PLCProgram node). Programs are
+ * scanned in order within the same tick and exchange data only through signals.
+ */
+export interface PlcRuntime {
+  /** All programs in scan order. */
+  programs(): PlcProgramInfo[];
+  /** A program by scene path or name (case-insensitive), or null. */
+  program(pathOrName: string): PlcControl | null;
+  /** Outputs written by more than one program (bad practice on a real PLC too). */
+  conflicts(): { signal: string; programs: string[] }[];
+  /**
+   * Every signal usage of every PLCProgram of the scene, read from the current
+   * `PLCProgram.Code` data (not from the deployed program) — inactive and
+   * uncompilable programs included (plan-566). Optional: older runtimes lack it.
+   */
+  getSignalUsages?(): PlcSignalUsage[];
+}
+
+let currentPlcRuntime: PlcRuntime | null = null;
+
+/** Registers the multi-program runtime (pass null to unregister). Called by the private runtime. */
+export function registerPlcRuntime(runtime: PlcRuntime | null): void {
+  currentPlcRuntime = runtime;
+  notifyPlcSignalUsagesChanged();
+}
+
+// ─── Signal usages: change channel + editor navigation (plan-566) ──────────
+
+const usageListeners = new Set<() => void>();
+
+/** Subscribe to "the PLC signal usages may have changed"; returns the unsubscribe. */
+export function subscribePlcSignalUsages(cb: () => void): () => void {
+  usageListeners.add(cb);
+  return () => { usageListeners.delete(cb); };
+}
+
+/** Announce that the PLC signal usages changed (runtime / navigation registered, editor buffer dirty state flipped). */
+export function notifyPlcSignalUsagesChanged(): void {
+  for (const cb of [...usageListeners]) {
+    try { cb(); } catch (e) { console.warn('[plc-control] usage listener failed:', e); }
+  }
+}
+
+/** Opens the PLC editor at a program line. Registered by the private PLC plugin. */
+export interface PlcNavigation {
+  /** Opens `programPath` in the PLC editor, scrolls to `line` (1-based) and highlights it. */
+  revealLine(programPath: string, line: number): void;
+}
+
+let currentPlcNavigation: PlcNavigation | null = null;
+
+/** Registers the PLC editor navigation (pass null to unregister, e.g. on plugin dispose). */
+export function registerPlcNavigation(navigation: PlcNavigation | null): void {
+  currentPlcNavigation = navigation;
+  notifyPlcSignalUsagesChanged();
+}
+
+/** The PLC editor navigation, or null without the PLC plugin — PLC usages are then not clickable. */
+export function getPlcNavigation(): PlcNavigation | null {
+  return currentPlcNavigation;
+}
+
+/** The multi-program runtime, or null when no PLC runtime is registered. */
+export function getPlcRuntime(): PlcRuntime | null {
+  return currentPlcRuntime;
 }
 
 // ─── Mini registry (private runner registers, public UI/MCP read) ──────────
 
 let currentPlcControl: PlcControl | null = null;
 
-/** Registers the active PLC control (pass null to unregister). Called by the private runtime. */
+/** Registers the active PLC control — the SELECTED program (pass null to unregister). Called by the private runtime. */
 export function registerPlcControl(control: PlcControl | null): void {
   currentPlcControl = control;
 }
 
-/** The active PLC control, or null when no PLC runtime is registered. */
+/** The selected program's control, or null when no PLC runtime is registered. */
 export function getPlcControl(): PlcControl | null {
   return currentPlcControl;
 }

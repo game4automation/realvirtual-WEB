@@ -117,13 +117,13 @@ function setup() {
 describe('Conveyor behavior — hierarchy badge', () => {
   it('registers a ConveyorBehavior badge capability (hierarchy badge; inspector marker hidden)', () => {
     const caps = getCapabilities('ConveyorBehavior');
-    expect(caps.hierarchyVisible).toBe(true);
+    expect(caps.ui.hidden).toBe(true);
     // plan-200 C1: the stamped marker section is hidden in the inspector (the
     // behavior is shown via the design-consistent States+Hardware section); the
-    // hierarchy badge + the Behavior filterLabel gate stay.
-    expect(caps.inspectorVisible).toBe(false);
-    expect(caps.filterLabel).toBe('Behavior');
-    expect(caps.badgeColor).toBe('#7e57c2');
+    // hierarchy badge + the Behavior ui.filter gate stay.
+    expect(caps.pick).toBe('none');
+    expect(caps.ui.filter).toBe('Behavior');
+    expect(caps.ui.badge).toBe('#7e57c2');
   });
 
   it('stamps a ConveyorBehavior marker on the object root', () => {

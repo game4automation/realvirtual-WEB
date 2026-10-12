@@ -35,21 +35,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Object3D } from 'three';
-import { EventEmitter } from '../../src/core/rv-events';
-import { ContextMenuStore } from '../../src/core/hmi/context-menu-store';
-import {
-  createBindContext,
-  applyKinematicsSpec,
-  iterateFixedUpdate,
-  type BindContextHost,
-  type BindContextHandle,
-  type KinematicsSpec,
-  type RVBindContext,
-} from '../../src/core/behavior-runtime';
-import { createSelf, type MaterialFlowSelf } from '../../src/core/material-flow/material-flow-self';
+import { iterateFixedUpdate, type BindContextHandle } from '../../src/core/behavior-runtime';
 import type { MaterialFlowDefinition } from '../../src/core/material-flow/define-material-flow';
-import { DESRunner } from '@rv-private/plugins/des/des-runner';
-import { _resetDesHookCache } from '@rv-private/plugins/des/des-hook-adapter';
 import { parsePathExtras } from '../../src/core/engine/rv-path';
 import { getDefaultPathNetwork } from '../../src/core/engine/rv-path-network';
 import { getDefaultSpacingController } from '../../src/core/engine/rv-spacing-controller';
@@ -59,13 +46,17 @@ import { getDefaultAgvFleet } from '../../src/core/engine/rv-agv-fleet';
 import { getDefaultPathDockRegistry } from '../../src/core/engine/rv-path-dock';
 import { clearLiveControl } from '../../src/core/engine/rv-live-control';
 import type { RVViewer } from '../../src/core/rv-viewer';
-import AgvBehavior, { AgvFlow } from '../../src/behaviors/Agv';
+import { AgvFlow } from '../../src/behaviors/Agv';
 // The DES test project's own fleet plugin — §9.4's second half is a change in
 // THAT file, so the test has to exercise the real module, not a copy of it.
 import {
   registerModelPlugins,
   unregisterModelPlugins,
 } from '@rv-projects/DiscreteEventSimulation/plugins/index';
+import { DESRunner } from '@rv-private/plugins/des/des-runner';
+import { makeHost, makeAgvRoot as makeAgv, bindContinuous, bindDes, clearShared, sig,
+  type AgvTestHost as Host,
+} from '../helpers/agv-harness';
 
 const AgvDef = AgvFlow as unknown as MaterialFlowDefinition;
 const TICK = 1 / 60;
@@ -84,72 +75,6 @@ const LAP = ['PathSouth', 'PathEast', 'PathNorth', 'PathWest', 'PathSouth'] as c
 const MAX_TICKS = 9000;
 
 // ─── Harness (agv-task-control / agv-des-parity pattern) ────────────────────
-
-interface Host extends BindContextHost {
-  values: Map<string, boolean | number>;
-}
-
-function makeHost(): Host {
-  const subs = new Map<string, Set<(v: boolean | number) => void>>();
-  const values = new Map<string, boolean | number>();
-  const events = new EventEmitter<Record<string, unknown>>();
-  return {
-    values,
-    signalStore: {
-      get: (n: string) => values.get(n),
-      set: (n: string, v: boolean | number) => { values.set(n, v); subs.get(n)?.forEach((cb) => cb(v)); },
-      subscribe: (n: string, cb: (v: boolean | number) => void) => {
-        let s = subs.get(n); if (!s) { s = new Set(); subs.set(n, s); }
-        s.add(cb); return () => { s!.delete(cb); };
-      },
-    },
-    on: (e, cb) => events.on(e, cb as never),
-    contextMenu: new ContextMenuStore(),
-    drives: [],
-    registry: null,
-  } as Host;
-}
-
-/** An Agv root configured via rv_extras. `LayoutObject` marks it as a placed
- *  instance, which is what gives each vehicle INSTANCE-SCOPED signal names
- *  (`<name>.Agv.Run`) instead of three vehicles sharing one `Agv.Run`. */
-function makeAgv(name: string, cfg: Record<string, unknown>): Object3D {
-  const root = new Object3D();
-  root.name = name;
-  root.userData.realvirtual = { LayoutObject: { Name: name }, Agv: cfg };
-  return root;
-}
-
-function bindContinuous(root: Object3D, host: Host): BindContextHandle {
-  const accum: KinematicsSpec = {};
-  const { ctx, handle } = createBindContext(root, host, accum);
-  AgvBehavior.bind(ctx);
-  applyKinematicsSpec(root, accum);
-  return handle;
-}
-
-function makeCtx(root: Object3D, host: Host): { ctx: RVBindContext; handle: BindContextHandle } {
-  const accum: KinematicsSpec = {};
-  const { ctx, handle } = createBindContext(root, host, accum);
-  applyKinematicsSpec(root, accum);
-  return { ctx, handle };
-}
-
-/** DES instance over the same definition (agv-des-parity pattern). */
-function bindDes(runner: DESRunner, root: Object3D, host: Host): MaterialFlowSelf {
-  const { ctx } = makeCtx(root, host);
-  let adapter: { entityId: number } | null = null;
-  const self = createSelf(ctx, AgvDef, {
-    mode: 'des',
-    scheduler: runner.makeScheduler(AgvDef, () => adapter?.entityId ?? -1),
-    local: (AgvDef.state ?? AgvDef.local)?.(),
-  });
-  adapter = runner.addInstance(AgvDef, self, root);
-  return self;
-}
-
-const sig = (host: Host, agv: string, key: string): boolean | number | undefined =>
-  host.values.get(`${agv}.Agv.${key}`);
 
 // ─── The course ─────────────────────────────────────────────────────────────
 
@@ -238,17 +163,8 @@ function traceArrivals(traveler: PathTraveler, log: string[]): void {
   };
 }
 
-function clearShared(): void {
-  getDefaultPathNetwork().clear();
-  getDefaultSpacingController().clear();
-  getDefaultZoneRegistry().clear();
-  getDefaultAgvFleet().clear();
-  getDefaultPathDockRegistry().clear();
-}
-
 beforeEach(() => {
   clearShared();
-  _resetDesHookCache();
   clearLiveControl();
 });
 afterEach(() => {
@@ -401,9 +317,14 @@ describe('plan-451 §9.3 — Run=false parks the vehicle', () => {
 
     runner.start([AgvDef], { root: new Object3D() });
     expect(sig(host, 'Agv1', 'Run')).toBe(true); // asserted by setup(), inside start()
+    const start = root.position.clone();
     for (let i = 0; i < 600; i++) { runner.tick(TICK); runner.lateTick(TICK); }
 
-    expect(sig(host, 'Agv1', 'Position') as number).toBeGreaterThan(0);
+    // plan-558: one leg per PLAN — `Position` is published at the plan's own
+    // events, so after 10 s the leg is running (Moving, the root advanced)
+    // rather than a per-piece Position update.
+    expect(sig(host, 'Agv1', 'Moving')).toBe(true);
+    expect(root.position.distanceTo(start)).toBeGreaterThan(1);
     runner.dispose();
   });
 });

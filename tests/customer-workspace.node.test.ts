@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -22,6 +22,8 @@ import {
   runBuild,
   stageFilteredSourceTree,
 } from '../scripts/_workspace-lib.mjs';
+// @ts-expect-error — plan-487 cache lease helpers are not part of the declared module surface.
+import { acquireBuildCacheLease, releaseBuildCacheLease } from '../scripts/_workspace-lib.mjs';
 import { PROJECT_KINDS, knownProjectKeys } from '../scripts/_rv-guards.mjs';
 // T8 runs the REAL validator over the REAL generated manifest. Importing it in-process is the
 // form the delivery gate uses too — a child process would only give us stdout to parse.
@@ -58,6 +60,8 @@ const alwaysDeliveredDocs = [
   // And again, from the 6.3.19 release branch: doc-webviewer.md sends the reader here for the
   // path/AGV task primitive, so the delivered guide links a file the staged workspace must carry.
   'doc-path-fleet-control.md',
+  'doc-getting-started.md', 'doc-projects.md', 'doc-project-plugin-example.md',
+  'doc-embedding.md', 'doc-migration.md',
   // Moved out of CONDITIONAL_DELIVERED_DOCS by plan-739: the layout planner is statically
   // imported by src/main.ts and the multiuser connection modes live in src/core/hmi, so both
   // documents describe code every customer already receives. The gate map is now empty.
@@ -354,6 +358,34 @@ describe('customer workspace generator', () => {
     expect(readFileSync(join(coreRoot, 'node_modules', 'cache-sentinel.txt'), 'utf8')).toBe('cache-hit');
   });
 
+  it('installs the private package dependencies after a cache hit, which skips the postinstall', () => {
+    // /dev failed 2026-10-04..09: the cache restores realvirtual-web/node_modules only, so a hit
+    // left realvirtual-web-pro/node_modules (three-gpu-pathtracer) missing.
+    const { workspaceRoot, cacheRoot, state } = buildFixture();
+    const calls: string[] = [];
+    const privateDepsRunner = (root: string, core: string) => { calls.push(`${root}|${core}`); };
+    withBuildCache(cacheRoot, () => runBuild(workspaceRoot, { fast: true, npmRunner: state.runner, privateDepsRunner }));
+    expect(calls).toEqual([]); // a miss runs `npm ci`, whose postinstall does it
+
+    const hit = withBuildCache(cacheRoot, () => runBuild(workspaceRoot, {
+      fast: true, npmRunner: state.runner, privateDepsRunner,
+    })) as ReturnType<typeof runBuild> & { cacheStatus: string };
+    expect(hit.cacheStatus).toBe('hit');
+    expect(calls).toHaveLength(1);
+    expect(state.ciCalls).toBe(1);
+  });
+
+  it('the default private-deps step is a no-op without a staged private package', () => {
+    const { workspaceRoot, coreRoot, cacheRoot, state } = buildFixture();
+    withBuildCache(cacheRoot, () => runBuild(workspaceRoot, { fast: true, npmRunner: state.runner }));
+    rmSync(join(coreRoot, 'node_modules'), { recursive: true, force: true });
+    const hit = withBuildCache(cacheRoot, () => runBuild(workspaceRoot, {
+      fast: true, npmRunner: state.runner,
+    })) as ReturnType<typeof runBuild> & { cacheStatus: string };
+    expect(hit.cacheStatus).toBe('hit');
+    expect(state.buildCalls).toBe(2);
+  });
+
   it('rebuilds the fast cache when an optional pro lockfile changes', () => {
     const { workspaceRoot, coreRoot, cacheRoot, state } = buildFixture();
     const proLock = join(workspaceRoot, 'realvirtual-web-pro', 'package-lock.json');
@@ -385,6 +417,116 @@ describe('customer workspace generator', () => {
     expect(state.buildMarkers).toEqual(['ci-1', 'ci-2']);
     expect(existsSync(join(cacheRoot, 'rv-build-cache'))).toBe(false);
     expect(JSON.parse(readFileSync(join(coreRoot, 'dist', '.rv-build-provenance.json'), 'utf8')).fast).toBe(false);
+  });
+
+  // ── plan-487 9.7: the shared build cache is keyed by runtime and protected ──
+
+  it('keys the fast cache by the Node runtime, not by the lockfiles alone', () => {
+    // A local Node update changes no lockfile, but native modules in the cache were built for
+    // the old ABI — the same lockfiles under another runtime must be a different profile.
+    const { workspaceRoot, cacheRoot, state } = buildFixture();
+    withBuildCache(cacheRoot, () => runBuild(workspaceRoot, {
+      fast: true, npmRunner: state.runner, runtimeIdentity: 'node-22|abi-127|win32-x64',
+    }));
+    const result = withBuildCache(cacheRoot, () => runBuild(workspaceRoot, {
+      fast: true, npmRunner: state.runner, runtimeIdentity: 'node-24|abi-137|win32-x64',
+    })) as ReturnType<typeof runBuild> & { cacheStatus: string };
+
+    expect(result.cacheStatus).toBe('rebuild');
+    expect(state.ciCalls).toBe(2);
+    expect(readdirSync(join(cacheRoot, 'rv-build-cache'))).toHaveLength(2);
+  });
+
+  it('a restore failure in one build cannot delete the profile another build is reading', () => {
+    const a = buildFixture();
+    const b = buildFixture();
+    // Build A populates the cache, then rebuilds from it (a junction into the shared profile).
+    withBuildCache(a.cacheRoot, () => runBuild(a.workspaceRoot, { fast: true, npmRunner: a.state.runner }));
+    const profile = readdirSync(join(a.cacheRoot, 'rv-build-cache'))[0];
+    write(join(a.cacheRoot, 'rv-build-cache', profile, 'node_modules', 'cache-sentinel.txt'), 'cache-hit');
+    rmSync(join(a.coreRoot, 'node_modules'), { recursive: true, force: true });
+
+    let sentinelAfterB = '';
+    let bStatus = '';
+    const result = withBuildCache(a.cacheRoot, () => runBuild(a.workspaceRoot, {
+      fast: true,
+      npmRunner(args: string[], options: { cwd: string }) {
+        if (args.join(' ') === 'run build') {
+          // While A's Vite build runs, a second local build with the SAME profile key fails its
+          // restore. Before plan-487 it deleted the shared profile under A's feet.
+          const nested = runBuild(b.workspaceRoot, {
+            fast: true, npmRunner: b.state.runner, cacheRestore: () => null,
+          }) as ReturnType<typeof runBuild> & { cacheStatus: string };
+          bStatus = nested.cacheStatus;
+          sentinelAfterB = readFileSync(join(options.cwd, 'node_modules', 'cache-sentinel.txt'), 'utf8');
+        }
+        a.state.runner(args, options);
+      },
+    })) as ReturnType<typeof runBuild> & { cacheStatus: string };
+
+    expect(result.cacheStatus).toBe('hit');
+    expect(bStatus).toBe('rebuild');
+    expect(b.state.ciCalls).toBe(1);
+    expect(sentinelAfterB).toBe('cache-hit');
+    expect(readFileSync(join(a.cacheRoot, 'rv-build-cache', profile, 'node_modules', 'cache-sentinel.txt'), 'utf8'))
+      .toBe('cache-hit');
+  });
+
+  it('prunes aged profiles nobody reads, never one another process holds a lease on', () => {
+    const { workspaceRoot, cacheRoot, state } = buildFixture();
+    const cacheBase = join(cacheRoot, 'rv-build-cache');
+    const unread = 'a'.repeat(64);
+    const held = 'b'.repeat(64);
+    const fresh = 'c'.repeat(64);
+    for (const key of [unread, held, fresh]) write(join(cacheBase, key, 'node_modules', 'marker.txt'), key);
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    utimesSync(join(cacheBase, unread), old, old);
+    utimesSync(join(cacheBase, held), old, old);
+    const lease = acquireBuildCacheLease(cacheBase, held);
+    expect(lease).not.toBeNull();
+    try {
+      withBuildCache(cacheRoot, () => runBuild(workspaceRoot, { fast: true, npmRunner: state.runner }));
+    } finally {
+      releaseBuildCacheLease(lease);
+    }
+
+    expect(existsSync(join(cacheBase, unread))).toBe(false);
+    expect(readFileSync(join(cacheBase, held, 'node_modules', 'marker.txt'), 'utf8')).toBe(held);
+    expect(existsSync(join(cacheBase, fresh))).toBe(true);
+    expect(readdirSync(cacheBase).filter((name) => name.startsWith('.'))).toEqual([]);
+  });
+
+  it('releases its lease when the build fails', () => {
+    const { workspaceRoot, cacheRoot, state } = buildFixture();
+    expect(() => withBuildCache(cacheRoot, () => runBuild(workspaceRoot, {
+      fast: true,
+      npmRunner(args: string[], options: { cwd: string }) {
+        if (args.join(' ') === 'run build') throw new Error('vite exploded');
+        state.runner(args, options);
+      },
+    }))).toThrow(/vite exploded/);
+
+    const leases = join(cacheRoot, 'rv-build-cache.locks', 'leases');
+    const held = readdirSync(leases).flatMap((key) => readdirSync(join(leases, key)));
+    expect(held).toEqual([]);
+    expect(existsSync(join(cacheRoot, 'rv-build-cache.locks', 'writer'))).toBe(false);
+  });
+
+  it('removing a staging workspace after a cache hit leaves the shared cache intact', () => {
+    // Every deploy removes its staging tree; after a hit that tree holds a junction INTO the
+    // shared cache. The removal must unlink it, never follow it.
+    const { workspaceRoot, coreRoot, cacheRoot, state } = buildFixture();
+    withBuildCache(cacheRoot, () => runBuild(workspaceRoot, { fast: true, npmRunner: state.runner }));
+    rmSync(join(coreRoot, 'node_modules'), { recursive: true, force: true });
+    const result = withBuildCache(cacheRoot, () => runBuild(workspaceRoot, {
+      fast: true, npmRunner: state.runner,
+    })) as ReturnType<typeof runBuild> & { cacheStatus: string };
+    expect(result.cacheStatus).toBe('hit');
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    const profile = readdirSync(join(cacheRoot, 'rv-build-cache'))[0];
+    expect(readFileSync(join(cacheRoot, 'rv-build-cache', profile, 'node_modules', 'install-marker.txt'), 'utf8'))
+      .toBe('ci-1');
   });
 
   // The delivered workspace installs realvirtual-web-pro with `npm ci`, which rejects any lockfile
@@ -570,7 +712,9 @@ describe('customer workspace generator', () => {
     const claudeGuide = readFileSync(join(first.workspaceRoot, 'CLAUDE.md'), 'utf8');
     const agentsGuide = readFileSync(join(first.workspaceRoot, 'AGENTS.md'), 'utf8');
     expect(agentsGuide).toBe(claudeGuide);
-    expect(claudeGuide).toContain('projects/acme/plugins/index.ts');
+    expect(claudeGuide).toContain('projects/acme/plugins/');
+    expect(claudeGuide).toContain('documents[].scriptRef');
+    expect(claudeGuide).toContain('build:project-scripts');
     expect(claudeGuide).toContain('realvirtual-web/doc-webviewer.md');
     expect(claudeGuide).toContain('realvirtual-web/webviewer.mcp.md');
     expect(claudeGuide).toContain('[workspace recipes](recipes/README.md)');
@@ -674,13 +818,20 @@ describe('customer workspace generator', () => {
   // It needed its own filter branch because every pre-existing exclusion in
   // `copyCore()` filters a SUBDIRECTORY (`scenes/`, `aasx/`, `library/`), and a
   // top-level file sails straight past all of them.
-  it('never delivers the demo project onto a customer deploy root', () => {
+  it('delivers the demo project onto the customer deploy root, where it can actually be read', () => {
     const { core, privateRoot, delivery } = fixture();
     const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
     temporary.push(staged.workspaceRoot);
 
-    expect(existsSync(join(staged.coreRoot, 'public', 'demo-realvirtual'))).toBe(false);
-    // It is not absent, though — it is somewhere better (plan-737 F4).
+    // This assertion was inverted on 2026-09-12. It used to pin the plan-737 F4
+    // filter that kept the demo OFF the deploy root, on the argument that
+    // `projects/demo-realvirtual/` is "somewhere better". It is not reachable:
+    // a delivered workspace serves `realvirtual-web/` only, so nothing fetches
+    // `projects/`, nothing pre-links it, and the dashboard's unconditional
+    // `DemoRealvirtual` row 404s on click. Observed on a standard-customer
+    // install; the folder now travels to both places.
+    expect(existsSync(join(staged.coreRoot, 'public', 'demo-realvirtual', 'project.json'))).toBe(true);
+    // …and it still travels as a writable project as well (plan-737 F4).
     expect(existsSync(join(staged.workspaceRoot, 'projects', 'demo-realvirtual', 'project.json'))).toBe(true);
     // The neighbours it is filtered alongside, restated so a regression that
     // widened the filter the wrong way is visible here too.
@@ -1903,6 +2054,21 @@ describe('projectless customer workspace', () => {
       expect(text, `${rel} names the slug`).not.toContain('beispiel');
     }
 
+    // The generated deploy-root manifest, which `generatedTexts()` above cannot
+    // see: it skips `realvirtual-web/` as "core source, identical for everyone",
+    // and that blind spot is exactly where this leak survived until 2026-09-12.
+    // `writeGeneratedDeliveryManifest()` stamped `delivery.customer` /
+    // `delivery.project`, and `deliver-release.mjs` drives the one shared push
+    // with `shared.customers[0]` — so the alphabetically first slug named itself
+    // in a file every standard customer pulls.
+    const generated = JSON.parse(
+      readFileSync(join(staged.coreRoot, 'public', 'project.json'), 'utf8'));
+    expect(generated.id).toBe('prj_delivery_standard');
+    expect(generated.name).toBe('realvirtual Commercial');
+    expect(generated.canonicalName).toBe('delivery');
+    expect(JSON.stringify(generated)).not.toContain('Hochschule Beispiel');
+    expect(JSON.stringify(generated)).not.toContain('beispiel');
+
     const readme = readFileSync(join(staged.workspaceRoot, 'README.md'), 'utf8');
     const features = readFileSync(join(staged.workspaceRoot, 'FEATURES.md'), 'utf8');
     expect(readme.startsWith('# realvirtual Commercial\n')).toBe(true);
@@ -2632,5 +2798,75 @@ describe('T6/T7/T8: the delivered workspace carries no placeholder licence, trac
     expect(result.ok).toBe(true);
     // Named explicitly, because "no errors" would also hold if the kind rule stopped running.
     expect(PROJECT_KINDS).toContain(manifest.kind);
+  });
+});
+
+// plan-544 F3/F6/F11/F12 — the third-party notices travel with every staged workspace: the plugin
+// and its core (vite.config.ts imports them at config-load time), the public policy, the manual
+// list and the canonical licence texts; the Private policy rides with the private tree. The
+// customer's own policy file is never shipped by us and survives every snapshot.
+describe('third-party notices in the customer workspace (plan-544)', () => {
+  function withNoticesSources(core: string, privateRoot: string) {
+    const repo = resolve(__dirname, '..');
+    for (const rel of [
+      'scripts/vite-plugin-third-party-notices.mjs', 'scripts/vite-plugin-third-party-notices.d.mts',
+      'scripts/lib/rv-third-party-notices.mjs', 'scripts/lib/rv-third-party-notices.d.mts',
+      'third-party/license-policy.json', 'third-party/manual-components.json', 'third-party/license-texts/MIT.txt',
+    ]) write(join(core, rel), readFileSync(join(repo, rel), 'utf8'));
+    // A dev checkout that happens to carry a customer file must not leak it into a delivery.
+    write(join(core, 'third-party', 'license-policy.customer.json'), '{"exceptions":[{"name":"dev-only"}]}');
+    write(join(privateRoot, 'third-party', 'license-policy.json'), '{"allowed":[],"dynamicOnly":[],"exceptions":[],"vendorTerms":[]}');
+  }
+
+  it('stages plugin, core, declarations, policies and licence texts — never a customer file', () => {
+    const { core, privateRoot, delivery } = fixture();
+    withNoticesSources(core, privateRoot);
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+    for (const rel of [
+      'scripts/vite-plugin-third-party-notices.mjs', 'scripts/vite-plugin-third-party-notices.d.mts',
+      'scripts/lib/rv-third-party-notices.mjs', 'scripts/lib/rv-third-party-notices.d.mts',
+      'third-party/license-policy.json', 'third-party/manual-components.json', 'third-party/license-texts/MIT.txt',
+    ]) expect(existsSync(join(staged.coreRoot, rel)), rel).toBe(true);
+    expect(existsSync(join(staged.coreRoot, 'third-party', 'license-policy.customer.json'))).toBe(false);
+    expect(existsSync(join(staged.workspaceRoot, 'realvirtual-web-pro', 'third-party', 'license-policy.json'))).toBe(true);
+  });
+
+  it('the customer licence-policy file survives a snapshot that replaces the core', () => {
+    const { core, privateRoot, delivery } = fixture();
+    withNoticesSources(core, privateRoot);
+    const staged = stageFilteredSourceTree({ coreRoot: core, privateRoot, projectKey: 'acme', profile: delivery, delivery });
+    temporary.push(staged.workspaceRoot);
+    const clone = mkdtempSync(join(tmpdir(), 'rv-snapshot-clone-'));
+    temporary.push(clone);
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', [
+      '-c', 'user.email=fixture@example.invalid', '-c', 'user.name=Fixture', '-c', 'commit.gpgsign=false', ...args,
+    ], { cwd, stdio: 'ignore' });
+    git(clone, 'init', '-q', '-b', 'main');
+    const customerFile = join(clone, 'realvirtual-web', 'third-party', 'license-policy.customer.json');
+    write(customerFile, '{"exceptions":[{"name":"customer-lib","version":"1.0.0","reason":"ours"}]}\n');
+    write(join(clone, 'realvirtual-web', 'stale.txt'), 'old core file');
+    git(clone, 'add', '-A');
+    git(clone, 'commit', '-q', '-m', 'customer state');
+    git(clone, 'tag', 'delivery/0.0.1');
+
+    applySnapshot(staged.workspaceRoot, clone, { version: '9.9.9' });
+
+    expect(readFileSync(customerFile, 'utf8')).toContain('customer-lib');
+    expect(existsSync(join(clone, 'realvirtual-web', 'stale.txt'))).toBe(false);
+    expect(existsSync(join(clone, 'realvirtual-web', 'third-party', 'license-policy.json'))).toBe(true);
+  }, 60000);
+
+  it('runBuild marks itself as OUR release build for the notices mode', () => {
+    const { workspaceRoot, state } = buildFixture();
+    const envs: Array<Record<string, string | undefined>> = [];
+    runBuild(workspaceRoot, {
+      npmRunner: (args: string[], options: { cwd: string; env: Record<string, string | undefined> }) => {
+        envs.push(options.env);
+        state.runner(args, options);
+      },
+    });
+    expect(envs.length).toBeGreaterThan(0);
+    for (const env of envs) expect(env.RV_NOTICES_RELEASE_BUILD).toBe('1');
   });
 });

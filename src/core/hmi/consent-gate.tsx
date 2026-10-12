@@ -13,6 +13,10 @@
  *
  * On private/self-hosted deploys with no analytics id, requireAnalyticsConsent()
  * resolves immediately and nothing is shown.
+ *
+ * plan-564 F14: `?consent=decline` (used by the agent launcher, allowed on any
+ * link) is a SESSION DECLINE — modelled as its own outcome, never as consent:
+ * the gate is skipped, the app starts, and the caller must not load analytics.
  */
 
 import { useState } from 'react';
@@ -22,16 +26,32 @@ import { Box, Typography, Button, Paper, Link } from '@mui/material';
 import { Cookie } from '@mui/icons-material';
 import { rvDarkTheme } from './theme';
 import { getAppConfig } from '../rv-app-config';
-import { isAnalyticsConfigured, hasAnalyticsConsent, grantAnalyticsConsent } from '../consent-store';
+import {
+  isAnalyticsConfigured, hasAnalyticsConsent, grantAnalyticsConsent,
+  declineAnalyticsForSession, hasAnalyticsSessionDecline, readConsentUrlDirective,
+} from '../consent-store';
 
 /**
- * Resolve immediately when analytics is not configured or already consented.
- * Otherwise mount a blocking gate and resolve only once the user opts in.
+ * How the analytics question was settled for this boot. Only `granted` may load
+ * the tracker; `declined` starts the app without it; `not-configured` has no
+ * tracker to load at all.
  */
-export function requireAnalyticsConsent(): Promise<void> {
-  if (!isAnalyticsConfigured() || hasAnalyticsConsent()) return Promise.resolve();
+export type AnalyticsConsentOutcome = 'not-configured' | 'granted' | 'declined';
 
-  return new Promise<void>((resolve) => {
+/**
+ * Resolve immediately when analytics is not configured, already consented or
+ * declined for this session (link `?consent=decline`). Otherwise mount a
+ * blocking gate and resolve only once the user opts in.
+ */
+export function requireAnalyticsConsent(
+  search: string = typeof window !== 'undefined' ? window.location.search : '',
+): Promise<AnalyticsConsentOutcome> {
+  if (!isAnalyticsConfigured()) return Promise.resolve('not-configured');
+  if (hasAnalyticsConsent()) return Promise.resolve('granted');
+  if (readConsentUrlDirective(search) === 'decline') declineAnalyticsForSession();
+  if (hasAnalyticsSessionDecline()) return Promise.resolve('declined');
+
+  return new Promise<AnalyticsConsentOutcome>((resolve) => {
     const el = document.createElement('div');
     el.id = 'rv-consent-gate-root';
     el.style.cssText = 'position:fixed;inset:0;z-index:30000;pointer-events:auto;';
@@ -45,7 +65,7 @@ export function requireAnalyticsConsent(): Promise<void> {
         try { root.unmount(); } catch { /* ignore */ }
         if (el.parentNode) el.parentNode.removeChild(el);
       }, 0);
-      resolve();
+      resolve('granted');
     };
 
     root.render(

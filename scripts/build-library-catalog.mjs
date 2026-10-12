@@ -23,10 +23,16 @@
  *   node scripts/build-library-catalog.mjs --publish  # also PUT it into the library repo
  *
  * Auth: uses $GITHUB_TOKEN if set, otherwise falls back to `gh auth token`.
+ *
+ * plan-508: every entry carries `sha256` + `sizeBytes` of the file behind its
+ * `glbUrl`. The tree API only knows git blob ids (SHA-1 over a header), so each
+ * GLB is downloaded once from raw.githubusercontent.com and hashed here — the
+ * browser keys its blob cache on this hash and verifies every download with it.
  */
 
 import { writeFile } from 'fs/promises';
 import { execSync } from 'child_process';
+import { sha256Buffer } from './lib/rv-hash.mjs';
 
 const OWNER = 'game4automation';
 const REPO = 'realvirtual-Library';
@@ -80,11 +86,27 @@ function buildCatalog(tree) {
       category: 'custom',
       glbUrl: rawUrl,
       thumbnailUrl: '',
+      _path: n.path,
       ...(parent ? { collections: [parent] } : {}),
     };
   });
 
   return { version: '1.0', name: REPO, entries };
+}
+
+//! Download every entry's GLB once and stamp `sha256` + `sizeBytes` (plan-508).
+//! Sequential on purpose: a catalog build is rare, and parallel 30-MB downloads
+//! are what trips raw.githubusercontent.com's abuse limits.
+async function stampHashes(catalog, token) {
+  for (const entry of catalog.entries) {
+    const resp = await fetch(entry.glbUrl, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} downloading ${entry._path} for its hash`);
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    entry.sha256 = sha256Buffer(bytes);
+    entry.sizeBytes = bytes.byteLength;
+    delete entry._path;
+  }
+  return catalog;
 }
 
 async function main() {
@@ -102,7 +124,7 @@ async function main() {
     throw new Error('Repository tree was truncated — manifest would be incomplete.');
   }
 
-  const catalog = buildCatalog(treeData.tree);
+  const catalog = await stampHashes(buildCatalog(treeData.tree), token);
   const json = JSON.stringify(catalog, null, 2) + '\n';
   await writeFile(OUT_FILE, json, 'utf8');
   console.log(`Wrote ${OUT_FILE} with ${catalog.entries.length} entries.`);

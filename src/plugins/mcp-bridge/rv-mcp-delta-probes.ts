@@ -254,7 +254,7 @@ function ambiguousDelta(otherCallId: number): ToolDelta {
  *
  * THE one parse site: no tool body and no probe parses its own result. Returns
  * `null` rather than throwing for anything that is not a JSON OBJECT — image
- * payloads from `web_screenshot*` / `web_render`, JSON arrays, empty strings.
+ * payloads from `web_screenshot*` / `web_eye`, JSON arrays, empty strings.
  * A probe must therefore tolerate `result === null`.
  */
 export function parseResult(resultJson: unknown): Rec | null {
@@ -427,6 +427,47 @@ const simProbe: DeltaProbe = {
     if (mus !== snap.mus) lines.push(`MUs: ${snap.mus}→${mus}`);
     if (lines.length > 0 && other !== null) return ambiguousDelta(other);
     return makeDelta(lines, lines.length === 0 ? 'simulation state unchanged' : undefined);
+  },
+};
+
+// ─── Workpiece carriers (plan-567) ──────────────────────────────────────
+
+/** Live-MU count plus the addressed carrier's world position — one MU by id, O(n) scan of `mus` only. */
+function readCarrier(ctx: ProbeContext, args: Rec): { mus: number; pos: [number, number, number] | null } | null {
+  const tm = ctx.viewer.transportManager;
+  if (!tm) return null;
+  const id = typeof args['id'] === 'number' ? args['id'] : NaN;
+  let pos: [number, number, number] | null = null;
+  for (const mu of tm.mus) {
+    if (mu.id !== id || mu.markedForRemoval) continue;
+    mu.updateAABB();
+    pos = [mu.aabb.center.x, mu.aabb.min.y, mu.aabb.center.z];
+    break;
+  }
+  return { mus: tm.mus.length, pos };
+}
+
+/** `web_mu_delete` / `web_mu_move`: did the carrier leave, did it land somewhere else? */
+const muProbe: DeltaProbe = {
+  before(ctx, args) {
+    return { ...enterScope(`mu:${String(args['id'])}`, ctx.callId), state: readCarrier(ctx, args) };
+  },
+  after(ctx, args, snapshot, _result) {
+    const snap = snapshot as (ScopedSnapshot & { state: ReturnType<typeof readCarrier> }) | undefined;
+    if (!snap) return null;
+    const other = leaveScope(snap, ctx.callId);
+    const before = snap.state;
+    const after = readCarrier(ctx, args);
+    if (!before || !after) return null;
+    const lines: string[] = [];
+    if (after.mus !== before.mus) lines.push(`MUs: ${before.mus}→${after.mus}`);
+    if (before.pos && !after.pos) lines.push(`mu#${String(args['id'])}: removed`);
+    if (before.pos && after.pos
+      && (before.pos[0] !== after.pos[0] || before.pos[1] !== after.pos[1] || before.pos[2] !== after.pos[2])) {
+      lines.push(`mu#${String(args['id'])}: ${fmt(before.pos)}→${fmt(after.pos)}`);
+    }
+    if (lines.length > 0 && other !== null) return ambiguousDelta(other);
+    return makeDelta(lines, lines.length === 0 ? 'the carrier did not change' : undefined);
   },
 };
 
@@ -696,6 +737,10 @@ export const DELTA_PROBES: Record<string, DeltaProbe> = {
   // Simulation
   web_sim_play_pause: simProbe,
   web_sim_reset: simProbe,
+
+  // Workpiece carriers (plan-567)
+  web_mu_delete: muProbe,
+  web_mu_move: muProbe,
 
   // Workspace
   web_mode_set: modeProbe,

@@ -26,7 +26,7 @@
  *
  * Batching contract. The cap moves and swaps material at runtime, so its mesh
  * is flagged `userData._rvSceneButtonMesh` — the same three-place exclusion
- * (`rv-batched-render`, `rv-uber-material`, `rv-material-dedup`) that
+ * (`rv-bake-pipeline`, `rv-uber-material`, `rv-material-dedup`) that
  * `_rvLampMesh` uses. Only the cap is excluded; the static button base stays
  * batched.
  *
@@ -48,7 +48,7 @@
  * switches — but the lever never visibly moves.
  *
  * PRIMARY fix for (2) is therefore NOT here but in `rv-freeze-static.ts`:
- * `SceneButtonMoveable` is part of `MOVER_KEY`, so the cap (plus its ancestors
+ * `SceneButtonMoveable` declares `bake: 'chunk'`, so the cap (plus its ancestors
  * and subtree) is never frozen in the first place, whatever the bind order.
  * Undoing it here alone could not work — Phase 11 runs after `init()`.
  *
@@ -56,7 +56,7 @@
  * whose pass runs before construction, and it keeps caps that are placed or
  * re-bound at RUNTIME — after the loader passes are long done — animating.
  * `matrixAutoUpdate = true` is also the same "this node moves" oracle
- * `ensureMovableTransform()` sets for gizmo-moved nodes and `rv-arena-planner`
+ * `ensureMovableTransform()` sets for gizmo-moved nodes and the bake
  * reads. The cap mesh is thawed too when it is a separate child.
  *
  * Only the cap is thawed — deliberately NOT its ancestors. The frozen ancestor
@@ -252,7 +252,7 @@ export class RVSceneButtonMoveable implements RVComponent {
    * header: `matrixAutoUpdate` alone is not enough — without
    * `matrixWorldAutoUpdate` the recomposed `matrix` never reaches `matrixWorld`
    * and the cap stays visually frozen. For a GLB load the world flag is already
-   * guaranteed by `MOVER_KEY` in `rv-freeze-static.ts`; setting it here covers
+   * guaranteed by the `chunk` role in `rv-freeze-static.ts`; setting it here covers
    * caps bound after that pass (runtime placement, re-bind).
    */
   private _thaw(node: Object3D): void {
@@ -400,11 +400,12 @@ registerComponent({
   type: 'SceneButtonMoveable',
   schema: RVSceneButtonMoveable.schema,
   capabilities: {
-    // Data + animation only: the cap is deliberately not a hover/click target
-    // (a rotated cap would otherwise sit in the pick BVH with a stale pose).
-    hoverable: false,
-    selectable: false,
-    badgeColor: '#8d6e63',
+    // The animated cap: a clickable ACTION (never selected, plan-753 §2.3) and
+    // a mover — it translates or rotates on hover/click, so it must stay
+    // matrix-dynamic and gets its own chunk once baked.
+    pick: 'action',
+    bake: 'chunk',
+    ui: { badge: '#8d6e63' },
   },
   create: (node) => new RVSceneButtonMoveable(node),
   afterCreate: (inst, node) => {

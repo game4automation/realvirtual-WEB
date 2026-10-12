@@ -16,12 +16,33 @@ import { useViewer } from '../../hooks/use-viewer';
 import { useGroupsOverlayOpen } from '../../hooks/use-groups-overlay';
 import { FloatingPanel } from './FloatingPanel';
 import { BOTTOM_BAR_HEIGHT } from './layout-constants';
-import { GroupsListContent, persistCurrentGroupVisibility } from './GroupsListContent';
+import { GroupsListContent, applyPersistedGroupVisibility, persistCurrentGroupVisibility } from './GroupsListContent';
 import { useOverlayVisibilityState } from '../../hooks/use-overlay-visible';
+import { getActiveAssetContext } from '../editor/active-asset-store';
+import type { RVViewer } from '../rv-viewer';
 
 const DEFAULT_W = 280;
 const DEFAULT_H = 260;
 const BOTTOM_MARGIN = BOTTOM_BAR_HEIGHT + 12;
+
+/**
+ * Close the Display panel and persist the current group visibility — unless
+ * the asset editor is active (plan-760 F15).
+ *
+ * Rule: **Quick Edit = live, Display panel = persisted.** The editor's Quick
+ * Edit lists (Kinematics, Groups) hide and isolate groups for the editing
+ * session only and never write `rv-group-visibility`; the armed Auto Assign
+ * target is even hidden by the editor itself. Persisting on close while the
+ * editor is open would leak exactly that transient state into the HMI
+ * profile, where it is restored on every later model load. Outside the
+ * editor the behaviour is unchanged. Exported so the rule is testable
+ * without rendering the panel.
+ */
+export function closeGroupsOverlay(viewer: RVViewer): void {
+  viewer.toggleGroupsOverlay(false);
+  if (getActiveAssetContext() !== null) return;
+  persistCurrentGroupVisibility(viewer);
+}
 
 export function GroupsOverlay() {
   const viewer = useViewer();
@@ -29,6 +50,18 @@ export function GroupsOverlay() {
   const overlayCats = useOverlayVisibilityState().present;
   // Counts for the subtitle — refreshed on the same events the list uses.
   const [counts, setCounts] = useState({ filters: 0, groups: 0 });
+
+  // Restore persisted group visibility on EVERY model load, open or closed:
+  // this host is always mounted (App.tsx), the list below is not. A restore
+  // that ran only from the list applied only while the panel was open, so a
+  // group hidden in the editor reappeared after the switch to the HMI and
+  // back (2026-09-24). Listener order against the list does not matter: the
+  // list renders the registry's shared `GroupInfo` objects, so it shows the
+  // restored state whichever listener ran first (React runs child effects
+  // before the parent's on a mount).
+  useEffect(() => viewer.on('model-loaded', ({ result }) => {
+    applyPersistedGroupVisibility(viewer, result);
+  }), [viewer]);
 
   useEffect(() => {
     if (!open) return;
@@ -42,10 +75,7 @@ export function GroupsOverlay() {
     return () => { offGroups(); offModel(); };
   }, [open, viewer]);
 
-  const handleClose = useCallback(() => {
-    viewer.toggleGroupsOverlay(false);
-    persistCurrentGroupVisibility(viewer);
-  }, [viewer]);
+  const handleClose = useCallback(() => closeGroupsOverlay(viewer), [viewer]);
 
   if (!open) return null;
 

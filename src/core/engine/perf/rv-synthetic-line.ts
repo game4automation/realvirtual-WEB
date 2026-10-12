@@ -47,6 +47,14 @@ import type { RVTransportManager } from '../rv-transport-manager';
 import type { ComponentContext } from '../rv-component-registry';
 import type { SignalStore, SignalWriter } from '../rv-signal-store';
 import { createSignalWriter } from '../rv-signal-store';
+import {
+  LIBRARY_CONVEYOR_WIDTH_M, MU_LIBRARY_ASSETS, ROBOT_AXIS_COUNT, buildConveyorVisuals,
+  buildLibraryMuTemplate, buildRobotFarm, cachedAsset, pieceForLength, preloadSyntheticAssets,
+  tileSegment,
+} from './rv-synthetic-assets';
+import type { SyntheticMuAsset } from './rv-synthetic-assets';
+export type { SyntheticMuAsset } from './rv-synthetic-assets';
+import type { ConveyorPlacement, ConveyorVisualHandle, RobotFarmHandle } from './rv-synthetic-assets';
 
 /** Signal-name prefix owned by the synthetic line. `dispose()` removes exactly this. */
 export const SYNTHETIC_LINE_PREFIX = 'LINE/';
@@ -97,6 +105,32 @@ export interface SyntheticLineConfig {
    */
   originX: number;
   originZ: number;
+  /**
+   * `primitive` (default, plan-465 behaviour): a belt is an invisible
+   * `Object3D` plus an AABB — zero draw calls, zero triangles.
+   * `library`: the same belts, with `RollConveyor-*.glb` from
+   * `public/library/PalletHandling/` drawn on them as `InstancedMesh`es.
+   *
+   * The TRANSPORT topology is identical in both cases: the surface AABB, the
+   * drive and the seam geometry come from the configuration, never from the
+   * asset. Only the render cost changes, which is what makes the difference
+   * between the two attributable.
+   */
+  geometry: 'primitive' | 'library';
+  /**
+   * `primitive` (default): the MU is a `BoxGeometry`, which `analyzeTemplate`
+   * always instances. `cartonbox`: the MU template is `CartonBox.glb`.
+   * `pallet`: a loaded Euro pallet (`EuropalletLoaded.glb`), which wants
+   * `muLengthMm` ≈ 1200 — see `MU_ASSET_PITCH_MM`. Since 2026-09-25 the
+   * template builder merges a multi-part asset into ONE multi-material mesh,
+   * so every library MU instances; `muInstanced` in the plan is still read
+   * back from the source after `init()`, never predicted.
+   */
+  muAsset: SyntheticMuAsset;
+  /** Six-axis robots standing beside the lanes. They never touch the material flow. */
+  robots: number;
+  /** `erratic` re-targets every axis the moment it arrives — deliberately incoherent. */
+  robotMotion: 'static' | 'erratic';
 }
 
 /**
@@ -122,7 +156,31 @@ export const DEFAULT_SYNTHETIC_LINE: SyntheticLineConfig = {
   signalBinding: 'connect',
   originX: 1000,
   originZ: 1000,
+  geometry: 'primitive',
+  muAsset: 'primitive',
+  robots: 0,
+  robotMotion: 'static',
 };
+
+/**
+ * The library assets a configuration needs, so the caller can preload them
+ * before the SYNCHRONOUS build. Empty for the plan-465 defaults — a run that
+ * does not ask for library geometry touches the network at all.
+ */
+export function requiredAssets(cfg: SyntheticLineConfig): string[] {
+  const names: string[] = [];
+  if (cfg.geometry === 'library') {
+    for (const len of tileSegment(cfg.segmentLengthM)) {
+      const piece = pieceForLength(len);
+      if (piece && !names.includes(piece)) names.push(piece);
+    }
+  }
+  if (cfg.muAsset !== 'primitive') {
+    const asset = MU_LIBRARY_ASSETS[cfg.muAsset];
+    if (!names.includes(asset)) names.push(asset);
+  }
+  return names;
+}
 
 export interface SyntheticLinePlan {
   /** Geometric capacity: how many MUs physically fit on all belts. */
@@ -165,6 +223,33 @@ export interface SyntheticLinePlan {
   /** Echo of the configuration the plan was computed from (report provenance). */
   config: SyntheticLineConfig;
   fixedTimeStep: number;
+  /** What the realistic-scene options actually produced. Filled by the BUILDER
+   *  (a plan computed without building cannot know an asset's mesh count), so
+   *  it is null on `plan()` and populated on `build()`. */
+  scene: SyntheticSceneInfo | null;
+}
+
+/** Measured facts about the built scene — the report quotes these verbatim. */
+export interface SyntheticSceneInfo {
+  geometry: 'primitive' | 'library';
+  muAsset: SyntheticMuAsset;
+  /** Draw calls the conveyor visuals add (one per InstancedMesh). */
+  conveyorDraws: number;
+  conveyorTriangles: number;
+  conveyorPlacements: number;
+  /** Plain meshes a `clone()` build would have produced instead. */
+  conveyorClonesAvoided: number;
+  /** Mesh count of ONE MU template — `analyzeTemplate` instances only at 1. */
+  muMeshCount: number;
+  muTriangles: number;
+  /** Whether the sources really took the instanced path (read back from
+   *  `RVSource.useInstancing` AFTER `init()`, not predicted). */
+  muInstanced: boolean;
+  robots: number;
+  robotDrives: number;
+  robotMeshes: number;
+  robotTriangles: number;
+  robotMotion: 'static' | 'erratic';
 }
 
 export interface SyntheticLineHandle {
@@ -230,6 +315,26 @@ function signalNamesFor(cfg: SyntheticLineConfig): string[] {
  * at more than 80 % of a hard ceiling spends the whole measurement window jammed
  * against that ceiling, which measures the ceiling and not the configuration.
  */
+/** Clear space between two library conveyors of neighbouring lanes, in metres. */
+const LIBRARY_LANE_CLEARANCE_M = 0.4;
+
+/**
+ * Centre-to-centre pitch of the lanes, in metres.
+ *
+ * A primitive belt is two MU lengths wide and lanes sit 1.5 widths apart (the
+ * plan-465 geometry, unchanged). Library pieces are as wide as the ASSET —
+ * `LIBRARY_CONVEYOR_WIDTH_M`, 1.12 m for `RollConveyor-*` — which is wider than
+ * that 0.6 m pitch, so a library line spreads its lanes to the asset width plus
+ * a clearance instead. Only the drawing moves: capacity, fill time and every
+ * surface AABB depend on lane LENGTH, never on the pitch.
+ */
+export function laneSpacingFor(cfg: Pick<SyntheticLineConfig, 'muLengthMm' | 'geometry'>): number {
+  const laneWidthM = (cfg.muLengthMm / MM_PER_M) * 2;
+  const primitivePitch = laneWidthM * 1.5;
+  if (cfg.geometry !== 'library') return primitivePitch;
+  return Math.max(primitivePitch, LIBRARY_CONVEYOR_WIDTH_M + LIBRARY_LANE_CLEARANCE_M);
+}
+
 export function computeSyntheticLinePlan(
   cfg: SyntheticLineConfig,
   fixedTimeStep = 1 / 60,
@@ -293,6 +398,7 @@ export function computeSyntheticLinePlan(
     signals: signalNamesFor(cfg),
     config: { ...cfg },
     fixedTimeStep,
+    scene: null,
   };
 }
 
@@ -322,15 +428,30 @@ export function buildSyntheticLine(
   host.scene.add(root);
 
   const laneWidthM = (cfg.muLengthMm / MM_PER_M) * 2;
-  const laneSpacingM = laneWidthM * 1.5;
+  const laneSpacingM = laneSpacingFor(cfg);
   const beltHalf = new Vector3(cfg.segmentLengthM / 2, 0.05, laneWidthM / 2);
-  /** Everything that rides ON the belt sits with its underside on the belt top. */
-  const rideY = beltHalf.y + cfg.muLengthMm / MM_PER_M / 2;
+  // The MU's half-extents: a cube of `muLengthMm` for the primitive box, the
+  // baked asset's real extents for a library MU (a loaded pallet is 1.2 m long
+  // and 0.32 m tall; the cube assumption floated it half a metre above the
+  // rollers). Probed once — the baked template is cached per (asset, length).
+  const libraryMuAsset = cfg.muAsset === 'primitive' ? null : MU_LIBRARY_ASSETS[cfg.muAsset];
   const muHalf = new Vector3(
     cfg.muLengthMm / MM_PER_M / 2,
     cfg.muLengthMm / MM_PER_M / 2,
     cfg.muLengthMm / MM_PER_M / 2,
   );
+  if (libraryMuAsset) {
+    const probe = buildLibraryMuTemplate(libraryMuAsset, cfg.muLengthMm, '__rvMuProbe');
+    if (!probe) {
+      throw new Error(
+        `[synthetic-line] muAsset=${cfg.muAsset} needs "${libraryMuAsset}" preloaded — `
+        + 'call the preload() hook (or preloadSyntheticAssets) before build()',
+      );
+    }
+    muHalf.copy(probe.halfExtents);
+  }
+  /** Everything that rides ON the belt sits with its underside on the belt top. */
+  const rideY = beltHalf.y + muHalf.y;
 
   // Shared MU geometries/materials — `muTemplates` distinct ones, reused across
   // lanes. Each lane still gets its OWN template node (and therefore its own
@@ -353,8 +474,16 @@ export function buildSyntheticLine(
   const sources: RVSource[] = [];
   const sinks: RVSink[] = [];
   const drives: RVDrive[] = [];
+  /** Where a library conveyor piece goes. Collected in the segment loop and
+   *  turned into InstancedMeshes ONCE, after it, so the whole line is a handful
+   *  of draw calls rather than one per belt. */
+  const conveyorPlacements: ConveyorPlacement[] = [];
   const unsubs: (() => void)[] = [];
   const sensorListeners: { sensor: RVSensor; cb: () => void }[] = [];
+
+  let muMeshCount = 1;
+  let muTriangles = 12;
+  const templates: Object3D[] = [];
 
   const prevMaxLiveMUs = tm.maxLiveMUs;
   tm.maxLiveMUs = plan.maxLiveMUs;
@@ -382,6 +511,23 @@ export function buildSyntheticLine(
       beltNode.position.set(centreX, 0, z);
       laneGroup.add(beltNode);
       beltNode.updateWorldMatrix(true, false);
+
+      if (cfg.geometry === 'library') {
+        // Tile the segment with library pieces. The pieces are VISUAL ONLY: the
+        // surface AABB below still comes from `segmentLengthM`, so a 5 m belt
+        // drawn as 3 m + 2 m transports exactly like the primitive one.
+        let pieceX = centreX - cfg.segmentLengthM / 2;
+        for (const len of tileSegment(cfg.segmentLengthM)) {
+          conveyorPlacements.push({
+            x: pieceX + len / 2,
+            y: beltHalf.y,
+            z,
+            lengthM: len,
+            flipped: forward < 0,
+          });
+          pieceX += len;
+        }
+      }
 
       const drive = new RVDrive(beltNode);
       drive.Direction = DriveDirection.LinearX;
@@ -455,13 +601,32 @@ export function buildSyntheticLine(
     }
 
     // ── MU template + source at the lane head ──
-    const template = new Mesh(
-      geometries[lane % geometries.length],
-      materials[lane % materials.length],
-    );
-    template.name = `MU_L${lane}`;
-    template.position.set(0, 0, 0);
+    const templateName = `MU_L${lane}`;
+    let template: Object3D;
+    if (libraryMuAsset) {
+      const built = buildLibraryMuTemplate(libraryMuAsset, cfg.muLengthMm, templateName);
+      if (!built) {
+        throw new Error(
+          `[synthetic-line] muAsset=${cfg.muAsset} needs "${libraryMuAsset}" preloaded — `
+          + 'call the preload() hook (or preloadSyntheticAssets) before build()',
+        );
+      }
+      template = built.node;
+      muMeshCount = built.meshCount;
+      muTriangles = built.triangles;
+    } else {
+      const mesh = new Mesh(
+        geometries[lane % geometries.length],
+        materials[lane % materials.length],
+      );
+      mesh.position.set(0, 0, 0);
+      template = mesh;
+      muMeshCount = 1;
+      muTriangles = 12;
+    }
+    template.name = templateName;
     laneGroup.add(template);
+    templates.push(template);
 
     const headX = forward > 0 ? HEAD_INSET_M : laneLengthM - HEAD_INSET_M;
     const sourceNode = new Object3D();
@@ -520,12 +685,15 @@ export function buildSyntheticLine(
   const decoration = /_ghost$|_ghostFill$|_preview$|_sourceMarkerRing$/;
   for (let lane = 0; lane < sources.length; lane++) {
     const laneGroup = sources[lane].node.parent;
-    const instanced = sources[lane].useInstancing;
-    laneGroup?.traverse((o) => {
-      const mesh = o as Mesh;
-      if (!mesh.isMesh || (mesh as unknown as { isInstancedMesh?: boolean }).isInstancedMesh) return;
-      if (decoration.test(mesh.name) || (instanced && mesh.name === `MU_L${lane}`)) mesh.visible = false;
-    });
+    // Hide the decoration ROOTS, not individual meshes: three.js cascades
+    // `visible`, and a library MU template's ghost clone is a whole subtree
+    // whose children carry the ASSET's names, not `_ghost`. Matching on mesh
+    // names only (the plan-465 form) left 24 full-detail cartons in the frame.
+    laneGroup?.traverse((o) => { if (decoration.test(o.name)) o.visible = false; });
+    // The TEMPLATE is only hidden when its source really went the instanced
+    // route: on the clone path `_buildRealClone` copies the template node, and a
+    // clone of an invisible node is an invisible MU.
+    if (sources[lane].useInstancing) templates[lane].visible = false;
   }
 
   root.updateWorldMatrix(true, true);
@@ -539,6 +707,64 @@ export function buildSyntheticLine(
       store.register(`${SYNTHETIC_LINE_PREFIX}PLC${plc}/SEQ`, `__perf__/PLC${plc}/SEQ`, 0, 'DINT');
     }
   }
+  // ── Realistic-scene extras (plan-469 Phase 0d) ──
+  //
+  // Built AFTER the transport topology, and touching none of it: the conveyor
+  // visuals are InstancedMeshes with no components on them, and the robots are
+  // drives on nodes that own no surface, no sensor and no sink. Whatever they
+  // cost lands in the render pass and in the DRIVE stage, never in transport.
+  let conveyors: ConveyorVisualHandle | null = null;
+  if (cfg.geometry === 'library') {
+    if (conveyorPlacements.length > 0 && !cachedAsset(pieceForLength(conveyorPlacements[0].lengthM) ?? '')) {
+      throw new Error(
+        '[synthetic-line] geometry=library needs the RollConveyor assets preloaded — '
+        + 'call the preload() hook (or preloadSyntheticAssets) before build()',
+      );
+    }
+    conveyors = buildConveyorVisuals(root, conveyorPlacements);
+  }
+
+  let robotFarm: RobotFarmHandle | null = null;
+  if (cfg.robots > 0) {
+    // Two rows, one on each side of the lane block, 1.5 m clear of the outermost
+    // lane so a 1.5 m-reach arm can never intersect a belt or an MU.
+    const zNear = -1.5;
+    const zFar = (cfg.lanes - 1) * laneSpacingM + 1.5;
+    const spanX = Math.max(1, cfg.segments * cfg.segmentLengthM);
+    robotFarm = buildRobotFarm({
+      parent: root,
+      count: cfg.robots,
+      motion: cfg.robotMotion,
+      seed: cfg.seed,
+      registerDrive: (d) => { drives.push(d); host.drives.push(d); },
+      place: (i, out) => {
+        const perRow = Math.ceil(cfg.robots / 2);
+        const row = i % 2;
+        const col = Math.floor(i / 2);
+        return out.set(((col + 0.5) / perRow) * spanX, 0, row === 0 ? zNear : zFar);
+      },
+    });
+  }
+
+  plan.scene = {
+    geometry: cfg.geometry,
+    muAsset: cfg.muAsset,
+    conveyorDraws: conveyors?.draws ?? 0,
+    conveyorTriangles: conveyors?.triangles ?? 0,
+    conveyorPlacements: conveyors?.placements ?? 0,
+    conveyorClonesAvoided: conveyors?.clonedMeshesAvoided ?? 0,
+    muMeshCount,
+    muTriangles,
+    // Read BACK off the source rather than predicted: `analyzeTemplate` is the
+    // authority, and whether CartonBox.glb instances is the finding, not an input.
+    muInstanced: sources.length > 0 && sources.every((src) => src.useInstancing),
+    robots: cfg.robots,
+    robotDrives: robotFarm?.drives.length ?? 0,
+    robotMeshes: robotFarm?.meshes ?? 0,
+    robotTriangles: robotFarm?.triangles ?? 0,
+    robotMotion: cfg.robotMotion,
+  };
+
   tm.notifyTopologyChanged();
 
   let disposed = false;
@@ -577,6 +803,17 @@ export function buildSyntheticLine(
     for (const sensor of sensors) sensor.dispose();
     for (const surface of surfaces) surface.dispose();
 
+    // Robots BEFORE the shared drive teardown: the farm has to release its
+    // after-update callbacks while its drives are still live, and it owns its own
+    // link geometry/material.
+    robotFarm?.dispose();
+    robotFarm = null;
+    // Library conveyors: the InstancedMeshes are ours; the geometry behind them
+    // belongs to the module-level asset cache and is deliberately kept, so the
+    // next build reuses it instead of re-parsing megabytes of GLB.
+    conveyors?.dispose();
+    conveyors = null;
+
     const driveSet = new Set<RVDrive>(drives);
     for (let i = host.drives.length - 1; i >= 0; i--) {
       if (driveSet.has(host.drives[i])) host.drives.splice(i, 1);
@@ -602,6 +839,10 @@ export function buildSyntheticLine(
 
 /** Shape exposed as `window.__rvSyntheticLine` (see `doc-web-debugging.md`). */
 export interface SyntheticLineHook {
+  /** Fetch and parse the library GLBs a configuration needs. MUST be awaited
+   *  before `build()` whenever `geometry: 'library'` or `muAsset: 'cartonbox'`
+   *  is used — the builder itself stays synchronous on purpose. */
+  preload(cfg?: Partial<SyntheticLineConfig>): Promise<string[]>;
   build(cfg?: Partial<SyntheticLineConfig>): SyntheticLinePlan;
   plan(cfg?: Partial<SyntheticLineConfig>): SyntheticLinePlan;
   dispose(): void;
@@ -619,6 +860,11 @@ export function installSyntheticLineHook(host: SyntheticLineHost): SyntheticLine
       { ...DEFAULT_SYNTHETIC_LINE, ...cfg },
       host.fixedTimeStep ?? 1 / 60,
     ),
+    async preload(cfg) {
+      const names = requiredAssets({ ...DEFAULT_SYNTHETIC_LINE, ...cfg });
+      await preloadSyntheticAssets(names);
+      return names;
+    },
     build(cfg) {
       handle?.dispose();
       handle = buildSyntheticLine(host, cfg);

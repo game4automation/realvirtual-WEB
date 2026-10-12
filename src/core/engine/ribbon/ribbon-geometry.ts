@@ -76,6 +76,21 @@ export interface Circle2 {
    *  `0` = Auto: resolved by {@link resolveAutoSides} from the roller's position
    *  relative to its neighbours (the wrap under 180 deg, the only one a real web can take). */
   side: 1 | -1 | 0;
+  /**
+   * rad — how far the web additionally wraps THIS roller at the END of the path
+   * it sits on: a PRE-arc before the first tangent (roller `0`) or a POST-arc
+   * after the last one (roller `n-1`), plan-468.
+   *
+   * It is read at those two positions only. An inner roller already carries an
+   * arc derived from its two tangents and ignores the field, so a value there is
+   * inert rather than wrong. `undefined`, `0` or a negative / non-finite value
+   * reproduces the plan-459/460 output exactly — no segment is inserted (F4).
+   *
+   * The DEGREES a `RibbonWinder` authors are converted outside this module, the
+   * same division of labour {@link Circle2.side} has: the portable geometry sees
+   * radians and a sign, never a component field.
+   */
+  wrapRad?: number;
 }
 
 /** A straight run between two contact points. */
@@ -168,13 +183,62 @@ export function wrapAngle(seg: ArcSegment2): number {
 }
 
 /**
+ * The wrap arc an END roller adds to the open path, or `null` when it asks for
+ * none (plan-468).
+ *
+ * `contact` is the tangent point that is ALREADY on the path — the DEPARTURE
+ * point at roller `0`, the ARRIVAL point at roller `n-1` — and `atStart` says
+ * which of the two it is.
+ *
+ * ## Why this does not reuse the inner-roller normalisation
+ *
+ * An inner arc derives its sweep from TWO independent tangent points by an
+ * `atan2` difference, which is only defined modulo `2π`: the `[0, 2π)`
+ * normalisation is what picks the wrap the side prescribes out of the two
+ * candidates. Here the sweep is GIVEN (`wrapRad`), so there is no second
+ * candidate and no ambiguity — normalising would silently fold a deliberate
+ * `WrapDeg` of 450 deg back to 90 deg.
+ *
+ * The sweep runs in the running direction, i.e. `+wrapRad` on a CCW (`side +1`)
+ * wrap and `-wrapRad` on a CW one — `side * wrapRad` for both. A PRE-arc ends at
+ * `contact`, so it starts one sweep before it (`a0 = aContact - sweep`, the
+ * `a0 = a1 - side·wrapRad` of the plan); a POST-arc starts there.
+ */
+function endWrapArc(c: Circle2, contact: Vec2, atStart: boolean): ArcSegment2 | null {
+  const wrap = c.wrapRad;
+  // A negative or non-finite value is treated as "no wrap" rather than trusted:
+  // the owning component clamps it, but a bad number must never reach the sample
+  // buffer as a negative arc length.
+  if (wrap === undefined || !Number.isFinite(wrap) || !(wrap > 0)) return null;
+  // `resolveAutoSides` has already run, so `side` is +-1; a 0 that slipped
+  // through follows the same "ends default Left" rule as the auto resolution.
+  const sweep = (c.side < 0 ? -1 : 1) * wrap;
+  const aContact = Math.atan2(contact.y - c.cy, contact.x - c.cx);
+  return {
+    kind: 'arc',
+    cx: c.cx,
+    cy: c.cy,
+    r: c.r,
+    a0: atStart ? aContact - sweep : aContact,
+    sweep,
+    lengthMm: c.r * wrap,
+  };
+}
+
+/**
  * Build the OPEN path `line, arc, line, arc, …, line` over `rollers`
  * (in running order).
  *
- * The first and last roller carry NO arc: the path starts at the contact point
- * of the first tangent and ends at the contact point of the last one — that is
- * what "open" means (a winder pays the web out at a tangent point and takes it
- * up at one; it does not wrap all the way round).
+ * The first and last roller carry no arc DERIVED from tangents: the path starts
+ * at the contact point of the first tangent and ends at the contact point of the
+ * last one — that is what "open" means (a winder pays the web out at a tangent
+ * point and takes it up at one; it does not wrap all the way round).
+ *
+ * Since plan-468 those two rollers may ask for a wrap of their own through
+ * {@link Circle2.wrapRad}: a PRE-arc prepended at roller `0` and a POST-arc
+ * appended at roller `n-1`, so the web visibly starts and ends ON the roll
+ * instead of at a tangent point in mid-air. Without it — the default — the
+ * output is bit-identical to plan-459/460.
  *
  * Every intermediate roller contributes exactly one arc, swept in the direction
  * its `side` prescribes and normalised into `[0, 2π)`. A wrap of `0` (three
@@ -204,6 +268,15 @@ export function buildRibbonSegments(rollers: readonly Circle2[]): RibbonPathGeom
   const segments: RibbonSegment2[] = [];
   let lengthMm = 0;
 
+  // The PRE-arc at roller 0 (plan-468 F2): it ENDS where the path used to begin,
+  // so everything after it keeps the geometry it had — only its index moves by
+  // one, which is what `RVRibbonPath._startArcOffset` compensates for.
+  const preArc = endWrapArc(rollers[0], tangents[0].p0, true);
+  if (preArc) {
+    segments.push(preArc);
+    lengthMm += preArc.lengthMm;
+  }
+
   for (let i = 0; i < tangents.length; i++) {
     // Arc on roller i, between the incoming tangent (i-1) and this one.
     if (i > 0) {
@@ -232,6 +305,17 @@ export function buildRibbonSegments(rollers: readonly Circle2[]): RibbonPathGeom
     const len = Math.hypot(t.p1.x - t.p0.x, t.p1.y - t.p0.y);
     segments.push({ kind: 'line', x0: t.p0.x, y0: t.p0.y, x1: t.p1.x, y1: t.p1.y, lengthMm: len });
     lengthMm += len;
+  }
+
+  // The POST-arc at roller n-1 (plan-468 F3): it STARTS where the path used to
+  // end, so it needs no index correction anywhere — it sits behind every inner
+  // arc a consumer addresses.
+  const postArc = endWrapArc(
+    rollers[rollers.length - 1], tangents[tangents.length - 1].p1, false,
+  );
+  if (postArc) {
+    segments.push(postArc);
+    lengthMm += postArc.lengthMm;
   }
 
   return { segments, lengthMm };

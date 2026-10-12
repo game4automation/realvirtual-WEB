@@ -16,12 +16,16 @@ import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import type { CollisionRoleName } from './rv-collision-role';
 import { NodeRegistry } from './rv-node-registry';
 import { debug } from './rv-debug';
+import { findByNameInSubtree } from './rv-traverse-utils';
 import { MM_TO_METERS } from './rv-constants';
 import { buildSourceMarker } from './rv-source-marker';
 import { applyShadowFlags } from './rv-mesh-classifier';
 import type { RVTransportManager } from './rv-transport-manager';
 import { RVTransportSurface } from './rv-transport-surface';
 import { AABB } from './rv-aabb';
+import { wireBoolSignal } from './rv-signal-wiring';
+import { readMUColliderTemplate, type MUColliderTemplate } from './rv-mu-collider-template';
+import { readLoadSeatDepth } from './rv-mu-load';
 import type { EventEmitter } from '../rv-events';
 import type { ViewerEvents } from '../rv-viewer-events';
 import {
@@ -29,6 +33,12 @@ import {
   OCCUPANCY_GATED_BEHAVIORS, SURFACE_TOP_EPS_M,
   type SourcePlacement,
 } from './rv-source-placement';
+
+/** The source's own ghost / overlay / preview / marker children — never an MU template. */
+const isSourceRuntimeHelper = (node: Object3D): boolean => {
+  const ud = node.userData;
+  return !!(ud?._isSourceGhost || ud?._isGhostOverlay || ud?._isSourcePreview || ud?._isSourceMarker);
+};
 
 // Pre-allocated temp vectors (no GC in hot path)
 const _sourcePos = new Vector3();
@@ -83,7 +93,12 @@ export function isTransformNeutral(n: Object3D): boolean {
  * is set on every descendant and therefore cannot identify the root.
  */
 export function isLayoutPlacementRoot(n: Object3D): boolean {
-  return typeof n.userData?.['_layoutId'] === 'string';
+  // INNERMOST reading (plan-757 Phase 2, F5): a nested reference node inside a
+  // placed asset is a placement root too (`_layoutNestedOf`) — it carries its
+  // authored offset inside the parent asset, so it is exactly as wrong a spawn
+  // parent as a planner record's root.
+  const ud = n.userData;
+  return typeof ud?.['_layoutId'] === 'string' || typeof ud?.['_layoutNestedOf'] === 'string';
 }
 
 export function resolveSpawnParent(contextRoot: Object3D, sourceNode: Object3D): Object3D {
@@ -132,6 +147,8 @@ function stripComponentMetadata(obj: Object3D): void {
     delete ud.realvirtual;
     delete ud._layoutObject;
     delete ud._layoutId;
+    delete ud._layoutNestedOf;
+    delete ud._layoutNestedId;
   });
 }
 
@@ -158,6 +175,16 @@ const _sourceEdgeMaterial = new LineBasicMaterial({ color: 0xffffff, transparent
  * userData and an RVSource ref is circular. Auto-released when the node is GC'd.
  */
 const _engineSourceByNode = new WeakMap<Object3D, RVSource>();
+
+const _sourceTemplateMaterials = new WeakMap<Mesh, { mesh: Mesh; real: Material | Material[] }>();
+
+/** Authored material hidden by a source preview, including subsequent editor paint. */
+export function getSourceTemplateMaterial(mesh: Mesh): Material | Material[] | null {
+  const entry = _sourceTemplateMaterials.get(mesh);
+  if (!entry) return null;
+  return mesh.material === _sourceFillHiddenMaterial ? entry.real : mesh.material;
+}
+
 
 /** Resolve the engine RVSource bound to a source LayoutObject node (or null).
  *  The DES runner uses it to clone real MU meshes for its event-driven MUs. */
@@ -187,6 +214,30 @@ export class RVSource implements RVComponent {
 
   // Properties — exact C# Inspector field names
   AutomaticGeneration = true;
+  Enabled = true;
+  GenerateMU = true;
+  DeleteAllMU = false;
+  StartInterval = 0;
+  RandomDistance = false;
+  RangeDistance = 300;
+  LimitNumber = false;
+  MaxNumberMUs = 1;
+  Created = 0;
+  Mass = 1;
+  SourceGenerate: string | null = null;
+  SourceGenerateOnDistance: string | null = null;
+  private unityControls = false;
+  private generatedBefore = false;
+  private deleteBefore = false;
+  private distanceSignal = false;
+  private initAutomatic = false;
+  private nextDistance = 300;
+  private elapsed = 0;
+  private nextInterval = 0;
+  private signalUnsubs: (() => void)[] = [];
+  private generated = new Set<RVMovingUnit | InstancedMovingUnit>();
+  private pendingGenerated: (RVMovingUnit | InstancedMovingUnit)[] = [];
+  private colliderTemplate: MUColliderTemplate | undefined;
   Interval = 0;
   GenerateIfDistance = 300;
   PlaceOnTransportSurface = true;
@@ -323,15 +374,7 @@ export class RVSource implements RVComponent {
    * falls back to the global registry).
    */
   private _resolveTemplateInSubtree(root: Object3D, muName: string): Object3D | null {
-    const wanted = muName.includes('/') ? muName.slice(muName.lastIndexOf('/') + 1) : muName;
-    let found: Object3D | null = null;
-    root.traverse((child) => {
-      if (found) return;
-      const ud = child.userData;
-      if (ud?._isSourceGhost || ud?._isGhostOverlay || ud?._isSourcePreview || ud?._isSourceMarker) return;
-      if (child.name === wanted || child.name === muName) found = child;
-    });
-    return found;
+    return findByNameInSubtree(root, muName, isSourceRuntimeHelper);
   }
 
   /**
@@ -349,6 +392,14 @@ export class RVSource implements RVComponent {
     if (this.rawExtras) {
       this.computeSpawnConfig(this.rawExtras);
     }
+    this.unityControls ||= !!this.SourceGenerate || !!this.SourceGenerateOnDistance;
+    if (this.SourceGenerate) this.AutomaticGeneration = false;
+    this.nextDistance = this.GenerateIfDistance;
+    this.nextInterval = this.StartInterval;
+    this.signalUnsubs.push(wireBoolSignal(context.signalStore, this.SourceGenerate,
+      v => { this.GenerateMU = v; }, undefined, context.reapply).unsubscribe);
+    this.signalUnsubs.push(wireBoolSignal(context.signalStore, this.SourceGenerateOnDistance,
+      v => { this.distanceSignal = v; }, undefined, context.reapply).unsubscribe);
     this.spawnParent = this._resolveSpawnParent(context.root);
 
     // Find MU template.
@@ -414,6 +465,11 @@ export class RVSource implements RVComponent {
    * Called by loader after applySchema + legacy field handling.
    */
   computeSpawnConfig(extras: Record<string, unknown>): void {
+    // Existing web-authored documents retain their conveyor-placement policy.
+    // Unity control fields opt into the Unity Source fixed-step semantics.
+    this.unityControls = ['Enabled', 'GenerateMU', 'DeleteAllMU', 'SourceGenerate',
+      'SourceGenerateOnDistance', 'StartInterval', 'RandomDistance', 'LimitNumber'].some(k => k in extras)
+      || extras['Spawn'] === 'OnSignal';
     const interval = this.Interval;
     const distance = this.GenerateIfDistance;
     const autoGen = this.AutomaticGeneration;
@@ -457,6 +513,7 @@ export class RVSource implements RVComponent {
 
   /** Set the template MU and pre-compute its half-size and center offset */
   setTemplate(template: Object3D): void {
+    this.colliderTemplate = undefined;
     this.muTemplate = template;
     const info = computeTemplateAABBInfo(template);
     this.templateHalfSize = info.halfSize;
@@ -584,7 +641,9 @@ export class RVSource implements RVComponent {
       this._edgeOverlays.push(edges);
 
       // Hide the real fill (no colour/depth write → x-ray, no scene occlusion).
-      this._hiddenFillMeshes.push({ mesh, real: mesh.material });
+      const entry = { mesh, real: mesh.material };
+      this._hiddenFillMeshes.push(entry);
+      _sourceTemplateMaterials.set(mesh, entry);
       mesh.material = _sourceFillHiddenMaterial;
       mesh.castShadow = false;
     }
@@ -654,6 +713,9 @@ export class RVSource implements RVComponent {
    *  source is removed from the scene (e.g. layout-planner remove, model
    *  clear via TransportManager.reset). */
   dispose(): void {
+    for (const unsub of this.signalUnsubs) unsub();
+    this.signalUnsubs = [];
+    this.generated.clear(); this.pendingGenerated = [];
     if (this._unsubPlacement) {
       this._unsubPlacement();
       this._unsubPlacement = null;
@@ -675,7 +737,10 @@ export class RVSource implements RVComponent {
       edges.geometry.dispose();
     }
     this._edgeOverlays = [];
-    for (const { mesh, real } of this._hiddenFillMeshes) mesh.material = real;
+    for (const { mesh, real } of this._hiddenFillMeshes) {
+      mesh.material = getSourceTemplateMaterial(mesh) ?? real;
+      _sourceTemplateMaterials.delete(mesh);
+    }
     this._hiddenFillMeshes = [];
     // Marker disposal — frees ring geometry/material + label texture/material
     // and detaches the marker node from `this.node`.
@@ -700,6 +765,10 @@ export class RVSource implements RVComponent {
    * "delete" the source (and strip a self-template source's translucent shells).
    */
   reset(): void {
+    this.generatedBefore = this.deleteBefore = this.initAutomatic = false;
+    this.elapsed = 0; this.nextInterval = this.StartInterval;
+    this.nextDistance = this.GenerateIfDistance; this.Created = 0;
+    this.generated.clear(); this.pendingGenerated = [];
     this.timer = 0;
     this.lastSpawnedMU = null;
     this.muIdCounter = 0;
@@ -728,6 +797,8 @@ export class RVSource implements RVComponent {
       this._ensurePreview();
       return null;
     }
+
+    if (this.unityControls || this.spawnMode === 'OnSignal') return this.updateUnity(dt, forceClone);
 
     // Re-resolve what the source stands on (throttled). Force a fresh resolve
     // while a held preview is pending so a spawn decision after a planner move
@@ -786,7 +857,6 @@ export class RVSource implements RVComponent {
         return this.spawn(forceClone);
       }
     }
-    // OnSignal mode not implemented for PoC
 
     return null;
   }
@@ -887,8 +957,62 @@ export class RVSource implements RVComponent {
     mu?.dispose();
   }
 
+  private updateUnity(dt: number, forceClone: boolean): RVMovingUnit | InstancedMovingUnit | null {
+    const generate = () => {
+      const mu = this.spawn(forceClone);
+      if (mu) this.pendingGenerated.push(mu);
+    };
+    this.elapsed += dt;
+    if (this.Interval > 0 && this.elapsed >= this.nextInterval) {
+      this.nextInterval += this.Interval;
+      generate();
+    }
+    if (this.SourceGenerateOnDistance) {
+      if (!this.AutomaticGeneration && this.distanceSignal) this.initAutomatic = true;
+      this.AutomaticGeneration = this.distanceSignal;
+    }
+    if (this.GenerateMU && !this.generatedBefore) generate();
+    this.generatedBefore = this.GenerateMU;
+    if (this.AutomaticGeneration) {
+      const last = this.lastSpawnedMU;
+      const deleted = last && (last.markedForRemoval || (this.transportManager
+        && !this.transportManager.mus.includes(last) && !this.pendingGenerated.includes(last)));
+      if (last) { this.node.getWorldPosition(_sourcePos); last.getWorldPosition(_lastMUPos); }
+      if (deleted || (last && _sourcePos.distanceTo(_lastMUPos) * MM_TO_METERS > this.nextDistance)
+        || (this.initAutomatic && !last)) {
+        generate();
+        this.nextDistance = this.GenerateIfDistance + (this.RandomDistance ? (Math.random() * 2 - 1) * this.RangeDistance : 0);
+        this.initAutomatic = false;
+      }
+    }
+    if (this.DeleteAllMU && !this.deleteBefore) this.DeleteAll();
+    this.deleteBefore = this.DeleteAllMU;
+    // Drop references to consumed parts without resetting Unity's lifetime Created count.
+    if (this.transportManager) for (const mu of this.generated) {
+      if (!this.transportManager.mus.includes(mu) && !this.pendingGenerated.includes(mu)) this.generated.delete(mu);
+    }
+    return this.pendingGenerated.shift() ?? null;
+  }
+
+  /** Deletes this source's generated MUs; the lifetime Created count is retained, as in Unity. */
+  DeleteAll(): void {
+    for (const mu of this.generated) {
+      if (this.transportManager?.mus.includes(mu)) this.transportManager.removeMU(mu);
+      else mu.dispose();
+    }
+    this.generated.clear(); this.pendingGenerated = [];
+  }
+
+  /** Additional MUs when independent Unity interval and edge triggers fire in one tick. */
+  drainGenerated(): (RVMovingUnit | InstancedMovingUnit)[] {
+    return this.pendingGenerated.splice(0);
+  }
+
   private spawn(forceClone = false): (RVMovingUnit | InstancedMovingUnit) | null {
+    if (!this.Enabled || (this.LimitNumber && this.Created >= this.MaxNumberMUs)) return null;
     if (!this.muTemplate || !this.spawnParent || !this.templateHalfSize) return null;
+    // Authored compound bodies need per-MU transforms and collider metadata.
+    forceClone ||= !!this.muTemplate.userData.realvirtual?.Rigidbody;
 
     // ── Instanced path ──
     if (this.useInstancing && this.pool && !forceClone) {
@@ -903,6 +1027,8 @@ export class RVSource implements RVComponent {
       const muId = `imu_${this.node.name}_${this.muIdCounter++}`;
 
       const mu = this.pool.spawn(_sourcePos, _spawnQuat, muId, this.node.name);
+      if (this.unityControls) mu.physicsMassKg = this.Mass;
+      this.Created++; if (this.unityControls) this.generated.add(mu);
       this.lastSpawnedMU = mu;
       this.spawnCount++;
       return mu;
@@ -931,6 +1057,11 @@ export class RVSource implements RVComponent {
     // into its own fields and they are immutable after setTemplate(), so cloning
     // per spawn was pure GC churn (the instanced path already passes by reference).
     const mu = new RVMovingUnit(clone, this.node.name, this.templateHalfSize, this.templateLocalCenter ?? undefined);
+    // The clone lost its rv-extras (stripComponentMetadata) — hand the
+    // template's seat depth over explicitly (plan-577 F2).
+    mu.loadSeatDepth = readLoadSeatDepth(this.muTemplate);
+    if (this.unityControls) mu.physicsMassKg = this.Mass;
+    this.Created++; if (this.unityControls) this.generated.add(mu);
     this.lastSpawnedMU = mu;
     return mu;
   }
@@ -950,7 +1081,10 @@ export class RVSource implements RVComponent {
     // (no render in between) so the source never flickers. We must NOT stash the
     // real material in userData — Object3D.clone() JSON-round-trips userData and
     // would corrupt the Material into a useless plain object.
-    for (const e of this._hiddenFillMeshes) e.mesh.material = e.real;
+    for (const e of this._hiddenFillMeshes) {
+      e.real = getSourceTemplateMaterial(e.mesh) ?? e.real;
+      e.mesh.material = e.real;
+    }
     const clone = this.muTemplate!.clone();
     for (const e of this._hiddenFillMeshes) e.mesh.material = _sourceFillHiddenMaterial;
 
@@ -971,6 +1105,8 @@ export class RVSource implements RVComponent {
     // driven by RVMovingUnit — it must never carry a `Source`/`LayoutObject`
     // definition, or `processExtras` would turn it into a recursive Source.
     stripComponentMetadata(clone);
+    this.colliderTemplate ??= readMUColliderTemplate(this.muTemplate!);
+    if (this.colliderTemplate) clone.userData.physicsBody = this.colliderTemplate;
 
     // Force everything visible — for self-template sources the real meshes were
     // hidden (`_hideRealMeshes`) and that flag carries over via clone().
@@ -1024,7 +1160,8 @@ registerComponent({
   schema: RVSource.schema,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    badgeColor: '#ab47bc',
+    bake: 'keep',       // the MU preview / template is cloned at runtime — never baked
+    ui: { badge: '#ab47bc' },
   },
   create: (node) => new RVSource(node),
 });

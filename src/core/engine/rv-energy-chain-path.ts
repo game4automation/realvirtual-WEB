@@ -340,6 +340,8 @@ export interface CalibrationInput {
    * different parts of the same cloud.
    */
   points: Float32Array;
+  /** Optional triangle topology for exact cross-sections of sparse CAD meshes. */
+  triangles?: Uint32Array;
   /** Scale factor from bind-frame units to millimetres. Default 1000 (metres). */
   unitsToMm?: number;
   /** Force the drive axis instead of measuring it. */
@@ -376,6 +378,33 @@ export interface CalibrationResult {
 const AXIS_NAMES: ReadonlyArray<'X' | 'Y' | 'Z'> = ['X', 'Y', 'Z'];
 /** Below this ratio between the two longest AABB extents the axis is ambiguous. */
 const AXIS_RATIO_MIN = 1.5;
+
+/** Intersect CAD triangles with a cross-section plane. Sampling the resulting
+ * intervals avoids depending on tessellation density along straight faces. */
+function sampleTriangleSlice(
+  points: Float32Array, indices: Uint32Array, uAxis: number, vAxis: number,
+  plane: number, spacing: number, out: number[],
+): void {
+  for (let i = 0; i + 2 < indices.length; i += 3) {
+    let lo = Infinity, hi = -Infinity;
+    for (let edge = 0; edge < 3; edge++) {
+      const a = indices[i + edge] * 3, b = indices[i + (edge + 1) % 3] * 3;
+      const ua = points[a + uAxis], ub = points[b + uAxis];
+      if (plane < Math.min(ua, ub) || plane > Math.max(ua, ub)) continue;
+      if (ua === ub) {
+        lo = Math.min(lo, points[a + vAxis], points[b + vAxis]);
+        hi = Math.max(hi, points[a + vAxis], points[b + vAxis]);
+      } else {
+        const t = (plane - ua) / (ub - ua);
+        const v = points[a + vAxis] + t * (points[b + vAxis] - points[a + vAxis]);
+        lo = Math.min(lo, v); hi = Math.max(hi, v);
+      }
+    }
+    if (!Number.isFinite(lo)) continue;
+    const steps = Math.max(1, Math.ceil((hi - lo) / spacing));
+    for (let step = 0; step <= steps; step++) out.push(lo + (hi - lo) * step / steps);
+  }
+}
 
 /**
  * Measure bend radius, link height, chain length and drive axis from the CAD
@@ -448,30 +477,44 @@ export function calibrate(input: CalibrationInput): CalibrationResult {
   // Try slices at increasing inset from BOTH ends. The open end has two
   // clusters, the bend end has one continuous band — that asymmetry is what
   // identifies which end carries the bend.
-  const insets = [0.02, 0.05, 0.10, 0.16, 0.24];
+  const insets = [0.02, 0.05, 0.10, 0.16, 0.24, 0.32, 0.40, 0.46];
   const sliceWidth = uSpan * 0.03;
   const vBuf: number[] = [];
 
   let openAtMin = false;
   let clusters: Cluster[] | null = null;
-  outer:
+  let bestSeparation = -Infinity;
   for (const inset of insets) {
     for (const fromMin of [true, false]) {
       const base = fromMin ? uMin + uSpan * inset : uMax - uSpan * inset - sliceWidth;
       const lo = base;
       const hi = base + sliceWidth;
       vBuf.length = 0;
-      for (let i = 0; i < n; i++) {
-        const u = pts[i * 3 + axisIndex];
-        if (u < lo || u > hi) continue;
-        vBuf.push(pts[i * 3 + upIndex]);
+      if (input.triangles) {
+        sampleTriangleSlice(pts, input.triangles, axisIndex, upIndex,
+          (lo + hi) / 2, gapThreshold / 3, vBuf);
+      } else {
+        for (let i = 0; i < n; i++) {
+          const u = pts[i * 3 + axisIndex];
+          if (u < lo || u > hi) continue;
+          vBuf.push(pts[i * 3 + upIndex]);
+        }
       }
       if (vBuf.length < 8) continue;
       const found = clusterSorted(vBuf, gapThreshold);
       if (found.length === 2) {
+        const separation = found[1].center - found[0].center;
+        const height = (found[0].width + found[1].width) / 2;
+        // Sparse edge bands and slices through the bend can look like two
+        // strands. Keep searching instead of accepting the first such slice.
+        // Straight strands have the largest centerline separation; curved
+        // slices have a smaller separation even when they pass closure.
+        if (!(height > 0) || !(separation > 0)
+          || Math.abs(separation + height - vExtent) > vExtent * 0.1
+          || separation <= bestSeparation) continue;
+        bestSeparation = separation;
         clusters = found;
         openAtMin = fromMin;
-        break outer;
       }
     }
   }
@@ -501,7 +544,21 @@ export function calibrate(input: CalibrationInput): CalibrationResult {
 
   // ── 3. Bend location ────────────────────────────────────────────
   // The bend sits at the end OPPOSITE the two-cluster slice.
-  const bendDir: 1 | -1 = openAtMin ? 1 : -1;
+  // With unequal strand lengths, a valid slice may lie nearer the bend than
+  // the open ends. Locate the connector across the inner gap independently
+  // instead of inferring bend direction from which side we scanned first.
+  const transverseMid = (low.center + high.center) / 2;
+  const innerHalf = (high.center - low.center) * 0.2;
+  let connectorMin = Infinity, connectorMax = -Infinity;
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(pts[i * 3 + upIndex] - transverseMid) >= innerHalf) continue;
+    const u = pts[i * 3 + axisIndex];
+    connectorMin = Math.min(connectorMin, u);
+    connectorMax = Math.max(connectorMax, u);
+  }
+  const bendDir: 1 | -1 = Number.isFinite(connectorMin)
+    ? ((connectorMin + connectorMax) / 2 > (uMin + uMax) / 2 ? 1 : -1)
+    : (openAtMin ? 1 : -1);
   const rUnits = rMm / toMm;
   const hUnits = linkMm / toMm;
   const outerEdge = bendDir === 1 ? uMax : uMin;

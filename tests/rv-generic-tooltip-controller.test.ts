@@ -33,16 +33,16 @@ function resolveHoverSections(
   for (const key of Object.keys(rv)) {
     if (typeof rv[key] !== 'object') continue;
     const caps = getCapabilities(key);
-    if (!caps.tooltipType) continue;
-    const resolver = registry.getDataResolver(caps.tooltipType);
+    if (!caps.ui.tooltip) continue;
+    const resolver = registry.getDataResolver(caps.ui.tooltip);
     if (!resolver) continue;
     const data = resolver(node, viewer);
     if (!data) continue;
     sections.push({
-      id: `tooltip-hover:${caps.tooltipType}`,
-      type: caps.tooltipType,
+      id: `tooltip-hover:${caps.ui.tooltip}`,
+      type: caps.ui.tooltip,
       data,
-      priority: caps.hoverPriority ?? 5,
+      priority: caps.ui.priority,
     });
   }
   return sections;
@@ -62,7 +62,7 @@ describe('GenericTooltipController rv_extras iteration', () => {
   });
 
   it('should produce tooltip section for node with Drive rv_extras', () => {
-    registerCapabilities('Drive', { tooltipType: 'drive', hoverPriority: 10 });
+    registerCapabilities('Drive', { ui: { tooltip: 'drive', priority: 10 } });
 
     const registry = new TooltipContentRegistry();
     const node = new Object3D();
@@ -86,8 +86,8 @@ describe('GenericTooltipController rv_extras iteration', () => {
   });
 
   it('should produce multiple sections for node with Drive + AASLink', () => {
-    registerCapabilities('Drive', { tooltipType: 'drive', hoverPriority: 10 });
-    registerCapabilities('AASLink', { tooltipType: 'aas', hoverPriority: 3 });
+    registerCapabilities('Drive', { ui: { tooltip: 'drive', priority: 10 } });
+    registerCapabilities('AASLink', { ui: { tooltip: 'aas', priority: 3 } });
 
     const registry = new TooltipContentRegistry();
     const node = new Object3D();
@@ -123,7 +123,7 @@ describe('GenericTooltipController rv_extras iteration', () => {
   });
 
   it('should skip scalar rv_extras keys', () => {
-    registerCapabilities('Drive', { tooltipType: 'drive', hoverPriority: 10 });
+    registerCapabilities('Drive', { ui: { tooltip: 'drive', priority: 10 } });
 
     const registry = new TooltipContentRegistry();
     const node = new Object3D();
@@ -144,7 +144,7 @@ describe('GenericTooltipController rv_extras iteration', () => {
   });
 
   it('should skip types without registered resolver', () => {
-    registerCapabilities('Sensor', { tooltipType: 'sensor', hoverPriority: 5 });
+    registerCapabilities('Sensor', { ui: { tooltip: 'sensor', priority: 5 } });
 
     const registry = new TooltipContentRegistry();
     const node = new Object3D();
@@ -159,7 +159,7 @@ describe('GenericTooltipController rv_extras iteration', () => {
   });
 
   it('should skip when resolver returns null', () => {
-    registerCapabilities('Drive', { tooltipType: 'drive', hoverPriority: 10 });
+    registerCapabilities('Drive', { ui: { tooltip: 'drive', priority: 10 } });
 
     const registry = new TooltipContentRegistry();
     const node = new Object3D();
@@ -182,8 +182,8 @@ describe('GenericTooltipController rv_extras iteration', () => {
     expect(sections).toHaveLength(0);
   });
 
-  it('should use default hoverPriority when not specified in capabilities', () => {
-    registerCapabilities('CustomType', { tooltipType: 'custom' });
+  it('should use default ui.priority when not specified in capabilities', () => {
+    registerCapabilities('CustomType', { ui: { tooltip: 'custom' } });
 
     const registry = new TooltipContentRegistry();
     const node = new Object3D();

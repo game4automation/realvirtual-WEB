@@ -27,7 +27,9 @@ import { useChangeGatedTick } from '../../hooks/use-change-gated-tick';
 import { useEditorPlugin } from '../../hooks/use-editor-plugin';
 import { MathUtils } from 'three';
 import type { Object3D } from 'three';
-import { RV_SCROLL_CLASS } from './shared-sx';
+import { RV_SYNTHETIC_KEY } from '../engine/rv-bake-chunk';
+import { DIVIDER, FS, ICON_SIZE, LINK, OCCUPIED, RV_SCROLL_CLASS, SUCCESS, WARN, WARN_LIGHT } from './shared-sx';
+import { InspectorSubheader } from './rv-inspector-blocks';
 import {
   Box,
   Typography,
@@ -54,10 +56,10 @@ import type { SnapPointPlugin } from '../../plugins/snap-point';
 import { getOverriddenFields } from '../engine/rv-extras-overlay-store';
 import {
   overrideTargetOf,
-  overriddenFieldsOf,
   revertComponentOverride,
   writeOverride,
 } from '../ops/rv-reference-guard';
+import { referenceOverriddenFields } from './rv-field-override';
 import { USER_PAUSE_REASON } from '../engine/rv-constants';
 import { LeftPanel } from './LeftPanel';
 import { AasDetailHeaderAction } from '../../plugins/aas-link-plugin';
@@ -70,6 +72,7 @@ import {
   type ReverseReference,
 } from './rv-inspector-helpers';
 import { getPrimaryDisplayValue, applyLiveEdit, getLiveStateFor } from './rv-value-resolver';
+import { FMU_TYPE } from '../engine/rv-fmu-constants';
 import { navigateToRef } from './rv-reference-display';
 import { ComponentSection, runtimeRow } from './rv-component-section';
 import { AddComponentSection } from './rv-add-component-section';
@@ -79,6 +82,8 @@ import { ConnectionsSection } from './rv-connections-section';
 import { findLayoutRoot } from './layout-root-utils';
 import { findPickOwner } from '../engine/rv-pick-owner';
 import { isModelRoot } from '../engine/rv-model-root';
+import { collectNodeMeshInfo, type NodeMeshEntry } from '../engine/rv-node-mesh-info';
+import { buildBakedGeometryVirtualComponent } from './rv-baked-geometry-section';
 import { getCapabilities } from '../engine/rv-component-registry';
 import { Vector3Editor } from './rv-field-editors';
 import { InspectorRow } from './rv-inspector-row';
@@ -86,6 +91,9 @@ import { StepState } from '../engine/rv-logic-step';
 import type { StepStateInfo } from '../engine/rv-logic-engine';
 import { STEP_STATE_COLORS, STEP_STATE_LABELS } from './rv-logic-step-colors';
 import { PROVENANCE_REFERENCED_TITLE } from './signal-vocabulary';
+import { SignalUsageSection } from './rv-signal-usage-list';
+import { signalNameForPath } from './use-signal-usages';
+import { isSignalComponentTypeKey } from '../engine/rv-node-registry';
 
 // Re-export isHiddenComponentType for backward compatibility
 export { isHiddenComponentType } from './rv-inspector-helpers';
@@ -114,29 +122,8 @@ function loadDetached(): boolean {
 // Virtual (ephemeral) sections never edit/reset — pass shared frozen handlers
 // so they don't allocate a fresh closure per render.
 const EMPTY_OVERRIDES: Set<string> = new Set();
-const NO_FIELDS: readonly string[] = [];
-
-/**
- * Fields of `componentType` that an enclosing `AssetReference` overrides for
- * this node (plan-703 F7).
- *
- * Empty in `viewer` mode by decision 9 — not because the data is absent, but
- * because the badge is an EDIT affordance: it is clickable and it reverts. A
- * kiosk must not offer that, and hiding the control while leaving it reachable
- * would be worse than not showing it.
- */
-function referenceOverriddenFields(
-  viewer: RVViewer,
-  nodePath: string,
-  componentType: string,
-): readonly string[] {
-  if (viewer.modes.activeMode === 'viewer') return NO_FIELDS;
-  const node = viewer.registry?.getNode(nodePath);
-  if (!node) return NO_FIELDS;
-  const target = overrideTargetOf(node, viewer.currentModelRoot ?? null);
-  if (!target) return NO_FIELDS;
-  return overriddenFieldsOf(target.referenceNode, target.nodeId, componentType);
-}
+// `referenceOverriddenFields` moved to `rv-field-override.ts` (plan-512): the
+// unit auto-scale's write rule has to see exactly the override union the dot shows.
 
 /**
  * Drop the instance override for one field — or, with no field, for the whole
@@ -178,7 +165,7 @@ interface RuntimeFieldRowProps {
 function RuntimeFieldRow({ label, value, color }: RuntimeFieldRowProps) {
   return (
     <InspectorRow label={label} labelTitle={label} labelColor="text.disabled" dense minHeight={22} py={0.15}>
-      <Typography sx={{ fontSize: 10, color: color ?? 'text.primary', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+      <Typography sx={{ fontSize: FS.micro, color: color ?? 'text.primary', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {value}
       </Typography>
     </InspectorRow>
@@ -208,7 +195,7 @@ export function snapInspectorData(
 }
 
 /** Accent color for an occupied snap (amber). */
-const SNAP_OCCUPIED_COLOR = '#e8b04a';
+const SNAP_OCCUPIED_COLOR = OCCUPIED;
 
 /** Build the read-only-live virtual component for a selected snap Empty, or null
  *  when the node is not a registered snap. Resolves the snap by Object3D.uuid
@@ -236,73 +223,87 @@ function buildSnapVirtualComponent(viewer: RVViewer, uuid: string): { type: stri
   return { type: 'Snap Point', data };
 }
 
+/** Rows of the per-node mesh list before the rest collapses into one "+N" row
+ *  (a baked model root owns every static chunk). */
+const MESH_ROWS_MAX = 6;
+
+const MESH_KIND_LABELS: Record<NodeMeshEntry['kind'], string> = {
+  own: 'Mesh',
+  chunk: 'Chunk',
+  window: 'Chunk window',
+};
+
+/** Pure projection of a node's mesh entries into inspector rows (label → text),
+ *  in display order. The own mesh gets the full read-out, chunks and chunk
+ *  windows one row each. Testable without a React render. */
+export function meshInspectorRows(entries: readonly NodeMeshEntry[]): Array<[string, string]> {
+  const n = (v: number): string => v.toLocaleString('en-US');
+  const rows: Array<[string, string]> = [];
+  const rest = entries.filter((e) => e.kind !== 'own');
+  const own = entries.find((e) => e.kind === 'own');
+  if (own) {
+    rows.push(['Geometry', own.block]);
+    rows.push(['Triangles', n(own.triangles)]);
+    if (own.vertices !== null) rows.push(['Vertices', n(own.vertices)]);
+    if (own.materials.length > 0) rows.push(['Material', own.materials.join(', ')]);
+    if (own.attributes.length > 0) rows.push(['Attributes', own.attributes.join(', ')]);
+  }
+  rest.slice(0, MESH_ROWS_MAX).forEach((e, i) => {
+    const parts = [e.name, `${n(e.triangles)} tris`];
+    if (e.range) parts.push(`idx ${n(e.range.indexStart)} +${n(e.range.indexCount)}`);
+    rows.push([`${MESH_KIND_LABELS[e.kind]} ${i + 1}`, parts.join(' · ')]);
+  });
+  if (rest.length > MESH_ROWS_MAX) rows.push(['More', `+${rest.length - MESH_ROWS_MAX}`]);
+  return rows;
+}
+
 function LogicStepRuntimeSection({ info }: { info: StepStateInfo }) {
   const stateColor = STEP_STATE_COLORS[info.state];
   const stateLabel = STEP_STATE_LABELS[info.state];
 
   return (
-    <Box sx={{ borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
-      {/* Section header */}
-      <Box
-        sx={{
-          display: 'flex',
-          alignItems: 'center',
-          px: 1,
-          py: 0.5,
-          bgcolor: stateColor + '18',
-          borderBottom: `2px solid ${stateColor}44`,
-        }}
+    <Box sx={{ borderBottom: `1px solid ${DIVIDER}` }}>
+      {/* Section header — the shared InspectorSubheader with the state as accent (plan-510). */}
+      <InspectorSubheader
+        accent={stateColor}
+        dot={<Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: stateColor, flexShrink: 0 }} />}
+        trailing={
+          <Typography sx={{ fontSize: FS.micro, color: stateColor, fontWeight: 600 }}>
+            {stateLabel}
+          </Typography>
+        }
       >
-        <Box
-          sx={{
-            width: 8,
-            height: 8,
-            borderRadius: '50%',
-            bgcolor: stateColor,
-            mr: 0.75,
-            flexShrink: 0,
-          }}
-        />
-        <Typography sx={{ fontSize: 10, fontWeight: 700, color: stateColor, textTransform: 'uppercase', letterSpacing: 0.5, flex: 1 }}>
-          Runtime Status
-        </Typography>
-        <Typography sx={{ fontSize: 9, color: stateColor, fontWeight: 600 }}>
-          {stateLabel}
-        </Typography>
-      </Box>
+        Runtime Status
+      </InspectorSubheader>
 
       {/* Runtime fields */}
       <Box sx={{ py: 0.5 }}>
         <RuntimeFieldRow label="State" value={info.state} color={stateColor} />
         {info.reason === 'suppressed-live' && (
-          <RuntimeFieldRow label="Control" value="Live-controlled" color="#ffb74d" />
+          <RuntimeFieldRow label="Control" value="Live-controlled" color={WARN_LIGHT} />
         )}
         <RuntimeFieldRow label="Type" value={info.type} />
 
-        {/* Progress bar */}
-        <Box sx={{ px: 1, py: 0.25 }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Typography sx={{ fontSize: 10, color: 'text.disabled', width: 100, flexShrink: 0 }}>
-              Progress
+        {/* Progress bar — an InspectorRow like its siblings (plan-514: no private
+            100 px label column), the bar + percentage in the value column. */}
+        <InspectorRow label="Progress" labelTitle="Progress" labelColor="text.disabled" dense minHeight={22} py={0.15}>
+          <Box sx={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 0.5 }}>
+            <LinearProgress
+              variant="determinate"
+              value={Math.min(100, info.progress)}
+              sx={{
+                flex: 1,
+                height: 4,
+                borderRadius: 2,
+                bgcolor: DIVIDER,
+                '& .MuiLinearProgress-bar': { bgcolor: stateColor, borderRadius: 2 },
+              }}
+            />
+            <Typography sx={{ fontSize: FS.micro, color: 'text.secondary', minWidth: 28, textAlign: 'right' }}>
+              {info.progress.toFixed(0)}%
             </Typography>
-            <Box sx={{ flex: 1, display: 'flex', alignItems: 'center', gap: 0.5 }}>
-              <LinearProgress
-                variant="determinate"
-                value={Math.min(100, info.progress)}
-                sx={{
-                  flex: 1,
-                  height: 4,
-                  borderRadius: 2,
-                  bgcolor: 'rgba(255,255,255,0.06)',
-                  '& .MuiLinearProgress-bar': { bgcolor: stateColor, borderRadius: 2 },
-                }}
-              />
-              <Typography sx={{ fontSize: 9, color: 'text.secondary', minWidth: 28, textAlign: 'right' }}>
-                {info.progress.toFixed(0)}%
-              </Typography>
-            </Box>
           </Box>
-        </Box>
+        </InspectorRow>
 
         {/* SerialContainer-specific fields */}
         {info.type === 'SerialContainer' && (
@@ -405,7 +406,11 @@ function readLiveSignature(
   const parts: string[] = [];
   for (const type of liveComponentTypes) {
     const live = getLiveStateFor(viewer, nodePath, type);
-    parts.push(`${type}=${live ? JSON.stringify(live) : ''}`);
+    // The section header's value (Drive position, FMU state) is part of what the
+    // inspector DISPLAYS — without it an FMU going running → idle never re-renders
+    // the header once its drive stands still.
+    const header = getPrimaryDisplayValue(viewer, nodePath, type, {}).text ?? '';
+    parts.push(`${type}=${live ? JSON.stringify(live) : ''}|${header}`);
   }
   if (behaviorRootNode) {
     const d = collectBehaviorData(viewer as unknown as BehaviorViewerSnapshot, behaviorRootNode);
@@ -420,6 +425,9 @@ interface LayoutTransformSectionProps {
   // wiring callbacks.
   viewer: RVViewer;
   nodePath: string;
+  /** The object to read, when it has no path to look up by — an unregistered
+   *  node the hierarchy selected (plan-754 D2). Always read-only in that case. */
+  node?: import('three').Object3D | null;
   locked: boolean;
   /** The lock is a PROPERTY of the node, not a user setting — hide the toggle
    *  entirely (the model root, plan-715). A disabled toggle would invite the
@@ -438,8 +446,8 @@ interface LayoutTransformSectionProps {
   canReverse?: boolean;
 }
 
-function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleLock, onToggleVisible, onReverseDirection, canReverse }: LayoutTransformSectionProps) {
-  const node = viewer.registry?.getNode(nodePath);
+function LayoutTransformSection({ viewer, nodePath, node: nodeOverride, locked, lockFixed, onToggleLock, onToggleVisible, onReverseDirection, canReverse }: LayoutTransformSectionProps) {
+  const node = nodeOverride ?? viewer.registry?.getNode(nodePath);
 
   // Poll position/rotation at 200 ms for live updates (e.g. during a
   // TransformControls drag) — but ONLY commit when something the section
@@ -448,9 +456,9 @@ function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleL
   // section 5×/s forever. `nodePath` as resetKey re-baselines on selection change
   // and clears the old interval.
   const tick = useChangeGatedTick({
-    read: () => readTransformSignature(viewer.registry?.getNode(nodePath)),
+    read: () => readTransformSignature(nodeOverride ?? viewer.registry?.getNode(nodePath)),
     equal: transformSignaturesEqual,
-    resetKey: nodePath,
+    resetKey: nodePath || nodeOverride?.uuid || '',
   });
 
   const pos = useMemo(() => {
@@ -517,14 +525,13 @@ function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleL
   if (!node) return null;
 
   const labelColor = locked ? 'text.disabled' : 'text.secondary';
-  const resetBtnSx = { p: 0.15, color: 'text.disabled', flexShrink: 0, '&:hover': { color: '#ffa726' } };
+  const resetBtnSx = { p: 0.15, color: 'text.disabled', flexShrink: 0, '&:hover': { color: WARN } };
 
   return (
-    <Box sx={{ borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', px: 1, py: 0.5, bgcolor: 'rgba(100, 181, 246, 0.08)', borderBottom: '2px solid rgba(100, 181, 246, 0.2)' }}>
-        <Typography sx={{ fontSize: 10, fontWeight: 700, color: '#64b5f6', textTransform: 'uppercase', letterSpacing: 0.5, flex: 1 }}>
-          Transform
-        </Typography>
+    <Box sx={{ borderBottom: `1px solid ${DIVIDER}` }}>
+      <InspectorSubheader
+        accent={LINK}
+        trailing={<Box sx={{ display: 'flex', alignItems: 'center' }}>
         {/* Reverse direction — rotates the asset 180° around its connected
             snap-point's outward axis. Only visible when the asset is part of
             a snap-chain (`canReverse` true). Sits before the visibility
@@ -537,7 +544,7 @@ function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleL
               onClick={onReverseDirection}
               sx={{ p: 0.25, mr: 0.25, color: 'text.secondary', '&:hover': { color: 'primary.main' } }}
             >
-              <SwapHoriz sx={{ fontSize: 14 }} />
+              <SwapHoriz sx={{ fontSize: ICON_SIZE.sm }} />
             </IconButton>
           </Tooltip>
         )}
@@ -550,26 +557,29 @@ function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleL
               onClick={() => onToggleVisible(!node.visible)}
               sx={{ p: 0.25, mr: 0.25, color: node.visible ? 'primary.main' : 'text.disabled', '&:hover': { color: node.visible ? 'primary.light' : 'text.primary' } }}
             >
-              {node.visible ? <Visibility sx={{ fontSize: 14 }} /> : <VisibilityOff sx={{ fontSize: 14 }} />}
+              {node.visible ? <Visibility sx={{ fontSize: ICON_SIZE.sm }} /> : <VisibilityOff sx={{ fontSize: ICON_SIZE.sm }} />}
             </IconButton>
           </Tooltip>
         )}
         {lockFixed ? (
           <Tooltip title="Model root — always at the asset origin, not editable">
-            <Lock sx={{ fontSize: 14, color: 'text.disabled', mx: 0.25 }} />
+            <Lock sx={{ fontSize: ICON_SIZE.sm, color: 'text.disabled', mx: 0.25 }} />
           </Tooltip>
         ) : (
           <Tooltip title={locked ? 'Unlock object' : 'Lock object'}>
             <IconButton
               size="small"
               onClick={onToggleLock}
-              sx={{ p: 0.25, color: locked ? '#ffa726' : 'text.secondary', '&:hover': { color: locked ? '#ffb74d' : 'text.primary' } }}
+              sx={{ p: 0.25, color: locked ? WARN : 'text.secondary', '&:hover': { color: locked ? WARN_LIGHT : 'text.primary' } }}
             >
-              {locked ? <Lock sx={{ fontSize: 14 }} /> : <LockOpen sx={{ fontSize: 14 }} />}
+              {locked ? <Lock sx={{ fontSize: ICON_SIZE.sm }} /> : <LockOpen sx={{ fontSize: ICON_SIZE.sm }} />}
             </IconButton>
           </Tooltip>
         )}
-      </Box>
+        </Box>}
+      >
+        Transform
+      </InspectorSubheader>
       <Box sx={{ py: 0.5, opacity: locked ? 0.5 : 1, pointerEvents: locked ? 'none' : 'auto' }}>
         <InspectorRow
           fullWidthField
@@ -579,7 +589,7 @@ function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleL
           trailing={
             <Tooltip title="Reset position to 0,0,0">
               <IconButton size="small" onClick={handleResetPosition} sx={resetBtnSx}>
-                <RestartAlt sx={{ fontSize: 12 }} />
+                <RestartAlt sx={{ fontSize: ICON_SIZE.xs }} />
               </IconButton>
             </Tooltip>
           }
@@ -596,7 +606,7 @@ function LayoutTransformSection({ viewer, nodePath, locked, lockFixed, onToggleL
           trailing={
             <Tooltip title="Reset rotation to 0,0,0">
               <IconButton size="small" onClick={handleResetRotation} sx={resetBtnSx}>
-                <RestartAlt sx={{ fontSize: 12 }} />
+                <RestartAlt sx={{ fontSize: ICON_SIZE.xs }} />
               </IconButton>
             </Tooltip>
           }
@@ -616,15 +626,37 @@ export interface PropertyInspectorProps {
   viewer: RVViewer;
 }
 
+/**
+ * The path the inspector may WRITE against for a selection, or null.
+ *
+ * plan-755 F9: a node the bake created (`userData._rvSynthetic` — a partition
+ * object) is registered and HAS a path, but it stands in no document and is
+ * rebuilt by every bake, so an override written against it would address
+ * nothing on the next load. It therefore takes the runtime-selection branch:
+ * fields visible, nothing editable, no `writeOverride`.
+ */
+export function inspectorWritePath(node: Object3D | null | undefined, path: string | null | undefined): string | null {
+  if (!node || !path) return null;
+  if ((node.userData as Record<string, unknown> | undefined)?.[RV_SYNTHETIC_KEY] === true) return null;
+  return path;
+}
+
 export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const { plugin, state } = useEditorPlugin();
-  const selectedPath = state.selectedNodePath;
+  const selectedNode = state.selectedNode;
+  const selectedPath = inspectorWritePath(selectedNode, state.selectedNodePath);
+  /**
+   * The selection is a node the document does not address (plan-754 D2): a
+   * chunk mesh, a light, a hover overlay. Everything that WRITES here goes
+   * through a path — the overlay, the op log, Add Component — so the inspector
+   * shows what such a node IS (transform, geometry) and nothing that pretends
+   * it could be edited.
+   */
+  const isRuntimeSelection = !!selectedNode && !selectedPath;
 
-  // Find the selected node in the scene and read its userData
+  // Read the selected node's userData
   const nodeData = useMemo(() => {
-    if (!selectedPath || !viewer.registry) return null;
-
-    const node = viewer.registry.getNode(selectedPath);
+    const node = selectedNode;
     if (!node) return null;
 
     const rv = node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
@@ -654,18 +686,16 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
     // whose field rows are memoised on the `data` reference. Unchanged
     // components keep their identity, so their child memos stay stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPath, viewer.registry, state]);
+  }, [selectedNode, state]);
 
   // Check if the selected node has a LayoutObject (for transform section)
   // Re-read Locked from live userData on any state change (state is always a new ref after notify())
   const hasLayoutObject = !!nodeData?.layoutObj;
   const layoutLocked = useMemo(() => {
-    if (!selectedPath || !viewer.registry) return false;
-    const node = viewer.registry.getNode(selectedPath);
-    const rv = node?.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
+    const rv = selectedNode?.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined;
     return !!(rv?.LayoutObject?.Locked);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPath, viewer.registry, state]);
+  }, [selectedNode, state]);
 
   /**
    * The selected node is the GLB root (plan-715).
@@ -678,10 +708,24 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
    * addressable in the first place.
    */
   const isRootSelected = useMemo(
-    () => isModelRoot(selectedPath ? viewer.registry?.getNode(selectedPath) : null, viewer.currentModelRoot),
+    () => isModelRoot(selectedNode, viewer.currentModelRoot),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [selectedPath, viewer, state],
+    [selectedNode, viewer, state],
   );
+
+  // Geometry the selected node carries (own mesh, attached chunks, chunk
+  // windows) — null for a plain group. The bake revision covers the draw state
+  // changing under a standing selection (placement baked / released, the
+  // loader bake landing late).
+  const bakeRevision = useChangeGatedTick({
+    read: () => viewer.bakeRegistry.revision,
+    resetKey: selectedNode?.uuid ?? '',
+  });
+  const meshRows = useMemo(() => {
+    const entries = selectedNode ? collectNodeMeshInfo(selectedNode, viewer.bakeRegistry) : [];
+    return entries.length > 0 ? meshInspectorRows(entries) : null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedNode, viewer, state, bakeRevision]);
 
   // Check if the selected node has a LogicStep component
   const hasLogicStep = nodeData?.components.some(c => c.type.startsWith('LogicStep_')) ?? false;
@@ -691,6 +735,12 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const stepInfo = hasLogicStep && logicEngine && selectedPath
     ? logicEngine.getStepInfo(selectedPath)
     : null;
+
+  // plan-566: a selected SIGNAL node gets the "Used by" cross-reference list.
+  const selectedSignalName = useMemo(() => {
+    if (!nodeData?.components.some((c) => isSignalComponentTypeKey(c.type))) return null;
+    return signalNameForPath(viewer, selectedPath);
+  }, [nodeData, viewer, selectedPath]);
 
   // Find reverse references: who points to this node via ComponentReference?
   // Uses the pre-built index in NodeRegistry (O(1) lookup instead of full scene scan).
@@ -704,18 +754,16 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   // ancestor carrying components (e.g. the Drive of an axis sub-mesh) as a
   // clickable breadcrumb chip. Null when the node is its own owner.
   const pickOwner = useMemo(() => {
-    if (!selectedPath || !viewer.registry) return null;
-    const node = viewer.registry.getNode(selectedPath);
-    if (!node) return null;
-    const owner = findPickOwner(node, viewer.registry);
-    return owner && owner.node !== node ? owner : null;
+    if (!selectedNode || !viewer.registry) return null;
+    const owner = findPickOwner(selectedNode, viewer.registry);
+    return owner && owner.node !== selectedNode ? owner : null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPath, viewer.registry, state]);
+  }, [selectedNode, viewer.registry, state]);
 
   // Behavior States+Hardware gate: the stamped behavior marker is
-  // inspectorVisible:false, so it no longer appears in nodeData.components.
+  // ui.hidden, so it no longer appears in nodeData.components.
   // Detect it by scanning the SELECTED node's RAW userData (filterHidden:false)
-  // for a component whose capability filterLabel is 'Behavior'.
+  // for a component whose capability ui.filter is 'Behavior'.
   //
   // The gate matches ONLY when the LayoutObject ROOT ITSELF is selected
   // (`findLayoutRoot(node) === node`) — not a snap-point child or any other
@@ -723,17 +771,15 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   // Returns the marker type (e.g. `ConveyorBehavior`) used as the virtual
   // component's header name, or null.
   const behaviorRoot = useMemo<{ root: import('three').Object3D; markerType: string } | null>(() => {
-    if (!selectedPath || !viewer.registry) return null;
-    const node = viewer.registry.getNode(selectedPath);
-    if (!node) return null;
+    if (!selectedNode) return null;
     // Only when the LayoutObject root itself is the selected node.
-    if (findLayoutRoot(node) !== node) return null;
-    const rootRv = node.userData?.realvirtual;
+    if (findLayoutRoot(selectedNode) !== selectedNode) return null;
+    const rootRv = selectedNode.userData?.realvirtual;
     const rawTypes = extractComponentTypes(rootRv, { filterHidden: false });
-    const markerType = rawTypes.find(t => getCapabilities(t).filterLabel === 'Behavior');
-    return markerType ? { root: node, markerType } : null;
+    const markerType = rawTypes.find(t => getCapabilities(t).ui.filter === 'Behavior');
+    return markerType ? { root: selectedNode, markerType } : null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPath, viewer.registry, state]);
+  }, [selectedNode, state]);
 
   // Count total overrides for this node
   const totalOverrides = useMemo(() => {
@@ -759,7 +805,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
       // - Crop{Min,Max}{XYZ} → setSplatCrop (shader uniforms for AABB clip)
       if (componentType === 'Splat' && viewer.registry) {
         plugin.updateOverlayField(selectedPath, componentType, fieldName, value);
-        const node = viewer.registry.getNode(selectedPath);
+        const node = selectedNode;
         if (node?.userData?._isSplat) {
           const splat = node.userData.realvirtual as Record<string, Record<string, unknown>> | undefined;
           const splatPlugin = viewer.getPlugin('gaussian-splat') as unknown as {
@@ -790,8 +836,8 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
       // Side-effect for LayoutObject.Visible/Locked: also mutate node.visible
       // so the change is immediately visible in the 3D view. The overlay
       // update below persists the value the regular way.
-      if (componentType === 'LayoutObject' && viewer.registry) {
-        const node = viewer.registry.getNode(selectedPath);
+      if (componentType === 'LayoutObject') {
+        const node = selectedNode;
         if (node) {
           if (fieldName === 'Visible') {
             node.visible = !!value;
@@ -812,7 +858,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
       // No-op for non-live / non-owner components.
       applyLiveEdit(viewer, selectedPath, componentType, fieldName, value);
     },
-    [plugin, selectedPath, viewer],
+    [plugin, selectedPath, selectedNode, viewer],
   );
 
   const handleFieldReset = useCallback(
@@ -884,7 +930,10 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   // paused or static scene costs zero inspector re-renders.
   const liveTypes = useMemo(
     () => (nodeData?.components ?? [])
-      .filter(c => c.type === 'Drive' || c.type === 'TransportSurface')
+      // Fmu: its header shows the instance state, which changes without any
+      // signal or drive movement (plan-510 fix).
+      .filter(c => c.type === 'Drive' || c.type === 'TransportSurface'
+        || c.type === FMU_TYPE || c.type.startsWith(`${FMU_TYPE}_`))
       .map(c => c.type),
     [nodeData],
   );
@@ -905,9 +954,11 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
     resetKey: `${selectedPath ?? ''}|${liveTypesKey}|${behaviorRootKey}`,
   });
 
-  if (!plugin || !selectedPath || !nodeData) return null;
+  if (!plugin || !selectedNode || !nodeData) return null;
 
-  const nodeName = selectedPath.split('/').pop() ?? selectedPath;
+  const nodeName = selectedPath
+    ? selectedPath.split('/').pop() ?? selectedPath
+    : selectedNode.name || selectedNode.type;
 
   // Show runtime section only when step is not Idle (matching C# ShowIf pattern)
   const showRuntimeSection = stepInfo && stepInfo.state !== StepState.Idle;
@@ -916,13 +967,13 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   const toolbarButtons = (
     <>
       <Tooltip title={consumedOnly ? 'Showing active fields only \u2014 click to show all' : 'Click to show only active fields'}>
-        <IconButton size="small" onClick={toggleConsumedOnly} sx={{ color: consumedOnly ? '#66bb6a' : 'text.secondary', p: 0.25 }}>
-          <FilterList sx={{ fontSize: 14 }} />
+        <IconButton size="small" onClick={toggleConsumedOnly} sx={{ color: consumedOnly ? SUCCESS : 'text.secondary', p: 0.25 }}>
+          <FilterList sx={{ fontSize: ICON_SIZE.sm }} />
         </IconButton>
       </Tooltip>
       <Tooltip title={detached ? 'Dock to hierarchy panel' : 'Detach as floating window'}>
         <IconButton size="small" onClick={toggleDetached} sx={{ color: 'text.secondary', p: 0.25 }}>
-          {detached ? <PushPin sx={{ fontSize: 14 }} /> : <OpenInNew sx={{ fontSize: 14 }} />}
+          {detached ? <PushPin sx={{ fontSize: ICON_SIZE.sm }} /> : <OpenInNew sx={{ fontSize: ICON_SIZE.sm }} />}
         </IconButton>
       </Tooltip>
     </>
@@ -931,15 +982,16 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
   // ── Shared footer ─────────────────────────────────────────────────────
   const footerContent = (
     <>
+      {/* plan-566: where this signal is used (components, logic steps, PLC,
+          operator panel, bindings, CONNECT bridges) — every entry jumps there. */}
+      {selectedSignalName && <SignalUsageSection viewer={viewer} name={selectedSignalName} />}
       {/* Reverse references. Shares its title with the signal tooltip's incoming
           block on purpose (plan-353 F4): same relation, same word — the title
           comes from the vocabulary SSOT so they cannot drift apart. */}
       {referencedBy.length > 0 && (
-        <Box sx={{ px: 1, py: 0.75, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-          <Typography sx={{ fontSize: 9, color: 'text.disabled', mb: 0.5, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
-            {PROVENANCE_REFERENCED_TITLE}
-          </Typography>
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+        <Box sx={{ pb: 0.75, borderTop: `1px solid ${DIVIDER}` }}>
+          <InspectorSubheader>{PROVENANCE_REFERENCED_TITLE}</InspectorSubheader>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, px: 1 }}>
             {referencedBy.map((ref, i) => {
               const sourceName = ref.sourcePath.split('/').pop() ?? ref.sourcePath;
               const color = componentColor(ref.componentType);
@@ -951,7 +1003,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
                     onClick={() => navigateToRef(viewer, ref.sourcePath)}
                     sx={{
                       height: 16,
-                      fontSize: 9,
+                      fontSize: FS.micro,
                       fontWeight: 500,
                       cursor: 'pointer',
                       bgcolor: color + '18',
@@ -970,7 +1022,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
       {/* Override count + Reset — same compact grey-text footer row as the
           hierarchy window for a unified footer design across all windows. */}
       <Box sx={{ px: 1, py: 0.25, display: 'flex', alignItems: 'center', gap: 1 }}>
-        <Typography sx={{ fontSize: 10, color: 'text.disabled', flex: 1 }}>
+        <Typography sx={{ fontSize: FS.micro, color: 'text.disabled', flex: 1 }}>
           {totalOverrides > 0
             ? `${totalOverrides} override${totalOverrides !== 1 ? 's' : ''}`
             : 'No overrides'}
@@ -979,16 +1031,16 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
           <Button
             size="small"
             variant="text"
-            startIcon={<RestartAlt sx={{ fontSize: 12 }} />}
+            startIcon={<RestartAlt sx={{ fontSize: ICON_SIZE.xs }} />}
             onClick={handleResetAll}
             sx={{
-              fontSize: 10,
+              fontSize: FS.micro,
               textTransform: 'none',
-              color: '#ffa726',
+              color: WARN,
               py: 0,
               px: 0.5,
               minWidth: 0,
-              '&:hover': { bgcolor: 'rgba(255,167,38,0.1)' },
+              '&:hover': { bgcolor: `${WARN}1a` },
             }}
           >
             Reset All
@@ -1032,6 +1084,16 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
     const snapVc = buildSnapVirtualComponent(viewer, nodeData.uuid);
     if (snapVc) virtualComponents.push(snapVc);
   }
+  // Baked geometry — what a selected chunk mesh IS (boundary, partition,
+  // material, size); BEFORE the generic Mesh block (plan-505 F7).
+  const bakedVc = buildBakedGeometryVirtualComponent(viewer, selectedNode);
+  if (bakedVc) virtualComponents.push(bakedVc);
+  // Mesh data — own mesh, attached chunks, chunk windows + subtree totals.
+  if (meshRows) {
+    const data: Record<string, unknown> = {};
+    for (const [label, text] of meshRows) data[label] = runtimeRow(text);
+    virtualComponents.push({ type: 'Mesh', data });
+  }
   const hasContent = nodeData.components.length > 0 || virtualComponents.length > 0;
 
   // ── Shared scrollable content ─────────────────────────────────────────
@@ -1046,11 +1108,9 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
       {/* Owner breadcrumb: exact-node editor picks land on plain geometry —
           offer one click to jump to the owning component node (e.g. Drive). */}
       {pickOwner && (
-        <Box sx={{ px: 1, py: 0.75, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-          <Typography sx={{ fontSize: 9, color: 'text.disabled', mb: 0.5, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600 }}>
-            Part of
-          </Typography>
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+        <Box sx={{ pb: 0.75, borderBottom: `1px solid ${DIVIDER}` }}>
+          <InspectorSubheader>Part of</InspectorSubheader>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, px: 1 }}>
             {(() => {
               const ownerName = pickOwner.path.split('/').pop() ?? pickOwner.path;
               const primaryType = pickOwner.components[0];
@@ -1063,7 +1123,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
                     onClick={() => navigateToRef(viewer, pickOwner.path)}
                     sx={{
                       height: 16,
-                      fontSize: 9,
+                      fontSize: FS.micro,
                       fontWeight: 500,
                       cursor: 'pointer',
                       bgcolor: color + '18',
@@ -1103,6 +1163,13 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         <LayoutTransformSection viewer={viewer} nodePath={selectedPath} locked lockFixed />
       )}
 
+      {/* Runtime node (plan-754 D2): the same read-only Transform, addressed by
+          the object instead of a path. Everything below that could WRITE is
+          suppressed — there is no path to write against. */}
+      {isRuntimeSelection && (
+        <LayoutTransformSection viewer={viewer} nodePath="" node={selectedNode} locked lockFixed />
+      )}
+
       {/* Signal linking is INLINE since plan-325: every componentRef+signal
           schema field renders as a SignalSlotRow inside its component section
           (the former "Signals (CONNECT)" SignalBindSection was removed). */}
@@ -1112,7 +1179,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
       {selectedPath && <ConnectionsSection viewer={viewer} nodePath={selectedPath} />}
 
       {!hasContent ? (
-        <Typography sx={{ fontSize: 12, color: 'text.disabled', textAlign: 'center', py: 4 }}>
+        <Typography sx={{ fontSize: FS.body, color: 'text.disabled', textAlign: 'center', py: 4 }}>
           No component data
         </Typography>
       ) : (
@@ -1122,8 +1189,10 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         // itself lives in TRANSFORM's header (outside this wrapper) so the
         // user can still unlock.
         <Box sx={{ opacity: layoutLocked ? 0.5 : 1, pointerEvents: layoutLocked ? 'none' : 'auto' }}>
-          {/* Real (editable) component sections FIRST. */}
-          {nodeData.components.map(({ type, data }) => {
+          {/* Real (editable) component sections FIRST — only where there is a
+              path to write against. An unregistered node's components render
+              through the read-only pipeline below instead (plan-754 D2). */}
+          {selectedPath && nodeData.components.map(({ type, data }) => {
             // Two sources, one badge (plan-703 F7): the scene overlay's own
             // overrides, and the `AssetOverrides` an enclosing reference node
             // carries for this node. They are the same idea addressed two ways —
@@ -1141,7 +1210,10 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
             const headerValue = getPrimaryDisplayValue(viewer, selectedPath, type, data).text;
             return (
               <ComponentSection
-                key={type}
+                // Keyed by NODE + type: a type-only key reused the section (and the
+                // local draft of its field editors) across a selection change, so an
+                // unblurred draft of node A could be committed into node B.
+                key={`${selectedPath}:${type}`}
                 nodePath={selectedPath}
                 componentType={type}
                 data={data}
@@ -1160,13 +1232,32 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
             );
           })}
 
+          {/* An unregistered node's own components, read-only: the values are
+              worth seeing, but nothing here can be overridden or saved. */}
+          {isRuntimeSelection && nodeData.components.map(({ type, data }) => (
+            <ComponentSection
+              key={`runtime:${type}`}
+              nodePath=""
+              componentType={type}
+              data={data}
+              overriddenFields={EMPTY_OVERRIDES}
+              consumedOnly={consumedOnly}
+              readOnlyLive
+              onFieldEdit={NOOP_FIELD_EDIT}
+              onFieldReset={NOOP_FIELD_RESET}
+              onResetComponent={NOOP_RESET}
+              viewer={viewer}
+              signalStore={signalStore}
+            />
+          ))}
+
           {/* Ephemeral read-only "virtual components" (behavior live state,
               snap data) AFTER the editable sections — same header / collapse /
               color pipeline, but rendered read-only (no editor / overlay). */}
           {virtualComponents.map(({ type, data, extraContent }) => (
             <ComponentSection
               key={`virtual:${type}`}
-              nodePath={selectedPath}
+              nodePath={selectedPath ?? ''}
               componentType={type}
               data={data}
               overriddenFields={EMPTY_OVERRIDES}
@@ -1200,8 +1291,8 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
         open
         onClose={handleClose}
         title={nodeName}
-        titleColor="#90caf9"
-        subtitle={selectedPath}
+        titleColor={LINK}
+        subtitle={selectedPath ?? undefined}
         defaultWidth={420}
         defaultHeight={500}
         zIndex={1600}
@@ -1228,7 +1319,7 @@ export function PropertyInspector({ viewer }: PropertyInspectorProps) {
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
           }}
-          title={selectedPath}
+          title={selectedPath ?? undefined}
         >
           {nodeName}
         </Typography>

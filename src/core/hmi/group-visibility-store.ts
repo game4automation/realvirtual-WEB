@@ -20,6 +20,11 @@ export interface GroupVisibilitySettings {
   isolatedGroup: string | null;
   /** Groups excluded from the Groups overlay panel. */
   excludedFromOverlay?: string[];
+  /** The subset of `excludedFromOverlay` the panel added ITSELF because a drive
+   *  moved the group (structural kinematic groups). Only these are released
+   *  again when a later load says the group is not driven any more; a name the
+   *  user excluded by hand in Settings → Groups is never touched. */
+  autoExcludedKinematic?: string[];
   /** Groups hidden by default when a model loads. */
   defaultHiddenGroups?: string[];
   /** Component type keys of hidden auto-filter groups (e.g. 'Drive', 'Sensor'). */
@@ -50,6 +55,14 @@ export function loadGroupVisibilitySettings(): GroupVisibilitySettings {
       if (!Array.isArray(parsed.hiddenGroups)) fixed.hiddenGroups = [];
       if (typeof parsed.isolatedGroup !== 'string') fixed.isolatedGroup = null;
       if (!Array.isArray(parsed.excludedFromOverlay)) fixed.excludedFromOverlay = [];
+      // `undefined` is meaningful (legacy profile, see applyPersistedGroupVisibility);
+      // anything else that is not a string array is dropped, never handed on.
+      if (parsed.autoExcludedKinematic !== undefined
+        && !(Array.isArray(parsed.autoExcludedKinematic) && parsed.autoExcludedKinematic.every(x => typeof x === 'string'))) {
+        // The validator's result is spread OVER the merged object, so an
+        // explicit `undefined` is what removes the malformed value.
+        fixed.autoExcludedKinematic = undefined;
+      }
       if (!Array.isArray(parsed.defaultHiddenGroups)) fixed.defaultHiddenGroups = [];
       if (!Array.isArray(parsed.hiddenAutoFilters)) fixed.hiddenAutoFilters = [];
       if (typeof parsed.isolatedAutoFilter !== 'string') fixed.isolatedAutoFilter = null;
@@ -69,4 +82,21 @@ export function saveGroupVisibilitySettings(settings: GroupVisibilitySettings): 
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
   } catch { /* quota exceeded — silently ignore */ }
+  for (const cb of _listeners) {
+    try { cb(); } catch { /* a listener must not break the save */ }
+  }
+}
+
+const _listeners = new Set<() => void>();
+
+/**
+ * Be told after every {@link saveGroupVisibilitySettings}. The Display panel
+ * filters its Groups list by `excludedFromOverlay`, and until 2026-09-24 it
+ * read that list inside a memo keyed on the group array only — a change made
+ * in Settings → Groups or by an MCP tool stayed invisible until the list
+ * happened to rebuild (Festo `Cover`). Returns the unsubscribe.
+ */
+export function subscribeGroupVisibilitySettings(cb: () => void): () => void {
+  _listeners.add(cb);
+  return () => { _listeners.delete(cb); };
 }

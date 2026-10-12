@@ -940,3 +940,32 @@ function collectConnections(root: Object3D): {
   });
   return { connections, connectionTypes };
 }
+
+
+describe('Saving after a temporary test export', () => {
+  it('patches the original node after reordering and still rejects changed source bytes', async () => {
+    const original = await harness();
+    const provenance = original.result.registry.captureGltfProvenance();
+    const testTree = buildPlantTree();
+    testTree.children.reverse();
+    testTree.add(meshNamed('CreatedDuringEditing'));
+    const temporaryBytes = await objectToGlb(testTree);
+    const restored = await harness(temporaryBytes);
+    expect(restored.expectedNames.length).not.toBe(original.expectedNames.length);
+    restored.result.registry.restoreGltfProvenance(provenance);
+    const resolver = makeRegistryBakeResolver(restored.result.registry, restored.result.composition?.frames ?? []);
+    const expectedNames = restored.result.registry.getGltfNodeNames();
+    const edits = materialise([op({
+      kind: 'setField', nodePath: restored.pathOf('Floor'),
+      componentType: 'Conveyor', fieldName: 'Speed', value: 777, prev: 100,
+    })]);
+    const saved = await bakeIntoGlb(plantBytes, edits, resolver, { expectedNames });
+    const reloaded = await load(saved.glb);
+    expect(findByName(reloaded.root, 'Floor')!.userData.realvirtual.Conveyor.Speed).toBe(777);
+    expect(findByName(reloaded.root, 'Motor')!.userData.realvirtual?.Conveyor).toBeUndefined();
+    expect(restored.result.registry.getGltfLocation(restored.pathOf('CreatedDuringEditing'))).toBeNull();
+    expect(resolver.locate(restored.pathOf('Ram'))?.kind).toBe('referenced');
+    await expect(bakeIntoGlb(temporaryBytes, edits, resolver, { expectedNames }))
+      .rejects.toBeInstanceOf(ModelSourceChangedError);
+  });
+});

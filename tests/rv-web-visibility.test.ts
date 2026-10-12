@@ -117,8 +117,8 @@ describe('RVWebVisibility — error', () => {
     expect(errorStore.getActive().map(e => e.path)).toContain(comp.path);
     expect(errorStore.getActive()[0].text).toBe('Jam');
     expect(comp.isErrorActive()).toBe(true);
-    // highlight + badge gizmos exist
-    expect((mgr as any)._entries.size).toBeGreaterThanOrEqual(2);
+    // the highlight gizmo exists (no world-space badge any more)
+    expect((mgr as any)._entries.size).toBeGreaterThanOrEqual(1);
   });
 
   it('SignalError low → error cleared', () => {

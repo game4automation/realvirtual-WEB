@@ -182,8 +182,7 @@ registerComponent({
   displayName: 'SafetyDoor',
   schema: RVSafetyDoor.schema,
   capabilities: {
-    hoverable: false,
-    selectable: false,
+    pick: 'action',   // click toggles the door, never selects the node (plan-753 §2.3)
   },
   create: (node) => new RVSafetyDoor(node),
 });

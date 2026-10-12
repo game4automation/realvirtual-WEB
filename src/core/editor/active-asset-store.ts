@@ -53,6 +53,46 @@ export function getActiveAssetVersion(): number {
   return _version;
 }
 
+// ─── Opening window (plan-597 R2-2) ───────────────────────────────────────
+
+/**
+ * Asset-document opens currently in flight.
+ *
+ * The context above is published only at the END of an editor activation, but
+ * the activation loads its base (`model-loaded` fires) and then replays a
+ * recovered draft asynchronously — a window in which the scene is NOT yet the
+ * document. A consumer that judges the scene after a load (the hierarchy filter
+ * validation) must not treat that half-built scene as final. Deliberately not
+ * part of the version / listeners: it is a fact read at a moment, not a state
+ * anyone renders.
+ */
+let _openingCount = 0;
+
+/**
+ * Mark an asset-document open as in flight. Returns the idempotent end call;
+ * call it in a `finally` so a failed or superseded open cannot leave the flag
+ * raised.
+ */
+export function beginAssetDocumentOpen(): () => void {
+  _openingCount++;
+  let ended = false;
+  return () => {
+    if (ended) return;
+    ended = true;
+    _openingCount--;
+  };
+}
+
+/** True while an asset-document open (incl. draft replay) is in flight. */
+export function isAssetDocumentOpening(): boolean {
+  return _openingCount > 0;
+}
+
+/** Active OR still opening: the scene may not be the final document yet. */
+export function isAssetDocumentBusy(): boolean {
+  return _current !== null || _openingCount > 0;
+}
+
 // ─── What the scene is showing, across modes (plan-703, Lauf 14) ──────────
 
 /**

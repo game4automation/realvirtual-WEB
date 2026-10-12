@@ -113,10 +113,12 @@ describe('surface: inspector field (getSignalHeaderColor / getRefSignalColor)', 
 describe('surface: bind popover + 3D badges', () => {
   it('UNTOUCHED: element BINDING STATE keeps its own colour map', () => {
     // STATE_COLOR describes whether an element is bound/live/pending, not a
-    // signal value — migration table says "nein".
-    expect(popoverSource).toMatch(/const STATE_COLOR[\s\S]*?unbound: '#808080'/);
-    expect(popoverSource).toMatch(/live: '#66bb6a'/);
-    expect(popoverSource).toMatch(/conflict: '#ef5350'/);
+    // signal value — migration table says "nein". plan-514 moved its VALUES to
+    // the shared-sx design tokens (same hex: NEUTRAL #808080, SUCCESS #66bb6a,
+    // ERROR #ef5350); it stays its own map and never reads signal-colors.
+    expect(popoverSource).toMatch(/const STATE_COLOR[\s\S]*?unbound: NEUTRAL/);
+    expect(popoverSource).toMatch(/live: SUCCESS/);
+    expect(popoverSource).toMatch(/conflict: ERROR/);
     expect(popoverSource).not.toMatch(/signal-colors/);
   });
 

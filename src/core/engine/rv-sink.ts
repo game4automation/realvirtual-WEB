@@ -21,9 +21,28 @@ export class RVSink implements RVComponent {
   readonly node: Object3D;
   readonly aabb: AABB;
   isOwner = true;
+  DeleteMus = true;
+  DeleteOnlyTag = '';
+
+  accepts(mu: RVMovingUnit | InstancedMovingUnit): boolean {
+    return this.DeleteMus && (!this.DeleteOnlyTag || mu.node.userData.tag === this.DeleteOnlyTag);
+  }
 
   /** Callback when a MU is consumed */
   onConsumed?: (mu: RVMovingUnit | InstancedMovingUnit, sink: RVSink) => void;
+  private readonly consumedListeners = new Set<(mu: RVMovingUnit | InstancedMovingUnit) => void>();
+
+  subscribeConsumed(cb: (mu: RVMovingUnit | InstancedMovingUnit) => void): () => void {
+    this.consumedListeners.add(cb);
+    return () => { this.consumedListeners.delete(cb); };
+  }
+
+  notifyConsumed(mu: RVMovingUnit | InstancedMovingUnit): void {
+    this.onConsumed?.(mu, this);
+    for (const cb of this.consumedListeners) cb(mu);
+  }
+
+  dispose(): void { this.consumedListeners.clear(); }
 
   constructor(node: Object3D, aabb: AABB) {
     this.node = node;
@@ -41,15 +60,21 @@ export class RVSink implements RVComponent {
    * Uses XZ-only overlap (same as transport surfaces) because MUs sit ON
    * surfaces and their Y-axis AABB may not intersect the sink's BoxCollider.
    * Skips gripped MUs — they are controlled by the Grip system.
+   *
+   * Passive loads (plan-516) are never in `mus`: consuming a carrier takes its
+   * whole load tree with it (the loads are children of the carrier's node). A
+   * pre-placed carrier is only detached, so a simulation reset restores it
+   * together with its loads from their snapshots.
    */
   markOverlapping(mus: (RVMovingUnit | InstancedMovingUnit)[]): void {
     if (!this.isOwner) return; // Server controls MU removal in multiuser
     for (const mu of mus) {
+      if (!this.accepts(mu)) continue;
       if (mu.markedForRemoval) continue;
       if (!mu.isInstanced && (mu as RVMovingUnit).isGripped) continue;
       if (this.aabb.overlapsXZ(mu.aabb)) {
         mu.markedForRemoval = true;
-        this.onConsumed?.(mu, this);
+        this.notifyConsumed(mu);
       }
     }
   }
@@ -67,7 +92,12 @@ registerComponent({
   needsAABB: true,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    badgeColor: '#ef5350',
+    // 'merge' (plan-753 F6): a sink is static geometry — it only destroys MUs
+    // that arrive. It sat in the old exclusion list only because Source/Sink
+    // were listed together; the OLD pipelines keep the `keep` behaviour via
+    // `LEGACY_KEEP_OVERRIDE` (rv-freeze-static.ts) until plan-753 Phase 4b removed it.
+    bake: 'merge',
+    ui: { badge: '#ef5350' },
   },
   create: (node, aabb) => new RVSink(node, aabb!),
 });

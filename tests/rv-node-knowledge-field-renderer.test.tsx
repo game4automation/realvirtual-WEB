@@ -658,7 +658,12 @@ describe('9.5c field parity', () => {
     expect([...hidden!, 'Note'].sort()).toEqual([...NODE_KNOWLEDGE_FIELDS].sort());
 
     // And every hidden field is actually accounted for by the header.
-    const fx = makeFixture({ Note: 'n', Author: 'user', Confidence: 'inferred' });
+    // A RELATIVE stamp: the header renders the age, so a fixed ISO date would
+    // pass until it drifts past a month and then read 'last month' forever.
+    const fx = makeFixture({
+      Note: 'n', Author: 'user', Confidence: 'inferred',
+      UpdatedAt: new Date(Date.now() - 2 * 3600_000).toISOString(),
+    });
     renderNote(fx);
     const header = screen.getByTestId('rv-knowledge-provenance');
     expect(header.textContent).toContain('user');            // Author

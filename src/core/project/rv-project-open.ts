@@ -10,7 +10,8 @@
  *
  *  1. **What did the user just pick?** — {@link detectOpenTarget}. A folder with
  *     its own `project.json` is a project; a folder holding child projects is a
- *     workspace; a folder that is neither is an offer to create one.
+ *     parent to link them from; a folder that is neither is an offer to make one
+ *     into a project.
  *  2. **What should be open once it is loaded?** — {@link resolveResumeTarget}.
  *     URL beats the remembered pair beats `defaultModel`, and a kiosk takes the
  *     start document its project names, then the project's own active document.
@@ -27,12 +28,12 @@
  * a directory listing — cheap, and it is exactly the listing the caller has to
  * do anyway.
  *
- * ## Project beats workspace (decision 2)
+ * ## Project beats parent (decision 2)
  *
  * A folder can legitimately be both: a project whose subfolders happen to be
  * projects too. It opens as the project, and the child projects surface as a
  * HINT in the detail pane ({@link OpenTarget.childProjects}) rather than as a
- * second interpretation. Opening the workspace instead would hide the manifest
+ * second interpretation. Treating it as a parent instead would hide the manifest
  * the user actually named.
  *
  * ## The mode follows the SESSION, not the asset (decision 24)
@@ -41,19 +42,36 @@
  * type: {@link ResumeTarget} carries a mode **only** when the session is being
  * established. {@link resumeTargetForAssetSwitch} is the function for switching
  * assets inside a live session, and it cannot return a mode at all.
+ * There is now a SECOND place a mode is deliberately established, and it is the
+ * only other one: the recent-documents ring (plan-478). A click on a recent
+ * restores `(project, document, mode)` in one gesture, which is a new session
+ * being established rather than an asset switch inside a live one — so it does
+ * not weaken decision 24, it is an instance of it. Everything here stays
+ * untouched by it: the chain lives in `core/hmi/projects/open-recent-entry.ts`,
+ * activates its mode as its LAST step through `setMode`, and never enters the
+ * resume path. If you are adding a third such place, read that file's header
+ * first — the order of its steps is what makes it safe.
  *
  * Storage-free and React-free: every input is a value.
  */
 
-/** What the picked folder turned out to be. */
-export type OpenTargetKind = 'project' | 'workspace' | 'empty';
+/**
+ * What the picked folder turned out to be.
+ *
+ * Renamed by plan-743, which deleted the workspace: a folder full of projects
+ * is no longer a concept the app stores, it is simply a `parent` — Add links
+ * every child in it and writes nothing to the folder itself. `plain` (was
+ * `empty`) says the same thing more honestly: the folder may well be full of
+ * GLBs, it just holds no manifest anywhere in sight.
+ */
+export type OpenTargetKind = 'project' | 'parent' | 'plain';
 
 export interface OpenTarget {
   kind: OpenTargetKind;
   /**
    * Child folders holding a `project.json`.
    *
-   * For a `workspace` these are the content. For a `project` they are the hint
+   * For a `parent` these are the content. For a `project` they are the hint
    * of decision 2 — shown in the detail pane, not acted on.
    */
   childProjects: string[];
@@ -76,8 +94,8 @@ export interface OpenProbe {
 export function detectOpenTarget(probe: OpenProbe): OpenTarget {
   const childProjects = [...(probe.childProjectFolders ?? [])];
   if (probe.hasManifest) return { kind: 'project', childProjects };
-  if (childProjects.length > 0) return { kind: 'workspace', childProjects };
-  return { kind: 'empty', childProjects: [] };
+  if (childProjects.length > 0) return { kind: 'parent', childProjects };
+  return { kind: 'plain', childProjects: [] };
 }
 
 // ─── Resume ─────────────────────────────────────────────────────────────
@@ -370,6 +388,69 @@ export function resumeTargetForAssetSwitch(asset: string): { asset: string } {
 export function rememberedSessionOf(asset: string, mode?: string | null): RememberedSession {
   const trimmed = (mode ?? '').trim();
   return trimmed === '' ? { asset } : { asset, mode: trimmed };
+}
+
+// ─── Hosted deploy boot (plan-759 F4 / F4b / F4c) ─────────────────────────
+
+/**
+ * Where the served project of this boot lives: the `?projectUrl=` query first
+ * (it keeps overriding), else `settings.json`'s `projectUrl` resolved against
+ * the runtime's own URL (`p/` next to `index.html`), else null — an ordinary
+ * deploy. Pure so the precedence is a test, not a reading of `main.ts`.
+ */
+export function resolveServedProjectUrl(
+  queryProjectUrl: string | null | undefined,
+  settingsProjectUrl: string | null | undefined,
+  baseHref: string,
+): string | null {
+  const fromQuery = (queryProjectUrl ?? '').trim();
+  if (fromQuery !== '') return fromQuery;
+  const fromSettings = (settingsProjectUrl ?? '').trim();
+  if (fromSettings === '') return null;
+  try {
+    const url = new URL(fromSettings, baseHref);
+    // A project root is a directory: the backend appends `project.json` to it.
+    if (!url.pathname.endsWith('/')) url.pathname += '/';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** What a hosted boot (served project, no `mode.lock`) shows once the gate is passed. */
+export type HostedBootVerdict =
+  | { kind: 'not-hosted' }
+  | { kind: 'error'; reason: 'no-manifest' | 'no-documents'; detail: string }
+  | { kind: 'dashboard' };
+
+/**
+ * The hosted boot rule (D14): the root is ALWAYS the dashboard of the served
+ * project; a document opens only through its own `?doc=` (handled before this
+ * runs — a routed boot never reaches it). `settings.defaultModel` is not
+ * consulted. The kiosk (`mode.lock`) path is untouched: it keeps
+ * {@link diagnoseKioskBoot} and its start-document contract.
+ */
+export function resolveHostedBoot(probe: {
+  servedProjectUrl: string | null;
+  modeLocked: boolean;
+  hasDeployedManifest: boolean;
+  documentCount: number;
+}): HostedBootVerdict {
+  if (!probe.servedProjectUrl || probe.modeLocked) return { kind: 'not-hosted' };
+  const verdict = diagnoseKioskBoot({
+    projectUrl: probe.servedProjectUrl,
+    hasDeployedManifest: probe.hasDeployedManifest,
+    documentCount: probe.documentCount,
+    // The dashboard needs no start document; only the two "nothing served"
+    // verdicts of the shared diagnosis apply to a hosted boot.
+    resolvedAsset: null,
+  });
+  if (!verdict.ok && (verdict.reason === 'no-manifest' || verdict.reason === 'no-documents')) {
+    return { kind: 'error', reason: verdict.reason, detail: verdict.detail };
+  }
+  return { kind: 'dashboard' };
 }
 
 /** Parse a stored snapshot defensively; a broken one is simply "nothing remembered". */

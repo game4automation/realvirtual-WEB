@@ -1,5 +1,11 @@
 # Component Scripting (JS-in-GLB)
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
+For a complete public project using `scriptRef`, follow the [Community project plugin](doc-project-plugin-example.md).
+
 realvirtual WEB lets you attach a JavaScript behavior directly to a node in the GLB. The script travels with the model — no separate signal map, no build step, no plugin registration. It runs in a sandboxed QuickJS virtual machine inside the browser, is authored in the built-in Monaco editor (TypeScript, checked against the SDK's own type declarations), and hot-reloads without a scene reload.
 
 One script writes one behavior once. The same handler set runs unmodified against the continuous, real-time simulation kernel and — where a DES runner is present — against the event-based kernel, so a turntable or a supervisory cell coordinator written today keeps working if the model later runs headless at 1000× speed.
@@ -34,6 +40,20 @@ realvirtual WEB gives you two different ways to add custom logic, and they are n
 | Distribution | inside the GLB | the viewer build | the project directory (copy the folder, the code comes along) |
 | Sandbox / limits | QuickJS VM, trust gate | None — native JS execution | None — native JS execution |
 
+### Binding a script to a document
+
+You do **not** edit `project.json` to make the binding. Open the project in the dashboard, select the document, and use the third reference slot on its hero card — **PLUGIN**, next to CONNECT and KNOWLEDGE:
+
+- **Drag** a `.ts`/`.tsx` file from the project tree onto the slot. Only files under the project's `plugins/` folder are accepted; anything else is refused with the reason on the spot.
+- **Or bind it from the keyboard** — the card's *Bind plugin…* entry opens a dialog listing the project's script files, so the binding needs no mouse.
+- The chip then shows the bound file name. Clicking it jumps to the file; the **×** clears the binding.
+
+The chip also carries the **state** of the binding, which is the part a JSON edit could never show: bound, loaded, a file that is not there any more, a file with no `registerModelPlugins`/`unregisterModelPlugins` pair, or an error while importing or registering. A binding that used to fail silently in the browser console is now visible on the card.
+
+Over MCP the same write is `web_document_bind(document, field, ref)` — `field` takes `scriptRef` or its aliases `script` / `plugin`, and the binding is cleared when `ref` is omitted.
+
+A document points at the module it wants, which may be the plugin file **itself** (`plugins/ribbon-tension-controls-plugin.tsx`). A collecting `plugins/index.ts` that re-exports several plugins is no longer needed and is no longer the recommended shape: one plugin, one file, one `scriptRef`.
+
 ### How project code is loaded — two modes, one reference
 
 The same `scriptRef` is resolved two ways, in this order:
@@ -43,12 +63,16 @@ The same `scriptRef` is resolved two ways, in this order:
 
 A `scriptRef` that resolves to neither loads **no** plugins. There is deliberately no fallback to the old name-based match: binding the wrong code is worse than binding none.
 
-**Producing the sibling.** Compilation happens on the dev/delivery path, not in the browser:
+**Producing the sibling.** Compilation happens on the dev/delivery path, not in the browser — and on the delivery path it happens **by itself**. A maintainer customer delivery (the private workspace’s `npm run deliver:customer`, not a command in this Community repository; see [Deployment](doc-deploy.md)) compiles every `scriptRef` of every delivered project in the **staged copy** it assembles, before anything is committed or pushed, and a script that does not compile stops the delivery. So nothing has to be built by hand before a delivery, and no `.js` is ever written into the source tree.
+
+The command exists for the two cases the delivery does not cover — building the siblings locally to try runtime mode out, and verifying **between** deliveries that the sources still compile:
 
 ```bash
-npm run build:project-scripts -- <projectDir>          # build the .js siblings
-npm run build:project-scripts -- <projectDir> --check  # CI gate: exit 3 if missing/stale
+npm run build:project-scripts -- <projectDir>          # build the .js siblings locally
+npm run build:project-scripts -- <projectDir> --check  # verification between deliveries: exit 3 if missing/stale
 ```
+
+`--check` is a *reporting* gate: it never produces an artefact, so it can only be run where the siblings already exist. In a clean project tree there are none — which is exactly why it is not the delivery gate.
 
 The artefact is a **self-contained ES module** (esbuild, `bundle: true`, `format: esm`): it is imported from a Blob URL, which has no directory, so a relative `import './util'` inside it could not resolve. Bare package imports (`three`, `react`, `@mui/material`) stay external and resolve against the viewer's copies.
 
@@ -246,12 +270,32 @@ The typed shortcuts resolve the same handles by path directly: `self.drive(p)`, 
 | `SensorHandle` | `occupied`, `mode` (`'Raycast' \| 'Collision'`), `node` | `on(cb)` → unsubscribe function. `cb` is `(occupied: boolean, mu?: MU \| null) => void` — the second argument carries the occupying `MU` on **enter**, and is `null` on exit or when the backend cannot resolve it. |
 | `BeltHandle` | `occupied`, `speed`, `node` | `run(forward)` |
 | `TransportHandle` | `direction`, `speed`, `radial`, `node` | — (read-only) |
-| `SourceHandle` | `automatic` (settable), `interval` (settable) | `spawn()` → `MU` |
+| `SourceHandle` | `automatic` (settable), `interval` (settable) | `spawn()` → `MU` or `null` when disabled, capped, or missing a template |
 | `SinkHandle` | — | `on(cb)` → unsubscribe function, called with the arriving `MU` |
 | `GripHandle` | `gripped` (`MU[]`), `range` | `pick()`, `place()` |
-| `LogicStepHandle` | `state` (`'Idle'\|'Active'\|'Waiting'\|'Finished'`), `progress` | `start()`, `reset()` |
+| `LogicStepHandle` | `state` (`'Idle'\|'Active'\|'Waiting'\|'Finished'`), `progress`, `runId` | `start()`, `reset()`, `complete()` (JavaScript steps only) |
 
-The host environment wires which kinds are actually available for a given deployment (the live viewer wires drive/sensor/belt/transport today; `source`/`sink`/`grip`/`logicStep` resolve `null` unless a host supplies them). A missing resolver is not an error — the script should always null-check before use, as every example in this document does.
+The live viewer wires drive, sensor, belt, transport, source, sink, grip and logic-step handles. Use full hierarchy paths and check for missing components. Source spawning goes through the continuous transport manager, including limits, counters, collision roles and lifecycle hooks. Sink subscriptions are removed when the script is disposed or reloaded.
+
+### Scene component access
+
+The web host exposes all registered scene components for discovery. Reads return schema fields and component live-state values as plain data; engine objects and private fields are not exposed.
+
+```js
+const sources = self.scene.list('Source'); // omit type to list all components
+const values = self.scene.read('Festo/LogoSource', 'Source');
+self.scene.set('Festo/LogoSource', 'Source', 'Enabled', true);
+```
+
+Writes accept editable runtime scalar, enum and vector fields. Vectors use viewer coordinates. Read-only fields, invalid values, private fields and live-controlled components reject writes. Use signal handles for signal values and the scene editor for changing component references. Complex engine objects read as `null`; scene access does not expose arbitrary engine methods. Use typed handles for commands. These writes affect the running simulation; they do not save changes into the GLB. Unity-only components without a web implementation are unavailable.
+
+### Web-native JavaScript logic steps
+
+On a node beneath your sequence, author both `LogicStep_JavaScript: { Active: true }` and a normal `WebComponent` containing its `Code`. This is a pure web feature and needs no Unity counterpart. Enable scripts through the existing script trust controls. Open the node's script editor to edit and hot-reload the code.
+
+The sequence activates the step. The script reads `self.logicStep(self.path)` and calls `complete()` when its work is done. The sequence then advances. `runId` increases on each start, allowing the script to recognize a new cycle even when the sequence restarts within one frame. A disabled or failed script leaves the step waiting instead of silently advancing.
+
+The complete [random Source example](examples/scripts/random-source-step.js) uses `self.random()` to generate 1–3 parts, spaces them by 0.3 simulation seconds, retries when the Source is capped, and completes the step after the final part. Keep the Source's independent interval and automatic generation disabled when the script should be its sole trigger. The saved Festo sequence continues to generate exactly three parts; this example is optional.
 
 ### Signals
 

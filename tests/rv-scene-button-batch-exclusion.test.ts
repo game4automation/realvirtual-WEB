@@ -13,7 +13,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { BoxGeometry, Mesh, MeshStandardMaterial, Object3D } from 'three';
-import { isBatchSafe } from '../src/core/engine/rv-batched-render';
+import { bakeFateOf } from './helpers/bake-fate';
 import { deduplicateMaterials } from '../src/core/engine/rv-material-dedup';
 import { buildButtonScene, PATHS } from './scene-button-fixture';
 
@@ -33,22 +33,22 @@ describe('SceneButton batching exclusion', () => {
     expect(base.userData._rvSceneButtonMesh).toBeUndefined();
   });
 
-  it('excludes the cap from the batch arena and keeps the base batchable', () => {
+  it('keeps the cap out of the bake chunks and stages the base', async () => {
     const h = buildButtonScene();
     const cap = h.cap(PATHS.pushCap).capMesh!;
     const base = h.base(PATHS.pushBase).node as Mesh;
 
-    expect(isBatchSafe(cap, h.root)).toBe(false);
-    expect(isBatchSafe(base, h.root)).toBe(true);
+    expect(await bakeFateOf(cap, h.root)).toBe('keep');
+    expect(await bakeFateOf(base, h.root)).not.toBe('keep');
   });
 
-  it('excludes a child mesh of a flagged cap as well (parent rule)', () => {
+  it('keeps a child mesh of a flagged cap as well (parent rule)', async () => {
     const h = buildButtonScene();
     const cap = h.cap(PATHS.pushCap).capMesh!;
     const child = plainMesh('CapDecal');
     cap.add(child);
 
-    expect(isBatchSafe(child, h.root)).toBe(false);
+    expect(await bakeFateOf(child, h.root)).toBe('keep');
   });
 
   it('keeps the cap material out of the dedup fingerprint map', () => {
@@ -73,20 +73,21 @@ describe('SceneButton batching exclusion', () => {
     expect(twin.material).not.toBe(capMat);
   });
 
-  it('the flag disappears again on dispose so a reloaded model can batch', () => {
+  it('the flag disappears again on dispose so a reloaded model can bake the cap', async () => {
     const h = buildButtonScene();
     const capComponent = h.cap(PATHS.pushCap);
     const cap = capComponent.capMesh!;
 
     capComponent.dispose();
     expect(cap.userData._rvSceneButtonMesh).toBeUndefined();
-    expect(isBatchSafe(cap, h.root)).toBe(true);
+    // Without the flag the cap follows its SceneButtonMoveable role (chunk).
+    expect(await bakeFateOf(cap, h.root)).not.toBe('keep');
   });
 
-  it('an unrelated mesh is unaffected by the new exclusion', () => {
+  it('an unrelated mesh is unaffected by the exclusion', async () => {
     const root = new Object3D();
     const m = plainMesh('Plain');
     root.add(m);
-    expect(isBatchSafe(m, root)).toBe(true);
+    expect(await bakeFateOf(m, root)).toBe('static');
   });
 });

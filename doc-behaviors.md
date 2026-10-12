@@ -1,5 +1,9 @@
 # Component Behaviors
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 realvirtual WEB is the open standard for browser-based 3D-HMI in manufacturing. Component Behaviors are the standard's wiring layer: they turn a generic GLB into a working machine — drives, sensors, transports, signals, AAS links and right-click menus — without touching the GLB or the engine.
 
 There are three ways to declare wiring; all of them feed the same low-level core (`applyKinematicsSpec`):

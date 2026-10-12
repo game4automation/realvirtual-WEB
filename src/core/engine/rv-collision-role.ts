@@ -159,8 +159,7 @@ registerComponent({
   schema: RVCollisionRole.schema,
   capabilities: {
     authorable: true,        // addable in the asset editor (schema-complete)
-    badgeColor: '#ff7043',
-    filterLabel: 'Collision Roles',
+    ui: { badge: '#ff7043', filter: 'Collision Roles', category: 'physics' },
   },
   create: (node) => new RVCollisionRole(node),
   afterCreate: (inst, node) => setComponentInstance(node, inst),

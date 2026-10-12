@@ -23,7 +23,7 @@
  */
 
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -65,28 +65,64 @@ function hasRequiresPrivateMarker(source) {
   return /@rv-requires-private\b/.test(source);
 }
 
-/** Recursively collect test files under tests/. */
-function collectTestFiles(dir, out = []) {
+/** Recursively collect the TypeScript sources under tests/ — test files and their helpers. */
+function collectTestSources(dir, out = []) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) collectTestFiles(path, out);
-    else if (/\.(test|spec)\.(ts|tsx)$/.test(entry.name)) out.push(path);
+    if (entry.isDirectory()) collectTestSources(path, out);
+    else if (/\.(ts|tsx)$/.test(entry.name) && !/\.d\.ts$/.test(entry.name)) out.push(path);
   }
   return out;
 }
 
-/** Compute the sorted repo-relative list of private-dependent test files. */
+/** The tests/ source a relative specifier of `fromAbs` names, or null. */
+function resolveTestSource(fromAbs, spec, known) {
+  if (!spec.startsWith('.')) return null;
+  const base = join(dirname(fromAbs), spec).replace(/\.(js|mjs)$/, '');
+  for (const candidate of [base, `${base}.ts`, `${base}.tsx`, join(base, 'index.ts')]) {
+    if (known.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Compute the sorted repo-relative list of private-dependent test files.
+ *
+ * A HELPER under tests/ (`_mechanism-path-rig.ts`) that imports a private module is
+ * private-dependent too, and so is every test or helper that imports such a helper —
+ * the community `tsc` compiles helpers whether a test excludes them or not. The
+ * dependency is followed to a fixed point.
+ */
 export function computePrivateDependentTests(root = ROOT) {
-  const files = collectTestFiles(join(root, 'tests'));
-  const result = [];
+  const files = collectTestSources(join(root, 'tests'));
+  const known = new Set(files);
+  const imports = new Map();
+  const privateSet = new Set();
+  // Only an unresolvable IMPORT travels to the importer. A helper that merely names
+  // the private folder as a path (a dev-asset availability probe) lets its tests
+  // skip at runtime, and those tests stay in the community run.
+  const importsPrivate = new Set();
   for (const abs of files) {
     const source = readFileSync(abs, 'utf8');
-    const needsPrivate = importSpecifiers(source).some(isPrivateSpecifier)
-      || referencesPrivatePath(source)
-      || hasRequiresPrivateMarker(source);
-    if (needsPrivate) result.push(relative(root, abs).replace(/\\/g, '/'));
+    const specs = importSpecifiers(source);
+    imports.set(abs, specs.map((spec) => resolveTestSource(abs, spec, known)).filter(Boolean));
+    if (specs.some(isPrivateSpecifier)) importsPrivate.add(abs);
+    const isTest = /\.(test|spec)\.(ts|tsx)$/.test(abs);
+    if (specs.some(isPrivateSpecifier) || (isTest && (referencesPrivatePath(source) || hasRequiresPrivateMarker(source)))) {
+      privateSet.add(abs);
+    }
   }
-  return result.sort();
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const abs of files) {
+      if (!importsPrivate.has(abs) && imports.get(abs).some((dep) => importsPrivate.has(dep))) {
+        importsPrivate.add(abs);
+        privateSet.add(abs);
+        grew = true;
+      }
+    }
+  }
+  return [...privateSet].map((abs) => relative(root, abs).replace(/\\/g, '/')).sort();
 }
 
 /** Rewrite the exclude block in tsconfig.json. Output stays strict JSON (see BEGIN). */

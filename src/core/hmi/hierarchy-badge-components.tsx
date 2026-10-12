@@ -11,7 +11,7 @@
  * - `NodeBadges` — composite row that renders type badges + live signal badges
  */
 
-import { memo, useMemo } from 'react';
+import { memo, useMemo, useSyncExternalStore } from 'react';
 import { Box, Chip, Typography } from '@mui/material';
 import type { RVViewer } from '../rv-viewer';
 import type { SignalStore } from '../engine/rv-signal-store';
@@ -20,6 +20,7 @@ import { StepState } from '../engine/rv-logic-step';
 import { STEP_STATE_COLORS } from './rv-logic-step-colors';
 import { SignalBadge, type SignalDirection } from './rv-signal-badge';
 import { CHIP_RADIUS } from './shared-sx';
+import { FMU_STATE_COLORS, fmuOf, getFmuInstances, subscribeFmuInstances } from '../engine/rv-fmu';
 import {
   badgeColor,
   badgeLabel,
@@ -29,6 +30,27 @@ import {
   signalBadgeColor,
   splitTypes,
 } from './hierarchy-utils';
+
+// ─── FmuBadgeChip ────────────────────────────────────────────────────────
+
+/**
+ * The `Fmu` type badge in its STATE colour (plan-498 §2.7): grey standalone /
+ * idle, blue uploading / starting, amber needs-trust / unsupported, green
+ * running, red error. Subscribes to the FMU instance list, so a state change
+ * repaints only this chip.
+ */
+function FmuBadgeChip({ viewer, path, label, fallback, onClick }: {
+  viewer?: RVViewer;
+  path: string | null;
+  label: string;
+  fallback: string;
+  onClick?: (e: React.MouseEvent) => void;
+}) {
+  useSyncExternalStore(subscribeFmuInstances, getFmuInstances, getFmuInstances);
+  const fmu = path ? fmuOf(viewer?.registry?.getNode(path) ?? null) : null;
+  const color = fmu ? FMU_STATE_COLORS[fmu.state] : fallback;
+  return <BadgeChip color={color} label={label} onClick={onClick} />;
+}
 
 // ─── BadgeChip ───────────────────────────────────────────────────────────
 
@@ -86,6 +108,40 @@ export function BadgeChip({
         }),
       }}
     />
+  );
+}
+
+// ─── StateBadge (neutral, plan-754 D2) ───────────────────────────────────
+
+/**
+ * A dimmed, colourless badge for what a row IS, not what it carries: `runtime`
+ * (the registry does not know this node) and `chunk` (baked geometry).
+ *
+ * Deliberately neutral — Instrument Blue is the product's ONE accent (DESIGN.md)
+ * and these say "less important", the opposite of what an accent says. They also
+ * never share the coloured type-badge vocabulary, so a scan of the badge column
+ * still reads as "which components does this node have".
+ */
+export function StateBadge({ label, title }: { label: string; title?: string }) {
+  return (
+    <Typography
+      component="span"
+      title={title}
+      sx={{
+        fontSize: 9,
+        fontWeight: 600,
+        letterSpacing: 0.4,
+        textTransform: 'uppercase',
+        color: 'text.disabled',
+        border: '1px solid rgba(255,255,255,0.10)',
+        borderRadius: CHIP_RADIUS,
+        px: 0.4,
+        lineHeight: '14px',
+        flexShrink: 0,
+      }}
+    >
+      {label}
+    </Typography>
   );
 }
 
@@ -177,14 +233,23 @@ export const NodeBadges = memo(function NodeBadges({
   // ellipsis) is what truncates when space runs out, never the chips.
   return (
     <Box sx={{ display: 'flex', gap: 0.25, flexShrink: 0, ml: 'auto', alignItems: 'center' }}>
-      {nonSignalTypes.map((type) => (
+      {nonSignalTypes.map((type) => (type === 'Fmu' ? (
+        <FmuBadgeChip
+          key={type}
+          viewer={viewer}
+          path={path ?? null}
+          label={badgeLabel(type)}
+          fallback={badgeColor(type)}
+          onClick={chipClick}
+        />
+      ) : (
         <BadgeChip
           key={type}
           color={badgeColor(type, isLogicStepType(type) ? stepState : undefined)}
           label={badgeLabel(type, isLogicStepType(type) ? stepState : undefined)}
           onClick={chipClick}
         />
-      ))}
+      )))}
       {progressText && <ContainerProgressBadge text={progressText} />}
       {signalTypes.length > 0 && nonSignalTypes.length > 0 && (
         <Box sx={{ width: 2, flexShrink: 0 }} />

@@ -132,10 +132,8 @@ registerComponent({
   schema: RVMachiningTool.schema,
   capabilities: {
     authorable: true,
-    hoverable: true,
-    selectable: true,
-    badgeColor: '#5c6bc0',
-    filterLabel: 'Machining Tools',
+    pick: 'select',
+    ui: { badge: '#5c6bc0', filter: 'Machining Tools', category: 'process' },
   },
   create: (node) => new RVMachiningTool(node),
   afterCreate: (inst, node) => setComponentInstance(node, inst),

@@ -69,6 +69,20 @@ export interface SceneGlbPointer {
   size: number;
   /** ISO timestamp of the write that installed this pointer. */
   updatedAt: string;
+  /**
+   * The revision of the document FILE this body was baked from (plan-546).
+   *
+   * Only a document's draft slot carries it. Absent on every pointer written
+   * before plan-546 and on every write whose caller knew no file revision —
+   * never carried over from the previous pointer, because a stamp that
+   * survives a write it does not describe is worse than none.
+   */
+  baseSha?: string;
+  /**
+   * ISO timestamp of the move that put this pointer into a set-aside slot
+   * (`draft/~stale/<documentId>/<sha12>`, plan-546). Absent everywhere else.
+   */
+  movedAt?: string;
 }
 
 // ─── Pointer ────────────────────────────────────────────────────────────
@@ -90,6 +104,8 @@ export function readSceneGlbPointer(sceneId: string): SceneGlbPointer | null {
       sha: parsed.sha,
       size: typeof parsed.size === 'number' ? parsed.size : 0,
       updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : '',
+      ...(typeof parsed.baseSha === 'string' && parsed.baseSha !== '' ? { baseSha: parsed.baseSha } : {}),
+      ...(typeof parsed.movedAt === 'string' && parsed.movedAt !== '' ? { movedAt: parsed.movedAt } : {}),
     };
   } catch {
     return null;
@@ -133,14 +149,24 @@ export async function readSceneGlb(sceneId: string): Promise<Uint8Array | null> 
  *
  * @returns the new revision (the body's SHA-256).
  */
-export async function writeSceneGlb(sceneId: string, glb: Uint8Array): Promise<string> {
+export async function writeSceneGlb(
+  sceneId: string,
+  glb: Uint8Array,
+  meta: { baseSha?: string } = {},
+): Promise<string> {
   if (!sceneId) throw new Error('writeSceneGlb needs a scene id.');
   const blob = new Blob([glb as unknown as BlobPart], { type: 'model/gltf-binary' });
   const sha = await sha256OfBlob(blob);
   await putBlob(sha, blob);
 
   const previous = readSceneGlbPointer(sceneId);
-  const pointer: SceneGlbPointer = { sha, size: blob.size, updatedAt: new Date().toISOString() };
+  const pointer: SceneGlbPointer = {
+    sha,
+    size: blob.size,
+    updatedAt: new Date().toISOString(),
+    // Only what THIS write was told — never the previous pointer's stamp.
+    ...(meta.baseSha ? { baseSha: meta.baseSha } : {}),
+  };
   try {
     localStorage.setItem(pointerKey(sceneId), JSON.stringify(pointer));
   } catch (e) {
@@ -149,8 +175,9 @@ export async function writeSceneGlb(sceneId: string, glb: Uint8Array): Promise<s
     // swallowed: the caller would report "Saved" for a scene nobody can open.
     throw new Error(`Could not record the scene body for ${sceneId}: ${String(e)}`);
   }
-  // Only once the pointer is safely moved is the old body garbage.
-  if (previous && previous.sha !== sha) await deleteBlob(previous.sha).catch(() => {});
+  // Only once the pointer is safely moved is the old body garbage — and only
+  // when no other pointer still names it (plan-546 AC 13).
+  if (previous && previous.sha !== sha) await deleteBlobIfUnreferenced(previous.sha);
   return sha;
 }
 
@@ -160,7 +187,98 @@ export async function deleteSceneGlb(sceneId: string): Promise<void> {
   try {
     localStorage.removeItem(pointerKey(sceneId));
   } catch { /* private mode — the blob cleanup below is still worth doing */ }
-  if (pointer) await deleteBlob(pointer.sha).catch(() => {});
+  if (pointer) await deleteBlobIfUnreferenced(pointer.sha);
+}
+
+/**
+ * Is `sha` still named by any `rv-scene-glb/` pointer? (plan-546 AC 13)
+ *
+ * Bodies are content-addressed, so two pointers can name the same blob — a
+ * draft and the set-aside copy of it, or two identical bakes. Deleting the blob
+ * because ONE of them went away would empty the other. Called after the
+ * caller's own pointer is already gone (or moved off `sha`), so any hit is
+ * somebody else's.
+ */
+function isShaReferenced(sha: string): boolean {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(LS_KEY_SCENE_GLB_PREFIX)) continue;
+      if (readSceneGlbPointer(k.slice(LS_KEY_SCENE_GLB_PREFIX.length))?.sha === sha) return true;
+    }
+  } catch {
+    // A storage we cannot scan cannot prove the blob unreferenced, and keeping
+    // an orphan costs space while deleting a live body costs work.
+    return true;
+  }
+  return false;
+}
+
+/** Delete a body blob unless another pointer still names it. Never throws. */
+async function deleteBlobIfUnreferenced(sha: string): Promise<void> {
+  if (isShaReferenced(sha)) return;
+  await deleteBlob(sha).catch(() => {});
+}
+
+/** Outcome of {@link moveSceneGlbPointer}. */
+export type SceneGlbMoveResult =
+  /** `from` now lives at `to`; `from` is gone. */
+  | 'moved'
+  /** `to` already named the same body, so only `from` was dropped. */
+  | 'same'
+  /** `from` no longer held `expectedSha`, or `to` holds a different body. */
+  | 'conflict';
+
+/** Metadata changes a move applies to the moved pointer; `null` removes a field. */
+export interface SceneGlbMoveStamp {
+  baseSha?: string | null;
+  movedAt?: string | null;
+  updatedAt?: string;
+}
+
+/**
+ * Move a pointer to another slot, compare-and-swap on its sha (plan-546).
+ *
+ * Moves only when `from` still names `expectedSha` and `to` is empty. When `to`
+ * already names the same body the move is complete in substance, so `from` is
+ * dropped and the result says `same`. NEVER deletes a blob: the body is the
+ * same content-addressed bytes before and after, only the name changes.
+ */
+export function moveSceneGlbPointer(
+  from: string,
+  to: string,
+  expectedSha: string,
+  stamp: SceneGlbMoveStamp = {},
+): SceneGlbMoveResult {
+  if (!from || !to || from === to) return 'conflict';
+  const source = readSceneGlbPointer(from);
+  if (!source || source.sha !== expectedSha) return 'conflict';
+  const target = readSceneGlbPointer(to);
+  try {
+    if (target) {
+      if (target.sha !== source.sha) return 'conflict';
+      localStorage.removeItem(pointerKey(from));
+      return 'same';
+    }
+    const moved: SceneGlbPointer = { ...source };
+    if (stamp.updatedAt) moved.updatedAt = stamp.updatedAt;
+    if (stamp.baseSha === null) delete moved.baseSha;
+    else if (typeof stamp.baseSha === 'string' && stamp.baseSha) moved.baseSha = stamp.baseSha;
+    if (stamp.movedAt === null) delete moved.movedAt;
+    else if (typeof stamp.movedAt === 'string' && stamp.movedAt) moved.movedAt = stamp.movedAt;
+    // Write-new, then remove-old: interrupted in between, both keys name the
+    // same blob, which duplicates a name and loses nothing.
+    localStorage.setItem(pointerKey(to), JSON.stringify(moved));
+    localStorage.removeItem(pointerKey(from));
+    return 'moved';
+  } catch {
+    return 'conflict';
+  }
+}
+
+/** Every slot id under `prefix` (e.g. `draft/~stale/<documentId>/`). */
+export function listSceneGlbSlots(prefix: string): string[] {
+  return listSceneGlbIds().filter(id => id.startsWith(prefix));
 }
 
 /** Every scene id that currently has a GLB body. Test/cleanup utility. */

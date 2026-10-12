@@ -2,7 +2,11 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * MultiuserPanel — Simplified join/share popup for the TopBar.
+ * MultiuserPanel — Simplified join/share popup opened from the activity bar.
+ *
+ * Desktop: the button sits in the bottom group of the left activity bar, so the
+ * popup anchors beside that bar near the bottom. Mobile: the button rides in
+ * the top-right pill, so the popup anchors top-right (`placement="top"`).
  *
  * Default flow: enter name + session code → Join & Share.
  * Auto-detects mode: ws:// input = direct connection, otherwise = relay with join code.
@@ -27,6 +31,7 @@ import { loadMultiuserSettings, saveMultiuserSettings, useMultiuserEnabled } fro
 import type { MultiuserPluginAPI } from '../types/plugin-types';
 import type { PlayerInfo } from '../engine/rv-avatar-manager';
 import { ISA_GREEN, ISA_RED } from './isa-colors';
+import { ACTIVITY_BAR_WIDTH } from './layout-constants';
 
 // ── Styling constants ─────────────────────────────────────────────────────
 
@@ -70,11 +75,15 @@ function isDirectUrl(value: string): boolean {
 
 // ── Panel ─────────────────────────────────────────────────────────────────
 
+type MultiuserPlacement = 'right' | 'top';
+
 interface MultiuserPanelProps {
   onClose: () => void;
+  /** Where the opening button lives: 'right' = left activity bar (desktop), 'top' = top-right pill (mobile). */
+  placement?: MultiuserPlacement;
 }
 
-export function MultiuserPanel({ onClose }: MultiuserPanelProps) {
+export function MultiuserPanel({ onClose, placement = 'right' }: MultiuserPanelProps) {
   const viewer = useViewer();
   const mu = useMultiuser();
 
@@ -188,8 +197,9 @@ export function MultiuserPanel({ onClose }: MultiuserPanelProps) {
   return (
     <Box data-ui-panel sx={{
       position: 'fixed',
-      top: 44,
-      right: 8,
+      ...(placement === 'top'
+        ? { top: 44, right: 8 }
+        : { left: ACTIVITY_BAR_WIDTH + 6, bottom: 8 }),
       width: PANEL_WIDTH,
       bgcolor: BG,
       border: `1px solid ${BORDER}`,
@@ -374,7 +384,7 @@ export function MultiuserPanel({ onClose }: MultiuserPanelProps) {
  * popup. Self-contained — owns its open state and only renders when the feature
  * is enabled (reactive) and the multiuser plugin is present.
  */
-export function MultiuserButton({ placement = 'right' }: { placement?: 'right' | 'top' }) {
+export function MultiuserButton({ placement = 'right' }: { placement?: MultiuserPlacement }) {
   const viewer = useViewer();
   const enabled = useMultiuserEnabled();
   const mu = useMultiuser();
@@ -398,7 +408,7 @@ export function MultiuserButton({ placement = 'right' }: { placement?: 'right' |
           )}
         </IconButton>
       </Tooltip>
-      {open && <MultiuserPanel onClose={() => setOpen(false)} />}
+      {open && <MultiuserPanel placement={placement} onClose={() => setOpen(false)} />}
     </>
   );
 }

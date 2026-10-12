@@ -30,6 +30,7 @@ import {
   documentRefsOf,
   documentsWithRef,
   isContainedRef,
+  isProjectScriptPath,
   normalizeRefPath,
   projectConnectRefs,
   readDocumentRef,
@@ -141,6 +142,22 @@ describe('§9.1 — a rename cannot break a binding', () => {
     // A model that is not a document of this project binds nothing.
     expect(scriptRefForModelUrl(project, '/demo/bundled.glb')).toBeNull();
     expect(scriptRefForModelUrl(null, '/models/linie1.glb')).toBeNull();
+  });
+
+  // The URL a project document is actually opened with wears the `rvproject:`
+  // scheme, glued onto the path without a slash. Matching only on `/`-delimited
+  // tails missed it, so every document of an open project resolved to "not mine"
+  // — the manifest binding existed and no project code ever loaded from it.
+  it('resolves the rvproject: URL a project document is opened with', () => {
+    const project = fixture();
+    expect(scriptRefForModelUrl(project, 'rvproject:models/linie1.glb'))
+      .toBe('scripts/linie1/index.ts');
+    expect(scriptRefForModelUrl(project, 'rvproject:models/linie1.glb?v=3'))
+      .toBe('scripts/linie1/index.ts');
+    expect(documentForModelUrl(project, 'rvproject:models/linie1-detail.glb')?.id)
+      .toBe('ast_p4q');
+    // The scheme does not invent a membership the manifest does not state.
+    expect(scriptRefForModelUrl(project, 'rvproject:models/not-a-row.glb')).toBeNull();
   });
 });
 
@@ -272,5 +289,56 @@ describe('§9.7 — the shared fixture says what both languages must agree on', 
     // perfectly well-formed, its target is simply not in `presentFiles`.
     expect(EXPECT.presentFiles).not.toContain(dead.ref);
     expect(EXPECT.presentFiles.every(f => isContainedRef(f))).toBe(true);
+  });
+});
+
+describe('plan-479 §9.1 — what may be BOUND as a project script', () => {
+  it('accepts a .ts/.tsx under plugins/, at any depth', () => {
+    expect(isProjectScriptPath('plugins/index.ts')).toBe(true);
+    expect(isProjectScriptPath('plugins/ribbon-tension-controls-plugin.tsx')).toBe(true);
+    // Any depth: `moduleMatchesScriptRef` already matches on a segment-aligned
+    // suffix, so a depth limit here would be a rule with no carrier in the code.
+    expect(isProjectScriptPath('plugins/deep/nested/util.ts')).toBe(true);
+  });
+
+  it('rejects the right ending in the wrong place', () => {
+    expect(isProjectScriptPath('models/helper.ts')).toBe(false);
+    expect(isProjectScriptPath('helper.ts')).toBe(false);
+    // `other-plugins/` is not `plugins/` — the same segment rule the resolver
+    // uses, so the drag cannot offer what the loader would refuse.
+    expect(isProjectScriptPath('other-plugins/index.ts')).toBe(false);
+    expect(isProjectScriptPath('src/plugins/index.ts')).toBe(false);
+  });
+
+  it('rejects the right place with the wrong ending', () => {
+    expect(isProjectScriptPath('plugins/readme.md')).toBe(false);
+    expect(isProjectScriptPath('plugins/data.json')).toBe(false);
+    // A declaration file exports no runtime module, so binding it could only fail.
+    expect(isProjectScriptPath('plugins/types.d.ts')).toBe(false);
+  });
+
+  it('reads a Windows path and a ./ prefix as the same file', () => {
+    expect(isProjectScriptPath('plugins\\index.ts')).toBe(true);
+    expect(isProjectScriptPath('./plugins/index.ts')).toBe(true);
+    expect(isProjectScriptPath('  plugins/index.ts  ')).toBe(true);
+  });
+
+  it('rejects a non-path and anything that would leave the project', () => {
+    expect(isProjectScriptPath(null)).toBe(false);
+    expect(isProjectScriptPath(undefined)).toBe(false);
+    expect(isProjectScriptPath('')).toBe(false);
+    expect(isProjectScriptPath('plugins')).toBe(false);
+    expect(isProjectScriptPath('../plugins/index.ts')).toBe(false);
+    expect(isProjectScriptPath('plugins/../../escape.ts')).toBe(false);
+  });
+
+  it('does NOT narrow what the resolver already accepts', () => {
+    // The shared fixture binds `scripts/linie1/index.ts` — outside `plugins/`.
+    // This predicate gates what the NEW gesture may offer, never what an
+    // existing manifest may carry: `moduleMatchesScriptRef` is unchanged, and a
+    // shipped project must not lose its binding to a UI rule (F11).
+    expect(isProjectScriptPath('scripts/linie1/index.ts')).toBe(false);
+    expect(readDocumentRef(fixture().documents!.find(d => d.id === 'ast_m8x'), 'scriptRef'))
+      .toBe('scripts/linie1/index.ts');
   });
 });

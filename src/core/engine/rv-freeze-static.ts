@@ -5,19 +5,25 @@
  * rv-freeze-static.ts — Prune the per-frame matrix recursion on large scenes.
  *
  * On a big CAD model the scene graph holds tens of thousands of structural
- * Group nodes plus the baked-away source meshes that the merges keep around for
- * hover-highlight. Three.js walks ALL of them every frame in
+ * Group nodes. Three.js walks ALL of them every frame in
  * `scene.updateMatrixWorld()` — measured as the dominant CPU cost (~2x the
  * render-loop time on the Mauser line, ~40 ms/frame), paid even when nothing
  * moves and again on every post-processing pass that re-renders the scene.
  *
- * This pass sets `matrixWorldAutoUpdate = false` on every node that is provably
- * static, so Three.js skips it (and, since it is the recursion gate, its whole
- * subtree) in the automatic world-matrix update. A node is kept DYNAMIC iff it,
- * one of its ancestors, or one of its descendants carries a motion / MU-spawn
- * component (see {@link MOVER_KEY}): Drive(*), Kinematic, Grip, TransportSurface,
- * Source, Sink, MU, Cam, SceneButtonMoveable, Chain(Element). That closure keeps
- * alive:
+ * This pass sets `matrixWorldAutoUpdate = false` AND `matrixAutoUpdate = false`
+ * on every node that is provably static. Three.js (r185) has no recursion gate:
+ * `updateMatrixWorld` visits every child and re-composes the LOCAL matrix of
+ * every node with `matrixAutoUpdate`, whatever `matrixWorldAutoUpdate` says —
+ * freezing only the world flag left ~23k static Mauser nodes composing a matrix
+ * per frame and per pass (profile 2026-09-17). Every thaw site
+ * (`ensureMovableTransform`, placement materialize, scene-button bind, chain
+ * clones, the editor's drive preview) re-enables both flags together.
+ * A node is kept DYNAMIC iff it,
+ * one of its ancestors, or one of its descendants carries a component whose
+ * bake role is `chunk` (a mover: Drive(*), Kinematic, Grip, SceneButtonMoveable,
+ * ChainElement, PlacementMeta …) or `keep` (runtime-mutated originals: Source,
+ * Sink, MU, TransportSurface, Chain, ribbon web …) — see `bakeRoleOf()` in
+ * rv-component-registry.ts and {@link isMoverNode}. That closure keeps alive:
  *   - Drive-driven subtrees (the Drive node + everything under it),
  *   - the chain of ancestors above each Drive (needed so the recursion can reach
  *     it — including the always-dynamic model root, under which runtime MUs are
@@ -31,51 +37,45 @@
  * the freeze active, zero frozen node ever changed its world position, while all
  * 33 genuinely-moving meshes kept moving.
  *
- * MUST run AFTER kinematic re-parenting and the static/kinematic merges, on the
- * FINAL hierarchy — earlier the parent chains (and therefore the mover closure)
+ * MUST run AFTER kinematic re-parenting and the bake, on the FINAL hierarchy — earlier the parent chains (and therefore the mover closure)
  * are not yet correct. World matrices are computed once up front so every frozen
  * node holds its correct, final transform.
  */
 
 import type { Object3D } from 'three';
+import { bakeRoleOf } from './rv-component-registry';
 
 /**
- * rv_extras component keys whose node — together with its ancestors and its
- * whole subtree — must stay matrix-dynamic. Matched case-insensitively against
- * the START of the key, so `Drive_Cylinder`, `Drive_Gear`, `Drive_ErraticPosition`
- * etc. are all covered by `Drive`. Source/Sink/MU/TransportSurface are included
- * because they spawn or carry movable units at runtime.
+ * Which component keeps a node matrix-dynamic is no longer a key list here but
+ * the component's own `capabilities.bake` (plan-753 §2.3): every type whose
+ * role is `chunk` or `keep` is a mover. The reasons the old list carried live
+ * on in the declarations — e.g. `SceneButtonMoveable` (plan-417: the cap
+ * translates on click, and the component's own thaw in `_bind()` ran BEFORE
+ * this pass and was overwritten by it) and `PlacementMeta` (plan-397 phase 6:
+ * a baked planner placement moves as one unit; freezing its frame nodes made a
+ * drag move only the rolls, 2026-09-01 DemoPlanner). Types without a component
+ * module (`PlacementMeta`, `Cam`) are registered in rv-scene-loader.ts.
+ * The Phase-1 `LEGACY_KEEP_OVERRIDE` (TransportSurface / Sink / Cam kept
+ * dynamic for the arena batcher) went with that batcher in plan-753 Phase 4b —
+ * the registry roles are the only source now.
  *
- * `SceneButtonMoveable` (plan-417) is a mover too: the cap of a 3D scene button
- * translates or rotates on hover/click. It is listed here — and not left to the
- * component's own thaw in `RVSceneButtonMoveable._bind()` — because ORDER made
- * that thaw useless: components are constructed in Phase 8, this pass runs in
- * Phase 11, so the freeze overwrote `matrixWorldAutoUpdate` again right after.
- * Symptom: the signal toggles and the light switches, but the lever never
- * visibly moves. Being on this list makes the cap dynamic regardless of when it
- * is bound.
- *
- * `PlacementMeta` marks a planner placement (plan-397 phase 6): movable and
- * deletable at runtime, exactly like a freshly dragged-in library object —
- * which stays dynamic because it arrives AFTER this pass. Freezing a BAKED
- * placement kept its drive subtrees dynamic (rolls) but froze the sibling
- * frame nodes, and the planner's move paths write via `updateMatrixWorld(true)`,
- * whose force flag never recomputes a `matrixWorldAutoUpdate=false` node —
- * dragging moved only the rolls while the frame stood still (2026-09-01,
- * DemoPlanner, second layer under the same-day batcher exclusion).
+ * An authored `rv.BakeRole` extras value on a node overrides the type role.
  */
-const MOVER_KEY = /^(Drive|Kinematic|Grip|TransportSurface|Source|Sink|MU|Cam|SceneButtonMoveable|Chain|PlacementMeta|RibbonPath|RibbonWinder|RibbonRoller|RibbonDancer)/i;
 
 /**
  * plan-460 F11: a `RibbonRoller` with `SpinMode: Texture` deliberately does NOT
  * move — it scrolls its mantle map and leaves the node quaternion alone, which
  * makes it the one web component that may be frozen. Any other value, and a
- * missing field, keep the plan-459 behaviour (dynamic).
+ * missing field, keep the plan-459 behaviour (dynamic). Passed to `bakeRoleOf`
+ * as the skip predicate so the roller's `keep` role is ignored for THAT node
+ * only (it stays `keep` for the batcher, which has no per-instance UV offset).
  *
  * `RibbonDancer` extends the roller but TRANSLATES, so it must never qualify —
- * hence the anchored `RibbonRoller` prefix rather than a loose `Ribbon` one.
+ * hence the exact `RibbonRoller` type rather than a loose `Ribbon` prefix.
  */
-const RIBBON_ROLLER_KEY = /^RibbonRoller/i;
+function isTextureRoller(type: string, config: unknown): boolean {
+  return type === 'RibbonRoller' && (config as { SpinMode?: unknown }).SpinMode === 'Texture';
+}
 
 export interface FreezeStaticResult {
   /** Nodes whose matrixWorldAutoUpdate was turned off. */
@@ -84,26 +84,29 @@ export interface FreezeStaticResult {
   dynamic: number;
   /** Total nodes visited. */
   total: number;
+  /** The dynamic closure itself — movers, their ancestors and descendants.
+   *  Everything else is provably static (input of the ghost data tree). */
+  dynamicNodes: ReadonlySet<Object3D>;
 }
 
-/** True if the node itself carries a motion / MU-spawn component. */
-function isMoverNode(node: Object3D): boolean {
+/** True for a placement root, or a node carrying a component with bake role `chunk` or `keep`. */
+export function isMoverNode(node: Object3D): boolean {
   // Already-bound scene-button cap mesh: `RVSceneButtonMoveable._bind()` stamps
   // this marker on the animated mesh even when the extras live on a parent node,
   // and it survives a re-freeze after a runtime placement.
   if (node.userData?._rvSceneButtonMesh === true) return true;
-  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
-  if (!rv) return false;
-  for (const key in rv) {
-    if (!rv[key]) continue;
-    if (RIBBON_ROLLER_KEY.test(key)) {
-      const mode = (rv[key] as { SpinMode?: unknown }).SpinMode;
-      if (mode === 'Texture') continue;
-      return true;
-    }
-    if (MOVER_KEY.test(key)) return true;
-  }
-  return false;
+  // A placement root moves as ONE unit, whatever stamp it carries. A RELOADED
+  // reference node has `PlacementMeta` (a `chunk` role) from the GLB; a LIVE
+  // drop (`PlacementInstancer.materialize` → `stampPlacementMarkers`) and a
+  // NESTED placement root carry only the runtime markers `_layoutId` /
+  // `_layoutNestedOf`. Without this the placement freeze (integratePlacedContent
+  // F13) froze a live-dropped conveyor's frame chunks while the drive nodes
+  // stayed dynamic — a drag moved the rolls and left the frame behind
+  // (2026-09-24, tests/placement-move-follows-root.test.ts).
+  const ud = node.userData;
+  if (typeof ud?._layoutId === 'string' || typeof ud?._layoutNestedOf === 'string') return true;
+  const role = bakeRoleOf(node, isTextureRoller);
+  return role === 'chunk' || role === 'keep';
 }
 
 /**
@@ -114,6 +117,12 @@ function isMoverNode(node: Object3D): boolean {
 export function freezeStaticMatrices(
   root: Object3D,
   extraMovers?: readonly Object3D[],
+  /** `extraMoversReparented`: a RUNTIME load re-parented the kinematic group
+   *  members under their axis — they ride along and nobody writes their local
+   *  transform, so they need no per-frame local re-compose. An authoring load
+   *  moves them by world delta (writes `position`), so there they stay local
+   *  movers (the default). */
+  opts?: { extraMoversReparented?: boolean },
 ): FreezeStaticResult {
   // Compute every world matrix once so frozen nodes keep their final transform.
   root.updateMatrixWorld(true);
@@ -122,14 +131,20 @@ export function freezeStaticMatrices(
   // descendants live. Ancestor walks short-circuit once they hit a node already
   // marked dynamic, so the whole pass stays ~O(nodes).
   const dynamic = new Set<Object3D>();
-  const keepAlive = (node: Object3D): void => {
+  // Nodes whose LOCAL transform is written at runtime: the movers themselves.
+  // Their ancestors and descendants only need a live WORLD matrix — their
+  // local matrix is as constant as a static node's, so they stop re-composing
+  // it (16k nodes under the Mauser's 169 drives, per frame AND per pass).
+  const localMovers = new Set<Object3D>();
+  const keepAlive = (node: Object3D, writesLocal = true): void => {
+    if (writesLocal) localMovers.add(node);
     for (let a: Object3D | null = node; a && !dynamic.has(a); a = a.parent) {
       dynamic.add(a);
     }
     node.traverse((c) => dynamic.add(c));
   };
   root.traverse((node) => {
-    if (isMoverNode(node)) keepAlive(node);
+    if (isMoverNode(node)) keepAlive(node, true);
   });
   // plan-727: kinematic group members handed in by the caller. The closure above
   // asks a PHYSICAL question — is a mover in my parent chain or my subtree? — and
@@ -138,18 +153,23 @@ export function freezeStaticMatrices(
   // by world delta), so freezing it — or any of its ancestors, which are the
   // recursion gate — would leave the drive running and the geometry standing
   // still. Purely additive: this can only keep MORE nodes dynamic.
-  if (extraMovers) for (const node of extraMovers) keepAlive(node);
+  if (extraMovers) for (const node of extraMovers) keepAlive(node, opts?.extraMoversReparented !== true);
 
   let frozen = 0;
   let total = 0;
   root.traverse((node) => {
     total++;
-    if (dynamic.has(node)) return;
+    if (dynamic.has(node)) {
+      if (!localMovers.has(node) && node !== root) node.matrixAutoUpdate = false;
+      return;
+    }
+    // Local matrices are current (the forced update above composed them).
+    node.matrixAutoUpdate = false;
     if (node.matrixWorldAutoUpdate) {
       node.matrixWorldAutoUpdate = false;
       frozen++;
     }
   });
 
-  return { frozen, dynamic: dynamic.size, total };
+  return { frozen, dynamic: dynamic.size, total, dynamicNodes: dynamic };
 }

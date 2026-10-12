@@ -43,8 +43,7 @@
  */
 
 import {
-  documentOfAssetEntry,
-  documentOfSceneEntry,
+  documentOfEntry,
   readDocuments,
   stableDocumentId,
   withoutLegacyArrays,
@@ -186,13 +185,19 @@ export async function migrateProjectDocuments(
   const legacy = project as {
     scenes?: unknown; models?: unknown; library?: unknown;
   };
+  // One lift for all three arrays (plan-744 F2/F4). The scene branch used to
+  // have its own, and the only thing it did differently was stamp
+  // `section: 'scenes'`; that stamp is gone, so which legacy array a row came
+  // out of no longer changes the row. The arrays are still read separately
+  // because their ORDER is the migrated list's order, and because `counts` is
+  // what the migration reports.
   const scenes = arrayOf<RvProjectSceneEntry>(legacy.scenes);
-  for (const entry of scenes) documents.push(documentOfSceneEntry(entry, mint));
+  for (const entry of scenes) documents.push(documentOfEntry(entry, mint));
   counts.scenes = scenes.length;
 
   for (const section of ['models', 'library'] as const) {
     const list = arrayOf<RvProjectAssetEntry>(legacy[section]);
-    for (const entry of list) documents.push(documentOfAssetEntry(entry, section, mint));
+    for (const entry of list) documents.push(documentOfEntry(entry, mint));
     counts[section] = list.length;
   }
 

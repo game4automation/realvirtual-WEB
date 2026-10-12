@@ -96,7 +96,6 @@ import {
   writeSceneOwner,
 } from '../rv-scene-owner';
 import {
-  assetDocumentsOf,
   readDocuments,
   withDerivedDocuments,
   type DocumentStat,
@@ -107,7 +106,6 @@ import {
   sceneGlbRelPathFor,
   type RvDocumentEntry,
   type RvProject,
-  type RvProjectAssetEntry,
   type RvProjectSceneEntry,
 } from '../rv-project-types';
 import {
@@ -115,6 +113,7 @@ import {
   docPathOf,
   docRefOf,
   documentRecord,
+  isInternalProjectPath,
   preconditionOf,
   WriteQueue,
   type DocRef,
@@ -299,17 +298,36 @@ export class BrowserBackend implements ProjectBackend {
 
   // ─── Listing ──────────────────────────────────────────────────────────
 
-  async listModels(): Promise<RvProjectAssetEntry[]> {
-    return assetDocumentsOf(this._readStoredManifest(), 'models');
-  }
-
-  async listLibrary(): Promise<RvProjectAssetEntry[]> {
-    return assetDocumentsOf(this._readStoredManifest(), 'library');
-  }
+  // `listModels()`/`listLibrary()` are gone (plan-744 Phase 1). Here they were
+  // pure manifest filters over `sectionOfDocument`, which for THIS backend is
+  // the one place the heuristic has nothing to read: a browser document's path
+  // is its bare id, so every row answered `'library'` unless it carried the
+  // transitional stamp — and that stamp is gone too (Phase 2).
 
   /** The one list (plan-413 §2.4), over the index plus the stored manifest. */
   async listDocuments(): Promise<RvDocumentEntry[]> {
     return this._documentsOf(this._readStoredManifest());
+  }
+
+  /**
+   * Every file this project owns, project-relative — the plan-445 F1 contract
+   * the folder and bundled backends already honour.
+   *
+   * There is no directory to walk: a browser project keeps its documents in
+   * the manifest (scene bodies live under `rv-scene-glb/<id>`, addressed by id
+   * only) and everything else in the path-keyed blob index. The union of the
+   * two is the whole answer; without this method `listProjectFiles()` fell
+   * back to the per-ending walks, which this backend does not have either, so
+   * an MCP client saw a browser project as GLBs only.
+   */
+  async listAllFiles(): Promise<string[]> {
+    const fromBlobs = Object.keys(this._readBlobIndex());
+    const fromDocuments = this._documentsOf(this._readStoredManifest())
+      .map((d) => d.path)
+      .filter((p): p is string => typeof p === 'string' && p.length > 0);
+    return [...new Set([...fromBlobs, ...fromDocuments])]
+      .filter((path) => !isInternalProjectPath(path))
+      .sort();
   }
 
   /**

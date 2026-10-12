@@ -36,15 +36,28 @@ import type { SnapMarkerRenderer } from './snap-marker-renderer';
 import { snapHoverStore } from './snap-hover-store';
 import { snapToolbarStore } from './snap-toolbar-store';
 import { ndcToScreen } from '../../core/engine/rv-ndc';
+import { DRAG_THRESHOLD_PX } from '../../core/engine/rv-constants';
 
 /** Pixel radius around a visible marker that still counts as "on a marker". */
 export const DEFAULT_PIXEL_THRESHOLD = 36;
 /** How long markers stay visible after the cursor leaves their owning asset. */
 export const DEFAULT_GRACE_MS = 600;
+/**
+ * Pixel radius around a marker within which a CLICK opens the picker.
+ *
+ * Deliberately much smaller than {@link DEFAULT_PIXEL_THRESHOLD}, which is the
+ * hover/highlight radius. The marker is drawn 13–15 px wide; a click radius of
+ * 36 px covered half of a 1 m conveyor at planner zoom, so selecting the part
+ * opened the picker, and the popup then sat on top of the part the user was
+ * about to drag (field finding 2026-09-25). The part owns its own pixels; the
+ * picker owns the marker's.
+ */
+export const DEFAULT_CLICK_RADIUS_PX = 12;
 
 export interface SnapControllerOptions {
   pixelThreshold?: number;
   graceMs?: number;
+  clickRadiusPx?: number;
 }
 
 interface ProximityResult {
@@ -60,6 +73,7 @@ export class SnapPointController {
   private readonly markerRenderer: SnapMarkerRenderer;
   private readonly pixelThreshold: number;
   private readonly graceMs: number;
+  private readonly clickRadiusPx: number;
 
   private canvas: HTMLCanvasElement | null = null;
   private active = false;
@@ -83,7 +97,20 @@ export class SnapPointController {
   // Bound listeners
   private readonly onMouseMoveBound: (e: MouseEvent) => void;
   private readonly onMouseDownBound: (e: MouseEvent) => void;
+  private readonly onMouseUpBound: (e: MouseEvent) => void;
   private readonly onKeyDownBound: (e: KeyboardEvent) => void;
+
+  /**
+   * A press that landed on a marker, waiting for its release (2026-09-25).
+   *
+   * The picker used to open on MOUSEDOWN. The planner arms its direct-drag on
+   * the same press (`pointerdown`), so grabbing a conveyor within the marker
+   * radius moved it AND left the picker standing after the drop — and the
+   * popup then swallowed the next press: "the conveyor cannot be moved". A
+   * marker press is therefore only a CANDIDATE here; the picker opens on the
+   * release, and only when the pointer stayed put (a click, not a drag).
+   */
+  private pendingPick: { snap: SnapPoint; x: number; y: number } | null = null;
   private readonly onObjectHoverBound: (data: ObjectHoverData | null) => void;
 
   /** Cleanup handle returned by viewer.on('object-hover', …). */
@@ -100,9 +127,11 @@ export class SnapPointController {
     this.markerRenderer = markerRenderer;
     this.pixelThreshold = opts?.pixelThreshold ?? DEFAULT_PIXEL_THRESHOLD;
     this.graceMs = opts?.graceMs ?? DEFAULT_GRACE_MS;
+    this.clickRadiusPx = opts?.clickRadiusPx ?? DEFAULT_CLICK_RADIUS_PX;
 
     this.onMouseMoveBound = this._onMouseMove.bind(this);
     this.onMouseDownBound = this._onMouseDown.bind(this);
+    this.onMouseUpBound = this._onMouseUp.bind(this);
     this.onKeyDownBound = this._onKeyDown.bind(this);
     this.onObjectHoverBound = this._onObjectHover.bind(this);
   }
@@ -116,6 +145,9 @@ export class SnapPointController {
 
     canvas.addEventListener('mousemove', this.onMouseMoveBound);
     canvas.addEventListener('mousedown', this.onMouseDownBound);
+    // On the window: a drag that ends off the canvas must still resolve the
+    // candidate (to nothing), or the next canvas press would inherit it.
+    window.addEventListener('mouseup', this.onMouseUpBound);
     window.addEventListener('keydown', this.onKeyDownBound);
 
     // Subscribe to viewer-level hover events. The viewer's RaycastManager
@@ -141,8 +173,10 @@ export class SnapPointController {
       this.canvas.removeEventListener('mousemove', this.onMouseMoveBound);
       this.canvas.removeEventListener('mousedown', this.onMouseDownBound);
     }
+    window.removeEventListener('mouseup', this.onMouseUpBound);
     window.removeEventListener('keydown', this.onKeyDownBound);
     this.canvas = null;
+    this.pendingPick = null;
 
     if (this.unsubObjectHover) { this.unsubObjectHover(); this.unsubObjectHover = null; }
     if (this.rafId !== null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
@@ -288,11 +322,31 @@ export class SnapPointController {
     const dx = screen.x - mx;
     const dy = screen.y - my;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > this.pixelThreshold) return;
+    // The CLICK radius, not the hover radius: a press on the part itself is a
+    // selection or a drag and belongs to the planner.
+    if (dist > this.clickRadiusPx) return;
 
-    e.stopPropagation();
-    e.preventDefault();
-    snapHoverStore.openPicker(sp, { x: e.clientX, y: e.clientY });
+    // Not `stopPropagation`, not `preventDefault`: the press may be the start
+    // of a planner drag, and that drag belongs to the planner. Whether this
+    // was a click is decided on release.
+    this.pendingPick = { snap: sp, x: e.clientX, y: e.clientY };
+  }
+
+  private _onMouseUp(e: MouseEvent): void {
+    const pending = this.pendingPick;
+    this.pendingPick = null;
+    if (!pending || e.button !== 0) return;
+
+    // Moved past the planner's own drag threshold = a drag happened; the
+    // planner moved the part and the picker has no business appearing.
+    const dx = e.clientX - pending.x;
+    const dy = e.clientY - pending.y;
+    if (dx * dx + dy * dy >= DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
+
+    // The snap may have been paired or removed during the press.
+    if (pending.snap.occupied || !pending.snap.object3D.parent) return;
+
+    snapHoverStore.openPicker(pending.snap, { x: e.clientX, y: e.clientY });
   }
 
   private _onKeyDown(e: KeyboardEvent): void {

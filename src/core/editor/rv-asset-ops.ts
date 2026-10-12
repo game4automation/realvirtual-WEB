@@ -53,6 +53,12 @@ export interface CADLinkExtras {
   ImportScaleFactor: number;
   /** Source CAD is Z-up (rotated to Y-up on import), mirrors Unity CADLink. */
   ZIsUpVector: boolean;
+  /**
+   * Converter that produced the geometry (plan-561). Absent = 'browser' (every import before
+   * plan-561). Browser and CONNECT produce different trees, so the GLB cache keys on it and
+   * re-import / re-tessellation stay with the original converter. Web-only field.
+   */
+  Converter?: 'connect' | 'browser';
 }
 
 // ─── Op taxonomy ────────────────────────────────────────────────────────
@@ -191,9 +197,8 @@ export interface AssetUnsetFieldOp extends AssetOpBase {
 /**
  * A serializable PBR material value — the payload of a material preset.
  *
- * Deliberately a plain JSON record with NO texture maps: the Materials window
- * authors flat PBR appearance (the overwhelming majority of CAD-cleanup work),
- * and keeping the op JSON-safe is what lets it replay from an IndexedDB draft.
+ * A plain JSON record, including an optional embedded color texture, so the
+ * material can replay from an IndexedDB draft without an external asset URL.
  * Meshes whose ORIGINAL material carried textures are restored on undo from the
  * executor's trash bin, not from this record — see `SetMaterialOp.prev`.
  */
@@ -212,6 +217,8 @@ export interface MaterialValue {
   /** Emissive color `#rrggbb`. Omitted = black (non-emissive). */
   emissive?: string;
   emissiveIntensity?: number;
+  /** Embedded PNG color map (data URL); existing mesh UV coordinates are used. */
+  texture?: string;
 }
 
 /**

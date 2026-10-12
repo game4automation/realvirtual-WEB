@@ -64,7 +64,7 @@ import {
   writeSettingsFile,
   type ManifestUpdate,
 } from './rv-project-storage';
-import { sceneDocumentsOf } from './rv-project-documents';
+import { documentsOf } from './rv-project-documents';
 import {
   sceneFileNameOfPath,
   sceneGlbRelPathFor,
@@ -324,7 +324,10 @@ export class RVProjectFolderWriter {
       // ── 2. Retire files left behind by a rename ──
       for (const [id, oldPath] of staleRenames) {
         const stillReferenced = upserts.some(e => e.path === oldPath)
-          || sceneDocumentsOf(this._host.getManifest()).some(e => e.id !== id && e.path === oldPath);
+          // Over the ONE list (plan-744 F3): "is any other document still at
+          // this path" is a question about the whole manifest. Asking only the
+          // scene-shaped subset could clear a file another document owns.
+          || documentsOf(this._host.getManifest()).some(e => e.id !== id && e.path === oldPath);
         if (stillReferenced) continue;
         await deleteSceneFile(dir, oldPath);
       }
@@ -395,10 +398,13 @@ export class RVProjectFolderWriter {
     relPath: string,
     opts: { forDelete?: boolean } = {},
   ): { ok: true } | { ok: false; reason: string } {
-    const scenes = sceneDocumentsOf(this._host.getManifest());
-    const own = scenes.find(e => e.id === id);
+    // Path ownership is a property of the whole manifest, not of a section
+    // (plan-744 F3): a `models/` row claiming this path has to refuse the
+    // write exactly as a `scenes/` one does.
+    const documents = documentsOf(this._host.getManifest());
+    const own = documents.find(e => e.id === id);
 
-    const claimant = scenes.find(e => e.id !== id && e.path === relPath);
+    const claimant = documents.find(e => e.id !== id && e.path === relPath);
     if (claimant) {
       return {
         ok: false,
@@ -434,7 +440,10 @@ export class RVProjectFolderWriter {
   }
 
   private _manifestEntry(id: string): RvProjectSceneEntry | undefined {
-    return sceneDocumentsOf(this._host.getManifest()).find(e => e.id === id);
+    // By ID over the one list (plan-744 F3) — unique, so a section filter
+    // could only lose the row.
+    return documentsOf(this._host.getManifest()).find(e => e.id === id) as
+      unknown as RvProjectSceneEntry | undefined;
   }
 
   /**

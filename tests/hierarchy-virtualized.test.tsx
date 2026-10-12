@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
+/**
+ * Virtualization of the hierarchy rows.
+ *
+ * Since plan-754 the rows come from the scene graph, so the fixtures here are
+ * real `Object3D` trees; the row pipeline (`flattenSceneRows` → virtualizer →
+ * `TreeNodeRow`) and its guarantees — mount only what is on screen, stable
+ * uuid keys, ARIA sibling metadata — are unchanged.
+ */
+
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Group, Object3D, Scene } from 'three';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { FlatNodeRow, TreeNodeRow, rowDomId } from '../src/core/hmi/HierarchyNodeRow';
-import {
-  flattenVisibleTree,
-  type TreeNode,
-  type VisibleTreeRow,
-} from '../src/core/hmi/hierarchy-utils';
+import { flattenSceneRows, type SceneRowContext, type SceneTreeNode } from '../src/core/hmi/hierarchy-rows';
+import type { TreeNode, VisibleTreeRow } from '../src/core/hmi/hierarchy-utils';
 import {
   resolvePointerRowHeight,
   ROW_HEIGHT_COARSE,
@@ -35,8 +42,33 @@ vi.mock('../src/core/hmi/hierarchy-badge-components', async (importOriginal) => 
 const viewer = { id: 'test-viewer' } as unknown as RVViewer;
 const noop = () => {};
 
-function leaf(path: string): TreeNode {
-  return { name: path.split('/').pop()!, path, types: [], hasOverrides: false, children: [] };
+/** A registered scene of `count` flat children under one root. */
+function makeScene(count: number, childFactory?: (i: number) => Object3D) {
+  const scene = new Scene();
+  const root = new Group(); root.name = 'Root';
+  scene.add(root);
+  const paths = new Map<Object3D, string>([[root, 'Root']]);
+  for (let i = 0; i < count; i++) {
+    const child = childFactory ? childFactory(i) : new Group();
+    if (!child.name) child.name = `Node-${i}`;
+    root.add(child);
+    paths.set(child, `Root/${child.name}`);
+    for (const g of child.children) paths.set(g, `Root/${child.name}/${g.name}`);
+  }
+  const ctx: SceneRowContext = {
+    getPathForNode: (n) => paths.get(n) ?? null,
+    overlay: null,
+    modelRoot: null,
+    hideRuntime: false,
+  };
+  const expandAll = new Set<string>();
+  scene.traverse((n) => expandAll.add(n.uuid));
+  return { scene, root, ctx, expandAll, paths };
+}
+
+function rowsOf(count: number) {
+  const s = makeScene(count);
+  return flattenSceneRows(s.scene, s.expandAll, s.ctx);
 }
 
 function VirtualTree({
@@ -51,8 +83,8 @@ function VirtualTree({
   initialActive?: string | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [activePath, setActivePath] = useState(initialActive);
-  const [pendingPath, setPendingPath] = useState<string | null>(null);
+  const [activeKey, setActiveKey] = useState(initialActive);
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
@@ -62,7 +94,7 @@ function VirtualTree({
   });
   const virtualItems = virtualizer.getVirtualItems();
   const mounted = useMemo(() => new Set(
-    virtualItems.flatMap((item) => rows[item.index]?.node.path ?? []),
+    virtualItems.flatMap((item) => rows[item.index]?.rowKey ?? []),
   ), [rows, virtualItems]);
 
   useEffect(() => {
@@ -70,25 +102,25 @@ function VirtualTree({
   }, [revealIndex, virtualizer]);
 
   useEffect(() => {
-    if (!pendingPath || !mounted.has(pendingPath)) return;
-    setActivePath(pendingPath);
-    setPendingPath(null);
-  }, [mounted, pendingPath]);
+    if (!pendingKey || !mounted.has(pendingKey)) return;
+    setActiveKey(pendingKey);
+    setPendingKey(null);
+  }, [mounted, pendingKey]);
 
   return (
     <div
       ref={scrollRef}
       role="tree"
       tabIndex={0}
-      aria-activedescendant={activePath && mounted.has(activePath) ? rowDomId(activePath) : undefined}
+      aria-activedescendant={activeKey && mounted.has(activeKey) ? rowDomId(activeKey) : undefined}
       onKeyDown={(event) => {
         if (event.key !== 'ArrowDown') return;
-        const current = rows.findIndex((row) => row.node.path === activePath);
+        const current = rows.findIndex((row) => row.rowKey === activeKey);
         const next = Math.min(rows.length - 1, Math.max(0, current + 1));
-        const path = rows[next]?.node.path;
-        if (!path) return;
+        const key = rows[next]?.rowKey;
+        if (!key) return;
         virtualizer.scrollToIndex(next, { align: 'center' });
-        setPendingPath(path);
+        setPendingKey(key);
       }}
       style={{ height, width: 320, overflow: 'auto', position: 'relative' }}
     >
@@ -99,10 +131,10 @@ function VirtualTree({
             <TreeNodeRow
               key={row.rowKey}
               row={row}
-              selectedPaths={new Set(activePath ? [activePath] : [])}
+              selected={row.rowKey === activeKey}
               expanded={new Set()}
               onToggleExpand={noop}
-              onSelect={setActivePath}
+              onSelect={(node) => setActiveKey((node as SceneTreeNode).object.uuid)}
               onDoubleClick={noop}
               onHover={noop}
               signalStore={null}
@@ -130,65 +162,54 @@ afterEach(() => {
 
 describe('HierarchyBrowser tree virtualization', () => {
   it('mounts only viewport rows for a 10k-node expanded tree', async () => {
-    const rows = flattenVisibleTree(
-      Array.from({ length: 10_000 }, (_, index) => leaf(`Root/Node-${index}`)),
-      new Set(),
-    );
-    render(<VirtualTree rows={rows} />);
+    render(<VirtualTree rows={rowsOf(10_000)} />);
 
     await waitFor(() => expect(screen.getAllByRole('treeitem').length).toBeGreaterThan(0));
     expect(screen.getAllByRole('treeitem').length).toBeLessThan(100);
   });
 
-  it('uses deferredTerm as the SSOT for every search-derived tree calculation', () => {
-    expect(hierarchyBrowserSource).toContain('filterTree(tree, deferredTerm, viewer)');
-    expect(hierarchyBrowserSource).toContain('if (!deferredTerm || typeFilter !== \'all\') return null;');
-    expect(hierarchyBrowserSource).toContain("if (typeFilter !== 'all' || !deferredTerm) return [null, null];");
-    expect(hierarchyBrowserSource).not.toContain('filterTree(tree, searchTerm, viewer)');
+  it('derives every tree-view row set from the scene graph, not a node scan', () => {
+    expect(hierarchyBrowserSource).toContain('flattenSceneRows(rootObject, expanded, rowCtx)');
+    expect(hierarchyBrowserSource).toContain('buildSceneSearchTree(rootObject, deferredTerm, rowCtx');
+    expect(hierarchyBrowserSource).not.toContain('state.editableNodes');
+    expect(hierarchyBrowserSource).not.toContain('hierarchyScope');
   });
 
   it('reveal scrolls an off-screen target into the rendered window', async () => {
-    const rows = flattenVisibleTree(
-      Array.from({ length: 1_000 }, (_, index) => leaf(`Root/Node-${index}`)),
-      new Set(),
-    );
+    const rows = rowsOf(1_000);
+    const target = rows[900].node.path;
     const { rerender } = render(<VirtualTree rows={rows} />);
     rerender(<VirtualTree rows={rows} revealIndex={900} />);
 
-    await waitFor(() => expect(document.querySelector('[data-path="Root/Node-900"]')).toBeTruthy());
+    await waitFor(() => expect(document.querySelector(`[data-path="${target}"]`)).toBeTruthy());
   });
 
   it('scrolls before moving aria-activedescendant to a mounted keyboard target', async () => {
-    const rows = flattenVisibleTree(
-      Array.from({ length: 500 }, (_, index) => leaf(`Root/Node-${index}`)),
-      new Set(),
-    );
-    render(<VirtualTree rows={rows} initialActive="Root/Node-499" />);
+    const rows = rowsOf(500);
+    const last = rows[rows.length - 1].rowKey;
+    render(<VirtualTree rows={rows} initialActive={last} />);
     const tree = screen.getByRole('tree');
     expect(tree.hasAttribute('aria-activedescendant')).toBe(false);
 
     fireEvent.keyDown(tree, { key: 'ArrowDown' });
-    await waitFor(() => expect(tree.getAttribute('aria-activedescendant')).toBe(rowDomId('Root/Node-499')));
-    expect(document.getElementById(rowDomId('Root/Node-499'))).toBeTruthy();
+    await waitFor(() => expect(tree.getAttribute('aria-activedescendant')).toBe(rowDomId(last)));
+    expect(document.getElementById(rowDomId(last))).toBeTruthy();
   });
 
   it('removes aria-activedescendant for an externally selected unmounted row', async () => {
-    const rows = flattenVisibleTree(
-      Array.from({ length: 500 }, (_, index) => leaf(`Root/Node-${index}`)),
-      new Set(),
-    );
-    render(<VirtualTree rows={rows} initialActive="Root/Node-499" />);
+    const rows = rowsOf(500);
+    render(<VirtualTree rows={rows} initialActive={rows[rows.length - 1].rowKey} />);
     await waitFor(() => expect(screen.getAllByRole('treeitem').length).toBeGreaterThan(0));
     expect(screen.getByRole('tree').hasAttribute('aria-activedescendant')).toBe(false);
   });
 
   it('passes shift-click modifiers so the caller can select a visible contiguous range', () => {
     const onSelect = vi.fn();
-    const row = flattenVisibleTree([leaf('Root/A')], new Set())[0];
+    const rows = rowsOf(1);
+    const row = rows[rows.length - 1];
     render(
       <TreeNodeRow
         row={row}
-        selectedPaths={new Set()}
         expanded={new Set()}
         onToggleExpand={noop}
         onSelect={onSelect}
@@ -202,19 +223,23 @@ describe('HierarchyBrowser tree virtualization', () => {
     );
 
     fireEvent.click(screen.getByRole('treeitem'), { shiftKey: true });
-    expect(onSelect).toHaveBeenCalledWith('Root/A', { shift: true, toggle: false });
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(onSelect.mock.calls[0][0].object).toBe((row.node as SceneTreeNode).object);
+    expect(onSelect.mock.calls[0][1]).toEqual({ shift: true, toggle: false });
   });
 
   it('maps flattened depth and sibling metadata onto ARIA treeitem attributes', () => {
-    const nested: TreeNode = {
-      ...leaf('Root/Parent'),
-      children: [leaf('Root/Parent/A'), leaf('Root/Parent/B')],
-    };
-    const row = flattenVisibleTree([nested], new Set(['Root/Parent']))[2];
+    const s = makeScene(2, (i) => {
+      const parent = new Group(); parent.name = `Parent-${i}`;
+      const child = new Group(); child.name = 'Leaf';
+      parent.add(child);
+      return parent;
+    });
+    const rows = flattenSceneRows(s.scene, s.expandAll, s.ctx);
+    const row = rows.find((r) => r.node.name === 'Parent-1')!;
     render(
       <TreeNodeRow
         row={row}
-        selectedPaths={new Set()}
         expanded={new Set()}
         onToggleExpand={noop}
         onSelect={noop}
@@ -228,21 +253,29 @@ describe('HierarchyBrowser tree virtualization', () => {
     );
 
     const item = screen.getByRole('treeitem');
-    expect(item.getAttribute('aria-level')).toBe('2');
+    expect(item.getAttribute('aria-level')).toBe('3'); // Scene > Root > Parent-1
     expect(item.getAttribute('aria-posinset')).toBe('2');
     expect(item.getAttribute('aria-setsize')).toBe('2');
   });
 
-  it('uses stable row keys when visible descendants are inserted above the viewport', () => {
-    const beforeTree: TreeNode[] = [
-      { ...leaf('Root/A'), children: [leaf('Root/A/A1')] },
-      leaf('Root/B'),
-    ];
-    const collapsed = flattenVisibleTree(beforeTree, new Set());
-    const expanded = flattenVisibleTree(beforeTree, new Set(['Root/A']));
+  it('uses stable uuid row keys when visible descendants are inserted above the viewport', () => {
+    const s = makeScene(2, (i) => {
+      const parent = new Group(); parent.name = i === 0 ? 'A' : 'B';
+      if (i === 0) { const c = new Group(); c.name = 'A1'; parent.add(c); }
+      return parent;
+    });
+    const b = s.root.children.find((c) => c.name === 'B')!;
+    const collapsed = flattenSceneRows(s.scene, new Set([s.scene.uuid, s.root.uuid]), s.ctx);
+    const expanded = flattenSceneRows(
+      s.scene,
+      new Set([s.scene.uuid, s.root.uuid, s.root.children[0].uuid]),
+      s.ctx,
+    );
 
-    expect(expanded.find((row) => row.node.path === 'Root/B')?.rowKey)
-      .toBe(collapsed.find((row) => row.node.path === 'Root/B')?.rowKey);
+    expect(expanded.find((r) => r.rowKey === b.uuid)?.rowKey)
+      .toBe(collapsed.find((r) => r.rowKey === b.uuid)?.rowKey);
+    // …and the key is the object identity, not the path.
+    expect(collapsed.find((r) => r.node.path === 'Root/B')!.rowKey).toBe(b.uuid);
   });
 
   it('resolves one shared fine/coarse row height contract for tree and flat rows', () => {
@@ -251,11 +284,10 @@ describe('HierarchyBrowser tree virtualization', () => {
     expect(fine).toBe(ROW_HEIGHT_FINE);
     expect(coarse).toBe(ROW_HEIGHT_COARSE);
 
-    const row = flattenVisibleTree([leaf('Root/Tree')], new Set())[0];
+    const row = rowsOf(1)[1];
     const { rerender } = render(
       <TreeNodeRow
         row={row}
-        selectedPaths={new Set()}
         expanded={new Set()}
         onToggleExpand={noop}
         onSelect={noop}
@@ -271,8 +303,8 @@ describe('HierarchyBrowser tree virtualization', () => {
 
     rerender(
       <FlatNodeRow
-        info={{ path: 'Root/Flat', types: [] }}
-        selectedPaths={new Set()}
+        node={row.node as TreeNode}
+        rowKey={row.rowKey}
         onSelect={noop}
         onDoubleClick={noop}
         onHover={noop}
@@ -287,10 +319,17 @@ describe('HierarchyBrowser tree virtualization', () => {
 
 describe('FlatNodeRow badges', () => {
   it('passes viewer to NodeBadges so signal chips stay live and interactive', () => {
+    const s = makeScene(1, () => {
+      const n = new Group(); n.name = 'Signal';
+      n.userData.realvirtual = { PLCOutputBool: {} };
+      return n;
+    });
+    const rows = flattenSceneRows(s.scene, s.expandAll, s.ctx);
+    const row = rows.find((r) => r.node.name === 'Signal')!;
     render(
       <FlatNodeRow
-        info={{ path: 'Root/Signal', types: ['PLCOutputBool'] }}
-        selectedPaths={new Set()}
+        node={row.node as TreeNode}
+        rowKey={row.rowKey}
         onSelect={noop}
         onDoubleClick={noop}
         onHover={noop}

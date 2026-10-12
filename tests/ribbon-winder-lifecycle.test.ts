@@ -97,6 +97,34 @@ describe('RibbonWinder lifecycle', () => {
     expect(f).toBeLessThan(1);
   });
 
+  /**
+   * An EMPTY reel has no paper, and the roll mesh must not be drawn as if it
+   * had: at zero wound length the roll radius is exactly `CoreRadiusMm`, so the
+   * paper cylinder lands exactly on the core modelled beside it — same axis,
+   * same radius — and the two z-fight along the whole side of the reel. The
+   * slitter's two rewinders showed it on every load, because they start empty.
+   */
+  it('hides an empty roll, refuses reverse restart, and restores the roll on reset', () => {
+    const h = ribbonHarness(line());
+    const path = h.buildPath();
+    const unwinder = path.winders[0];
+    const roll = h.nodes.get('Unwinder')!.getObjectByName('Roll')!;
+    expect(roll.visible).toBe(true);      // starts full
+
+    h.drive.jog(20_000);
+    while (unwinder.woundLengthMm > 0) h.step(DT);
+    expect(unwinder.woundLengthMm).toBe(0);
+    expect(roll.visible).toBe(false);     // no paper, no paper cylinder
+
+    h.drive.jog(-20_000);
+    h.step(DT);
+    expect(unwinder.woundLengthMm).toBe(0);
+    expect(roll.visible).toBe(false);
+    h.ribbonManager.resetAll();
+    expect(unwinder.woundLengthMm).toBeGreaterThan(0);
+    expect(roll.visible).toBe(true);
+  });
+
   it('empty unwinder clamps web speed to 0 and sets the registered Empty signal', () => {
     const h = ribbonHarness([
       // A nearly-empty roll: R barely above the core.
@@ -288,7 +316,7 @@ describe('Web groups (slitter)', () => {
     const h = ribbonHarness([
       {
         name: 'Unwinder', xMm: 0, yMm: 0, radiusMm: 100, winder: true,
-        extras: { InitialWoundLengthMm: 1000 * DT }, // exactly one tick of web
+        extras: { InitialWoundLengthMm: 2000 * DT }, // two ticks: move, then stop on exhaustion
       },
       { name: 'Rewinder_A', xMm: 3000, yMm: 200, radiusMm: 100, winder: true, driven: true },
       { name: 'Rewinder_B', xMm: 3000, yMm: -200, radiusMm: 100, winder: true, driven: true },
@@ -309,8 +337,14 @@ describe('Web groups (slitter)', () => {
     h.step(DT);
     expect(pathA.winders[0].isEmpty).toBe(true);
     expect(pathA.rollers[0].angle).toBe(angleShared);
-    expect(pathA.winders[1].woundLengthMm).toBe(lengthA);
-    expect(pathB.winders[1].woundLengthMm).toBe(lengthB);
+    // The final tick consumes the remaining web, then the interlock holds it.
+    expect(pathA.winders[1].woundLengthMm).toBeCloseTo(lengthA + 1000 * DT, 6);
+    expect(pathB.winders[1].woundLengthMm).toBeCloseTo(lengthB + 1000 * DT, 6);
+    const finalA = pathA.winders[1].woundLengthMm;
+    const finalB = pathB.winders[1].woundLengthMm;
+    h.step(DT);
+    expect(pathA.winders[1].woundLengthMm).toBe(finalA);
+    expect(pathB.winders[1].woundLengthMm).toBe(finalB);
   });
 
   it('shared rewinder reaching Full stops the whole group', () => {

@@ -78,6 +78,22 @@ export interface RVViewerPlugin {
    */
   onModelLoaded?(result: LoadResult, viewer: RVViewer): void;
 
+  /**
+   * Nodes this plugin needs at RUNTIME that carry no component of their own
+   * (plan-754 D17). Collected by the viewer before every model bake and fed
+   * into the bake survival model next to the component reference tags:
+   *   `'merge'` — the node survives as a node (addressable by path; its mesh
+   *               is merged into the enclosing chunk),
+   *   `'chunk'` — the node becomes a chunk boundary (it can be moved or hidden
+   *               as a unit).
+   * `path` is a registry path as `viewer.registry.getNode(path)` resolves it.
+   * A path that does not resolve in the loaded model is reported in the bake
+   * removal report, never thrown — a plugin may serve several models. The
+   * authoring-side alternative stays valid: a component or `rv.BakeRole` on
+   * the node in the GLB.
+   */
+  bakeClaims?(): Array<{ path: string; role: 'merge' | 'chunk' }>;
+
   /** Called at the start of clearModel, BEFORE state reset. */
   onModelCleared?(viewer: RVViewer): void;
 

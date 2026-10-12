@@ -6,8 +6,10 @@ import type { RVDrive } from './rv-drive';
 import type { RVSensor } from './rv-sensor';
 import { lastPathSegment } from './rv-constants';
 import { sanitizeLikeThree } from './rv-three-names';
+import { RV_SYNTHETIC_KEY } from './rv-bake-chunk';
 import { tooltipRegistry } from '../hmi/tooltip/tooltip-registry';
 import { ROOT_OCCURRENCE, ROOT_SOURCE_KEY, fullNodeAddress, getNodeId } from './rv-node-id';
+import { resolveReferencePath, scopeOf, type ReferenceScope } from './rv-reference-resolver';
 
 /**
  * Search result from NodeRegistry.search().
@@ -52,11 +54,16 @@ export interface SignalConsumerRef {
 /**
  * A component type key is a SIGNAL type (a PLC signal node), not a signal
  * CONSUMER. Used by the parent-walk to skip past `Signals` container children
- * and stop at the first owning NON-signal component (Drive/Sensor/…). Kept local
- * to avoid importing rv-inspector-helpers (which imports from the engine — would
+ * and stop at the first owning NON-signal component (Drive/Sensor/…), and by
+ * `buildPreBakeRegistry` to index signal nodes without pulling the whole signal
+ * construction stack (and its drive imports) into `prepare`. Kept local to
+ * avoid importing rv-inspector-helpers (which imports from the engine — would
  * create a cycle).
+ *
+ * Deliberately a PREFIX test rather than the `SIGNAL_TYPES` list: it must keep
+ * answering for a signal type added later without a second edit site.
  */
-function isSignalComponentTypeKey(type: string): boolean {
+export function isSignalComponentTypeKey(type: string): boolean {
   return type.startsWith('PLCInput') || type.startsWith('PLCOutput');
 }
 
@@ -114,6 +121,16 @@ export class NodeRegistry {
    * remove), handing callers a detached Object3D.
    */
   private aliasPaths = new Map<Object3D, string[]>();
+  /**
+   * Asset roots the ONE resolver (plan-757 F7, `rv-reference-resolver.ts`)
+   * may be relative to, with every name the root is or was known by: the
+   * main model root, every placement root, every editor-rebuilt subtree.
+   * `initSubtree` registers them; `unregisterSubtree` / `clear` take them
+   * down. A scope root's names are what makes step 2 of the tolerant read
+   * ("first segment == the asset root's authored or current name") strip a
+   * `Arburg/…` prefix on a placement the planner named `Arburg_1`.
+   */
+  private scopeNames = new Map<Object3D, Set<string>>();
   /**
    * `sanitizeLikeThree(path)` → the registered path(s) that sanitize to it —
    * the index behind resolution stage 4 (plan-734 F4).
@@ -267,6 +284,75 @@ export class NodeRegistry {
       typeSet.delete(path);
       if (typeSet.size === 0) this.typeIndex.delete(type);
     }
+  }
+
+  // ─── Reference scopes (plan-757 F7 / D12) ──────────────────────
+
+  /**
+   * Declare `root` an asset root references may be relative to, with the
+   * names it is or was known by (its current name is always included).
+   * Idempotent and additive; taken down with `unregisterSubtree(root)`.
+   */
+  registerScopeNames(root: Object3D, names: Iterable<string | undefined | null>): void {
+    let set = this.scopeNames.get(root);
+    if (!set) this.scopeNames.set(root, (set = new Set()));
+    if (root.name) set.add(root.name);
+    for (const n of names) if (n) set.add(n);
+  }
+
+  /** Is `root` a registered reference scope? */
+  isScopeRoot(root: Object3D): boolean {
+    return this.scopeNames.has(root);
+  }
+
+  /**
+   * The {@link ReferenceScope} of `root` for the ONE resolver: its registry
+   * path, its registered names and the leaf names of its aliases. `root` need
+   * not be a registered scope — a bare subtree resolves relative to itself.
+   */
+  scopeFor(root: Object3D): ReferenceScope {
+    const rootPath = this.nodePaths.get(root) ?? NodeRegistry.computeNodePath(root);
+    const names: string[] = [];
+    const registered = this.scopeNames.get(root);
+    if (registered) names.push(...registered);
+    const aliases = this.aliasPaths.get(root);
+    if (aliases) for (const a of aliases) names.push(lastPathSegment(a));
+    return scopeOf(root, rootPath, names);
+  }
+
+  /**
+   * The scope a node was authored in: the nearest registered scope root at or
+   * above it, else the node itself. What a runtime-created component (editor
+   * "add component") resolves its references relative to.
+   */
+  enclosingScope(node: Object3D): ReferenceScope {
+    for (let cur: Object3D | null = node; cur; cur = cur.parent) {
+      if (this.scopeNames.has(cur)) return this.scopeFor(cur);
+    }
+    return this.scopeFor(node);
+  }
+
+  private _scopeArg(scope: Object3D | ReferenceScope | null | undefined): ReferenceScope | null {
+    if (!scope) return null;
+    if ((scope as ReferenceScope).rootNames instanceof Set) return scope as ReferenceScope;
+    return this.enclosingScope(scope as Object3D);
+  }
+
+  /**
+   * THE path resolver (plan-757 F7): `path` as authored inside `scope` — as
+   * written, then with the asset root's name stripped, else `null`. Without a
+   * scope the path is looked up as written against the whole registry.
+   */
+  resolvePath(path: string, scope?: Object3D | ReferenceScope | null): Object3D | null {
+    return resolveReferencePath(this, path, this._scopeArg(scope)).node;
+  }
+
+  /** The component of `type` registered on `node`, by its canonical path. */
+  componentOn<T = unknown>(node: Object3D, type: string): T | null {
+    const path = this.nodePaths.get(node);
+    if (!path) return null;
+    const instance = this.components.get(path)?.get(type);
+    return instance === undefined ? null : (instance as T);
   }
 
   // ─── Lookup by Path ─────────────────────────────────────────────
@@ -423,6 +509,13 @@ export class NodeRegistry {
   private _indexSanitizedPath(path: string): void {
     const index = this.sanitizedPathIndex;
     if (!index) return;
+    // plan-755 R11: a node the bake CREATED (a partition object) was never an
+    // authored path, so no delivered GLB can spell it in a pre-sanitized form —
+    // stage 4 has nothing to repair for it. Letting it in only widens the
+    // collision surface: its name is free text (`MC01.13`, `A|B`), and a
+    // collision makes stage 4 refuse the AUTHORED path it collides with. It
+    // stays fully addressable through stages 1–3 by its real path.
+    if (this.nodes.get(path)?.userData?.[RV_SYNTHETIC_KEY] === true) return;
     const key = sanitizeLikeThree(path);
     const entry = index.get(key);
     if (entry === undefined) index.set(key, path);
@@ -648,14 +741,17 @@ export class NodeRegistry {
    * Resolve a ComponentReference from GLB extras to typed instances.
    * Replaces the standalone resolveComponentRef() function.
    *
-   * @param scope Optional subtree for a last-resort fallback: when the exact /
-   *   alias / suffix path lookups all miss (authored hierarchy no longer exists
-   *   — glTF name-dedup drift, editor re-saves), the ref
-   *   is resolved by NAME to a descendant of `scope` carrying the requested
-   *   component. Callers pass the subtree the ref was authored in (e.g. a
-   *   placed asset root), where axis/signal names are unambiguous.
+   * @param scope The asset the reference was authored in (a placed asset
+   *   root, the main model root, or a {@link ReferenceScope}). plan-757 F7:
+   *   the path is resolved FIRST through the ONE resolver inside that scope —
+   *   as written, then with the asset root's name stripped (`Arburg/Kine` on
+   *   the placement `Layout/Arburg_1`) — so ten placements never resolve each
+   *   other's axes. Only when both miss do the registry-wide stages (exact /
+   *   alias / suffix / sanitized) run, and last a NAME match to a descendant
+   *   of `scope` carrying the requested component (legacy tolerance for an
+   *   authored hierarchy that no longer exists).
    */
-  resolve(ref: ComponentRef | undefined | null, scope?: Object3D | null): {
+  resolve(ref: ComponentRef | undefined | null, scope?: Object3D | ReferenceScope | null): {
     drive?: RVDrive | null;
     sensor?: RVSensor | null;
     signalAddress?: string | null;
@@ -681,18 +777,25 @@ export class NodeRegistry {
     // name. Strip once, here, so there is exactly one place that knows about it.
     const ct = stripComponentNamespace(ref.componentType ?? '');
 
+    // plan-757 F7: the ONE resolver inside the authoring scope comes first.
+    const refScope = this._scopeArg(scope);
+    const scopedNode = refScope ? resolveReferencePath(this, ref.path, refScope).node : null;
+    const scopeRoot = refScope?.root ?? null;
+
     // Drive reference
     if (ct.includes('Drive')) {
-      let drive = this.getByPath<RVDrive>('Drive', ref.path);
-      if (!drive && scope) drive = this.findComponentInScope<RVDrive>('Drive', ref.path, scope);
+      let drive = scopedNode ? this.componentOn<RVDrive>(scopedNode, 'Drive') : null;
+      if (!drive) drive = this.getByPath<RVDrive>('Drive', ref.path);
+      if (!drive && scopeRoot) drive = this.findComponentInScope<RVDrive>('Drive', ref.path, scopeRoot);
       if (!drive) console.warn(`[NodeRegistry] Drive not found: "${ref.path}"`);
       return { drive };
     }
 
     // Sensor reference
     if (ct.includes('Sensor')) {
-      let sensor = this.getByPath<RVSensor>('Sensor', ref.path);
-      if (!sensor && scope) sensor = this.findComponentInScope<RVSensor>('Sensor', ref.path, scope);
+      let sensor = scopedNode ? this.componentOn<RVSensor>(scopedNode, 'Sensor') : null;
+      if (!sensor) sensor = this.getByPath<RVSensor>('Sensor', ref.path);
+      if (!sensor && scopeRoot) sensor = this.findComponentInScope<RVSensor>('Sensor', ref.path, scopeRoot);
       if (!sensor) console.warn(`[NodeRegistry] Sensor not found: "${ref.path}"`);
       return { sensor };
     }
@@ -701,16 +804,16 @@ export class NodeRegistry {
     // Resolve the C# path to the actual registered Three.js path
     // (handles root prefix mismatch and space→underscore sanitization)
     if (ct.includes('Signal') || ct.includes('PLC')) {
-      const node = this.getNode(ref.path);
+      const node = scopedNode ?? this.getNode(ref.path);
       if (node) {
         const resolvedPath = this.nodePaths.get(node);
         if (resolvedPath) return { signalAddress: resolvedPath };
       }
       // Scoped fallback: signal node by name inside the authoring subtree.
-      if (scope) {
-        const scopedNode = this.findNodeInScope(ref.path, scope);
-        if (scopedNode) {
-          const resolvedPath = this.nodePaths.get(scopedNode);
+      if (scopeRoot) {
+        const byName = this.findNodeInScope(ref.path, scopeRoot);
+        if (byName) {
+          const resolvedPath = this.nodePaths.get(byName);
           if (resolvedPath) return { signalAddress: resolvedPath };
         }
       }
@@ -737,8 +840,8 @@ export class NodeRegistry {
     // (unresolved + warning) — treating "unknown" as legacy would silently
     // bend a future reference type onto a node instead of failing visibly.
     if (ct === 'UnityEngine.Transform' || ct === '') {
-      let node = this.getNode(ref.path);
-      if (!node && scope) node = this.findNodeInScope(ref.path, scope);
+      let node = scopedNode ?? this.getNode(ref.path);
+      if (!node && scopeRoot) node = this.findNodeInScope(ref.path, scopeRoot);
       if (!node) console.warn(`[NodeRegistry] Node not found: "${ref.path}"`);
       return { node: node ?? null };
     }
@@ -759,8 +862,9 @@ export class NodeRegistry {
     // exist. Reporting a miss as a hard null here would break that contract for
     // the sake of a nicer-looking API.
     if (this.typeIndex.has(ct)) {
-      let component = this.getByPath<unknown>(ct, ref.path);
-      if (component === null && scope) component = this.findComponentInScope<unknown>(ct, ref.path, scope);
+      let component = scopedNode ? this.componentOn<unknown>(scopedNode, ct) : null;
+      if (component === null) component = this.getByPath<unknown>(ct, ref.path);
+      if (component === null && scopeRoot) component = this.findComponentInScope<unknown>(ct, ref.path, scopeRoot);
       if (component !== null && component !== undefined) return { component };
       console.warn(`[NodeRegistry] ${ct} not found: "${ref.path}"`);
     } else {
@@ -776,6 +880,36 @@ export class NodeRegistry {
     // it against the registry itself (two-phase construction — the target
     // instance need not exist yet at this point).
     return {};
+  }
+
+  /**
+   * Quiet twin of the SIGNAL branch of {@link resolve} (plan-566): the same
+   * three stages in the same order — the ONE resolver inside `scope`, the
+   * registry-wide lookup, the scoped name match — but without warnings, and
+   * with the outcome spelled out for the signal cross-reference list.
+   *
+   * - `path`     — the canonical registry path of the signal node, or the raw
+   *               path when nothing resolved (what the runtime falls back to);
+   * - `resolved` — a node was found;
+   * - `byName`   — found only by the legacy name match inside the scope.
+   */
+  resolveSignalReference(
+    refPath: string,
+    scope?: Object3D | ReferenceScope | null,
+  ): { path: string; resolved: boolean; byName: boolean } {
+    if (!refPath) return { path: refPath, resolved: false, byName: false };
+    const refScope = this._scopeArg(scope);
+    let node = refScope ? resolveReferencePath(this, refPath, refScope).node : null;
+    if (!node) node = this._getNode(refPath, false);
+    let byName = false;
+    if (!node && refScope) {
+      node = this.findNodeInScope(refPath, refScope.root);
+      byName = node !== null;
+    }
+    const resolvedPath = node ? this.nodePaths.get(node) : undefined;
+    return resolvedPath
+      ? { path: resolvedPath, resolved: true, byName }
+      : { path: refPath, resolved: false, byName: false };
   }
 
   /**
@@ -1099,6 +1233,9 @@ export class NodeRegistry {
         this.nodeAddresses.delete(node);
       }
 
+      // A reference scope goes with its root (plan-757 F7).
+      this.scopeNames.delete(node);
+
       const path = this.nodePaths.get(node);
       if (!path) return;
 
@@ -1145,6 +1282,21 @@ export class NodeRegistry {
     });
 
     return removed;
+  }
+
+  /**
+   * Remove exactly ONE path registration — `path` → `node` — and leave every
+   * other registration in `node`'s subtree alone (plan-567 SOL #8). A synthetic
+   * selectable path (`__mu#<n>`, MuReconciler) must not take the document paths
+   * of what rides on the carrier with it, which `unregisterSubtree` would.
+   * Returns false when `path` does not point at `node`.
+   */
+  unregisterNode(path: string, node: Object3D): boolean {
+    if (this.nodes.get(path) !== node) return false;
+    this.nodes.delete(path);
+    if (this.nodePaths.get(node) === path) this.nodePaths.delete(node);
+    this._dropFromSuffixMap(path);
+    return true;
   }
 
   /** Remove one path from the suffix index, dropping the bucket when empty. */
@@ -1247,6 +1399,7 @@ export class NodeRegistry {
     this.typeIndex.clear();
     this.suffixMap.clear();
     this.aliasPaths.clear();
+    this.scopeNames.clear();
     // Back to "never built": a reloaded scene registers its own paths, and the
     // next stage-4 miss builds the index over them. This is NOT the forbidden
     // invalidation-rebuild — clear() is a whole-scene teardown, not a per-frame
@@ -1414,6 +1567,43 @@ export class NodeRegistry {
 
   /** sourceKey → that file's raw glTF node names, for the per-file identity check. */
   private gltfSourceNames = new Map<string, readonly (string | undefined)[]>();
+
+  /** Preserve source-file identity before a temporary export replaces the live tree. */
+  captureGltfProvenance(): {
+    names: Map<string, readonly (string | undefined)[]>;
+    nodes: { path: string; sourceKey: string; index: number }[];
+  } {
+    const nodes: { path: string; sourceKey: string; index: number }[] = [];
+    for (const [node, index] of this.gltfNodeIndices) {
+      const path = this.getPathForNode(node);
+      if (path && this.nodes.get(path) === node) {
+        nodes.push({ path, sourceKey: this.gltfNodeSources.get(node) ?? ROOT_SOURCE_KEY, index });
+      }
+    }
+    return {
+      names: new Map([...this.gltfSourceNames].map(([key, names]) => [key, [...names]])),
+      nodes,
+    };
+  }
+
+  /** Restore original indices onto the same authoring hierarchy after a test run. */
+  restoreGltfProvenance(snapshot: ReturnType<NodeRegistry['captureGltfProvenance']>): void {
+    const indices = new Map<Object3D, number>();
+    const sources = new Map<Object3D, string>();
+    for (const entry of snapshot.nodes) {
+      // Exact paths only: a suffix alias must never attach an index to another part.
+      const node = this.nodes.get(entry.path);
+      if (!node) throw new Error(`Cannot restore model source mapping: missing "${entry.path}".`);
+      indices.set(node, entry.index);
+      sources.set(node, entry.sourceKey);
+    }
+    // Replace all maps together. Nodes created by edits remain without a source
+    // index even though the temporary test export assigned them one.
+    this.gltfNodeIndices = indices;
+    this.gltfNodeSources = sources;
+    this.gltfSourceNames = new Map(snapshot.names);
+    this.gltfNodeNames = snapshot.names.get(ROOT_SOURCE_KEY) ?? [];
+  }
 
   /** Hand over the load's `associations`-derived index map (see `collectGltfNodeIndices`). */
   setGltfNodeIndices(indices: Map<Object3D, number>, names: readonly (string | undefined)[] = []): void {

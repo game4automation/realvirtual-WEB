@@ -27,18 +27,29 @@ import { SignalBindingManager } from '../src/core/engine/rv-signal-binding-manag
 import { McpSignalBindTools } from '../src/plugins/mcp-bridge/rv-mcp-signal-bind-tools';
 import { setActiveEditTarget, type EditTarget } from '../src/core/hmi/rv-edit-target';
 import { mergeAppliedMappings } from '../src/plugins/signal-bind/binding-inventory';
+import { applyForward } from '../src/core/hmi/scene/rv-scene-executors';
+import type { RvSceneOp } from '../src/core/ops/rv-unified-ops';
 import type { RVViewer } from '../src/core/rv-viewer';
 
-/** An edit target that accepts ops and remembers them — persistence is available. */
+/**
+ * An edit target that accepts ops and remembers them — persistence is available.
+ * Since plan-512 a node bind is confirmed from the RESULTING state (the node's
+ * extras and the live binding), so the recorded op is also applied through the
+ * real scene executor once a fixture installed its viewer (`apply`).
+ */
 function recordingEditTarget() {
   const ops: Array<{ kind: string; nodePath: string; value?: unknown }> = [];
+  const state: { apply?: (op: RvSceneOp) => void } = {};
   const target: EditTarget = {
     available: true,
-    setField: (nodePath, _c, _f, value) => { ops.push({ kind: 'setField', nodePath, value }); },
+    setField: (nodePath, componentType, fieldName, value, prev) => {
+      ops.push({ kind: 'setField', nodePath, value });
+      state.apply?.({ id: `op${ops.length}`, ts: 0, schemaV: 1, kind: 'setField', nodePath, componentType, fieldName, value, prev } as RvSceneOp);
+    },
     unsetField: (nodePath) => { ops.push({ kind: 'unsetField', nodePath }); },
     withTransaction: async (_label, fn) => { await fn(); },
   };
-  return { target, ops };
+  return { target, ops, state };
 }
 
 /** An edit target that reports itself unavailable — the pre-boot / viewer case. */
@@ -134,6 +145,7 @@ function makeFixture(options?: { placed?: boolean }): Fixture {
     behaviors: { getActiveBinds: () => [] },
   } as unknown as RVViewer;
 
+  recorder.state.apply = (op) => { void applyForward(op, { viewer }); };
   return { viewer, tools: new McpSignalBindTools(() => viewer), mgr, root };
 }
 

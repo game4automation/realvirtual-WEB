@@ -7,9 +7,11 @@
  * On every onModelLoaded:
  *  1. Derive a stable per-model key from the URL/filename.
  *  2. Look for a saved preset in localStorage (user override). Priority 1.
- *  3. Otherwise scan viewer.scene.children for `userData.realvirtual.rv_camera_start`
- *     (author default in GLB rv_extras). Priority 2.
- *  4. If a preset exists and FPV is not active, smoothly tween the camera
+ *  3. Otherwise read the document's own `SceneCamera` from the model root's
+ *     scene extras (`scenes[0].extras.realvirtual.SceneCamera`). Priority 2.
+ *  4. Otherwise scan viewer.scene.children for `userData.realvirtual.rv_camera_start`
+ *     (Unity author default in GLB rv_extras). Priority 3.
+ *  5. If a preset exists and FPV is not active, smoothly tween the camera
  *     via viewer.animateCameraTo(). Otherwise: fall through to the engine's
  *     default fit-to-bounds behavior.
  *
@@ -28,6 +30,7 @@ import {
   loadStartPos, saveStartPos, clearStartPos, hasStartPos,
 } from '../core/hmi/camera-startpos-store';
 import { CameraStartTab } from '../core/hmi/settings/CameraStartTab';
+import { getSceneCamera, cameraStartFromSceneCamera } from '../core/engine/rv-asset-reference';
 
 const EPSILON_POS_EQ_TARGET = 1e-3;
 const MIN_DURATION = 0.05;
@@ -53,17 +56,12 @@ function extractScenePreset(scene: import('../core/hmi/scene/rv-scene-types').Rv
   return null;
 }
 
-/**
- * Exported pure function — testable without a viewer instance.
- * Derives a stable per-model key from a URL or File name.
- */
-export function deriveModelKey(url: string | null | undefined): string | null {
-  if (!url) return null;
-  const noQuery = url.split('?')[0];
-  const filename = noQuery.split('/').pop() ?? noQuery;
-  const stripped = filename.replace(/\.glb$/i, '');
-  return stripped.length > 0 ? stripped : null;
-}
+// The derivation itself lives in `core/engine/rv-model-key.ts` (plan-740 D-A3):
+// this module statically imports React/MUI through CameraStartTab, so anything
+// under `core/engine/` that needs the key must not reach in here. Re-exported
+// unchanged so every existing importer keeps working.
+import { deriveModelKey } from '../core/engine/rv-model-key';
+export { deriveModelKey };
 
 function isFin(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
@@ -151,7 +149,14 @@ export class CameraStartPosPlugin implements RVViewerPlugin {
    * model, or null if there is none. Priority order:
    *   0. per-scene `setCamera` op (unified Scene model, latest wins)
    *   1. localStorage user override (per-base default)
-   *   2. GLB rv_extras author default (`rv_camera_start`)
+   *   2. the document's own `SceneCamera` (scene extras on the model root)
+   *   3. GLB rv_extras author default (`rv_camera_start`)
+   *
+   * The `SceneCamera` is read HERE, not only through the localStorage copy that
+   * `SceneStore._adoptFromLoadedGlb` writes: that adoption runs AFTER
+   * `onModelLoaded`, so on the very first open of a document the browser had no
+   * copy yet and the viewer framed the bounds instead (plan-498 Nachkorrektur).
+   * The adoption only stores the value; it never animates, so nothing jumps twice.
    *
    * Public + side-effect-free so the loader (RVViewer.loadScene) can tell
    * whether a preset already positioned the camera before deciding to fall
@@ -161,6 +166,11 @@ export class CameraStartPosPlugin implements RVViewerPlugin {
     let preset: ModelCameraStart | null = extractScenePreset(viewer.currentScene);
     const key = deriveModelKey(viewer.pendingModelUrl ?? viewer.currentModelUrl);
     if (!preset && key) preset = loadStartPos(key);
+    if (!preset) {
+      const root = viewer.currentModelRoot;
+      const sceneCamera = root ? getSceneCamera(root) : null;
+      if (sceneCamera) preset = cameraStartFromSceneCamera(sceneCamera);
+    }
     if (!preset) preset = this._extractFromScene(viewer);
     return preset;
   }

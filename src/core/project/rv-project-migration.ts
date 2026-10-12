@@ -60,7 +60,7 @@ import { listMetas } from '../hmi/scene/rv-scene-storage';
 import { onSceneMutation } from '../hmi/scene/rv-scene-mutations';
 import { SAMPLE_PROJECT_ID } from './backends/bundled-backend';
 import { readManifest } from './rv-project-storage';
-import { sceneDocumentsOf } from './rv-project-documents';
+import { documentsOf } from './rv-project-documents';
 import {
   clearSceneOwner,
   listSceneOwnerIds,
@@ -172,7 +172,11 @@ export async function findGrantedFolderScenes(
       const result = await readManifest(dir);
       const project = result?.project;
       if (!project?.id) continue;
-      for (const entry of sceneDocumentsOf(project)) {
+      // Every document, not a scene-shaped subset (plan-744 F3): this builds
+      // the id → owning-project map that scene ownership is decided from, and
+      // an id is an id whatever folder its file sits in. Filtering first only
+      // ever dropped candidates — every browser row among them.
+      for (const entry of documentsOf(project)) {
         if (entry?.id && !found.has(entry.id)) found.set(entry.id, project.id);
       }
     } catch {

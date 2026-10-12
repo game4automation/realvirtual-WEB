@@ -18,7 +18,7 @@ import {
 import type { Material, Texture } from 'three';
 import { ribbonHarness, type RollerSpec } from './ribbon-fixture';
 import { freezeStaticMatrices } from '../src/core/engine/rv-freeze-static';
-import { isBatchSafe } from '../src/core/engine/rv-batched-render';
+import { bakeFateOf } from './helpers/bake-fate';
 import { deduplicateMaterials } from '../src/core/engine/rv-material-dedup';
 import { MM_TO_METERS } from '../src/core/engine/rv-constants';
 import type { RVRibbonRoller } from '../src/core/engine/rv-ribbon-roller';
@@ -210,7 +210,7 @@ describe('SpinMode Texture', () => {
     expect(twin.material).not.toBe(mantle.material);
   });
 
-  it('Texture rollers are static for freeze-static but still excluded from batching', () => {
+  it('Texture rollers are static for freeze-static but still excluded from batching', async () => {
     const root = new Object3D();
     root.name = 'Root';
     const make = (name: string, spinMode?: string): Mesh => {
@@ -233,10 +233,10 @@ describe('SpinMode Texture', () => {
     expect(transform.matrixWorldAutoUpdate).toBe(true);
     expect(absent.matrixWorldAutoUpdate).toBe(true);
 
-    // Static, but still not batchable: a BatchedMesh arena shares one material
+    // Static, but still a keep mesh of the bake: a chunk shares one material
     // and has no per-instance UV offset.
     for (const mesh of [texture, transform, absent]) {
-      expect(isBatchSafe(mesh, root)).toBe(false);
+      expect(await bakeFateOf(mesh, root)).toBe('keep');
     }
   });
 

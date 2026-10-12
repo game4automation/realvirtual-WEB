@@ -5,7 +5,8 @@
  * T1 / T4 — Mechanism solver provider: ABI gate + memory rules (plan-404 §2.3, §9).
  *
  * T1: the provider loads rv_kinematic_solver.wasm, the ABI version gate
- *     (`rvk_abi_version() === 3`) passes, and a real mechanism gets a handle.
+ *     (`rvk_abi_version() === 4`, ABI v4 since plan-467) passes, and a real mechanism
+ *     gets a handle.
  * T4: the documented memory rules hold — buffers are allocated ONCE per
  *     mechanism, the tick path never re-allocates, a mechanism without free
  *     bodies works with a zero-length free-body buffer, and views survive an
@@ -58,7 +59,7 @@ describe('T1 — ABI gate', () => {
     if (!requireSolver(ctx)) return;
     expect(provider.available).toBe(true);
     expect(provider.version).toBe(KINEMATIC_ABI_VERSION);
-    expect(provider.version).toBe(3);
+    expect(provider.version).toBe(4);
     expect(provider.failure).toBe('none');
   });
 

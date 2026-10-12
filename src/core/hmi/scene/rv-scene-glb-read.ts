@@ -53,6 +53,7 @@ import {
   parseClassification,
   type DocumentClassification,
 } from '../../project/rv-document-classification';
+import { parseDocumentInfo, type DocumentInfo } from '../../project/rv-document-info';
 import type { ModelCameraStart } from '../camera-startpos-types';
 import type { SceneEditsSettings } from './rv-scene-edits';
 import type {
@@ -172,4 +173,16 @@ export function readCameraStartFromScene(root: Object3D): ModelCameraStart | nul
 export function readClassificationFromScene(root: Object3D): DocumentClassification | null {
   const rv = (root.userData as Record<string, unknown> | undefined)?.['realvirtual'];
   return parseClassification(rv);
+}
+
+/**
+ * The document description stored in the file, or null (plan-506 §2.3).
+ *
+ * The sibling of {@link readClassificationFromScene} and read from the same
+ * place — the scene root's `userData.realvirtual`. `null` is the normal answer
+ * for every Unity export: Unity does not author the block.
+ */
+export function readDocumentInfoFromScene(root: Object3D): DocumentInfo | null {
+  const rv = (root.userData as Record<string, unknown> | undefined)?.['realvirtual'];
+  return parseDocumentInfo(rv);
 }

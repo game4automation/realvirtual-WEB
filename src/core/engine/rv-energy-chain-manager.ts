@@ -38,7 +38,7 @@ export class EnergyChainManager {
   /**
    * Wire the viewer's raycast manager once. Chains cannot reach it themselves:
    * a `SkinnedMesh` is excluded from the pick BVH by contract
-   * (`rv-raycast-geometry.ts`), so the only way a chain becomes clickable at all
+   * (`isPickableMesh`, rv-pick-utils.ts), so the only way a chain becomes clickable at all
    * is registering its invisible envelope hull as an auxiliary target.
    */
   setRaycastHost(host: ChainRaycastHost | null): void {

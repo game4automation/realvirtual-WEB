@@ -78,14 +78,8 @@ registerComponent({
   needsAABB: true,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    hoverable: true,
-    selectable: true,
-    tooltipType: 'metadata',
-    badgeColor: '#ffb74d',
-    filterLabel: 'Metadata',
-    hoverEnabledByDefault: true,
-    hoverPriority: 8,
-    pinPriority: 3,
+    pick: 'select',
+    ui: { tooltip: 'metadata', badge: '#ffb74d', filter: 'Metadata', category: 'info', priority: 8 },
   },
   create: (node, aabb) => new RVMetadata(node, aabb),
   // Runs after applySchema — `content` is populated here. Keep the userData
@@ -105,12 +99,6 @@ registerComponent({
 // Also register under the display name so lookups keyed on `_rvType='Metadata'`
 // (raycast geometry findContentAncestor, inspector helpers) resolve as hoverable.
 registerCapabilities('Metadata', {
-  hoverable: true,
-  selectable: true,
-  tooltipType: 'metadata',
-  badgeColor: '#ffb74d',
-  filterLabel: 'Metadata',
-  hoverEnabledByDefault: true,
-  hoverPriority: 8,
-  pinPriority: 3,
+  pick: 'select',
+  ui: { tooltip: 'metadata', badge: '#ffb74d', filter: 'Metadata', category: 'info', priority: 8 },
 });

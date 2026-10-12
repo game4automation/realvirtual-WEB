@@ -489,19 +489,52 @@ describe('applyUberMaterial', () => {
     expect(dedupedMaterials.has(textured)).toBe(true);
   });
 
-  it('skips multi-material meshes even if elements would be eligible', () => {
-    // Phase 2 deliberately leaves array-material meshes on deduped materials
-    // and defers uber-collapse to a later phase. The predicate does not fire.
+  it('bakes multi-material meshes group by group (plan-753 Phase 2, F7)', () => {
+    // Until plan-753 array-material meshes were skipped; the chunk bake splits
+    // them by `geometry.groups`, so every eligible group is now baked onto the
+    // uber reference with its own colour, and the mesh keeps one material
+    // entry per group.
     const root = new Object3D();
     const m1 = makeStandardMaterial({ color: 0xff0000 });
     const m2 = makeStandardMaterial({ color: 0x00ff00 });
-    root.add(makeMesh([m1, m2]));
+    const mesh = makeMesh([m1, m2]);
+    mesh.geometry.clearGroups();
+    const total = mesh.geometry.index ? mesh.geometry.index.count : mesh.geometry.getAttribute('position').count;
+    const half = Math.floor(total / 6) * 3;
+    mesh.geometry.addGroup(0, half, 0);
+    mesh.geometry.addGroup(half, total - half, 1);
+    root.add(mesh);
 
     const dedupedMaterials = new Set<Material>([m1, m2]);
     const result = applyUberMaterial(root, dedupedMaterials);
 
+    expect(result.bakedMeshCount).toBe(1);
+    expect(result.sharedMaterial).not.toBeNull();
+    const mats = mesh.material as Material[];
+    expect(mats[0]).toBe(result.sharedMaterial);
+    expect(mats[1]).toBe(result.sharedMaterial);
+    const color = mesh.geometry.getAttribute('color');
+    const index = mesh.geometry.index;
+    const v0 = index ? index.getX(0) : 0;
+    const v1 = index ? index.getX(half) : half;
+    expect([color.getX(v0), color.getY(v0)].map((c) => Math.round(c * 255))).toEqual([255, 0]);
+    expect([color.getX(v1), color.getY(v1)].map((c) => Math.round(c * 255))).toEqual([0, 255]);
+    expect(mesh.geometry.getAttribute('rmPacked')).toBeDefined();
+  });
+
+  it('leaves a multi-material mesh WITHOUT groups untouched (nothing to split by)', () => {
+    const root = new Object3D();
+    const m1 = makeStandardMaterial({ color: 0xff0000 });
+    const m2 = makeStandardMaterial({ color: 0x00ff00 });
+    const mesh = makeMesh([m1, m2]);
+    mesh.geometry.clearGroups();
+    root.add(mesh);
+
+    const result = applyUberMaterial(root, new Set<Material>([m1, m2]));
+
     expect(result.bakedMeshCount).toBe(0);
     expect(result.sharedMaterial).toBeNull();
+    expect((mesh.material as Material[])[0]).toBe(m1);
   });
 
   it('pipeline: dedup then uber collapses all untextured onto one reference', () => {

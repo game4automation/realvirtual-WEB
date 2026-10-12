@@ -126,69 +126,28 @@ describe('RvExtrasEditorPlugin', () => {
     expect((plugin as unknown as Record<string, unknown>).slots).toBeUndefined();
   });
 
-  it('onModelLoaded collects editable nodes correctly', () => {
+  // plan-754: there is no editable-node scan any more — the hierarchy renders
+  // the scene graph. What the plugin still owes its consumers is the structural
+  // TICK that says "re-read the graph".
+  it('onModelLoaded publishes a structural tick instead of a node scan', () => {
     const { scene, registry } = makeScene();
     const viewer = makeMockViewer(scene, registry);
-    const result = makeLoadResult(registry);
+    const before = plugin.getSnapshot().structureVersion;
 
-    plugin.onModelLoaded(result as any, viewer as any);
-
-    const state = plugin.getSnapshot();
-    expect(state.editableNodes.length).toBe(4); // Conveyor1, Conveyor2, Sensor1, Source1
-
-    // Check paths are sorted
-    const paths = state.editableNodes.map((n: EditableNodeInfo) => n.path);
-    expect(paths).toEqual([
-      'DemoCell/Conveyor1',
-      'DemoCell/Conveyor2',
-      'DemoCell/Sensor1',
-      'DemoCell/Source1',
-    ]);
-
-    // Check types
-    const conv1 = state.editableNodes.find((n: EditableNodeInfo) => n.path === 'DemoCell/Conveyor1');
-    expect(conv1).toBeDefined();
-    expect(conv1!.types).toContain('Drive');
-    expect(conv1!.types).toContain('TransportSurface');
-
-    const sensor = state.editableNodes.find((n: EditableNodeInfo) => n.path === 'DemoCell/Sensor1');
-    expect(sensor).toBeDefined();
-    expect(sensor!.types).toEqual(['Sensor']);
-  });
-
-  it('lists editor-created empty nodes (__rvAdded) with no rv_extras', () => {
-    // Reproduces the "Empty at Root" hierarchy bug: a freshly created empty
-    // carries only the __rvAdded marker (no userData.realvirtual), so the
-    // component-only scan used to drop it and it never appeared in the tree.
-    const scene: any = { name: 'Scene', parent: null, children: [], userData: {} };
-    const demoCell = makeNode('DemoCell', scene);
-    const conv1 = makeNode('Conveyor1', demoCell, { Drive: { TargetSpeed: 100 } });
-    const empty = makeNode('Empty', demoCell); // no rv extras
-    empty.userData.__rvAdded = true;
-    const plainStructural = makeNode('PlainGroup', demoCell); // neither extras nor __rvAdded
-
-    const allNodes = [scene, demoCell, conv1, empty, plainStructural];
-    scene.traverse = (fn: (n: any) => void) => { for (const n of allNodes) fn(n); };
-
-    const nodePaths = new Map<any, string>([
-      [demoCell, 'DemoCell'],
-      [conv1, 'DemoCell/Conveyor1'],
-      [empty, 'DemoCell/Empty'],
-      [plainStructural, 'DemoCell/PlainGroup'],
-    ]);
-    const registry = { getPathForNode: (n: any) => nodePaths.get(n) ?? null };
-
-    const viewer = makeMockViewer(scene, registry);
     plugin.onModelLoaded(makeLoadResult(registry) as any, viewer as any);
 
-    const nodes = plugin.getSnapshot().editableNodes;
-    const emptyInfo = nodes.find((n: EditableNodeInfo) => n.path === 'DemoCell/Empty');
-    expect(emptyInfo).toBeDefined();
-    expect(emptyInfo!.types).toEqual([]); // structural node — no component types
-    // The real component node is still listed…
-    expect(nodes.some((n: EditableNodeInfo) => n.path === 'DemoCell/Conveyor1')).toBe(true);
-    // …but a plain structural node without the __rvAdded marker is NOT.
-    expect(nodes.some((n: EditableNodeInfo) => n.path === 'DemoCell/PlainGroup')).toBe(false);
+    expect(plugin.getSnapshot().structureVersion).toBeGreaterThan(before);
+  });
+
+  it('refreshEditableNodes is a deprecated no-op that still ticks (plan-754)', () => {
+    const { scene, registry } = makeScene();
+    const viewer = makeMockViewer(scene, registry);
+    plugin.onModelLoaded(makeLoadResult(registry) as any, viewer as any);
+    const before = plugin.getSnapshot().structureVersion;
+
+    plugin.refreshEditableNodes();
+
+    expect(plugin.getSnapshot().structureVersion).toBe(before + 1);
   });
 
   it('selectNode updates selectedNodePath', () => {
@@ -198,12 +157,31 @@ describe('RvExtrasEditorPlugin', () => {
     expect(plugin.getSnapshot().selectedNodePath).toBe('DemoCell/Conveyor1');
   });
 
+  it('selectObject selects an unregistered node with no path (plan-754 D2)', () => {
+    const { scene, registry } = makeScene();
+    const viewer = makeMockViewer(scene, registry);
+    plugin.onModelLoaded(makeLoadResult(registry) as any, viewer as any);
+
+    const runtimeNode: any = { name: '[chunk] static', uuid: 'chunk-uuid', userData: {} };
+    plugin.selectObject(runtimeNode);
+
+    const state = plugin.getSnapshot();
+    expect(state.selectedNode).toBe(runtimeNode);
+    expect(state.selectedNodePath).toBeNull();
+  });
+
+  it('does not persist the selection (plan-754 D10)', () => {
+    plugin.selectNode('DemoCell/Conveyor1');
+    expect(localStorage.getItem('rv-extras-editor-selected')).toBeNull();
+  });
+
   it('clearSelection resets selectedNodePath', () => {
     plugin.selectNode('DemoCell/Conveyor1');
     expect(plugin.getSnapshot().selectedNodePath).toBe('DemoCell/Conveyor1');
 
     plugin.clearSelection();
     expect(plugin.getSnapshot().selectedNodePath).toBeNull();
+    expect(plugin.getSnapshot().selectedNode).toBeNull();
   });
 
   it('togglePanel toggles panelOpen', () => {
@@ -224,14 +202,13 @@ describe('RvExtrasEditorPlugin', () => {
     plugin.onModelLoaded(result as any, viewer as any);
     plugin.selectNode('DemoCell/Conveyor1');
 
-    expect(plugin.getSnapshot().editableNodes.length).toBe(4);
     expect(plugin.getSnapshot().selectedNodePath).toBe('DemoCell/Conveyor1');
 
     plugin.onModelCleared();
 
     const state = plugin.getSnapshot();
-    expect(state.editableNodes.length).toBe(0);
     expect(state.selectedNodePath).toBeNull();
+    expect(state.selectedNode).toBeNull();
     expect(state.overlay).toBeNull();
   });
 

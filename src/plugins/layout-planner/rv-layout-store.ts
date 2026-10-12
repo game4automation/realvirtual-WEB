@@ -97,6 +97,17 @@ export interface SignalMapping {
    * mode this anchor exists to avoid.
    */
   componentType?: string;
+  /**
+   * Provenance of an automatically written unit factor (plan-512): present ONLY
+   * when binding this mapping actually wrote `factor` into the slot's scale
+   * field (`field`), converting `from` (the signal's unit) to `to` (the slot's).
+   * Everything else — the badge state, the Problems entries — is derived from
+   * the live state, never from this record. Its one reader is the write rule of
+   * the NEXT bind: a scale field that still holds the factor recorded here may
+   * be rewritten; any other value is the user's and stays. Never written as a
+   * present `undefined` (`omitUndefined`, plan-422 F1).
+   */
+  unitScale?: { field: string; factor: number; from: string; to: string };
 }
 
 /**
@@ -551,6 +562,13 @@ export class LayoutStore {
     this._notify();
   }
 
+  /**
+   * Store-only rename. No caller in `src/` today. `label` IS the placement's
+   * scene node name (plan-758: `label === node.name`, and the GLB save writes
+   * the label as the reference node name) — whoever wires a rename UI to this
+   * MUST rename the node too and make the new name sibling-unique first
+   * (`uniqueName` in `rv-node-naming`), or save and scene diverge again.
+   */
   updateLabel(id: string, label: string): void {
     this._placed = this._placed.map(c =>
       c.id === id ? { ...c, label } : c,

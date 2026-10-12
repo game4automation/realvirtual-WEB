@@ -3,7 +3,9 @@
 
 /** Tiny global store for HMI overlay visibility (persisted in localStorage). */
 
-import { useSyncExternalStore } from 'react';
+import { useEffect, useSyncExternalStore } from 'react';
+import { getActiveAssetContext } from '../editor/active-asset-store';
+import { isEditableTarget } from './search-shortcut';
 
 const STORAGE_KEY = 'rv-hmi-visible';
 
@@ -45,4 +47,32 @@ export function useHmiVisible(): boolean {
     (cb) => { listeners.add(cb); return () => { listeners.delete(cb); }; },
     () => visible,
   );
+}
+
+/**
+ * Whether a keydown is the "hide/show HMI" shortcut **H** (the eye button's
+ * tooltip has promised it all along). Not while typing, not with a modifier
+ * (browser and OS accelerators), and not in the asset editor, where **H**
+ * already hides the selected node. Pure — unit-tested.
+ */
+export function isHmiToggleKey(
+  e: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey' | 'repeat'>,
+  ctx: { typing: boolean; editorActive: boolean },
+): boolean {
+  if (e.key !== 'h' && e.key !== 'H') return false;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey || e.repeat) return false;
+  return !ctx.typing && !ctx.editorActive;
+}
+
+/** Mounts the global **H** shortcut that hides and shows the HMI overlay. */
+export function useHmiToggleShortcut(): void {
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!isHmiToggleKey(e, { typing: isEditableTarget(e.target), editorActive: getActiveAssetContext() !== null })) return;
+      e.preventDefault();
+      toggleHmiVisible();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, []);
 }

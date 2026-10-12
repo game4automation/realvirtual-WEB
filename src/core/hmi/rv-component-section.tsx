@@ -8,7 +8,7 @@
  * consumedOnly filter support, and per-component reset.
  */
 
-import { useState, useMemo, useCallback, type KeyboardEvent } from 'react';
+import { useState, useMemo, useCallback, useEffect, useSyncExternalStore, type KeyboardEvent } from 'react';
 import {
   Box,
   Typography,
@@ -25,6 +25,8 @@ import {
   isPLCSignalComponent,
   PLCSignalSlot,
 } from '../../plugins/signal-bind/InlineSignalSlots';
+import { PLCSignalSections } from './rv-plc-signal-inspector';
+import { useUnitScaleBadges } from '../../plugins/signal-bind/unit-scale-badge';
 import { signalTypeBadgeColor } from './signal-colors';
 import {
   baseComponentType,
@@ -43,17 +45,22 @@ import {
 } from './rv-inspector-helpers';
 import { flattenObjectFields } from './rv-field-editors';
 import { FieldRow } from './rv-field-row';
+import { ReferencePickerRow } from './ReferencePickerRow';
+import { pickableReferenceFields } from './rv-reference-field';
+import { getActiveAssetContext, getActiveAssetVersion, subscribeActiveAsset } from '../editor/active-asset-store';
 import { InspectorRow } from './rv-inspector-row';
 import { fieldRendererRegistry } from './rv-field-renderer-registry';
-import { componentActionRegistry, type ComponentActionContext } from './rv-component-action-registry';
+import { componentActionRegistry, type ComponentAction, type ComponentActionContext } from './rv-component-action-registry';
+import { aiTouchSx, useCommandView } from './rv-command-view';
+import { getAiTouchMs } from './button-sim-state';
+import { inspectorFieldKey, useInspectorFieldReveal } from './inspector-field-touch';
+import { ACCENT, FS, ICON_SIZE, INK_HIGH, INK_LOW, INK_MID, MONO, ON_ACCENT, ROW_HOVER } from './shared-sx';
+import { InspectorActionRow, InspectorSectionMenu, inspectorActionButtonSx, inspectorSegmentedGroupSx, segmentActions } from './rv-inspector-blocks';
 
 // ── Expand state persistence (default: expanded) ────────────────────────
 
 const LS_KEY_COLLAPSED = 'rv-inspector-collapsed';
 const LS_KEY_SECTION_COLLAPSED = 'rv-inspector-section-collapsed';
-const INK_HIGH = 'rgba(255,255,255,0.92)';
-const INK_MED = 'rgba(255,255,255,0.7)';
-const INK_LOW = 'rgba(255,255,255,0.5)';
 const HIT_MIN = 24;
 
 /** Module-level caches to avoid re-parsing localStorage on every toggle. */
@@ -101,6 +108,34 @@ function persistSectionCollapsed(key: string, collapsed: boolean): void {
 
 /** Stable empty-actions array — shared by every section without registered actions. */
 const EMPTY_ACTIONS: readonly import('./rv-component-action-registry').ComponentAction[] = Object.freeze([]);
+
+// ── Opt-in fields shown with their default (plan-577) ───────────────────
+
+/**
+ * Opt-in fields added to a component AFTER documents were written. The
+ * inspector otherwise renders only stored keys, so an existing `MU` (`{}`) or
+ * `GripTarget` would never offer them; these appear with their schema default
+ * until the user sets them.
+ */
+const SEEDED_DEFAULT_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  MU: ['LoadSeatDepth'],
+  GripTarget: ['LoadOnCarrier'],
+};
+
+/** `data` plus the schema default of every seeded field it does not store (same object when nothing is missing). */
+export function withSeededDefaults(componentType: string, data: Record<string, unknown>): Record<string, unknown> {
+  const seeded = SEEDED_DEFAULT_FIELDS[componentType];
+  if (!seeded) return data;
+  let out: Record<string, unknown> | null = null;
+  for (const field of seeded) {
+    if (field in data) continue;
+    const def = getFieldDescriptor(componentType, field)?.default;
+    if (def === undefined) continue;
+    out ??= { ...data };
+    out[field] = def;
+  }
+  return out ?? data;
+}
 
 // ── Read-only live row spec ──────────────────────────────────────────────
 
@@ -160,8 +195,8 @@ function ReadOnlyLiveRow({ fieldName, value }: { fieldName: string; value: unkno
         tabIndex={clickable ? 0 : undefined}
         onKeyDown={clickable ? activateOnKey(() => spec?.onClick?.()) : undefined}
         sx={{
-          fontSize: 11,
-          fontFamily: 'monospace',
+          fontSize: FS.label,
+          fontFamily: MONO,
           color: spec?.color ?? 'text.primary',
           fontWeight: spec?.color ? 600 : 500,
           overflow: 'hidden',
@@ -174,7 +209,7 @@ function ReadOnlyLiveRow({ fieldName, value }: { fieldName: string; value: unkno
             minHeight: HIT_MIN,
             cursor: 'pointer',
             '&:hover': { textDecoration: 'underline' },
-            '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
+            '&:focus-visible': { outline: `1px solid ${ACCENT}`, outlineOffset: 1, borderRadius: 0.5 },
           } : {}),
         }}
       >
@@ -260,13 +295,26 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     return result;
   }, []);
 
+  // Structural references an author can pick in the editor (a step's sensor,
+  // drive or signal). Only while an asset document is being edited: there a
+  // field edit is an undoable document op. Elsewhere they keep their read-only
+  // ReferenceDisplay row.
+  const assetVersion = useSyncExternalStore(subscribeActiveAsset, getActiveAssetVersion);
+  const pickable = useMemo(
+    () => (getActiveAssetContext() !== null ? pickableReferenceFields(base) : []),
+    // assetVersion: re-evaluate when the editor opens or closes a document.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [base, assetVersion],
+  );
+  const pickableNames = useMemo(() => new Set(pickable.map((p) => p.field)), [pickable]);
+
   // Separate consumed fields (editable) from non-consumed (read-only)
   const { consumedEntries, otherEntries } = useMemo(() => {
     const consumed = new Set(getConsumedFields(base));
     const consumedRaw: [string, unknown][] = [];
     const otherRaw: [string, unknown][] = [];
 
-    for (const [key, value] of Object.entries(data)) {
+    for (const [key, value] of Object.entries(withSeededDefaults(base, data))) {
       if (key.startsWith('_')) continue;
       if (isFieldHidden(base, key)) continue;
       // Rendering-precedence contract (plan-325 S3/S4): signal-slot keys are
@@ -274,6 +322,8 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
       // their only render path (also for value === null/undefined, where
       // inferFieldType would misclassify them as 'string' and open an editor).
       if (isSignalSlotField(base, key)) continue;
+      // A pickable reference has its own row below (ReferencePickerRow).
+      if (pickableNames.has(key)) continue;
       // A DEPRECATED field drives nothing. While it is empty it gets no row at
       // all; once a document actually carries a value it is shown read-only with
       // a "(deprecated)" tag (added by FieldRow), so the user can see why the
@@ -294,7 +344,23 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     // Consumed entries keep objects as-is (editable ObjectEditor handles them)
     // Other entries flatten objects into sub-field rows
     return { consumedEntries: consumedRaw, otherEntries: flattenEntries(otherRaw) };
-  }, [base, data, flattenEntries]);
+  }, [base, data, flattenEntries, pickableNames]);
+
+  // An MCP field write (web_editor_set_field / web_component_set) asks for its
+  // row to be visible before the AI "clicks" it: open this section — and the
+  // "more fields" block when the field lives there — without persisting, so the
+  // user's own collapse preference survives the next selection.
+  const aiReveal = useInspectorFieldReveal();
+  useEffect(() => {
+    if (!aiReveal || readOnlyLive || aiReveal.path !== nodePath || aiReveal.componentType !== componentType) return;
+    setSectionExpanded(true);
+    const f = aiReveal.fieldName;
+    if (otherEntries.some(([k]) => k === f || k.startsWith(`${f}.`))) setShowOther(true);
+    // Only a NEW request reveals; a data change must not re-open what the user closed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiReveal?.seq]);
+  const aiKeyOf = (fieldName: string): string | undefined =>
+    !readOnlyLive && nodePath ? inspectorFieldKey(nodePath, componentType, fieldName) : undefined;
 
   // Action buttons contributed by plugins for this component type. Re-resolved
   // on every render — the registry is small and lookups are O(1); this keeps
@@ -308,6 +374,10 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     const baseList = base !== componentType ? componentActionRegistry.get(base) : EMPTY_ACTIONS;
     return [...concrete, ...baseList];
   }, [componentType, base]);
+  // plan-510 fix: operations stay in the body, component management goes into
+  // the header's ⋮ menu (placement 'menu').
+  const bodyActions = useMemo(() => actions.filter((a) => a.placement !== 'menu'), [actions]);
+  const menuActions = useMemo(() => actions.filter((a) => a.placement === 'menu'), [actions]);
 
   // Re-evaluation tick — `isActive` reads from `node.userData`, which the
   // action mutates synchronously. React doesn't see that change on its own
@@ -325,6 +395,10 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     // click — drives the actions.map() loop to re-evaluate isActive().
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewer, nodePath, data, actions.length, actionTick]);
+
+  // plan-512 F8: badges on the scale fields of bound slots — from the same
+  // evaluator as the Problems entries. Empty for virtual/live sections.
+  const unitBadges = useUnitScaleBadges(readOnlyLive ? null : viewer, nodePath, componentType, data);
 
   // ── Read-only live short-circuit ──
   // A virtual component (live behavior state, snap data) renders ALL its data
@@ -361,21 +435,21 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
               cursor: 'pointer',
               userSelect: 'none',
               '&:hover .rv-comp-title': { textDecoration: 'underline' },
-              '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
+              '&:focus-visible': { outline: `1px solid ${ACCENT}`, outlineOffset: 1, borderRadius: 0.5 },
             }}
           >
             {sectionExpanded
-              ? <ExpandMore sx={{ fontSize: 14, color: color }} />
-              : <ChevronRight sx={{ fontSize: 14, color: color }} />}
+              ? <ExpandMore sx={{ fontSize: ICON_SIZE.sm, color: color }} />
+              : <ChevronRight sx={{ fontSize: ICON_SIZE.sm, color: color }} />}
             <Typography
               className="rv-comp-title"
-              sx={{ fontSize: 11, fontWeight: 700, color: color, letterSpacing: 0.5, textTransform: 'uppercase' }}
+              sx={{ fontSize: FS.label, fontWeight: 700, color: color, letterSpacing: 0.5, textTransform: 'uppercase' }}
             >
               {componentType}
             </Typography>
           </Box>
           {signalValue != null && (
-            <Typography sx={{ fontSize: 11, fontWeight: 600, fontFamily: 'monospace', ml: 'auto', color: getSignalHeaderColor(componentType, String(signalValue)) }}>
+            <Typography sx={{ fontSize: FS.label, fontWeight: 600, fontFamily: MONO, ml: 'auto', color: getSignalHeaderColor(componentType, String(signalValue)) }}>
               {signalValue}
             </Typography>
           )}
@@ -409,34 +483,93 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
     return (
       <Box>
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, px: 1, py: 0.375, bgcolor: color + '11', borderBottom: `1px solid ${color}22`, borderTop: `1px solid ${color}22` }}>
-          <Typography sx={{ fontSize: 11, fontWeight: 700, color, letterSpacing: 0.5, textTransform: 'uppercase' }}>
+          <Typography sx={{ fontSize: FS.label, fontWeight: 700, color, letterSpacing: 0.5, textTransform: 'uppercase' }}>
             {`Signal (${signalTypeLabel(componentType)})`}
           </Typography>
-          <Typography sx={{ fontSize: 11, fontWeight: 600, fontFamily: 'monospace', ml: 'auto', color: valueColor }}>
+          <Typography sx={{ fontSize: FS.label, fontWeight: 600, fontFamily: MONO, ml: 'auto', color: valueColor }}>
             {valueText}
           </Typography>
           {headerAction}
         </Box>
-        <Box sx={{ display: 'flex', alignItems: 'center', px: 1, py: 0.15 }}>
-          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flexShrink: 0 }}>Symbol</Typography>
+        {/* plan-514: the card's rows are InspectorRows — the same value column
+            as every other section (no private 64 px label width). */}
+        <InspectorRow label="Symbol" labelColor={INK_LOW} py={0.15}>
           <Tooltip title={symbol} placement="top">
-            <Typography sx={{ fontSize: 11, fontFamily: 'monospace', color: INK_MED, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{symbol}</Typography>
+            <Typography sx={{ fontSize: FS.label, fontFamily: MONO, color: INK_MID, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{symbol}</Typography>
           </Tooltip>
-        </Box>
-        <Box sx={{ display: 'flex', alignItems: 'center', px: 1, py: 0.15 }}>
-          <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flexShrink: 0 }}>Value</Typography>
-          <Typography sx={{ fontSize: 11, fontFamily: 'monospace', color: valueColor, fontWeight: 500 }}>{valueText}</Typography>
-        </Box>
+        </InspectorRow>
+        <InspectorRow label="Value" labelColor={INK_LOW} py={0.15}>
+          <Typography sx={{ fontSize: FS.label, fontFamily: MONO, color: valueColor, fontWeight: 500 }}>{valueText}</Typography>
+        </InspectorRow>
         {comment && (
-          <Box sx={{ display: 'flex', alignItems: 'flex-start', px: 1, py: 0.15 }}>
-            <Typography sx={{ fontSize: 11, color: INK_LOW, width: 64, flexShrink: 0 }}>Comment</Typography>
-            <Typography sx={{ fontSize: 11, color: INK_MED }}>{comment}</Typography>
-          </Box>
+          <InspectorRow label="Comment" labelColor={INK_LOW} py={0.15}>
+            <Typography sx={{ fontSize: FS.label, color: INK_MID, minWidth: 0, overflowWrap: 'anywhere' }}>{comment}</Typography>
+          </InspectorRow>
         )}
         {extraContent}
       </Box>
     );
   }
+
+  const actionCtxForBody = actionCtx;
+  // One body action button (plan-510 fix: extracted so segment groups can share it).
+  const renderBodyAction = (action: ComponentAction) => {
+    const actionCtx = actionCtxForBody!;
+    // plan-499: a command view renders through the command (reason,
+    // afterglow, one execute per click) — see CommandActionButton.
+    if (action.command) {
+        return (
+          <CommandActionButton
+            key={action.id}
+            action={action}
+            ctx={actionCtx}
+            onAfterClick={() => setActionTick(t => t + 1)}
+          />
+        );
+      }
+      const active = action.isActive ? action.isActive(actionCtx) : false;
+      const Icon = action.icon;
+      const button = (
+        <Button
+          key={action.id}
+          size="small"
+          // Explicit `color` overrides the theme primary — used by
+          // axis-coded buttons (Splat Invert X/Y/Z = red/green/blue
+          // to match Three.js axis convention). Falls back to MUI's
+          // theme primary when not specified.
+          color={action.color ? undefined : 'primary'}
+          variant={active ? 'contained' : 'outlined'}
+          onClick={() => {
+            action.onClick(actionCtx);
+            // Immediately re-evaluate isActive — the action mutated
+            // userData synchronously, but React has no way to notice
+            // without our nudge.
+            setActionTick(t => t + 1);
+          }}
+          startIcon={Icon ? <Icon sx={{ fontSize: ICON_SIZE.sm }} /> : undefined}
+          sx={{
+            ...inspectorActionButtonSx,
+            // Custom color path — overrides MUI's color prop. Active
+            // = filled (contained), inactive = outlined; hover
+            // brightens proportionally.
+            ...(action.color ? {
+              color: active ? ON_ACCENT : action.color,
+              bgcolor: active ? action.color : 'transparent',
+              borderColor: action.color,
+              '&:hover': {
+                bgcolor: active ? action.color : action.color + '22',
+                borderColor: action.color,
+              },
+            } : {}),
+          }}
+        >
+          {typeof action.label === 'function' ? action.label(actionCtx) : action.label ?? action.id}
+        </Button>
+      );
+      return action.tooltip
+        ? <Tooltip key={action.id} title={action.tooltip} placement="top">{button}</Tooltip>
+        : button;
+  };
 
   return (
     <Box>
@@ -467,16 +600,16 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
             cursor: 'pointer',
             userSelect: 'none',
             '&:hover .rv-comp-title': { textDecoration: 'underline' },
-            '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
+            '&:focus-visible': { outline: `1px solid ${ACCENT}`, outlineOffset: 1, borderRadius: 0.5 },
           }}
         >
           {sectionExpanded
-            ? <ExpandMore sx={{ fontSize: 14, color: color }} />
-            : <ChevronRight sx={{ fontSize: 14, color: color }} />}
+            ? <ExpandMore sx={{ fontSize: ICON_SIZE.sm, color: color }} />
+            : <ChevronRight sx={{ fontSize: ICON_SIZE.sm, color: color }} />}
           <Typography
             className="rv-comp-title"
             sx={{
-              fontSize: 11,
+              fontSize: FS.label,
               fontWeight: 700,
               color: color,
               letterSpacing: 0.5,
@@ -489,9 +622,9 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
         {signalValue != null && (
           <Typography
             sx={{
-              fontSize: 11,
+              fontSize: FS.label,
               fontWeight: 600,
-              fontFamily: 'monospace',
+              fontFamily: MONO,
               ml: 'auto',
               color: getSignalHeaderColor(componentType, String(signalValue)),
             }}
@@ -500,6 +633,15 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           </Typography>
         )}
         {headerAction}
+        {menuActions.length > 0 && actionCtx && (
+          <Box sx={{ ml: signalValue == null && overriddenFields.size === 0 ? 'auto' : 0, order: 1 }}>
+            <InspectorSectionMenu
+              actions={menuActions}
+              ctx={actionCtx}
+              onAfterClick={() => setActionTick(t => t + 1)}
+            />
+          </Box>
+        )}
         {overriddenFields.size > 0 && (
           <Tooltip title="Click to reset all overrides for this component" placement="top">
             <Typography
@@ -512,12 +654,12 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
                 display: 'flex',
                 alignItems: 'center',
                 minHeight: HIT_MIN,
-                fontSize: 11,
-                color: '#4fc3f7',
+                fontSize: FS.label,
+                color: ACCENT,
                 ml: 'auto',
                 cursor: 'pointer',
                 '&:hover': { color: INK_HIGH, textDecoration: 'underline' },
-                '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: 1, borderRadius: 0.5 },
+                '&:focus-visible': { outline: `1px solid ${ACCENT}`, outlineOffset: 1, borderRadius: 0.5 },
               }}
             >
               {overriddenFields.size} override{overriddenFields.size !== 1 ? 's' : ''}
@@ -561,7 +703,10 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
             viewer={viewer}
             signalStore={signalStore}
             descriptor={getFieldDescriptor(base, fieldName)}
-            unit={getFieldUnit(base, fieldName)}
+            unit={getFieldUnit(base, fieldName, data)}
+            nodePath={nodePath}
+            derived={unitBadges.get(fieldName)}
+            aiKey={aiKeyOf(fieldName)}
           />
         );
       })}
@@ -570,6 +715,18 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
           field renders as a SignalSlotRow — also when the GLB has no value.
           The keys were removed from the FieldRow pipeline above; binding runs
           through SignalBindingManager + persistence, never onFieldEdit. */}
+      {pickable.map(({ field, target }) => (
+        <ReferencePickerRow
+          key={`ref:${field}`}
+          fieldName={field}
+          value={data[field]}
+          target={target}
+          viewer={viewer}
+          nodePath={nodePath}
+          onEdit={(v) => onFieldEdit(field, v)}
+        />
+      ))}
+
       {getSignalSlotFields(base).length > 0 && (
         <ComponentSignalSlots
           viewer={viewer}
@@ -592,69 +749,44 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
         />
       )}
 
+      {/* plan-589 F3/F4: the symbol's own editor ("Signal") and where it is bound in the plant
+          ("PLC binding"). Below the bind row on purpose — what the signal IS, then who reads it in
+          the model, then which gateway address it carries. */}
+      {isPLCSignalComponent(base) && (
+        <PLCSignalSections
+          viewer={viewer}
+          nodePath={nodePath}
+          componentType={componentType}
+          data={data}
+          onFieldEdit={onFieldEdit}
+        />
+      )}
+
       {/* Action buttons contributed by plugins (e.g. Splat Invert X/Y/Z,
           Drive Jog, Sensor Reset). Rendered between consumed fields and the
           collapsible "other fields" section so they sit visually with the
           editable area, not with the diagnostic dump.
           Styling: theme primary accent — intentionally NOT the component's
           own color, so the buttons read consistently across all sections and
-          stand out from the section's text/header tint. */}
-      {actions.length > 0 && actionCtx && (
-        <Box sx={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 0.5, px: 1, py: 0.5 }}>
-          {actions.map((action) => {
-            // Per-render visibility check — lets plugins hide actions based
-            // on node state (e.g. "Stop" only when running).
-            if (action.visible && !action.visible(actionCtx)) return null;
-            const active = action.isActive ? action.isActive(actionCtx) : false;
-            const Icon = action.icon;
-            const button = (
-              <Button
-                key={action.id}
-                size="small"
-                // Explicit `color` overrides the theme primary — used by
-                // axis-coded buttons (Splat Invert X/Y/Z = red/green/blue
-                // to match Three.js axis convention). Falls back to MUI's
-                // theme primary when not specified.
-                color={action.color ? undefined : 'primary'}
-                variant={active ? 'contained' : 'outlined'}
-                onClick={() => {
-                  action.onClick(actionCtx);
-                  // Immediately re-evaluate isActive — the action mutated
-                  // userData synchronously, but React has no way to notice
-                  // without our nudge.
-                  setActionTick(t => t + 1);
-                }}
-                startIcon={Icon ? <Icon sx={{ fontSize: 14 }} /> : undefined}
-                sx={{
-                  minWidth: 0,
-                  height: 24,
-                  px: 0.75,
-                  py: 0,
-                  fontSize: 11,
-                  fontWeight: 600,
-                  textTransform: 'none',
-                  // Custom color path — overrides MUI's color prop. Active
-                  // = filled (contained), inactive = outlined; hover
-                  // brightens proportionally.
-                  ...(action.color ? {
-                    color: active ? '#fff' : action.color,
-                    bgcolor: active ? action.color : 'transparent',
-                    borderColor: action.color,
-                    '&:hover': {
-                      bgcolor: active ? action.color : action.color + '22',
-                      borderColor: action.color,
-                    },
-                  } : {}),
-                }}
-              >
-                {typeof action.label === 'function' ? action.label(actionCtx) : action.label ?? action.id}
-              </Button>
-            );
-            return action.tooltip
-              ? <Tooltip key={action.id} title={action.tooltip} placement="top">{button}</Tooltip>
-              : button;
+          stand out from the section's text/header tint.
+          Layout (plan-510): InspectorActionRow — a pure layout wrapper that
+          starts the buttons on the value column's edge; the buttons and
+          their action logic are unchanged. Consecutive actions sharing a
+          `group` render as ONE segmented control (Jog − | Stop | Jog +);
+          `placement: 'menu'` actions live in the header's ⋮ menu instead. */}
+      {bodyActions.length > 0 && actionCtx && (
+        <InspectorActionRow data-testid="rv-component-actions">
+          {segmentActions(bodyActions.filter((a) => !a.visible || a.visible(actionCtx))).map((segment) => {
+            const rendered = segment.items.map((action) => renderBodyAction(action));
+            return segment.group
+              ? (
+                <Box key={`group-${segment.group}`} data-testid={`rv-action-group-${segment.group}`} sx={inspectorSegmentedGroupSx}>
+                  {rendered}
+                </Box>
+              )
+              : rendered;
           })}
-        </Box>
+        </InspectorActionRow>
       )}
 
       {/* Collapsible other (read-only) fields — hidden when consumedOnly is active.
@@ -677,17 +809,17 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
               px: 1,
               py: 0.125,
               cursor: 'pointer',
-              '&:hover': { bgcolor: 'rgba(255,255,255,0.02)' },
-              '&:focus-visible': { outline: '1px solid #4fc3f7', outlineOffset: -1 },
+              '&:hover': { bgcolor: ROW_HOVER },
+              '&:focus-visible': { outline: `1px solid ${ACCENT}`, outlineOffset: -1 },
             }}
           >
             <ExpandMore sx={{
-              fontSize: 12,
+              fontSize: ICON_SIZE.xs,
               color: INK_LOW,
               transform: showOther ? 'rotate(0deg)' : 'rotate(-90deg)',
               transition: 'transform 0.15s',
             }} />
-            <Typography sx={{ fontSize: 11, color: INK_LOW, ml: 0.25 }}>
+            <Typography sx={{ fontSize: FS.label, color: INK_LOW, ml: 0.25 }}>
               {otherEntries.length} more field{otherEntries.length !== 1 ? 's' : ''}
             </Typography>
           </Box>
@@ -703,7 +835,9 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
               viewer={viewer}
               signalStore={signalStore}
               descriptor={getFieldDescriptor(base, fieldName)}
-              unit={getFieldUnit(base, fieldName)}
+              unit={getFieldUnit(base, fieldName, data)}
+              nodePath={nodePath}
+              aiKey={aiKeyOf(fieldName)}
             />
           ))}
         </>
@@ -713,5 +847,58 @@ export function ComponentSection({ nodePath, componentType, data, overriddenFiel
       </Box>
       )}
     </Box>
+  );
+}
+
+// ── Command-view action (plan-499) ───────────────────────────────────────
+
+/**
+ * An inspector action that is a VIEW of a command (`ComponentAction.command`):
+ * disabled + tooltip = the command's `enabled()` reason (the same text an MCP
+ * tool bound to that command returns as `{error}`), the MCP choreography's
+ * hover/press and the AI afterglow land on this button, and a click is ONE
+ * `execute(..., {origin:'ui'})` — never `action.onClick` as well.
+ */
+function CommandActionButton({ action, ctx, onAfterClick }: {
+  action: ComponentAction;
+  ctx: ComponentActionContext;
+  onAfterClick: () => void;
+}) {
+  const cmd = action.command!;
+  const view = useCommandView({
+    id: cmd.id,
+    args: () => cmd.args(ctx),
+    viewer: ctx.viewer,
+    ...(cmd.buttonKey ? { buttonKey: cmd.buttonKey } : {}),
+  });
+  const active = action.isActive ? action.isActive(ctx) : false;
+  const Icon = action.icon;
+  const label = typeof action.label === 'function' ? action.label(ctx) : action.label ?? action.id;
+  const tip = view.disabled ? (view.reason ?? action.tooltip ?? '') : (action.tooltip ?? '');
+  const button = (
+    <Button
+      size="small"
+      color={action.color ? undefined : 'primary'}
+      variant={active ? 'contained' : 'outlined'}
+      disabled={view.disabled}
+      onClick={() => { view.onClick(); onAfterClick(); }}
+      startIcon={Icon ? <Icon sx={{ fontSize: ICON_SIZE.sm }} /> : undefined}
+      {...view.dataAttrs}
+      aria-description={view.touch ? 'Triggered by AI' : undefined}
+      sx={{
+        ...inspectorActionButtonSx,
+        ...(view.simPhase === 'hover' || view.simPhase === 'pressed' ? { bgcolor: `${ACCENT}2e` } : null),
+        ...(view.touch ? aiTouchSx(view.aiTouch, getAiTouchMs()) : null),
+      }}
+    >
+      {label}
+    </Button>
+  );
+  if (!tip) return button;
+  // A disabled Button fires no events — the tooltip (= the reason) needs a wrapper.
+  return (
+    <Tooltip title={tip} placement="top">
+      {view.disabled ? <span style={{ display: 'inline-flex' }}>{button}</span> : button}
+    </Tooltip>
   );
 }

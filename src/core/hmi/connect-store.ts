@@ -13,10 +13,26 @@
 import { createStore } from './create-store';
 import { deriveWireType, type S7Tag, type ParsedTopic } from '../import/s7-tag-table';
 import {
+  buildInterfaceSignals,
+  matchPlcSignals,
+  mergeDataBlockFilter,
+  sameSignals,
+  type AutoMapProtocol,
+  type AutoMapReport,
+  type DiscoveredPlcTag,
+  type ModelPlcSignal,
+} from '../import/rv-plc-automap';
+import {
   buildJsonTopicsFromRows,
+  SEW_DEFAULT_PUBLISH_ENCODING,
+  SEW_DEFAULT_PUBLISH_INTERVAL_MS,
+  SEW_DEFAULT_PUBLISH_TOPIC,
+  SEW_DEFAULT_RECEIVE_ENCODING,
+  SEW_DEFAULT_RECEIVE_TOPIC,
   type SewJsonTopicOptions,
   type SewSymbolRow,
 } from '../import/sew-symbol-table';
+import { reconcileSignals, type ReconcileReport } from '../import/rv-signal-reconcile';
 import { connectRestFetch } from './connect-rest';
 import { clearLicenseStatus, fetchLicenseStatus } from './license-store';
 import { fetchConnectNews } from '../news-store';
@@ -92,8 +108,40 @@ export type ConnectInterfaceType =
   | 'Festo'
   | 'Fanuc'
   | 'Denso'
+  /** plan-540 robot and controller ports of the realvirtual for Unity interfaces. */
+  | 'Kuka'
+  | 'KukaRsi'
+  | 'UniversalRobots'
+  | 'IgusRebel'
+  | 'Mitsubishi'
+  | 'Udp'
+  | 'WebSocketRealtime'
+  /** Windows-only on the gateway — offered only when `GET /interface-types` reports it. */
+  | 'WinmodY200'
+  | 'RoboDk'
+  | 'WandelbotsNova'
   | 'AbbRobotStudio'
-  | 'SHM';
+  | 'SHM'
+  | 'PlcSimAdvanced'
+  /** B&R PVI (plan-552) — Windows-only on the gateway, offered only when `GET /interface-types` reports it. */
+  | 'Pvi'
+  /** FMU co-simulation (plan-498) — provisioned by realvirtual WEB, never added by hand here. */
+  | 'FMI';
+
+/**
+ * Interface types realvirtual WEB provisions itself from the MODEL (plan-498):
+ * an `FMI` interface is created, fed and released by the FMU provisioning
+ * plugin from the `Fmu` components of the open scene (`POST /fmu/instances`,
+ * leases). The CONNECT panel shows them read-only and does not offer them in
+ * "Add Interface" — a hand-made copy would fight the plugin over the config.
+ */
+export function isModelManagedInterfaceType(type: string): boolean {
+  return type === 'FMI';
+}
+
+/** One-line explanation shown wherever a model-managed interface cannot be edited. */
+export const MODEL_MANAGED_INTERFACE_HINT =
+  'Managed by the model — attach an FMU to a node in the asset editor; realvirtual WEB starts it here.';
 
 /**
  * Per-type signal-authoring schema from `GET /interface-types` (`SignalSchemaInfo` on the gateway).
@@ -119,7 +167,34 @@ export interface ConnectSignalSchema {
   addressExamples: string[];
   /** Allowed DataType values; empty = free/optional (protocol is self-typed). */
   dataTypes: string[];
+  /**
+   * plan-589: whether a signal PLACE of this type needs a `protocolAddress` — per container and,
+   * for MQTT, per topic mode (`SignalSchemaInfo.AddressRule` on the gateway).
+   *
+   * ABSENT on an older gateway, and that is a first-class case: a missing rule must never create a
+   * requirement and never raise a warning (plan-589 §5.4). Read it through
+   * {@link addressRuleFor} rather than reaching into the shape — it is the one place that
+   * distinguishes "no rule stated" (`null`) from the four stated ones.
+   */
+  addressRule?: {
+    /** Rule for the interface-level `signals` container. */
+    signals: AddressRule;
+    /** MQTT only: rule per `ConnectMqttTopic.mode`. */
+    topicModes?: Partial<Record<MqttTopicMode, AddressRule>>;
+  };
 }
+
+/**
+ * plan-589: what the WORKER does with a signal whose `protocolAddress` is empty.
+ *
+ *   `required`        — the worker skips or rejects it (S7, Modbus, OPC-UA NodeId, ADS symbol, …)
+ *   `name-fallback`   — the worker uses the signal NAME as the wire name (PLCSIM, SHM, ABB, …)
+ *   `container-topic` — the container carries the address (an MQTT `Single` topic)
+ *   `none`            — this mode has no address at all (an MQTT `Json` topic keys by name)
+ *
+ * Only `required` makes an address mandatory in the editor; the other three make it optional.
+ */
+export type AddressRule = 'required' | 'name-fallback' | 'container-topic' | 'none';
 
 /** Response of `POST /signals/validate` (`AddressValidation.Result` on the gateway). */
 export interface SignalValidationResult {
@@ -166,6 +241,18 @@ export interface ModbusSettings {
   isServer: boolean;
   wordOrder: ModbusWordOrder;
   transport: ModbusTransport;
+  /** Connect and per-request timeout in ms (client mode, plan-540 Phase 11). */
+  connectionTimeoutMs: number;
+}
+
+/**
+ * Optional Siemens S7 settings — mirrors `S7Settings` (plan-540 Phase 11). The connection itself
+ * stays in the flat `ipAddress` / `rack` / `slot` fields; a missing block means these defaults.
+ */
+export interface S7Settings {
+  connectionTimeoutMs: number;
+  /** Path of a TIA Portal `.sdf` symbol table on the CONNECT host, browsed by signal discovery. */
+  symbolTable: string;
 }
 
 /** Allen-Bradley/Rockwell PLC family (`EipPlcType`) — the CIP dialect used to talk to the gateway. */
@@ -195,6 +282,11 @@ export interface CtrlXSettings {
   bridgePath: string;
   directPort: number;
   tokenTtlMinutes: number;
+  /**
+   * Data Layer publish interval in ms set on the bridge after every connect (plan-540 Phase 11).
+   * Null/absent = leave the bridge's own setting untouched.
+   */
+  publishIntervalMs?: number | null;
 }
 
 /** Bosch Rexroth ctrlX native Data Layer settings — mirrors `CtrlXDataLayerSettings`. */
@@ -226,6 +318,11 @@ export interface KebaSettings {
   username?: string | null;
   password?: string | null;
   importRootPaths: string[];
+  outputTopicName: string;
+  /** Kemro X topic CONNECT creates for the PLCInput variables (plan-540 Phase 11); empty = none. */
+  inputTopicName: string;
+  /** REST login and WebSocket connect timeout in seconds (plan-540 Phase 11). */
+  connectionTimeoutSeconds: number;
   cycleTimeMs: number;
   useOnChange: boolean;
   usePatternMatching: boolean;
@@ -242,6 +339,10 @@ export interface FestoSettings {
   password?: string | null;
   useSubscription: boolean;
   subscriptionCycleMs: number;
+  /** Validate the controller's TLS certificate (only with `useTls`, plan-540 Phase 11). */
+  validateCertificate: boolean;
+  /** Connect, send and receive timeout in seconds (plan-540 Phase 11). */
+  connectionTimeoutSeconds: number;
 }
 
 /** FANUC Robot-IF (SNPX) settings — mirrors `FanucSettings`. */
@@ -267,9 +368,221 @@ export interface DensoSettings {
   axisCount: number;
 }
 
+/** KUKA OfficeLite Y200 TCP settings — mirrors `KukaSettings` (plan-540 Phase 1). */
+export interface KukaSettings {
+  host: string;
+  port: number;
+  connectTimeoutMs: number;
+  maxDigitalSignals: number;
+  axisCount: number;
+}
+
+/** KUKA iiQKA / RSI Ethernet (UDP server) settings — mirrors `KukaRsiSettings` (plan-540 Phase 2). */
+export interface KukaRsiSettings {
+  listenIp: string;
+  rsiPort: number;
+  cycleMs: number;
+  axisPosTag: string;
+  receiveTimeoutMs: number;
+  maxConsecutiveTimeouts: number;
+  axisCount: number;
+  digitalChannels: number;
+  analogChannels: number;
+  echoIpoc: boolean;
+}
+
+/** Universal Robots RTDE settings — mirrors `UniversalRobotsSettings` (plan-540 Phase 3). */
+export interface UniversalRobotsSettings {
+  host: string;
+  rtdePort: number;
+  secondaryPort: number;
+  /** RTDE output frequency in Hz. */
+  outputFrequency: number;
+  axisCount: number;
+  connectTimeoutMs: number;
+}
+
+/** igus ReBeL (iRC, CRI protocol) settings — mirrors `IgusRebelSettings` (plan-540 Phase 4). */
+export interface IgusRebelSettings {
+  host: string;
+  port: number;
+  axisCount: number;
+  speed: number;
+  activateOnConnect: boolean;
+  jointVelocityPercent: number;
+  cartVelocityMmPerSec: number;
+  connectTimeoutMs: number;
+  aliveTimeoutMs: number;
+}
+
+/** Mitsubishi MELSEC MC 3E settings — mirrors `MitsubishiSettings` (plan-540 Phase 5). */
+export interface MitsubishiSettings {
+  host: string;
+  port: number;
+  connectionTimeoutMs: number;
+  optimizeBatchReads: boolean;
+  maxGapSize: number;
+  minBatchSize: number;
+  maxBatchSizeBits: number;
+  maxBatchSizeWords: number;
+  /** GX Works3 device-comment CSV on the CONNECT host, offered by signal discovery. */
+  csvFile: string;
+  importComments: boolean;
+  maxImportDevices: number;
+  validateDeviceAddresses: boolean;
+  importPhysicalInputs: boolean;
+  importPhysicalOutputs: boolean;
+  importInternalRelays: boolean;
+  importDataRegisters: boolean;
+  importTimers: boolean;
+  importCounters: boolean;
+  importStateRelays: boolean;
+  importSpecialDevices: boolean;
+}
+
+/** UDP binary telegram settings — mirrors `UdpSettings` (plan-540 Phase 6). */
+export interface UdpSettings {
+  localPort: number;
+  localBindAddress: string;
+  remoteHost: string;
+  remotePort: number;
+  littleEndian: boolean;
+  /** CSV symbol table on the CONNECT host, offered by signal discovery. */
+  symbolTable: string;
+  splitChar: string;
+}
+
+/** WebSocket Realtime (realvirtual protocol v2) settings — mirrors `WebSocketRealtimeSettings` (plan-540 Phase 7). */
+export interface WebSocketRealtimeSettings {
+  isServer: boolean;
+  address: string;
+  port: number;
+  useSsl: boolean;
+  path: string;
+  clientName: string;
+  bindAddress: string;
+  /** Credential — redacted to null in `GET /config`; null on save keeps the stored key. */
+  apiKey?: string | null;
+  allowedOrigins: string[];
+  maxMessageBytes: number;
+  onlyTransmitChangedInputs: boolean;
+  /** `Input` or `Output` — direction of an imported signal no pattern decides. */
+  defaultSignalDirection: string;
+  usePatternMatching: boolean;
+  inputPatterns: string[];
+  outputPatterns: string[];
+}
+
+/** WINMOD Y200 shared-memory settings — mirrors `WinmodY200Settings` (plan-540 Phase 8, Windows-only). */
+export interface WinmodY200Settings {
+  sharedMemoryName: string;
+  mutexName: string;
+  mutexTimeoutMs: number;
+  /** WINMOD signal list on the CONNECT host, offered by signal discovery. */
+  signalList: string;
+  /** Liveness watchdog in seconds, 0 = off (plan-540 Phase 11). */
+  keepAliveSeconds: number;
+}
+
+/** RoboDK API settings — mirrors `RoboDkSettings` (plan-540 Phase 9). */
+export interface RoboDkSettings {
+  host: string;
+  port: number;
+  robotName: string;
+  programName: string;
+  axisCount: number;
+  paramPollMs: number;
+  runProgramOnConnect: boolean;
+  loopProgram: boolean;
+  stopProgramOnDisconnect: boolean;
+  simulationSpeed: number;
+  forceSimulateRunMode: boolean;
+  connectTimeoutMs: number;
+  responseTimeoutMs: number;
+}
+
+/** Wandelbots NOVA API settings — mirrors `WandelbotsNovaSettings` (plan-540 Phase 10). */
+export interface WandelbotsNovaSettings {
+  server: string;
+  cell: string;
+  motionGroup: string;
+  controller: string;
+  username?: string | null;
+  /** Credential — redacted to null in `GET /config`; null on save keeps the stored value. */
+  password?: string | null;
+  /** Credential (Bearer token, wins over username/password) — redacted like `password`. */
+  token?: string | null;
+  axisCount: number;
+  streamRateMs: number;
+  programTemplate: string;
+  programTimeoutSeconds: number;
+  startProgramOnConnect: boolean;
+  loopProgram: boolean;
+  maxMessageBytes: number;
+  responseTimeoutMs: number;
+}
+
 /** ABB RobotStudio SIMIT shared-memory settings — mirrors `AbbRobotStudioSettings`. */
 export interface AbbRobotStudioSettings {
   sharedMemoryName: string;
+}
+
+/**
+ * Siemens PLCSIM Advanced native-API settings — mirrors `PlcSimAdvancedSettings`
+ * (ProtocolSettings.cs, plan-491). CONNECT attaches to an EXISTING instance; the
+ * discovery-only fields below shape the tag browse, not the running exchange.
+ */
+export interface PlcSimAdvancedSettings {
+  instanceName: string;
+  /**
+   * Remote Runtime Manager as `host[:port]` (plan-540 Phase 11); empty = this PC. Optional: a
+   * gateway before Phase 11 does not send it.
+   */
+  remoteAddress?: string;
+  apiPathOverride: string;
+  hmiTagsOnly: boolean;
+  dataBlockFilter: string;
+  regExImportSignals: string[];
+  regExSkipSignals: string[];
+  regExSymbolIsInput: string[];
+  ensureRunning: boolean;
+}
+
+/** Line the B&R PVI worker uses to reach the CPU — mirrors `PviConnectionType` (string enum on the wire). */
+export type PviConnectionType = 'Ansl' | 'Ina2000';
+
+/**
+ * B&R PVI settings — mirrors `PviSettings` (ProtocolSettings.cs, plan-552 §2.3, Windows-only on the
+ * gateway). CONNECT reaches the CPU (Automation Runtime or ArSim) through the PVI installation of
+ * the gateway machine.
+ */
+export interface PviSettings {
+  connectionType: PviConnectionType;
+  host: string;
+  /** Remote port; null = PVI default (ANSL 11169). */
+  port: number | null;
+  /** ANSL communication timeout in milliseconds (500…360000). */
+  communicationTimeoutMs: number;
+  /** ANSL login user (Automation Runtime A4.61 and newer); empty = no login. */
+  userName?: string | null;
+  /** Credential — redacted to null in `GET /config`; null on save keeps the stored value. */
+  password?: string | null;
+  /** INA2000 only: source station number (1…255). */
+  sourceStation: number;
+  /** INA2000 only: destination station number of the CPU (1…255). */
+  destinationStation: number;
+  /** INA2000 only: local port; 0 = PVI default. */
+  localPort: number;
+  /** Read cycle per variable in milliseconds. */
+  refreshTimeMs: number;
+  /** Period in seconds for reading the CPU state (`<id>.cpu.state` / `<id>.cpu.running`). */
+  cpuStatePollSeconds: number;
+  /** Period in seconds for reading the PVI licence state. */
+  licensePollSeconds: number;
+  /** Explicit folder of `BR.AN.PviServices.dll`; empty = found through the PVI installation. */
+  apiPathOverride?: string | null;
+  /** Upper bound of leaf signals a browse expands. */
+  maxBrowseVariables: number;
 }
 
 export interface ConnectInterface {
@@ -288,8 +601,28 @@ export interface ConnectInterface {
   festo?: FestoSettings;
   fanuc?: FanucSettings;
   denso?: DensoSettings;
+  s7?: S7Settings;
+  kuka?: KukaSettings;
+  kukaRsi?: KukaRsiSettings;
+  universalRobots?: UniversalRobotsSettings;
+  igusRebel?: IgusRebelSettings;
+  mitsubishi?: MitsubishiSettings;
+  udp?: UdpSettings;
+  webSocketRealtime?: WebSocketRealtimeSettings;
+  winmodY200?: WinmodY200Settings;
+  roboDk?: RoboDkSettings;
+  wandelbotsNova?: WandelbotsNovaSettings;
   abbRobotStudio?: AbbRobotStudioSettings;
-  /** Protocol-specific connection settings (endpoint, ipAddress, brokerUrl, updateCycleMs, allowWebToPlc, etc.) */
+  plcSimAdvanced?: PlcSimAdvancedSettings;
+  pvi?: PviSettings;
+  /**
+   * May realvirtual WEB write PLCInput signals of this interface to the target
+   * (plan-562)? CONNECT defaults it to `false` for API and config files — a live
+   * machine is never written to by accident — so an interface created outside
+   * the Add-Interface dialog arrives read-only and the write-gate overlay asks.
+   */
+  allowWebToPlc?: boolean;
+  /** Protocol-specific connection settings (endpoint, ipAddress, brokerUrl, updateCycleMs, etc.) */
   [key: string]: unknown;
   signals: ConnectInterfaceSignal[];
 }
@@ -319,6 +652,29 @@ export interface ConnectSignalIssue {
   topic?: string | null;
 }
 
+/**
+ * Read health of one interface worker (plan-562 F4) — `null`/absent for every
+ * worker that does not report it (only PLCSIM Advanced, S7, TwinCAT and OPC UA
+ * do), which is why "no PLC outputs received" is never claimed for the others.
+ */
+export interface ConnectReadHealth {
+  /** Readable tags the worker actually bound. 0 = nothing to receive, ever. */
+  boundReadTags: number;
+  /** Bound read tags that delivered at least one valid value since the connect. */
+  tagsWithValidValue: number;
+  /** Monotonic receive counter: +1 per poll cycle / notification carrying a valid value. */
+  progress: number;
+  /** +1 on every worker start — the identity of the observation window. */
+  workerGeneration: number;
+  /**
+   * True only when `progress` rises PERIODICALLY (polling / keep-alive). A pure
+   * on-change path (TwinCAT OnChange) reports false, and the "data stopped"
+   * rule must not fire there: a PLC whose outputs simply do not change is
+   * healthy, not silent.
+   */
+  progressIsPeriodic: boolean;
+}
+
 /** Live per-interface worker connection status from CONNECT's /status endpoint. */
 export interface ConnectInterfaceStatus {
   /** "Connected" | "Connecting" | "Reconnecting" | "Error" | "Stopped" | "Disabled" */
@@ -326,6 +682,24 @@ export interface ConnectInterfaceStatus {
   error?: string;
   /** Per-signal problems — undefined/empty when the worker reports none (incl. older gateways). */
   signalIssues?: ConnectSignalIssue[];
+  /**
+   * Opaque hash of this interface's configuration WITHOUT its write gate
+   * (plan-562 F3). Sent back with {@link setAllowWebToPlc} so the gateway can
+   * refuse the flip when the interface changed under us. Absent on gateways
+   * older than plan-562 — then the overlay cannot offer the one-click fix.
+   */
+  configRevision?: string;
+  /**
+   * Viewer write attempts CONNECT dropped because this interface's write gate is
+   * closed. `undefined` whenever the gateway sends `null` or omits the field —
+   * the /status projection is one anonymous type, so "nothing blocked yet"
+   * arrives as JSON `null`, exactly like `error` and `signalIssues`.
+   */
+  writesBlockedByGate?: number;
+  /** The most recent blocked signal names (gateway keeps at most 20, newest first). */
+  blockedSignals?: string[];
+  /** Read health, or undefined when this worker does not report any. */
+  readHealth?: ConnectReadHealth;
 }
 
 /** Index lifecycle reported by CONNECT's /diagnose/status (plan-284). */
@@ -434,6 +808,43 @@ export interface ConnectSnapshot {
    * first poll completes; `{ supported: false }` for gateways without the endpoint.
    */
   rag?: RagStatus;
+  /**
+   * Last PLC auto-map report (plan-545) - model PLC signals matched against one S7 / PLCSIM
+   * interface. `null` until a check ran; `interfaceId` on the report names the interface.
+   */
+  autoMapReport?: AutoMapReport | null;
+  /** True while an auto-map check or apply is in flight. */
+  autoMapBusy?: boolean;
+  /**
+   * The read-only reconcile report per interface id (plan-589 F6), the DISPLAY source for the
+   * ConnectPanel badge and the Problems entries. It replaces {@link autoMapReport} for showing
+   * what is coupled; `autoMapReport` stays the working state of the explicit "Adopt legacy
+   * addresses" action, which is the only thing that still WRITES addresses.
+   *
+   * Recomputed by {@link reconcileInterfaces} — debounced by the CONNECT plugin, never by a
+   * render — and pruned whenever an interface disappears, so a stale report can never outlive
+   * its interface.
+   */
+  /**
+   * Optional like {@link autoMapReport}: a hand-built snapshot in a test (and an older persisted
+   * one) must stay assignable, and an absent map reads exactly like an empty one.
+   */
+  reconcileReports?: Record<string, ReconcileReport>;
+  /**
+   * Is the CONNECT log window open (plan-562 F11)?
+   *
+   * Lives in the store, not in `ConnectPanel`, because the log is an entry point
+   * from OUTSIDE the panel: the no-data notice offers "Open log" while the panel
+   * is closed, and the log dialog only renders inside an open panel. One flag
+   * both sides read is the only way the two steps cannot drift apart.
+   */
+  logOpen?: boolean;
+  /**
+   * Interface whose Edit dialog some other surface asked the panel to open
+   * (plan-562: the "Writes blocked" chip and the overlay's "Update CONNECT"
+   * route). `null` when nothing is pending; the panel clears it when it acts.
+   */
+  editInterfaceId?: string | null;
 }
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -592,6 +1003,11 @@ const _store = createStore<ConnectSnapshot>({
   updateSupported: false,
   updateReason: null,
   revealSupported: false,
+  autoMapReport: null,
+  autoMapBusy: false,
+  reconcileReports: {},
+  logOpen: false,
+  editInterfaceId: null,
 });
 
 // ── React Integration (useSyncExternalStore) ───────────────────────────
@@ -877,6 +1293,8 @@ export function setServerUrl(url: string): void {
     localStorage.setItem(LS_KEY_URL, url);
   } catch { /* ignore */ }
   if (_store.getSnapshot().serverUrl !== url) {
+    // A `/status` answer still in flight belongs to the previous gateway.
+    _statusGeneration++;
     clearLicenseStatus();
     // A different gateway gets its own verdict on the active-document route,
     // and owes the card nothing the previous one reported.
@@ -1041,7 +1459,8 @@ function _friendlyError(err: unknown, serverUrl: string): string {
   return humanizeConnectError(msg);
 }
 
-interface GatewayHealth {
+/** The `/health` answer of a CONNECT gateway — exported for the AI Bridge diagnosis (plan-541). */
+export interface GatewayHealth {
   status: string;
   /** New gateways: semantic version "X.Y.Z". */
   version?: string;
@@ -1059,6 +1478,12 @@ interface GatewayHealth {
    * every gateway older than that plan, and false on one without a project root.
    */
   revealSupported?: boolean;
+  /**
+   * Is the browser bridge endpoint `/webviewer` mapped, i.e. the MCP server switched on (plan-541
+   * F10)? Absent on every gateway older than the bridge pairing — the AI Bridge reads its absence
+   * as "CONNECT too old".
+   */
+  bridgeEnabled?: boolean;
 }
 
 /**
@@ -1069,8 +1494,14 @@ interface GatewayHealth {
  */
 const HEALTH_TIMEOUT_MS = 5000;
 
-/** Read `/health` from one base URL and insist the answer is a healthy gateway's. */
-async function _fetchGatewayHealth(baseUrl: string): Promise<GatewayHealth> {
+/**
+ * Read `/health` from one base URL and insist the answer is a gateway's — reachable, JSON, and
+ * `status` either `ok` or `starting` (a supervised dev server still coming up is a gateway too).
+ * Throws on a network error, a timeout, a non-2xx answer, an HTML answer (a viewer, not a gateway)
+ * and any other status. Exported for the AI Bridge diagnosis (plan-541), which tells `starting`
+ * apart from `ok` itself.
+ */
+export async function fetchGatewayHealth(baseUrl: string): Promise<GatewayHealth> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
   let resp: Response;
@@ -1081,6 +1512,15 @@ async function _fetchGatewayHealth(baseUrl: string): Promise<GatewayHealth> {
   }
   if (!resp.ok) throw new Error(await _errorMessage(resp));
   const health = await _readGatewayJson<GatewayHealth>(resp, baseUrl);
+  if (health.status !== 'ok' && health.status !== 'starting') {
+    throw new Error(`Server reports status: ${health.status}`);
+  }
+  return health;
+}
+
+/** Read `/health` from one base URL and insist the answer is a HEALTHY gateway's (`status: ok`). */
+async function _fetchGatewayHealth(baseUrl: string): Promise<GatewayHealth> {
+  const health = await fetchGatewayHealth(baseUrl);
   if (health.status !== 'ok') throw new Error(`Server reports status: ${health.status}`);
   return health;
 }
@@ -1166,7 +1606,9 @@ export async function connectToServer(opts?: { explicit?: boolean }): Promise<vo
 
     if (opts?.explicit) _recordUserConnected();
 
-    // Load interfaces + the gateway's own type catalog after successful connect
+    // Load interfaces + the gateway's own type catalog after successful connect. The latch is
+    // released first: this may well be a different (updated) gateway than the one that 404'd.
+    _interfaceTypesUnsupported = false;
     await fetchInterfaces();
     await fetchInterfaceTypes();
     queueConnectNewsFetch();
@@ -1196,38 +1638,76 @@ function queueConnectNewsFetch(): void {
     });
 }
 
+/** A gateway that answered 404 has no catalog at all — stop asking it (reset on each connect). */
+let _interfaceTypesUnsupported = false;
+/** Guard so {@link ensureInterfaceTypes} cannot stack retries while one is already running. */
+let _interfaceTypesFetchInFlight = false;
+
 /**
  * Fetch the gateway's own interface-type catalog (`GET /interface-types`). Non-fatal: an older
  * gateway without the endpoint simply leaves `availableTypes` at `null`, and the Add-Interface
  * list falls back to the static {@link CONNECT_INTERFACE_TYPES} registry.
  */
 export async function fetchInterfaceTypes(): Promise<void> {
+  _interfaceTypesFetchInFlight = true;
   try {
-    const resp = await _fetchJson<{ types: {
+    const baseUrl = _store.getSnapshot().serverUrl;
+    const resp = await connectRestFetch(`${baseUrl}/interface-types`);
+    // 404 is the ONE answer that means "this gateway has no catalog" (older build) — latch it and
+    // fall back to the static registry. Every other failure (gateway still starting, a dropped
+    // request, a transient 5xx) leaves the current value alone so this can be retried. The status
+    // is read off the response on purpose: the previous version inferred it from the thrown error
+    // message, which is formatted for humans and does not reliably carry the code.
+    if (resp.status === 404) {
+      _interfaceTypesUnsupported = true;
+      _store.set({ availableTypes: null });
+      return;
+    }
+    if (!resp.ok) throw new Error(await _errorMessage(resp));
+
+    const body = await _readGatewayJson<{ types: {
       type: string;
       label: string;
       description: string;
       defaults: Record<string, unknown>;
       /** Signal-authoring schema — absent on older gateways (pre manual-signal support). */
       signals?: ConnectSignalSchema;
-    }[] }>(
-      '/interface-types',
-    );
-    if (Array.isArray(resp.types) && resp.types.length > 0) {
+      /** Vendor preset marker (plan-457) — absent on older gateways and on plain worker rows. */
+      preset?: string | null;
+    }[] }>(resp, baseUrl);
+
+    if (Array.isArray(body.types) && body.types.length > 0) {
+      _interfaceTypesUnsupported = false;
       _store.set({
-        availableTypes: resp.types.map(t => ({
+        availableTypes: body.types.map(t => ({
           type: t.type as ConnectInterfaceType,
           label: t.label,
           description: t.description,
           defaults: t.defaults ?? {},
           ...(t.signals ? { signals: t.signals } : {}),
+          ...(t.preset ? { preset: t.preset } : {}),
         })),
       });
     }
   } catch {
-    // Older gateway without /interface-types — keep null, callers use the static registry.
-    _store.set({ availableTypes: null });
+    // Transient — keep whatever we had; ensureInterfaceTypes() will come back for it.
+  } finally {
+    _interfaceTypesFetchInFlight = false;
   }
+}
+
+/**
+ * Re-fetch the type catalog when the connected gateway should have one but we do not: the initial
+ * fetch failed transiently, or the gateway was restarted under a session that stayed connected.
+ * Cheap and idempotent — resolves immediately once the catalog is there, on a gateway that answered
+ * 404, while a fetch is already running, or while disconnected. Callers may invoke it per render;
+ * it returns the in-flight promise so a test can await the retry instead of racing it.
+ */
+export function ensureInterfaceTypes(): Promise<void> {
+  if (_interfaceTypesUnsupported || _interfaceTypesFetchInFlight) return Promise.resolve();
+  const snap = _store.getSnapshot();
+  if (snap.state !== 'connected' || snap.availableTypes !== null) return Promise.resolve();
+  return fetchInterfaceTypes();
 }
 
 /**
@@ -1244,7 +1724,7 @@ export function getSignalSchema(type: ConnectInterfaceType | string): ConnectSig
  * when it advertises one, else the static compile-time registry (older gateways).
  */
 export function getAvailableInterfaceTypes(): ConnectInterfaceTypeDef[] {
-  return _store.getSnapshot().availableTypes ?? CONNECT_INTERFACE_TYPES;
+  return _store.getSnapshot().availableTypes ?? CONNECT_INTERFACE_TYPES.filter(def => !def.gatewayOnly);
 }
 
 /** Disconnect from CONNECT server. */
@@ -1256,6 +1736,10 @@ export function disconnectFromServer(): void {
   // connect may be to an updated one, and it deserves to be asked again.
   _activeDocumentUnsupported = false;
   clearActiveDocumentState();
+  // Nothing a poll started before the Disconnect may write back afterwards —
+  // it would resurrect an interface map for a gateway the user just left.
+  _statusGeneration++;
+  clearConnectBridges();
   _store.set({
     state: 'disconnected',
     errorMessage: '',
@@ -1275,6 +1759,11 @@ export function disconnectFromServer(): void {
     updateSupported: false,
     updateReason: null,
     revealSupported: false,
+    autoMapReport: null,
+    autoMapBusy: false,
+    reconcileReports: {},
+    logOpen: false,
+    editInterfaceId: null,
   });
 }
 
@@ -1293,6 +1782,77 @@ const STATUS_FAIL_THRESHOLD = 3;
 let _statusFailCount = 0;
 
 /**
+ * Generation of the gateway target. Bumped whenever the target moves (URL change,
+ * disconnect), so a `/status` answer that was in flight across the change writes
+ * nothing: it describes a gateway nobody is looking at anymore (plan-562 §9.5).
+ */
+let _statusGeneration = 0;
+
+/** A `/status` interface row as the gateway serialises it (plan-562 additive fields). */
+interface StatusInterfaceRow {
+  id: string;
+  status: string;
+  error?: string | null;
+  signalIssues?: ConnectSignalIssue[] | null;
+  configRevision?: string | null;
+  writesBlockedByGate?: number | null;
+  blockedSignals?: string[] | null;
+  readHealth?: Partial<ConnectReadHealth> | null;
+}
+
+/** A positive integer field, or undefined for `null` / absent / unusable. */
+function _statusCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Read health of one interface row, or `undefined`.
+ *
+ * `null`, an absent field and a body that is not an object all mean the same
+ * thing — this worker reports no read health — and the no-data notice must stay
+ * silent for all three. A present object is read defensively: every counter
+ * falls back to 0 so a partially filled body cannot make the watch compare
+ * `undefined` against a threshold.
+ */
+function _parseReadHealth(value: unknown): ConnectReadHealth | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Partial<ConnectReadHealth>;
+  return {
+    boundReadTags: _statusCount(raw.boundReadTags) ?? 0,
+    tagsWithValidValue: _statusCount(raw.tagsWithValidValue) ?? 0,
+    progress: _statusCount(raw.progress) ?? 0,
+    workerGeneration: _statusCount(raw.workerGeneration) ?? 0,
+    progressIsPeriodic: raw.progressIsPeriodic === true,
+  };
+}
+
+/**
+ * Map one `/status` interface row onto {@link ConnectInterfaceStatus}.
+ *
+ * Exported for the parser tests: every plan-562 field arrives as JSON `null`
+ * until it carries information (the `/status` projection is a single anonymous
+ * type, so it cannot omit members), and `null`, `undefined` and "field absent"
+ * must all read as `undefined` here — otherwise the overlay would trigger on a
+ * gateway that never blocked a single write.
+ */
+export function parseInterfaceStatusRow(row: StatusInterfaceRow): ConnectInterfaceStatus {
+  const blockedSignals = Array.isArray(row.blockedSignals) && row.blockedSignals.length
+    ? row.blockedSignals
+    : undefined;
+  return {
+    status: row.status,
+    error: row.error ? humanizeConnectError(row.error) : undefined,
+    signalIssues: row.signalIssues?.length ? row.signalIssues : undefined,
+    configRevision: typeof row.configRevision === 'string' && row.configRevision
+      ? row.configRevision
+      : undefined,
+    writesBlockedByGate: _statusCount(row.writesBlockedByGate),
+    blockedSignals,
+    readHealth: _parseReadHealth(row.readHealth),
+  };
+}
+
+/**
  * Fetch live per-interface worker status (/status) and update the snapshot map.
  *
  * Status truthfulness: a network-level fetch failure means the gateway process
@@ -1301,16 +1861,26 @@ let _statusFailCount = 0;
  * "Connected" for a dead gateway. The next successful poll clears it again.
  * An HTTP error (e.g. 404 on older gateways without /status) still proves the
  * gateway is alive and only leaves the per-interface map untouched.
+ *
+ * `signal` lets the ONE owner of this poll (`ConnectStatusPoll` in
+ * connect-plugin.tsx) put a deadline on a hanging gateway; an aborted request
+ * lands in the same branch as any other network failure, which is the truth —
+ * a gateway that does not answer within the deadline is not answering.
  */
-export async function fetchStatus(): Promise<void> {
+export async function fetchStatus(opts?: { signal?: AbortSignal }): Promise<void> {
   const serverUrl = _store.getSnapshot().serverUrl;
+  const generation = _statusGeneration;
+  /** The answer still describes the gateway the UI is pointed at. */
+  const current = (): boolean =>
+    generation === _statusGeneration && _store.getSnapshot().serverUrl === serverUrl;
   // License status shares this established 2 s poll. Starting both requests
   // together avoids a second timer and keeps neither endpoint behind the other.
   const licensePoll = fetchLicenseStatus(serverUrl);
   let resp: Response;
   try {
-    resp = await fetch(`${serverUrl}/status`);
+    resp = await fetch(`${serverUrl}/status`, opts?.signal ? { signal: opts.signal } : undefined);
   } catch {
+    if (!current()) { await licensePoll; return; }
     _statusFailCount++;
     if (_statusFailCount >= STATUS_FAIL_THRESHOLD && !_store.getSnapshot().gatewayUnreachable) {
       _store.set({ gatewayUnreachable: true });
@@ -1318,6 +1888,7 @@ export async function fetchStatus(): Promise<void> {
     await licensePoll;
     return;
   }
+  if (!current()) { await licensePoll; return; }
   _statusFailCount = 0;
   if (!resp.ok) {
     // Older gateways without /status — gateway alive, leave the map untouched.
@@ -1329,19 +1900,11 @@ export async function fetchStatus(): Promise<void> {
     const data = (await resp.json()) as {
       activeProfile?: string | null;
       activeProfileModel?: string | null;
-      interfaces: Array<{
-        id: string; status: string; error?: string | null;
-        signalIssues?: ConnectSignalIssue[] | null;
-      }>;
+      interfaces: StatusInterfaceRow[];
     };
+    if (!current()) { await licensePoll; return; }
     const map: Record<string, ConnectInterfaceStatus> = {};
-    for (const i of data.interfaces) {
-      map[i.id] = {
-        status: i.status,
-        error: i.error ? humanizeConnectError(i.error) : undefined,
-        signalIssues: i.signalIssues?.length ? i.signalIssues : undefined,
-      };
-    }
+    for (const i of data.interfaces) map[i.id] = parseInterfaceStatusRow(i);
     _store.set({
       interfaceStatus: map,
       activeProfile: data.activeProfile ?? null,
@@ -1351,9 +1914,223 @@ export async function fetchStatus(): Promise<void> {
     });
   } catch {
     // Malformed body — still a live gateway.
-    _store.set({ gatewayUnreachable: false, lastStatusUpdate: Date.now() });
+    if (current()) _store.set({ gatewayUnreachable: false, lastStatusUpdate: Date.now() });
   }
   await licensePoll;
+}
+
+// ── Write gate (plan-562) ──────────────────────────────────────────────
+
+/**
+ * Outcome of {@link setAllowWebToPlc}. Not a boolean, because the four failures
+ * need four different sentences: the configuration moved under us (`changed`),
+ * the interface is gone (`gone`), the gateway is too old to know the endpoint
+ * (`unsupported`), or the request did not get through (`error`).
+ */
+export type SetAllowWebToPlcResult =
+  | { kind: 'ok' }
+  | { kind: 'changed' }
+  | { kind: 'gone' }
+  | { kind: 'unsupported' }
+  | { kind: 'error'; message: string };
+
+/** The stable `code` of an error body, or null when the body carries none. */
+async function _responseCode(resp: Response): Promise<string | null> {
+  try {
+    const body = JSON.parse(await resp.text()) as { code?: unknown };
+    return typeof body.code === 'string' ? body.code : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open (or close) the write gate of ONE interface through the dedicated endpoint
+ * `PUT /config/interfaces/{id}/allow-web-to-plc` (plan-562 F3/F7).
+ *
+ * There is deliberately NO fallback to `PUT /config/interfaces/{id}`: that route
+ * replaces the whole interface from a cached copy, so using it here would let a
+ * one-click "Allow writes" silently revert whatever another client changed in
+ * the meantime. `revision` is the `configRevision` of the status snapshot the
+ * user was shown; the gateway compares it inside its own config lock and answers
+ * 409 when the interface has moved on.
+ */
+export async function setAllowWebToPlc(
+  id: string,
+  revision: string,
+  allow = true,
+): Promise<SetAllowWebToPlcResult> {
+  const base = _store.getSnapshot().serverUrl;
+  let resp: Response;
+  try {
+    resp = await connectRestFetch(
+      `${base}/config/interfaces/${encodeURIComponent(id)}/allow-web-to-plc`,
+      { method: 'PUT', body: JSON.stringify({ allow, revision }) },
+    );
+  } catch (err) {
+    return { kind: 'error', message: err instanceof Error ? err.message : 'Request failed' };
+  }
+  if (resp.ok) {
+    await fetchInterfaces();
+    return { kind: 'ok' };
+  }
+  // 405 is the gateway answering "this route exists for other verbs"; a 404
+  // WITHOUT a stable code is the SPA fallback of a CONNECT that never had the
+  // route. Both mean "update CONNECT", never "the interface is gone".
+  if (resp.status === 405) return { kind: 'unsupported' };
+  const code = await _responseCode(resp);
+  if (resp.status === 404) {
+    return code === 'interface-not-found' ? { kind: 'gone' } : { kind: 'unsupported' };
+  }
+  if (resp.status === 409) return { kind: 'changed' };
+  return { kind: 'error', message: code ?? `HTTP ${resp.status}: ${resp.statusText}` };
+}
+
+// ── Signal rename (plan-590) ───────────────────────────────────────────
+
+/** How a rename reaches what travels over a protocol (`POST /config/signals/rename`). */
+export type ConnectSignalRenameWireKind = 'json-key' | 'name-fallback' | 'mirror-topic' | 'mirror-membership';
+
+/** One wire effect of a signal rename — shown in the preview, confirmed by the user. */
+export interface ConnectSignalRenameWireChange {
+  interfaceId: string;
+  topic?: string | null;
+  kind: ConnectSignalRenameWireKind;
+  detail: string;
+}
+
+/** The 200 answer of `POST /config/signals/rename` (preview or committed apply). */
+export interface ConnectSignalRenameResult {
+  operationId: string | null;
+  status: 'preview' | 'committed';
+  /** Preview: the current revision to send with the apply. Commit: the revision after it. */
+  renameRevision: string;
+  changedInterfaces: Array<{ id: string; topics?: string[] | null }>;
+  changedMappings: number;
+  wireChanges: ConnectSignalRenameWireChange[];
+  /** Inactive CONNECT profiles that still contain the old name — never rewritten. */
+  inactiveProfiles: string[];
+  /** Apply only: the gateway's live value/force/subscribers moved to the new name. */
+  storeRenamed: boolean;
+  /** Preview: the old name is live in the gateway. Commit: the new name is. */
+  liveInGateway: boolean;
+}
+
+/**
+ * Outcome of {@link renameSignal}. Not a boolean: the coordinator needs to tell
+ * "nothing happened" (`revision-mismatch`, `name-collision`, `validation`,
+ * `unsupported`) from "it happened but the gateway could not finish"
+ * (`failed-after-persist`) from "we do not know" (`error` — ask
+ * {@link fetchSignalRenameStatus} with the same operation id).
+ */
+export type ConnectSignalRenameOutcome =
+  | { kind: 'ok'; result: ConnectSignalRenameResult }
+  | { kind: 'revision-mismatch'; renameRevision: string | null }
+  | { kind: 'name-collision'; renameRevision: string | null; detail?: string }
+  | { kind: 'validation'; detail: string }
+  | { kind: 'failed-after-persist'; operationId: string | null }
+  | { kind: 'unsupported' }
+  | { kind: 'error'; message: string };
+
+/** Status of an apply by operation id (`GET /config/signals/rename/{operationId}`). */
+export type ConnectSignalRenameStatus = 'pending' | 'committed' | 'rejected' | 'failed-after-persist' | 'unknown';
+
+/**
+ * Rename one signal in the active CONNECT configuration (plan-590 F1/§2.5):
+ * every `Signals[]` / `Topics[].Signals[]` entry and both sides of every
+ * mapping, in one persist; the gateway's live value, force and subscribers move
+ * with it. `preview: true` changes nothing and returns the `renameRevision` the
+ * apply must echo. Undo is the same call with the names swapped and a NEW
+ * operation id. A CONNECT without the endpoint answers `unsupported` — a rename
+ * with CONNECT references must then be refused ("update CONNECT").
+ *
+ * On a committed apply the interface list is re-read, like every other config write.
+ */
+export async function renameSignal(
+  oldName: string,
+  newName: string,
+  renameRevision: string | null,
+  preview: boolean,
+  operationId: string | null = null,
+  opts: { signal?: AbortSignal } = {},
+): Promise<ConnectSignalRenameOutcome> {
+  const base = _store.getSnapshot().serverUrl;
+  let resp: Response;
+  try {
+    resp = await connectRestFetch(`${base}/config/signals/rename`, {
+      method: 'POST',
+      body: JSON.stringify({ operationId, oldName, newName, renameRevision, preview }),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+  } catch (err) {
+    return { kind: 'error', message: err instanceof Error ? err.message : 'Request failed' };
+  }
+  if (resp.status === 404 || resp.status === 405) return { kind: 'unsupported' };
+  let body: Record<string, unknown> = {};
+  try {
+    body = JSON.parse(await resp.text()) as Record<string, unknown>;
+  } catch {
+    // A non-JSON answer is not the gateway's endpoint (SPA fallback of an old CONNECT, a proxy page).
+    return resp.ok ? { kind: 'unsupported' } : { kind: 'error', message: `HTTP ${resp.status}: ${resp.statusText}` };
+  }
+  const code = typeof body.code === 'string' ? body.code : null;
+  const revision = typeof body.renameRevision === 'string' ? body.renameRevision : null;
+  if (resp.ok) {
+    const result = body as unknown as ConnectSignalRenameResult;
+    if (result.status === 'committed' && (result.changedInterfaces?.length ?? 0) + (result.changedMappings ?? 0) > 0) {
+      await fetchInterfaces();
+    }
+    return { kind: 'ok', result };
+  }
+  if (resp.status === 409 && code === 'revision-mismatch') return { kind: 'revision-mismatch', renameRevision: revision };
+  if (resp.status === 409 && code === 'name-collision') {
+    return {
+      kind: 'name-collision', renameRevision: revision,
+      ...(typeof body.detail === 'string' ? { detail: body.detail } : {}),
+    };
+  }
+  if (resp.status === 400 && code === 'validation') {
+    return { kind: 'validation', detail: typeof body.detail === 'string' ? body.detail : 'Invalid rename request' };
+  }
+  if (resp.status === 500 && code === 'failed-after-persist') {
+    return { kind: 'failed-after-persist', operationId: typeof body.operationId === 'string' ? body.operationId : operationId };
+  }
+  return { kind: 'error', message: code ?? `HTTP ${resp.status}: ${resp.statusText}` };
+}
+
+/**
+ * The recorded outcome of a rename apply (plan-590 §2.1 "verlorene Antwort").
+ * `null` when the gateway could not be asked (or is too old to know the route).
+ */
+export async function fetchSignalRenameStatus(operationId: string): Promise<ConnectSignalRenameStatus | null> {
+  const base = _store.getSnapshot().serverUrl;
+  try {
+    const resp = await connectRestFetch(`${base}/config/signals/rename/${encodeURIComponent(operationId)}`);
+    if (!resp.ok) return null;
+    const body = JSON.parse(await resp.text()) as { status?: unknown };
+    switch (body.status) {
+      case 'pending': case 'committed': case 'rejected': case 'failed-after-persist': case 'unknown':
+        return body.status;
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** Open or close the CONNECT log window (plan-562 F11). */
+export function setConnectLogOpen(open: boolean): void {
+  _store.set({ logOpen: open });
+}
+
+/**
+ * Ask the CONNECT panel to open the Edit dialog of one interface — the way back
+ * from a "Read only" decision and from a gateway without the gate endpoint.
+ * Pass `null` to clear the request (the panel does that once it has acted).
+ */
+export function requestConnectInterfaceEdit(id: string | null): void {
+  _store.set({ editInterfaceId: id });
 }
 
 function _isProviders(v: unknown): v is { embedding: string; rerank: string; chat: string } {
@@ -1486,10 +2263,21 @@ export interface ConnectInterfaceTypeDef {
   /** Minimal default fields for a freshly-added interface of this type (merged onto `{ id, type, enabled: false }`). */
   defaults: Record<string, unknown>;
   /**
+   * Vendor preset of an existing worker type (plan-457: `'SEW'` = MQTT with two pre-filled Json
+   * topics). `type` alone is then not unique in the catalog — `type` + `preset` is.
+   */
+  preset?: string;
+  /**
    * Signal-authoring schema from the gateway (`GET /interface-types` → `signals`). Undefined on the
    * static fallback registry and on older gateways — manual signal editing is then unavailable.
    */
   signals?: ConnectSignalSchema;
+  /**
+   * Offered in the Add-Interface list only when the connected gateway's own catalog reports the
+   * type (plan-540: Windows-only WINMOD Y200). The static fallback registry keeps the entry for its
+   * label and Edit-form defaults, but {@link getAvailableInterfaceTypes} drops it.
+   */
+  gatewayOnly?: boolean;
 }
 
 /** Backend default `TwinCatSettings` (ProtocolSettings.cs) — also the Edit-form seed for legacy/partial configs. */
@@ -1516,6 +2304,7 @@ export const MODBUS_SETTINGS_DEFAULTS: ModbusSettings = {
   isServer: false,
   wordOrder: 'ABCD',
   transport: 'Tcp',
+  connectionTimeoutMs: 10000,
 };
 
 /** Same `ModbusSettings` shape, seeded for a `ModbusServer` (listener) interface. */
@@ -1526,6 +2315,7 @@ export const MODBUS_SERVER_SETTINGS_DEFAULTS: ModbusSettings = {
   isServer: true,
   wordOrder: 'ABCD',
   transport: 'Tcp',
+  connectionTimeoutMs: 10000,
 };
 
 /** Backend default `EthernetIpSettings`. */
@@ -1545,6 +2335,7 @@ export const CTRLX_SETTINGS_DEFAULTS: CtrlXSettings = {
   bridgePath: '/ctrlx-rv-bridge/ws',
   directPort: 8080,
   tokenTtlMinutes: 10,
+  publishIntervalMs: null,
 };
 
 /** Backend default `CtrlXDataLayerSettings`. */
@@ -1576,6 +2367,9 @@ export const KEBA_SETTINGS_DEFAULTS: KebaSettings = {
   username: 'Administrator',
   password: null,
   importRootPaths: ['SYS'],
+  outputTopicName: 'realvirtual_outputs',
+  inputTopicName: 'realvirtual_inputs',
+  connectionTimeoutSeconds: 10,
   cycleTimeMs: 100,
   useOnChange: true,
   usePatternMatching: true,
@@ -1592,6 +2386,8 @@ export const FESTO_SETTINGS_DEFAULTS: FestoSettings = {
   password: null,
   useSubscription: true,
   subscriptionCycleMs: 100,
+  validateCertificate: true,
+  connectionTimeoutSeconds: 10,
 };
 
 /** Backend default `FanucSettings`. */
@@ -1614,9 +2410,191 @@ export const DENSO_SETTINGS_DEFAULTS: DensoSettings = {
   axisCount: 6,
 };
 
+/** Backend default `S7Settings` (plan-540 Phase 11). */
+export const S7_SETTINGS_DEFAULTS: S7Settings = {
+  connectionTimeoutMs: 10000,
+  symbolTable: '',
+};
+
+/** Backend default `KukaSettings`. */
+export const KUKA_SETTINGS_DEFAULTS: KukaSettings = {
+  host: '127.0.0.1',
+  port: 54600,
+  connectTimeoutMs: 5000,
+  maxDigitalSignals: 10,
+  axisCount: 6,
+};
+
+/** Backend default `KukaRsiSettings`. */
+export const KUKARSI_SETTINGS_DEFAULTS: KukaRsiSettings = {
+  listenIp: '0.0.0.0',
+  rsiPort: 49152,
+  cycleMs: 4,
+  axisPosTag: 'AIPos',
+  receiveTimeoutMs: 100,
+  maxConsecutiveTimeouts: 10,
+  axisCount: 6,
+  digitalChannels: 8,
+  analogChannels: 0,
+  echoIpoc: true,
+};
+
+/** Backend default `UniversalRobotsSettings`. */
+export const UNIVERSALROBOTS_SETTINGS_DEFAULTS: UniversalRobotsSettings = {
+  host: '192.168.0.4',
+  rtdePort: 30004,
+  secondaryPort: 30001,
+  outputFrequency: 20,
+  axisCount: 6,
+  connectTimeoutMs: 5000,
+};
+
+/** Backend default `IgusRebelSettings`. */
+export const IGUSREBEL_SETTINGS_DEFAULTS: IgusRebelSettings = {
+  host: '127.0.0.1',
+  port: 3921,
+  axisCount: 6,
+  speed: 100,
+  activateOnConnect: true,
+  jointVelocityPercent: 100,
+  cartVelocityMmPerSec: 100,
+  connectTimeoutMs: 5000,
+  aliveTimeoutMs: 10000,
+};
+
+/** Backend default `MitsubishiSettings`. */
+export const MITSUBISHI_SETTINGS_DEFAULTS: MitsubishiSettings = {
+  host: '192.168.3.39',
+  port: 5001,
+  connectionTimeoutMs: 5000,
+  optimizeBatchReads: true,
+  maxGapSize: 5,
+  minBatchSize: 3,
+  maxBatchSizeBits: 960,
+  maxBatchSizeWords: 120,
+  csvFile: '',
+  importComments: true,
+  maxImportDevices: 1000,
+  validateDeviceAddresses: true,
+  importPhysicalInputs: true,
+  importPhysicalOutputs: true,
+  importInternalRelays: true,
+  importDataRegisters: true,
+  importTimers: true,
+  importCounters: true,
+  importStateRelays: true,
+  importSpecialDevices: false,
+};
+
+/** Backend default `UdpSettings`. */
+export const UDP_SETTINGS_DEFAULTS: UdpSettings = {
+  localPort: 11001,
+  localBindAddress: '0.0.0.0',
+  remoteHost: '127.0.0.1',
+  remotePort: 11000,
+  littleEndian: true,
+  symbolTable: '',
+  splitChar: ';',
+};
+
+/** Backend default `WebSocketRealtimeSettings`. */
+export const WEBSOCKETREALTIME_SETTINGS_DEFAULTS: WebSocketRealtimeSettings = {
+  isServer: true,
+  address: '127.0.0.1',
+  port: 8080,
+  useSsl: false,
+  path: '',
+  clientName: 'Client',
+  bindAddress: '127.0.0.1',
+  apiKey: null,
+  allowedOrigins: [],
+  maxMessageBytes: 1024 * 1024,
+  onlyTransmitChangedInputs: false,
+  defaultSignalDirection: 'Output',
+  usePatternMatching: true,
+  inputPatterns: ['Unity'],
+  outputPatterns: [],
+};
+
+/** Backend default `WinmodY200Settings`. */
+export const WINMODY200_SETTINGS_DEFAULTS: WinmodY200Settings = {
+  sharedMemoryName: 'Y200',
+  mutexName: '',
+  mutexTimeoutMs: 1000,
+  signalList: '',
+  keepAliveSeconds: 0,
+};
+
+/** Backend default `RoboDkSettings`. */
+export const ROBODK_SETTINGS_DEFAULTS: RoboDkSettings = {
+  host: 'localhost',
+  port: 20500,
+  robotName: '',
+  programName: '',
+  axisCount: 6,
+  paramPollMs: 500,
+  runProgramOnConnect: false,
+  loopProgram: false,
+  stopProgramOnDisconnect: false,
+  simulationSpeed: 1,
+  forceSimulateRunMode: true,
+  connectTimeoutMs: 5000,
+  responseTimeoutMs: 5000,
+};
+
+/** Backend default `WandelbotsNovaSettings`. */
+export const WANDELBOTSNOVA_SETTINGS_DEFAULTS: WandelbotsNovaSettings = {
+  server: 'http://localhost',
+  cell: 'cell',
+  motionGroup: '',
+  controller: '',
+  username: null,
+  password: null,
+  token: null,
+  axisCount: 6,
+  streamRateMs: 20,
+  programTemplate: '',
+  programTimeoutSeconds: 300,
+  startProgramOnConnect: false,
+  loopProgram: false,
+  maxMessageBytes: 1024 * 1024,
+  responseTimeoutMs: 5000,
+};
+
 /** Backend default `AbbRobotStudioSettings`. */
 export const ABB_ROBOTSTUDIO_SETTINGS_DEFAULTS: AbbRobotStudioSettings = {
   sharedMemoryName: 'SIMITShared Memory',
+};
+
+/** Backend default `PlcSimAdvancedSettings`. */
+export const PLCSIMADVANCED_SETTINGS_DEFAULTS: PlcSimAdvancedSettings = {
+  instanceName: 'PLCSimInstance',
+  remoteAddress: '',
+  apiPathOverride: '',
+  hmiTagsOnly: false,
+  dataBlockFilter: '',
+  regExImportSignals: [],
+  regExSkipSignals: [],
+  regExSymbolIsInput: [],
+  ensureRunning: false,
+};
+
+/** Backend default `PviSettings`. */
+export const PVI_SETTINGS_DEFAULTS: PviSettings = {
+  connectionType: 'Ansl',
+  host: '127.0.0.1',
+  port: null,
+  communicationTimeoutMs: 1500,
+  userName: null,
+  password: null,
+  sourceStation: 1,
+  destinationStation: 2,
+  localPort: 0,
+  refreshTimeMs: 100,
+  cpuStatePollSeconds: 2,
+  licensePollSeconds: 60,
+  apiPathOverride: null,
+  maxBrowseVariables: 5000,
 };
 
 /**
@@ -1630,6 +2608,22 @@ export const CONNECT_INTERFACE_TYPES: ConnectInterfaceTypeDef[] = [
     label: 'MQTT Broker',
     description: 'Topics or Siemens process image via broker',
     defaults: { brokerUrl: 'mqtt://localhost:1883' },
+  },
+  {
+    // plan-457: SEW MOVI-C is the MQTT worker in Json topic mode. The preset pre-creates the two
+    // Json topics of a SEW station with the symbol-table import defaults, so the import replaces
+    // them by topic name instead of appending. Signals stay empty until the table is imported.
+    type: 'MQTT',
+    preset: 'SEW',
+    label: 'SEW MOVI-C (MQTT Json)',
+    description: 'SEW / Codesys station — flat JSON process image on SEW/SimOUT and SEW/SimIN',
+    defaults: {
+      brokerUrl: 'mqtt://localhost:1883',
+      topics: [
+        { topic: SEW_DEFAULT_RECEIVE_TOPIC, mode: 'Json', qos: 1, retained: false, encoding: SEW_DEFAULT_RECEIVE_ENCODING, signals: [] },
+        { topic: SEW_DEFAULT_PUBLISH_TOPIC, mode: 'Json', qos: 1, retained: false, encoding: SEW_DEFAULT_PUBLISH_ENCODING, publishIntervalMs: SEW_DEFAULT_PUBLISH_INTERVAL_MS, signals: [] },
+      ],
+    },
   },
   {
     type: 'OpcUa',
@@ -1690,6 +2684,69 @@ export const CONNECT_INTERFACE_TYPES: ConnectInterfaceTypeDef[] = [
     description: 'Variable service via WebSocket topics and write_vars',
     defaults: { keba: { ...KEBA_SETTINGS_DEFAULTS } },
   },
+  // plan-540: the robot and controller ports of the realvirtual for Unity interfaces, in the
+  // gateway catalog's order (labels and descriptions as `InterfaceTypeEndpoints.Catalog`).
+  {
+    type: 'Kuka',
+    label: 'KUKA OfficeLite (Y200 TCP)',
+    description: '$IN/$OUT bits and joint positions via the OC_Assistant_OfficeLite Y200 server',
+    defaults: { kuka: { ...KUKA_SETTINGS_DEFAULTS } },
+  },
+  {
+    type: 'KukaRsi',
+    label: 'KUKA iiQKA / RSI (UDP)',
+    description: 'Joint positions and RSI digital/analog IO from a KUKA iiQKA VRC or controller (RSI Ethernet)',
+    defaults: { kukaRsi: { ...KUKARSI_SETTINGS_DEFAULTS } },
+  },
+  {
+    type: 'UniversalRobots',
+    label: 'Universal Robots (RTDE)',
+    description: 'Joint positions, digital outputs and robot state via RTDE; digital inputs via URScript (URSim or UR controller)',
+    defaults: { universalRobots: { ...UNIVERSALROBOTS_SETTINGS_DEFAULTS } },
+  },
+  {
+    type: 'IgusRebel',
+    label: 'igus ReBeL (CRI)',
+    description: 'Joint positions, digital outputs, global signals and move commands for an igus robot control (iRC) via CRI',
+    defaults: { igusRebel: { ...IGUSREBEL_SETTINGS_DEFAULTS } },
+  },
+  {
+    type: 'Mitsubishi',
+    label: 'Mitsubishi MELSEC (MC 3E)',
+    description: 'Bit and word devices of a MELSEC iQ-R / Q / L / iQ-F PLC via MC protocol (SLMP 3E binary); GX Works3 CSV import',
+    defaults: { mitsubishi: { ...MITSUBISHI_SETTINGS_DEFAULTS } },
+  },
+  {
+    type: 'Udp',
+    label: 'UDP (binary telegram)',
+    description: 'Fixed binary UDP telegrams to and from a PLC, SCADA or custom tool; CSV symbol table import',
+    defaults: { udp: { ...UDP_SETTINGS_DEFAULTS } },
+  },
+  {
+    type: 'WebSocketRealtime',
+    label: 'WebSocket Realtime (realvirtual v2)',
+    description: 'Signal exchange with Unity, another CONNECT or the ctrlX bridge over the realvirtual WebSocket protocol v2 — server or client',
+    defaults: {
+      webSocketRealtime: {
+        ...WEBSOCKETREALTIME_SETTINGS_DEFAULTS,
+        allowedOrigins: [...WEBSOCKETREALTIME_SETTINGS_DEFAULTS.allowedOrigins],
+        inputPatterns: [...WEBSOCKETREALTIME_SETTINGS_DEFAULTS.inputPatterns],
+        outputPatterns: [...WEBSOCKETREALTIME_SETTINGS_DEFAULTS.outputPatterns],
+      },
+    },
+  },
+  {
+    type: 'RoboDk',
+    label: 'RoboDK (API)',
+    description: 'Robot joints, station parameters and program start / stop / loop of a running RoboDK station via the RoboDK API',
+    defaults: { roboDk: { ...ROBODK_SETTINGS_DEFAULTS } },
+  },
+  {
+    type: 'WandelbotsNova',
+    label: 'Wandelbots NOVA',
+    description: 'Robot joints, controller IOs and Wandelscript program start / stop / loop of a Wandelbots NOVA cell via the NOVA API',
+    defaults: { wandelbotsNova: { ...WANDELBOTSNOVA_SETTINGS_DEFAULTS } },
+  },
   {
     type: 'Festo',
     label: 'Festo AX (PLCnext)',
@@ -1709,6 +2766,16 @@ export const CONNECT_INTERFACE_TYPES: ConnectInterfaceTypeDef[] = [
     defaults: { denso: { ...DENSO_SETTINGS_DEFAULTS } },
   },
   {
+    // plan-540 Phase 8: Windows-only on the gateway (WINMOD runs on the same machine). `gatewayOnly`
+    // keeps it out of the static fallback list, so the Add list shows it only when the connected
+    // gateway's own catalog reports it.
+    type: 'WinmodY200',
+    label: 'WINMOD Y200 (Shared Memory)',
+    description: 'Signal exchange with WINMOD over its Y200 shared memory on this machine; WINMOD signal list import',
+    defaults: { winmodY200: { ...WINMODY200_SETTINGS_DEFAULTS } },
+    gatewayOnly: true,
+  },
+  {
     type: 'AbbRobotStudio',
     label: 'ABB RobotStudio (SIMIT SHM)',
     description: 'Shared-memory exchange with RobotStudio on this machine',
@@ -1719,6 +2786,31 @@ export const CONNECT_INTERFACE_TYPES: ConnectInterfaceTypeDef[] = [
     label: 'Shared Memory (SIMIT)',
     description: 'SIMIT-layout shared memory for a Unity/SIMIT consumer on this machine',
     defaults: { sharedMemory: { sharedMemoryName: 'realvirtualSHM', useGlobalNamespace: false } },
+  },
+  {
+    // plan-491: the NATIVE PLCSIM Advanced path — no S7comm, no absolute DB addresses, no PUT/GET
+    // and no virtual Ethernet adapter. Windows-only on the gateway, so the entry only reaches the
+    // Add list when `GET /interface-types` actually offers it.
+    type: 'PlcSimAdvanced',
+    label: 'Siemens PLCSIM Advanced (native API)',
+    description: 'In-process Siemens simulation API — symbolic tags, optimized DBs, no coupler and no PUT/GET',
+    defaults: {
+      plcSimAdvanced: {
+        ...PLCSIMADVANCED_SETTINGS_DEFAULTS,
+        regExImportSignals: [...PLCSIMADVANCED_SETTINGS_DEFAULTS.regExImportSignals],
+        regExSkipSignals: [...PLCSIMADVANCED_SETTINGS_DEFAULTS.regExSkipSignals],
+        regExSymbolIsInput: [...PLCSIMADVANCED_SETTINGS_DEFAULTS.regExSymbolIsInput],
+      },
+    },
+  },
+  {
+    // plan-552: Windows-only on the gateway (needs the local B&R PVI installation). `gatewayOnly`
+    // keeps it out of the static fallback list; the label matches the gateway catalog.
+    type: 'Pvi',
+    label: 'B&R PVI (ANSL/INA2000)',
+    description: 'B&R controllers and ArSim through the local B&R PVI installation — global, task-local and module variables, structure members and array elements; variable browse',
+    defaults: { pvi: { ...PVI_SETTINGS_DEFAULTS } },
+    gatewayOnly: true,
   },
 ];
 
@@ -1738,14 +2830,29 @@ function _typeSlug(type: ConnectInterfaceType): string {
     case 'Festo': return 'festo';
     case 'Fanuc': return 'fanuc';
     case 'Denso': return 'denso';
+    case 'Kuka': return 'kuka';
+    case 'KukaRsi': return 'kuka-rsi';
+    case 'UniversalRobots': return 'ur';
+    case 'IgusRebel': return 'igus-rebel';
+    case 'Mitsubishi': return 'mitsubishi';
+    case 'Udp': return 'udp';
+    case 'WebSocketRealtime': return 'websocket-realtime';
+    case 'WinmodY200': return 'winmod-y200';
+    case 'RoboDk': return 'robodk';
+    case 'WandelbotsNova': return 'nova';
     case 'AbbRobotStudio': return 'abb-robotstudio';
+    case 'PlcSimAdvanced': return 'plcsim-advanced';
+    case 'Pvi': return 'pvi';
     default: return 'iface';
   }
 }
 
-/** Next free human-readable id for a new interface of `type` (e.g. "twincat-1", "twincat-2", ...). */
-export function nextInterfaceId(type: ConnectInterfaceType): string {
-  const slug = _typeSlug(type);
+/**
+ * Next free human-readable id for a new interface of `type` (e.g. "twincat-1", "twincat-2", ...).
+ * A vendor preset names the id after itself ("sew-1"), not after its worker type.
+ */
+export function nextInterfaceId(type: ConnectInterfaceType, preset?: string): string {
+  const slug = preset ? preset.toLowerCase().replace(/[^a-z0-9]+/g, '-') : _typeSlug(type);
   const existing = new Set(_store.getSnapshot().interfaces.map(i => i.id));
   let n = 1;
   while (existing.has(`${slug}-${n}`)) n++;
@@ -1866,6 +2973,27 @@ export function discoveredSignalName(displayName: string): string {
   return displayName.replace(/[^a-zA-Z0-9_]/g, '_');
 }
 
+/**
+ * True when a data type carries text: the CONNECT value kind `Text` and the PLC text types
+ * `STRING` / `WSTRING` (also with a declared length, `STRING[80]`), case-insensitive. A discovered
+ * or edited signal with such a type binds as `PLC…Text` — never as a number (plan-552 Phase 7).
+ */
+export function isTextDataType(dataType: string | null | undefined): boolean {
+  return /^(TEXT|W?STRING(\s*[[(]\s*\d+\s*[\])])?)$/.test((dataType ?? '').trim().toUpperCase());
+}
+
+/**
+ * Wire type a discovered signal binds as: direction from the browse, value kind from its data type
+ * (`Bool`, `Int`, text types → `Text`, everything else `Float` as before).
+ */
+export function discoveredSignalWireType(direction: DiscoveredSignal['direction'], dataType: string): string {
+  const kind = dataType === 'Bool' ? 'Bool'
+    : dataType === 'Int' ? 'Int'
+      : isTextDataType(dataType) ? 'Text'
+        : 'Float';
+  return `PLC${direction === 'input' ? 'Input' : 'Output'}${kind}`;
+}
+
 /** Bind selected discovered signals to the active interface. */
 export async function bindSelectedSignals(interfaceId: string): Promise<void> {
   const selected = _store.getSnapshot().discoveredSignals.filter(s => s.selected);
@@ -1874,7 +3002,7 @@ export async function bindSelectedSignals(interfaceId: string): Promise<void> {
   const bindings = selected.map(s => ({
     protocolAddress: s.protocolAddress,
     signalName: discoveredSignalName(s.displayName),
-    type: `PLC${s.direction === 'input' ? 'Input' : 'Output'}${s.dataType === 'Bool' ? 'Bool' : s.dataType === 'Int' ? 'Int' : 'Float'}`,
+    type: discoveredSignalWireType(s.direction, s.dataType),
     // Persist the discovered data type (plan-352 F9). Without it the gateway stores `""` and a
     // later direction change in the signal dialog has no type left to preserve.
     ...(s.dataType ? { dataType: s.dataType } : {}),
@@ -1904,34 +3032,161 @@ export async function bindSelectedSignals(interfaceId: string): Promise<void> {
 // tag-table import use, so the collision check (409), atomic config save and worker hot-reload
 // apply identically. A renamed/deleted signal's old store entry is pruned gateway-side on reload.
 
-/** Add a manually created signal to an interface. Throws with a readable message on a 409 name collision. */
-export async function addSignal(interfaceId: string, signal: ConnectInterfaceSignal): Promise<void> {
+/**
+ * plan-589: the CONTAINER the write goes into.
+ *
+ * An interface has more than one signal list — the flat `signals` array and, for MQTT, one per
+ * topic. Every write below takes the container as an optional trailing `topic`, so the three
+ * existing call sites (which all mean the flat list) keep working unchanged while the inspector's
+ * PLC binding and the signal dialog can address a topic's own list.
+ *
+ * Single-signal operations only, on purpose: an atomic multi-signal / multi-interface write is
+ * plan-590. Each of these is one `PUT /config/interfaces/{id}`, with CONNECT's own 409 name-collision
+ * check, atomic save and worker hot-reload.
+ */
+function _ifaceOrThrow(interfaceId: string): ConnectInterface {
   const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
   if (!iface) throw new Error(`Interface '${interfaceId}' not found`);
-  await updateInterface(interfaceId, { signals: [...(iface.signals ?? []), signal] });
+  return iface;
+}
+
+/**
+ * The `updateInterface` patch that applies `edit` to the container named by `topic`.
+ *
+ * A patch for a topic container must carry the WHOLE `topics` array — CONNECT replaces the field,
+ * so a patch with one topic in it would delete the others.
+ */
+function _signalContainerPatch(
+  iface: ConnectInterface,
+  topic: string | undefined,
+  edit: (signals: ConnectInterfaceSignal[]) => ConnectInterfaceSignal[],
+): Partial<ConnectInterface> {
+  if (topic === undefined) return { signals: edit([...(iface.signals ?? [])]) };
+  const topics = iface.topics ?? [];
+  if (!topics.some(t => t.topic === topic)) {
+    throw new Error(`Interface '${iface.id}' has no topic '${topic}'`);
+  }
+  return {
+    topics: topics.map(t => (t.topic === topic ? { ...t, signals: edit([...(t.signals ?? [])]) } : t)),
+  };
+}
+
+/**
+ * Add a manually created signal to an interface. Throws with a readable message on a 409 name
+ * collision. `topic` writes into that MQTT topic's own `signals` list instead of the flat one.
+ */
+export async function addSignal(
+  interfaceId: string,
+  signal: ConnectInterfaceSignal,
+  topic?: string,
+): Promise<void> {
+  const iface = _ifaceOrThrow(interfaceId);
+  await updateInterface(interfaceId, _signalContainerPatch(iface, topic, s => [...s, signal]));
 }
 
 /**
  * Update (or rename) an existing signal on an interface. `originalName` identifies the signal —
- * pass the pre-edit name so renames replace the old entry instead of duplicating it.
+ * pass the pre-edit name so renames replace the old entry instead of duplicating it. `topic` edits
+ * that MQTT topic's own list; a same-named signal in another container stays untouched.
  */
 export async function updateSignal(
   interfaceId: string,
   originalName: string,
   signal: ConnectInterfaceSignal,
+  topic?: string,
 ): Promise<void> {
-  const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
-  if (!iface) throw new Error(`Interface '${interfaceId}' not found`);
-  const signals = (iface.signals ?? []).map(s => (s.name === originalName ? signal : s));
-  await updateInterface(interfaceId, { signals });
+  const iface = _ifaceOrThrow(interfaceId);
+  await updateInterface(interfaceId, _signalContainerPatch(iface, topic,
+    s => s.map(entry => (entry.name === originalName ? signal : entry))));
 }
 
-/** Remove a signal from an interface. */
-export async function removeSignal(interfaceId: string, name: string): Promise<void> {
-  const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
-  if (!iface) throw new Error(`Interface '${interfaceId}' not found`);
-  const signals = (iface.signals ?? []).filter(s => s.name !== name);
-  await updateInterface(interfaceId, { signals });
+/** Remove a signal from an interface — from `topic`'s own list when given, else from the flat one. */
+export async function removeSignal(interfaceId: string, name: string, topic?: string): Promise<void> {
+  const iface = _ifaceOrThrow(interfaceId);
+  await updateInterface(interfaceId, _signalContainerPatch(iface, topic,
+    s => s.filter(entry => entry.name !== name)));
+}
+
+/** The signal named `name` in the container `topic` of `iface`, or null. */
+export function findSignalInContainer(
+  iface: ConnectInterface,
+  name: string,
+  topic?: string,
+): ConnectInterfaceSignal | null {
+  const list = topic === undefined
+    ? iface.signals ?? []
+    : (iface.topics ?? []).find(t => t.topic === topic)?.signals ?? [];
+  return list.find(s => s.name === name) ?? null;
+}
+
+/** What the inspector's "PLC binding" section and `editor.signalSetBinding` write (plan-589 F4). */
+export interface SignalBindingRequest {
+  interfaceId: string;
+  /** MQTT topic container; omit for the interface-level `signals` list. */
+  topic?: string;
+  /** CONNECT signal name = the model signal's runtime name. */
+  name: string;
+  /** rv wire type (`PLCOutputBool`, …). Required when the binding is created. */
+  type?: string;
+  protocolAddress?: string;
+  dataType?: string;
+  /** Remove the binding instead of writing it. */
+  remove?: boolean;
+}
+
+/** Outcome of {@link applySignalBinding} — what actually happened on the gateway. */
+export type SignalBindingOutcome = 'added' | 'updated' | 'removed' | 'absent';
+
+/**
+ * Said once wherever a PLC binding cannot be written: addresses live in CONNECT and nowhere else,
+ * so without a connection there is no place to put one. Lives here, not in the inspector component,
+ * so the command implementation can refuse with the same sentence the UI shows.
+ */
+export const PLC_BINDING_NEEDS_CONNECT =
+  'Connect to realvirtual CONNECT to bind this signal — PLC addresses live in the gateway, not in the model.';
+
+/**
+ * THE write path of a PLC binding (plan-589 F4): set, change or remove the address of one signal in
+ * one container.
+ *
+ * An existing entry is PATCHED, so `record`, `comment` and a `type`/`dataType` the caller did not
+ * supply survive — the inspector only ever knows about address and data type. A new entry needs a
+ * `type`; without one there is no wire type to register and the gateway would reject it.
+ */
+export async function applySignalBinding(request: SignalBindingRequest): Promise<SignalBindingOutcome> {
+  const { interfaceId, topic, name } = request;
+  const iface = _ifaceOrThrow(interfaceId);
+  const existing = findSignalInContainer(iface, name, topic);
+
+  if (request.remove) {
+    if (!existing) return 'absent';
+    await removeSignal(interfaceId, name, topic);
+    return 'removed';
+  }
+
+  const address = request.protocolAddress?.trim() ?? '';
+  if (existing) {
+    const next: ConnectInterfaceSignal = {
+      ...existing,
+      protocolAddress: address,
+      ...(request.type ? { type: request.type } : {}),
+      ...(request.dataType !== undefined ? { dataType: request.dataType } : {}),
+    };
+    await updateSignal(interfaceId, name, next, topic);
+    return 'updated';
+  }
+
+  if (!request.type) {
+    throw new Error(`Signal '${name}' does not exist on '${interfaceId}' — a wire type is required to create it`);
+  }
+  await addSignal(interfaceId, {
+    name,
+    protocolAddress: address,
+    type: request.type,
+    ...(request.dataType ? { dataType: request.dataType } : {}),
+    record: false,
+  }, topic);
+  return 'added';
 }
 
 /**
@@ -2037,6 +3292,191 @@ export async function importTagTable(params: ImportTagTableParams): Promise<void
 export async function importS7TagTable(interfaceId: string, tags: S7Tag[]): Promise<void> {
   const signals = _tagsToSignals(tags);
   await updateInterface(interfaceId, { signals });
+}
+
+// ── PLC Auto-Map (plan-545) ──────────────────────────────────────────────────
+//
+// Model PLC signals → S7 / PLCSIM Advanced interface signals. The matching is the pure
+// `rv-plc-automap` module; these actions only gather the PLC side (the interface's own
+// signals, plus a PLCSIM browse through `startDiscovery`) and write through `updateInterface`
+// (PUT /config/interfaces/{id}) — merge-only, `allowWebToPlc` untouched.
+
+/** Last PLCSIM browse per interface, so the re-check after an Apply needs no second browse. */
+const _autoMapDiscovery = new Map<string, DiscoveredPlcTag[]>();
+
+/** The auto-map protocol of an interface type, or null when auto-map does not apply. */
+export function autoMapProtocolOf(type: string): AutoMapProtocol | null {
+  return type === 'S7' || type === 'PlcSimAdvanced' ? type : null;
+}
+
+function _autoMapError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Run a PLCSIM browse through the shared discovery action and keep the tags. */
+async function _discoverPlcTags(interfaceId: string): Promise<DiscoveredPlcTag[]> {
+  await startDiscovery(interfaceId);
+  const tags: DiscoveredPlcTag[] = _store.getSnapshot().discoveredSignals.map(s => ({
+    tag: s.browsePath || s.protocolAddress,
+    direction: s.direction,
+    dataType: s.dataType,
+  }));
+  _autoMapDiscovery.set(interfaceId, tags);
+  return tags;
+}
+
+/** Match without touching `autoMapBusy`; `rediscover` runs a fresh PLCSIM browse. */
+async function _autoMapReport(
+  interfaceId: string,
+  model: readonly ModelPlcSignal[],
+  rediscover: boolean,
+): Promise<AutoMapReport> {
+  const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
+  if (!iface) throw new Error(`Interface '${interfaceId}' not found`);
+  const protocol = autoMapProtocolOf(iface.type);
+  if (!protocol) throw new Error(`Auto-map supports S7 and PlcSimAdvanced interfaces, not '${iface.type}'`);
+  let discovered: DiscoveredPlcTag[] | undefined;
+  if (protocol === 'PlcSimAdvanced') {
+    discovered = rediscover || !_autoMapDiscovery.has(interfaceId)
+      ? await _discoverPlcTags(interfaceId)
+      : _autoMapDiscovery.get(interfaceId);
+  }
+  const report = matchPlcSignals(model, {
+    signals: iface.signals ?? [],
+    discovered,
+    allowWebToPlc: iface['allowWebToPlc'] === true,
+    dataBlockFilter: iface.plcSimAdvanced?.dataBlockFilter,
+  }, protocol);
+  report.interfaceId = interfaceId;
+  return report;
+}
+
+/**
+ * Match the model's PLC signals against an S7 or PLCSIM Advanced interface and keep the report
+ * in `autoMapReport`. PLCSIM runs a tag browse first (`startDiscovery`).
+ */
+export async function checkAutoMap(
+  interfaceId: string,
+  model: readonly ModelPlcSignal[],
+): Promise<AutoMapReport> {
+  _store.set({ autoMapBusy: true });
+  try {
+    const report = await _autoMapReport(interfaceId, model, true);
+    _store.set({ autoMapReport: report });
+    return report;
+  } finally {
+    _store.set({ autoMapBusy: false });
+  }
+}
+
+/**
+ * Write the model's mappable signals into the interface (merge-only) and re-check.
+ *
+ * PLCSIM: data blocks the process-image browse cannot see are first added to
+ * `plcSimAdvanced.dataBlockFilter` (merged, never removed) and the browse is repeated. A rejected
+ * PUT (409 name collision, signal limit) does not throw: its message becomes a report hint and
+ * the interface list stays as the gateway has it.
+ */
+export async function applyAutoMap(
+  interfaceId: string,
+  model: readonly ModelPlcSignal[],
+): Promise<AutoMapReport> {
+  _store.set({ autoMapBusy: true });
+  try {
+    let report = await _autoMapReport(interfaceId, model, true);
+    const failed = (what: string, err: unknown): AutoMapReport => {
+      report.hints = [`${what} failed: ${_autoMapError(err)}`, ...report.hints];
+      _store.set({ autoMapReport: report });
+      return report;
+    };
+
+    if (report.protocol === 'PlcSimAdvanced' && report.dataBlockFilter.length > 0) {
+      const iface = _store.getSnapshot().interfaces.find(i => i.id === interfaceId);
+      const settings: PlcSimAdvancedSettings = { ...PLCSIMADVANCED_SETTINGS_DEFAULTS, ...iface?.plcSimAdvanced };
+      const merged = mergeDataBlockFilter(settings.dataBlockFilter, report.dataBlockFilter);
+      if (merged !== settings.dataBlockFilter) {
+        try {
+          await updateInterface(interfaceId, { plcSimAdvanced: { ...settings, dataBlockFilter: merged } });
+        } catch (err) {
+          return failed('Setting the PLCSIM data block filter', err);
+        }
+        report = await _autoMapReport(interfaceId, model, true);
+      }
+    }
+
+    const current = _store.getSnapshot().interfaces.find(i => i.id === interfaceId)?.signals ?? [];
+    const signals = buildInterfaceSignals(report, current);
+    const written = report.counts.toApply;
+    if (!sameSignals(signals, current)) {
+      try {
+        await updateInterface(interfaceId, { signals });
+      } catch (err) {
+        return failed('Apply', err);
+      }
+    }
+
+    const after = await _autoMapReport(interfaceId, model, false);
+    after.hints = [`Applied: ${written} signal(s) added or updated, nothing removed.`, ...after.hints];
+    _store.set({ autoMapReport: after });
+    return after;
+  } finally {
+    _store.set({ autoMapBusy: false });
+  }
+}
+
+/** Forget the auto-map report (e.g. after a model change). */
+export function clearAutoMapReport(): void {
+  _store.set({ autoMapReport: null });
+}
+
+// ── Reconcile reports (plan-589 F6) ──────────────────────────────────────────
+//
+// Read-only. Nothing in here contacts the gateway and nothing in here writes a signal: the report
+// is recomputed from the interface configuration the store already holds plus the model signals the
+// caller collected. The one write path for addresses stays `applyAutoMap` above, reached only
+// through the explicit "Adopt legacy addresses" action.
+
+/**
+ * Recompute the reconcile report for `interfaceIds` (default: every configured interface) and keep
+ * it in `reconcileReports`.
+ *
+ * Reports of interfaces that no longer exist are dropped in the same pass — the map must never
+ * answer for an interface the user deleted. Model-managed interfaces (FMI, provisioned FROM the
+ * model by the FMU plugin) are skipped: their signal list IS the model, so a report about them
+ * would only ever restate it.
+ *
+ * The result is the full, merged map — the same object the snapshot now carries.
+ */
+export function reconcileInterfaces(
+  model: readonly ModelPlcSignal[],
+  interfaceIds?: readonly string[],
+): Record<string, ReconcileReport> {
+  const snap = _store.getSnapshot();
+  const wanted = interfaceIds ? new Set(interfaceIds) : null;
+  const next: Record<string, ReconcileReport> = {};
+  for (const iface of snap.interfaces) {
+    if (isModelManagedInterfaceType(iface.type)) continue;
+    if (wanted && !wanted.has(iface.id)) {
+      // Not asked for, but still alive — keep what we had rather than dropping it.
+      const previous = snap.reconcileReports?.[iface.id];
+      if (previous) next[iface.id] = previous;
+      continue;
+    }
+    next[iface.id] = reconcileSignals(model, iface, getSignalSchema(iface.type));
+  }
+  _store.set({ reconcileReports: next });
+  return next;
+}
+
+/** The reconcile report of one interface, or null when none has been computed yet. */
+export function getReconcileReport(interfaceId: string): ReconcileReport | null {
+  return _store.getSnapshot().reconcileReports?.[interfaceId] ?? null;
+}
+
+/** Forget every reconcile report (model cleared, gateway gone). */
+export function clearReconcileReports(): void {
+  if (Object.keys(_store.getSnapshot().reconcileReports ?? {}).length === 0) return;
+  _store.set({ reconcileReports: {} });
 }
 
 // ── SEW Symbol Table Import (plan-457) ───────────────────────────────────────
@@ -2209,6 +3649,7 @@ export async function putMirrors(mirrors: ConnectMirrorRule[]): Promise<void> {
     method: 'PUT',
     body: JSON.stringify(mirrors),
   });
+  _setBridges({ mirrors: [...mirrors] });
 }
 
 export async function fetchMappings(): Promise<ConnectSignalMapping[]> {
@@ -2221,6 +3662,87 @@ export async function putMappings(mappings: ConnectSignalMapping[]): Promise<voi
     method: 'PUT',
     body: JSON.stringify(mappings),
   });
+  _setBridges({ mappings: [...mappings] });
+}
+
+// -- Bridge cache (plan-566 R2-1) ---------------------------------------------
+//
+// The bridges used to live only in the CONNECT panel's component state, which
+// made them invisible to everything else - in particular to the signal
+// cross-reference list, which must name a 1:1 mapping or mirror rule as a
+// usage of its signals even while the panel is closed. One cache now: loaded
+// on demand while connected, updated by every successful PUT, reloaded on a
+// profile switch, dropped on disconnect.
+
+/** What the gateway's bridges look like right now. */
+export interface ConnectBridgesState {
+  /** null while not loaded (or the gateway lacks the endpoints). */
+  mirrors: ConnectMirrorRule[] | null;
+  mappings: ConnectSignalMapping[] | null;
+  /** False when the connected gateway lacks the /config/mirrors endpoints (older EXE). */
+  supported: boolean;
+  /** A load finished (successfully or not) since the last connect. */
+  loaded: boolean;
+  /**
+   * Bridge row the CONNECT panel was asked to show (`mapping:<i>` / `mirror:<i>`),
+   * set by a "Used by" click; the panel scrolls to it and clears it.
+   */
+  revealKey: string | null;
+}
+
+const BRIDGES_EMPTY: ConnectBridgesState = { mirrors: null, mappings: null, supported: false, loaded: false, revealKey: null };
+let _bridges: ConnectBridgesState = BRIDGES_EMPTY;
+const _bridgeListeners = new Set<() => void>();
+let _bridgesInFlight: Promise<void> | null = null;
+let _bridgesGeneration = 0;
+
+function _setBridges(patch: Partial<ConnectBridgesState>): void {
+  _bridges = { ..._bridges, ...patch };
+  for (const cb of [..._bridgeListeners]) {
+    try { cb(); } catch (e) { console.warn('[connect-store] bridge listener failed:', e); }
+  }
+}
+
+/** Current bridge cache (stable identity between changes). */
+export function getConnectBridges(): ConnectBridgesState {
+  return _bridges;
+}
+
+/** Subscribe to bridge cache changes; returns the unsubscribe. */
+export function subscribeConnectBridges(cb: () => void): () => void {
+  _bridgeListeners.add(cb);
+  return () => { _bridgeListeners.delete(cb); };
+}
+
+/** (Re)load mirrors + mappings from the gateway. Concurrent calls share one request. */
+export function reloadConnectBridges(): Promise<void> {
+  if (_bridgesInFlight) return _bridgesInFlight;
+  const generation = _bridgesGeneration;
+  const request = Promise.all([fetchMirrors(), fetchMappings()])
+    .then(([mirrors, mappings]) => {
+      if (generation !== _bridgesGeneration) return;
+      _setBridges({ mirrors, mappings, supported: true, loaded: true });
+    })
+    .catch(() => {
+      // Older gateway without the endpoints - the bridges UI hides itself.
+      if (generation !== _bridgesGeneration) return;
+      _setBridges({ mirrors: null, mappings: null, supported: false, loaded: true });
+    })
+    .finally(() => { if (_bridgesInFlight === request) _bridgesInFlight = null; });
+  _bridgesInFlight = request;
+  return request;
+}
+
+/** Drop the cache (disconnect / reset). A load still in flight is ignored when it lands. */
+export function clearConnectBridges(): void {
+  _bridgesGeneration++;
+  _bridgesInFlight = null;
+  if (_bridges !== BRIDGES_EMPTY) _setBridges(BRIDGES_EMPTY);
+}
+
+/** Ask the CONNECT panel to show one bridge row (`mapping:<i>` / `mirror:<i>`); `null` clears the request. */
+export function requestConnectBridgeReveal(key: string | null): void {
+  if (_bridges.revealKey !== key) _setBridges({ revealKey: key });
 }
 
 // ── Signal-config profiles (plan-258) ────────────────────────────────────
@@ -2303,6 +3825,8 @@ export async function activateProfile(name: string): Promise<void> {
   await _fetchJson<{ success: boolean }>(`/config/profiles/${encodeURIComponent(name)}/activate`, { method: 'POST' });
   await fetchInterfaces();
   await fetchStatus();
+  // The profile swapped the whole config, bridges included (plan-566 R2-1).
+  void reloadConnectBridges();
 }
 
 /** The model the gateway HMI currently auto-loads (e.g. "models/CellA.glb"), or null. */
@@ -2761,14 +4285,17 @@ export async function confirmPendingActivation(): Promise<void> {
 
 /** @internal Reset store state (for testing only). */
 export function _resetConnectStore(): void {
+  _autoMapDiscovery.clear();
   _activeDocumentUnsupported = false;
   _writingBackCreatedRef = false;
   _activeDocumentGuard.invalidate();
   _activeDocumentDebounce.cancel();
   clearActiveDocumentState();
   _statusFailCount = 0;
+  _statusGeneration++;
   hasFetchedConnectThisSession = false;
   connectNewsFetchInFlight = false;
+  clearConnectBridges();
   _store.set({
     serverUrl: defaultGatewayUrl(),
     state: 'disconnected',
@@ -2789,5 +4316,10 @@ export function _resetConnectStore(): void {
     updateSupported: false,
     updateReason: null,
     revealSupported: false,
+    autoMapReport: null,
+    autoMapBusy: false,
+    reconcileReports: {},
+    logOpen: false,
+    editInterfaceId: null,
   });
 }

@@ -136,6 +136,34 @@ A deploy root without a readable `project.json` has no project at all: the viewe
 logs a named error and shows one, rather than inventing a project around whatever
 GLBs happen to be lying about.
 
+**Asset cache integrity (plan-508).** Library GLBs and splats go through
+`RVAssetBlobCache` (buckets `rv-assets-glb-v2` / `rv-assets-splat-v2`); its cache key is
+url + the catalog's `sha256` (`cacheKeyFor`, both tiers), looked up by url in
+`src/core/library/rv-asset-hash-registry.ts`, which the catalog normalizer fills. A hit
+under a hash key is served without re-hashing; network bytes are verified, a mismatch is
+refetched once with `cache: 'reload'` and then fails as "hash mismatch". `ModelCache`
+invalidates a key when its expected hash changes. Catalogs are stamped by the builders and
+re-stamped by the deploy AFTER signing; the dev server answers missing asset paths with 404
+(`rv-asset-404-guard`), the deploy probes the live host. Outcomes: `web_status.cache`,
+DevTools › Render › Asset cache. Details: `doc-web-debugging.md`, `doc-deploy.md`.
+
+### Local projects: the linked list, not a workspace (plan-743)
+
+**There is no workspace root.** The dashboard's Projects section is a flat,
+uncapped list of LINKED project folders (`rv-project/linked`, one
+`projectfolder:<id>` handle per project), with two verbs: **Add** links a folder
+you already have — a project folder, a folder full of project folders (each child
+is linked, nothing is written to the parent), or a plain folder that an uncapped
+recursive `.glb` scan turns into a project — and **New** creates one under a
+remembered parent. Permission is asked for when a project is OPENED and never
+when the list is drawn.
+
+When touching this area: the rules live in
+`src/core/hmi/projects/linked-project-verbs.ts` and `src/core/project/rv-project-{linked,add,scan}.ts`,
+never in `ProjectsDashboardHost.tsx` — that file cannot be rendered by a test, so
+a rule inside it is a rule with no test. `runLegacyCleanup()` deletes the old
+workspace keys on first boot; there is deliberately no migration.
+
 ## Operating Modes
 
 | Mode | Description |
@@ -151,6 +179,15 @@ GLBs happen to be lying about.
 - **GLB as single source of truth:** All component config is in `rv_extras` inside the GLB. No separate signal map files.
 - **Standalone simulation uses accumulator pattern:** Fixed-timestep equivalent to Unity FixedUpdate.
 - **Events & hooks for loose coupling:** Plugins, HMI components and engine systems communicate through the typed `ViewerEvents` bus (`viewer.on / viewer.emit`) and plugin-lifecycle hooks (`onModelLoaded`, `onModelCleared`, `onRender`, …) wherever possible. Direct cross-plugin imports / module-level coupling are kept for stable, performance-critical APIs only. Prefer registry patterns (`componentActionRegistry`, `fieldRendererRegistry`) and `viewer.on('layout-transform-update', …)`-style subscriptions over hard wiring; that's what lets plugins like `gaussian-splat-plugin` stay in step with `layout-planner` mutations without either side knowing about the other. When a new cross-cutting concern shows up, ask first whether a typed event or a tiny registry can carry it before reaching for a shared service singleton.
+
+## Commands (plan-499)
+
+A user action is ONE command in `commandRegistry` (`src/core/hmi/rv-command-registry.ts`): buttons
+(`ActionSegment`/`ActionButton` `command=`, `useCommandView`), context-menu items, inspector
+actions, keyboard handlers and MCP write tools (`@McpTool({ command })` + `dispatchBoundCommand`)
+are views of it — never a second copy of its rule. Every write tool is bound or allow-listed with a
+reason; `tests/rv-command-mcp-parity.node.test.ts` and `tests/rv-command-bindings-execution.test.ts`
+enforce it. Details: `doc-extending-webviewer.md` §5b.
 
 ## Testing
 
@@ -235,7 +272,7 @@ When the dev server is running (`npm run dev`), debug endpoints are available:
 
 realvirtual WEB includes a built-in MCP bridge (`src/plugins/mcp-bridge-plugin.ts`) that exposes the running Three.js scene to AI assistants. The MCP tools documentation is in `webviewer.mcp.md`.
 
-**The default MCP server is realvirtual CONNECT** (`http://localhost:5100/mcp`). It hosts the MCP endpoint itself, so nothing extra is installed: register it as `"realvirtual-CONNECT": { "type": "http", "url": "http://localhost:5100/mcp" }` in `.mcp.json`, enable it via the CONNECT tray icon (*MCP server ▸ Enabled*) and restart CONNECT. The browser reaches it over the same WebSocket contract at `:5100/webviewer` — that is the AI Bridge panel's default port, including under the Vite dev server on 5173 (`?mcpPort=5100` pins it explicitly). Claude Code and Claude Code Desktop speak HTTP natively; classic Claude Desktop needs the `npx -y mcp-remote http://localhost:5100/mcp --allow-http` stdio shim.
+**The default MCP server is realvirtual CONNECT** (`http://localhost:5100/mcp`). It hosts the MCP endpoint itself, so nothing extra is installed: register it as `"realvirtual-CONNECT": { "type": "http", "url": "http://localhost:5100/mcp" }` in `.mcp.json`, enable it via the CONNECT tray icon (*MCP server ▸ Enabled*) and restart CONNECT. The browser reaches it over the same WebSocket contract at `:5100/webviewer` — that is the AI Bridge panel's default port, including under the Vite dev server on 5173 (`?mcpPort=5100` pins it explicitly). A **hosted** page that CONNECT did not serve (the demo on `web.realvirtual.io`, a customer site) targets `ws://localhost:<port>/webviewer` on its own — no URL parameter — and its https origin is paired once in the CONNECT tray instead of being added to `AllowedOrigins` (plan-541; the AI Bridge panel names the cause when it does not connect). Claude Code and Claude Code Desktop speak HTTP natively; classic Claude Desktop needs the `npx -y mcp-remote http://localhost:5100/mcp --allow-http` stdio shim.
 
 The local **Node bridge** in `mcp-bridge/` (a stdio MCP server hosting its own WebSocket server on `:18714`/`:18715`) is **not deprecated** — it remains the documented emergency fallback. In `.mcp.json` it is parked under the top-level `_disabledMcpServers` key, which Claude Code never launches; move that block into `mcpServers`, run `npm run setup` inside `mcp-bridge/` once, and point the browser at its port to fall back. Moving it back is the way home.
 
@@ -305,3 +342,18 @@ public mirror:
 New UI must follow these files; they are the source of truth for design decisions. Without the
 private sibling (community edition) they are simply absent — the code itself remains the
 fallback authority (`src/core/hmi/theme.ts`, `signal-colors.ts`).
+
+### Inspector UI rule (plan-510) — read [`DESIGN.md`](DESIGN.md) before touching the inspector
+
+- Inspector UI is built **only** from the inspector building blocks (`InspectorRow`,
+  `InspectorSubheader`, `InspectorActionRow`, `DetailsDisclosure`) and the design values of
+  `src/core/hmi/shared-sx.ts` (`INK_*`, `DIVIDER`, `FS.*`, `ICON_SIZE.*`, `ACCENT`/`WARN`/…) —
+  no local colours, font sizes, pixel columns or `type="number"` inputs; UI text is English;
+  numbers go through `parseDecimal` / `formatDecimal` (`rv-number-format.ts`).
+- The ESLint baseline (`eslint-suppressions.json`) and the language allowlist
+  (`tests/fixtures/ui-language-allowlist.json`) **only shrink**: never regenerate or extend them,
+  never raise `SUPPRESSION_CEILING` / `ALLOWLIST_CEILING` without the user's approval — fix the
+  code, then `npm run lint:prune` and lower the ceiling.
+- The gate is `npm run test:all` (it runs `tests/hmi-design-lint.node.test.ts` and
+  `tests/ui-language.node.test.ts` via `test:node`); `npm test` alone does not.
+- Reference page: `?rvDev=inspector-gallery` on the dev server.

@@ -29,8 +29,12 @@
 
 import { useSyncExternalStore } from 'react';
 
-/** How the bytes on screen reached this page. */
-export type ModelProvenanceSource = 'share' | 'own-url' | 'local';
+/**
+ * How the bytes on screen reached this page. `'share-encrypted'` (plan-560) is
+ * a `?glb=` link opened with its password: trusted for this session only, with
+ * no trust-store record behind it — so nothing exists that could be revoked.
+ */
+export type ModelProvenanceSource = 'share' | 'own-url' | 'share-encrypted' | 'local';
 
 export interface ModelProvenance {
   /**

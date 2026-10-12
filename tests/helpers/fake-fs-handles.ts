@@ -85,6 +85,11 @@ export class FakeFile {
     return this.blob;
   }
 
+  /** Identity, as the platform answers it — see `FakeDir.isSameEntry`. */
+  async isSameEntry(other: unknown): Promise<boolean> {
+    return (other as unknown) === (this as unknown);
+  }
+
   /**
    * Open a writable stream. The failure check fires **here only**, not again
    * inside `write()`: one logical write must produce exactly one injector
@@ -167,10 +172,30 @@ export class FakeDir {
 
   // ── Directory API ──
 
+  /**
+   * Identity, as the platform answers it.
+   *
+   * Reference equality, which is the only identity a fake tree has: two
+   * `FakeDir`s with the same name are two different folders, exactly as two
+   * real folders of the same name in different parents are. Handle objects must
+   * never be compared with `===` in production code, so the duplicate guard
+   * needs this to be a real method rather than a property.
+   */
+  async isSameEntry(other: unknown): Promise<boolean> {
+    return (other as unknown) === (this as unknown);
+  }
+
   async getDirectoryHandle(name: string, opts?: { create?: boolean }): Promise<FakeDir> {
     this.failures.check('getDirectory', name);
     const hit = this.children.get(name);
     if (hit instanceof FakeDir) return hit;
+    // A name that is taken by a FILE is the platform's `TypeMismatchError`, not
+    // "not found": the path exists and is the wrong kind, which is what a user
+    // sees after replacing a project folder with a file of the same name. The
+    // dashboard's row-state logic distinguishes the two, so the fake has to.
+    if (hit instanceof FakeFile) {
+      throw namedError('TypeMismatchError', `"${name}" is a file, not a directory`);
+    }
     if (!opts?.create) throw namedError('NotFoundError', `no directory "${name}"`);
     const dir = new FakeDir(name, this.failures);
     dir.permissions = this.permissions;
@@ -182,6 +207,9 @@ export class FakeDir {
     this.failures.check('read', name);
     const hit = this.children.get(name);
     if (hit instanceof FakeFile) return hit;
+    if (hit instanceof FakeDir) {
+      throw namedError('TypeMismatchError', `"${name}" is a directory, not a file`);
+    }
     if (!opts?.create) throw namedError('NotFoundError', `no file "${name}"`);
     const file = new FakeFile(name, new Blob(), this.failures);
     this.children.set(name, file);

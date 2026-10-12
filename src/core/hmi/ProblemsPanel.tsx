@@ -11,7 +11,8 @@
  *
  * ## Content-driven presence
  *
- * Renders nothing at all when the list is empty — a permanently docked "0
+ * A standard FloatingPanel, toggled from its ActivityBar entry (red count
+ * badge). Renders nothing at all when the list is empty — a permanently docked "0
  * problems" panel would spend viewport on the normal case, and DESIGN.md's
  * north star is that the machine is the star. It appears when there is
  * something to say and leaves when there is not.
@@ -24,22 +25,58 @@
  * a rejection and is used for nothing but the icon.
  */
 
-import { useSyncExternalStore, useState, useCallback } from 'react';
-import { Box, IconButton, Tooltip, Typography } from '@mui/material';
-import { ErrorOutlineRounded, WarningAmberRounded, InfoOutlined, ExpandMore, ChevronRight } from '@mui/icons-material';
+import { useSyncExternalStore, useCallback } from 'react';
+import { Box, Button, Tooltip, Typography } from '@mui/material';
+import { ErrorOutlineRounded, WarningAmberRounded, InfoOutlined } from '@mui/icons-material';
 import {
   getProblems,
   subscribeProblems,
   type ProblemEntry,
   type ProblemSeverity,
 } from './problems-store';
-import { uiBlur } from './rv-ui-blur';
+import { commandRegistry } from './rv-command-registry';
+import { useOptionalViewer } from '../../hooks/use-viewer';
+import { FloatingPanel } from './FloatingPanel';
 
 /** Shared Warning Amber (DESIGN.md §2) — the one colour a rejection may take. */
 const AMBER = '#ffa726';
 
 export function useProblems(): ProblemEntry[] {
   return useSyncExternalStore(subscribeProblems, getProblems, getProblems);
+}
+
+// ── Open state ──────────────────────────────────────────────────────────────
+// Shared by the panel and its ActivityBar entry, which owns the toggle: the
+// panel's own collapse chevron floated over the viewport and could end up under
+// the floating tool strip (2026-10-12). Open by default, and re-opened whenever
+// the list goes from empty to non-empty — a new batch of problems is news; a
+// user's "close" holds only while the batch they closed is still there.
+
+let _open = true;
+let _hadProblems = getProblems().length > 0;
+const _openListeners = new Set<() => void>();
+
+function setProblemsPanelOpenInternal(open: boolean): void {
+  if (_open === open) return;
+  _open = open;
+  for (const l of _openListeners) l();
+}
+
+subscribeProblems(() => {
+  const has = getProblems().length > 0;
+  if (has && !_hadProblems) setProblemsPanelOpenInternal(true);
+  _hadProblems = has;
+});
+
+export function setProblemsPanelOpen(open: boolean): void { setProblemsPanelOpenInternal(open); }
+export function toggleProblemsPanel(): void { setProblemsPanelOpenInternal(!_open); }
+function subscribeProblemsPanelOpen(l: () => void): () => void {
+  _openListeners.add(l);
+  return () => { _openListeners.delete(l); };
+}
+const getProblemsPanelOpen = () => _open;
+export function useProblemsPanelOpen(): boolean {
+  return useSyncExternalStore(subscribeProblemsPanelOpen, getProblemsPanelOpen, getProblemsPanelOpen);
 }
 
 function SeverityIcon({ severity }: { severity: ProblemSeverity }) {
@@ -52,6 +89,36 @@ function SeverityIcon({ severity }: { severity: ProblemSeverity }) {
 /** Word form of the severity — the label half of "icon + label, never colour alone". */
 function severityWord(severity: ProblemSeverity): string {
   return severity === 'error' ? 'Error' : severity === 'warning' ? 'Warning' : 'Info';
+}
+
+/**
+ * The repair offer of a problem, when it carries one (plan-589 §2.7).
+ *
+ * It dispatches the command and nothing else: whatever the fix is lives in the command, so this
+ * button, the ConnectPanel's own button and the MCP tool are three views of one rule and cannot
+ * drift apart. A failure is swallowed here — the command itself reports it (toast / Problems), and
+ * a throwing click handler would take the panel down with it.
+ */
+function ProblemAction({ action }: { action: NonNullable<ProblemEntry['action']> }) {
+  // Optional on purpose: the panel floats over the viewport but is also rendered in tests and in
+  // shells without a provider, and an absent viewer lets the registry fall back to the attached one.
+  const viewer = useOptionalViewer();
+  const run = useCallback(() => {
+    void commandRegistry
+      .execute(action.commandId, action.args, { origin: 'ui', ...(viewer ? { viewer } : {}) })
+      .catch(() => { /* reported by the command */ });
+  }, [action.commandId, action.args, viewer]);
+  return (
+    <Button
+      size="small"
+      data-testid="problem-action"
+      data-problem-command={action.commandId}
+      onClick={run}
+      sx={{ mt: 0.25, fontSize: 11, textTransform: 'none', minWidth: 0, py: 0, px: 0.75 }}
+    >
+      {action.label}
+    </Button>
+  );
 }
 
 function ProblemRow({ entry }: { entry: ProblemEntry }) {
@@ -78,7 +145,8 @@ function ProblemRow({ entry }: { entry: ProblemEntry }) {
             fontFamily: 'monospace',
             color: 'rgba(255,255,255,0.7)',
             lineHeight: 1.35,
-            wordBreak: 'break-all',
+            // Break at the ", " between names, mid-name only when one is wider than the window.
+            overflowWrap: 'anywhere',
           }}
         >
           {entry.detail}
@@ -90,6 +158,7 @@ function ProblemRow({ entry }: { entry: ProblemEntry }) {
             {entry.nodePath}
           </Typography>
         )}
+        {entry.action && <ProblemAction action={entry.action} />}
       </Box>
     </Box>
   );
@@ -97,53 +166,29 @@ function ProblemRow({ entry }: { entry: ProblemEntry }) {
 
 export function ProblemsPanel() {
   const problems = useProblems();
-  const [collapsed, setCollapsed] = useState(false);
-  const toggle = useCallback(() => setCollapsed(c => !c), []);
+  const open = useProblemsPanelOpen();
+  const close = useCallback(() => setProblemsPanelOpen(false), []);
 
-  if (problems.length === 0) return null;
-
+  // The standard window (drag via title bar, resize via corner, Escape closes,
+  // geometry remembered under `rv-panel-geo:problems`). Opened from the
+  // ActivityBar it anchors next to the icon; on its own it starts bottom-left,
+  // right of the bar.
   return (
-    <Box
-      data-testid="problems-panel"
+    <FloatingPanel
+      open={open && problems.length > 0}
+      onClose={close}
+      title={`Problems (${problems.length})`}
+      titleColor={AMBER}
+      panelId="problems"
       role="region"
       aria-label="Problems"
-      sx={{
-        position: 'absolute',
-        left: 8,
-        bottom: 8,
-        zIndex: 6,
-        maxWidth: 420,
-        maxHeight: '40%',
-        overflowY: 'auto',
-        // Glass Floating — brightest tier, blur instead of shadow (DESIGN.md §2).
-        bgcolor: 'rgba(30,30,30,0.6)',
-        // `uiBlur`, never a literal: the `Fast` visual preset scales every
-        // backdrop blur through one CSS variable, and an inline radius is the
-        // one surface that would keep blurring on a machine that asked not to.
-        backdropFilter: uiBlur(16),
-        border: '1px solid rgba(255,255,255,0.08)',
-        borderRadius: '4px',
-        px: 1.25,
-        py: 0.75,
-        pointerEvents: 'auto',
-      }}
+      defaultWidth={440}
+      defaultHeight={320}
+      minWidth={320}
     >
-      <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-        <IconButton
-          size="small"
-          aria-label={collapsed ? 'Expand problems' : 'Collapse problems'}
-          onClick={toggle}
-          sx={{ p: 0, color: 'rgba(255,255,255,0.7)' }}
-        >
-          {collapsed ? <ChevronRight sx={{ fontSize: 14 }} /> : <ExpandMore sx={{ fontSize: 14 }} />}
-        </IconButton>
-        <Typography
-          sx={{ fontSize: 11, fontWeight: 500, letterSpacing: 0.4, color: 'rgba(255,255,255,0.7)' }}
-        >
-          {`PROBLEMS (${problems.length})`}
-        </Typography>
+      <Box data-testid="problems-panel" sx={{ flex: 1, minHeight: 0, overflowY: 'auto', px: 1.25, py: 0.75 }}>
+        {problems.map(entry => <ProblemRow key={entry.id} entry={entry} />)}
       </Box>
-      {!collapsed && problems.map(entry => <ProblemRow key={entry.id} entry={entry} />)}
-    </Box>
+    </FloatingPanel>
   );
 }

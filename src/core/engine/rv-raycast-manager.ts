@@ -4,14 +4,17 @@
 /**
  * RaycastManager — Unified raycast system for the realvirtual Web Viewer.
  *
- * Uses grouped BVH raycast geometries:
- *   - ONE merged BVH for all static meshes
- *   - ONE merged BVH per kinematic Drive group
- *   - InstancedMesh targets for MU pools
+ * Pick geometry:
+ *   - the baked pick backend (rv-pick-backend.ts) — realvirtual's own CPU pick
+ *     structure per chunk (the loaded model and every planner placement),
+ *     resolved to the owner node of the hit SEGMENT (plan-756),
+ *   - the instance pick index backend — real meshes with per-mesh BVHs
+ *     (authoring loads, and every load that did not bake),
+ *   - InstancedMesh targets for MU pools and aux targets (gizmos, hulls).
  *
- * Hit resolution uses face-range binary search (O(log n)) instead of
- * ancestor chain walk-up. Only objects with a content-providing ancestor
- * (userData.realvirtual) are included.
+ * Only objects with a content-providing ancestor (userData.realvirtual) or a
+ * segment owner resolve; everything else lets the ray pass — except OPAQUE baked
+ * geometry that owns nothing, which occludes ({@link RAYCAST_BLOCKED}).
  *
  * This class does NOT touch rv-sensor.ts — that remains a separate
  * O(1) physics raycast system.
@@ -28,15 +31,12 @@ import {
 import type { Camera, Intersection, PerspectiveCamera, Scene } from 'three';
 import type { NodeRegistry } from './rv-node-registry';
 import type { RVHighlightManager } from './rv-highlight-manager';
+import { rankHitsByWireProximity } from './rv-wire-pick';
 import type { MUInstancePool, InstancedMovingUnit } from './rv-mu';
 import type { PickMetrics } from './rv-pick-metrics';
-import {
-  resolveHit,
-  type RaycastGeometrySet,
-  type RaycastGroup,
-} from './rv-raycast-geometry';
-import { getCapabilities, getTypesWithCapability } from './rv-component-registry';
+import { getCapabilities, getPickableTypes } from './rv-component-registry';
 import { pointerToNDC } from './rv-pointer-utils';
+import { RV_CHAIN_PROXY } from './rv-traverse-utils';
 
 /** Ascending-distance comparator (matches three's internal raycast sort). */
 function _byDistance(a: Intersection<Object3D>, b: Intersection<Object3D>): number {
@@ -78,6 +78,14 @@ export interface ObjectClickData {
   pointer: { x: number; y: number };
 }
 
+/** Options of {@link RaycastManager.addAuxRaycastTarget}. */
+export interface AuxRaycastTargetOptions {
+  /** The target is drawn over the scene (overlay layer, no depth test — a
+   *  WebLabel billboard): its hit wins over any geometry in front of it, and it
+   *  is never a surface for {@link RaycastManager.raycastSurface}. */
+  onTop?: boolean;
+}
+
 /** Minimal event emitter interface to avoid circular dependency with RVViewer. */
 interface ViewerEmitter {
   emit(event: string, data?: unknown): void;
@@ -96,24 +104,34 @@ export type AncestorOverrideFn = (node: Object3D) => Object3D | null;
 const THROTTLE_MS = 50;
 
 /**
+ * How often a backend wants the POINTER HOVER ray (plan-756 F7 / Q10).
+ *
+ * - `'throttled'` (the default, and what every backend got before plan-756):
+ *   at most one hover ray every {@link THROTTLE_MS}. That interval WAS the whole
+ *   CPU budget of hovering when a ray could brute-force a multi-million-triangle
+ *   chunk.
+ * - `'frame'`: at most one hover ray per animation frame, and only when the
+ *   pointer actually moved since the last ray. The baked {@link PickBackend}
+ *   declares it — its p95 is ~0.03 ms, so the 50 ms staircase is pure latency.
+ *
+ * The cadence applies to POINTER HOVER only. A click, an AR tap, an XR ray and
+ * every explicit `raycast*` call intersect every backend immediately — they are
+ * user-initiated single events with no cadence to speak of.
+ */
+export type HoverCadence = 'frame' | 'throttled';
+
+/**
  * True when `node` and every ancestor have `.visible === true`.
  *
  * Runtime-hidden subtrees (WebVisibility PLC signal, Groups panel) keep their
- * triangles in the merged pick BVH — this gate makes them un-hoverable and
- * un-clickable at hit-resolution time. Applied to the RESOLVED node (content
- * ancestor), never to the pick mesh itself (the merged BVH meshes are always
- * `visible = false`). O(tree depth) property reads per hit, allocation-free.
- *
- * Known limitations of the MERGED-GROUP path (documented, not built —
- * escalate only if they matter; the editor instance pick backend has NEITHER:
+ * triangles inside the chunk they were merged into — this gate makes them
+ * un-hoverable and un-clickable at hit-resolution time. (The baked pick backend
+ * additionally skips their segments during the traversal, plan-756 F2, so the
+ * gate is the backstop rather than the only line of defence.) Applied to the
+ * RESOLVED node (content ancestor), never to the pick mesh itself. O(tree depth)
+ * property reads per hit, allocation-free. The editor instance pick backend needs it less:
  * per-mesh hits fall through past hidden meshes, and its broad-phase
- * visibility walk excludes hidden source meshes themselves):
- * - Within ONE merged group, `firstHitOnly` returns only the closest triangle;
- *   if that triangle belongs to a hidden node, geometry behind it in the SAME
- *   group is not reported (small dead-zone). Escalation: bounded re-cast
- *   continuation past `hit.point + ε`.
- * - A hidden plain-group child under a visible content ancestor still picks
- *   via the ancestor (face ranges don't carry the source-mesh identity).
+ * visibility walk excludes hidden source meshes themselves.
  */
 function isEffectivelyVisible(node: Object3D): boolean {
   for (let c: Object3D | null = node; c; c = c.parent) {
@@ -126,28 +144,107 @@ function isEffectivelyVisible(node: Object3D): boolean {
 
 /** Check if a type is a known hoverable type (from capabilities registry). */
 export function isKnownHoverableType(type: string): boolean {
-  return getCapabilities(type).hoverable;
+  return getCapabilities(type).pick !== 'none';
 }
 
 /**
- * Pluggable pick-geometry backend (editor instance pick index). When
- * installed, it is intersected ALONGSIDE the classic target list (merged
- * groups are absent in editor mode, so in practice it replaces them) and its
- * meshes resolve via `resolvePath` instead of the face-range tables. The
- * entire gate pipeline (ancestor overrides → metadata promotion → visibility
- * → isolation → allow → hover-type) applies unchanged to backend hits.
+ * A backend's `resolveHit` may answer with this instead of a node (plan-756 Q5):
+ * the hit is REAL, OCCLUDING geometry that resolves to nothing pickable — an
+ * opaque baked chunk face whose segment has no pick owner. It is NOT the same
+ * answer as `null`: `null` means "not mine / nothing pickable here, try the next
+ * hit", BLOCKED means "something solid is in the way, stop looking". The hit
+ * loop therefore ends on it with no selection instead of lighting up a part
+ * hidden inside a housing. A transparent chunk never answers BLOCKED, so a
+ * guard behind safety glass stays selectable.
+ */
+export const RAYCAST_BLOCKED = 'rv-blocked' as const;
+
+/** What a node-resolving backend may answer for one hit. */
+export type BackendHitResolution = Object3D | null | typeof RAYCAST_BLOCKED;
+
+/**
+ * Pluggable pick-geometry backend (chunk pick backend, instance pick index).
+ * When installed, it is intersected ALONGSIDE the target list (MU pools, aux
+ * targets) and its meshes resolve via `resolveHit` / `resolvePath`. The
+ * entire gate pipeline (ancestor overrides → visibility → isolation → allow
+ * → hover-type) applies unchanged to backend hits.
  */
 export interface RaycastBackend {
   /** Append intersections for the current ray. The CALLER sorts by distance. */
   raycast(raycaster: Raycaster, out: Intersection<Object3D>[]): void;
   /** Resolve a hit mesh to its content path; null = not a backend entry. */
   resolvePath(mesh: Object3D): string | null;
+  /**
+   * Resolve a hit to a NODE reference (plan-753 A1/F3) — consulted BEFORE
+   * `resolvePath`, with the whole intersection (so the backend can read its own
+   * per-hit data off it). Null = not a backend entry, {@link RAYCAST_BLOCKED} =
+   * occluding but unpickable. A node returned here is taken as the innermost
+   * pick target: the shared gate tail applies (ancestor overrides → visibility
+   * → isolation → allow → hover type) but NOT the RuntimeMetadata promotion — a
+   * metadata node with `pick:'select'` owns its segments, its CAD children
+   * resolve to it by construction.
+   */
+  resolveHit?(hit: PickHit): BackendHitResolution;
+  /**
+   * Hover cadence of THIS backend (plan-756 F7). Absent = `'throttled'`, the
+   * historical 50 ms. Cadences are per backend, never global: with a `'frame'`
+   * backend installed the manager samples per animation frame, and a
+   * `'throttled'` backend is simply skipped in the samples that fall inside its
+   * own 50 ms window.
+   */
+  readonly hoverCadence?: HoverCadence;
+}
+
+/**
+ * Result record of {@link RaycastManager.raycastSurface} (plan-515 §2.3).
+ * Caller-owned and reused — the manager only writes into it.
+ */
+export interface SurfaceHit {
+  /** World hit point. */
+  point: Vector3;
+  /** Ray distance to the hit (from the ray origin; for ortho that is the near plane). */
+  distance: number;
+  /** True when the surface is opaque geometry without a pick owner (RAYCAST_BLOCKED). */
+  blocked: boolean;
+  /** Resolved node path, or null for a blocked surface. */
+  path: string | null;
+  /**
+   * Optional, caller-owned: when present, `raycastSurface` writes the pick ray
+   * into it — for a hit AND for background — so navigation moves along exactly
+   * the ray it picked with (no second, slightly different cursor ray).
+   */
+  ray?: { origin: Vector3; direction: Vector3 };
+}
+
+/** The part of an intersection hit resolution reads (a full `Intersection` satisfies it). */
+export interface PickHit {
+  object: Object3D;
+  faceIndex?: number | null;
+  instanceId?: number;
 }
 
 export class RaycastManager {
   private readonly raycaster = new Raycaster();
   private readonly pointer = new Vector2();
   private lastRaycastMs = 0;
+
+  // ─── Hover cadence (plan-756 F7) ──────────────────────────────────
+  /** Client position of the pointermove that has not been answered by a ray yet. */
+  private _pendingPointerX = 0;
+  private _pendingPointerY = 0;
+  /** Did the pointer move since the last hover ray? No movement ⇒ no ray. */
+  private _pointerMovedSinceRay = false;
+  /** Handle of the scheduled frame-paced sample; null = nothing scheduled. */
+  private _hoverFrameHandle: number | null = null;
+  /** True only while a POINTER HOVER sample runs (the per-backend cadence gate). */
+  private _hoverSampling = false;
+  /** Set while a hover sample runs when a throttled backend was skipped for its
+   *  cadence — the sample's empty result is then inconclusive (see _doRaycast). */
+  private _hoverSkippedBackend = false;
+  /** `performance.now()` of the running sample — read once, shared by the gate. */
+  private _sampleNowMs = 0;
+  /** Per backend: when it last contributed to a hover sample. */
+  private readonly _backendLastHoverMs = new WeakMap<RaycastBackend, number>();
 
   /** Currently hovered realvirtual node (not the mesh, but its registered ancestor). */
   private _hoveredNode: Object3D | null = null;
@@ -173,8 +270,6 @@ export class RaycastManager {
   /** Last XR controller ray direction (for ray visualization). */
   lastRayDirection: Vector3 | null = null;
 
-  /** Grouped BVH raycast geometry set (set after scene load). */
-  private _raycastGeo: RaycastGeometrySet | null = null;
   /** InstancedMesh targets for MU pools. */
   private _instancedMeshes: InstancedMesh[] = [];
   /** Exclude filters applied to intersections. */
@@ -192,15 +287,11 @@ export class RaycastManager {
    * Stacked with `_allowFilter` (gate AND filter must pass).
    */
   private _isolationGate: ((node: Object3D) => boolean) | null = null;
-  /** Cached raycast target list (rebuilt when geometry or instanced meshes change). */
+  /** Cached raycast target list (rebuilt when the instanced meshes change):
+   *  InstancedMesh MU pools first, then the aux gizmo targets, which are only
+   *  ever appended/removed in the tail. The model's own pick geometry lives in
+   *  the backends (chunk pick backend / instance pick index), not here. */
   private _targets: Object3D[] = [];
-  /** Category boundaries inside `_targets` for timed picking:
-   *  [0, _staticTargetCount) = static merged BVH,
-   *  [_staticTargetCount, _staticTargetCount + _kinematicTargetCount) = per-drive BVHs,
-   *  rest = InstancedMesh MU pools + aux gizmo targets. Aux targets are only
-   *  ever appended/removed in the tail, so the boundaries stay valid. */
-  private _staticTargetCount = 0;
-  private _kinematicTargetCount = 0;
   /** Optional pick-path timing sink (DevTools "Picking & Highlight"). */
   private _metrics: PickMetrics | null = null;
   /** Per-category timings of the last _timedIntersect call (ms). */
@@ -209,13 +300,19 @@ export class RaycastManager {
    *  When a ray hits one of these, it is resolved to the owner via _auxOwners. */
   private _auxTargets: Object3D[] = [];
   private _auxOwners = new WeakMap<Object3D, Object3D>();
-  /** Map from raycast BVH mesh → RaycastGroup (for face-range lookup). */
-  private _meshToGroup = new Map<Object3D, RaycastGroup>();
-  /** Pluggable pick backend (editor instance pick index); null = merged groups only. */
+  /** Aux targets registered `onTop` (see {@link AuxRaycastTargetOptions}). */
+  private _auxOnTop = new Set<Object3D>();
+  private get _auxOnTopCount(): number { return this._auxOnTop.size; }
+  /** Pluggable pick backend (instance pick index); null = chunk backend + targets only. */
   private _backend: RaycastBackend | null = null;
+  /** Additional backends (plan-753 Phase 3: the chunk pick backend). They
+   *  coexist with the primary one: each answers only for ITS meshes and
+   *  passes everything else through. */
+  private _extraBackends: RaycastBackend[] = [];
 
   private readonly onPointerMove: (e: PointerEvent) => void;
   private readonly onPointerLeave: () => void;
+  private readonly onPointerDownCapture: (e: PointerEvent) => void;
 
   // Pre-allocated vectors for XR
   private readonly _xrOrigin = new Vector3();
@@ -251,6 +348,17 @@ export class RaycastManager {
     this.onPointerLeave = () => this._clearHover();
     renderer.domElement.addEventListener('pointerleave', this.onPointerLeave);
 
+    // A tap can arrive BEFORE the frame that would have answered the last
+    // pointermove (plan-756 F7), and the click path reads `hoveredNode`. Flush the
+    // pending sample first — in the CAPTURE phase, so it runs before the viewer's
+    // own pointerdown handlers whatever the construction order. Nothing pending
+    // means hover is already current and no ray is spent.
+    this.onPointerDownCapture = (e: PointerEvent) => {
+      if (!this._enabled || !this._pointerMovedSinceRay) return;
+      this._sampleHover(e.clientX, e.clientY);
+    };
+    renderer.domElement.addEventListener('pointerdown', this.onPointerDownCapture, { capture: true });
+
     // Default exclude filters
     this._excludeFilters.push(
       (obj) => !!obj.userData?._highlightOverlay,
@@ -263,6 +371,12 @@ export class RaycastManager {
       (obj) => !!obj.userData?._isSourceGhost,
       (obj) => !!obj.userData?._isGhostOverlay,
       (obj) => !!obj.userData?._isSourceMarker,
+      // The AI agent's camera-body gizmo (plan-740 D-A4/I1). Layer bits do not
+      // filter here (see the enableAll() above), so the cone would otherwise be
+      // hoverable and clickable — and clicking it would select "the agent"
+      // instead of the machine behind it. Its own double-click attach runs on a
+      // separate screen-space hit test, not through this pipeline.
+      (obj) => !!obj.userData?._agentEyeOverlay,
     );
 
     // Default: only drives are hoverable
@@ -295,30 +409,32 @@ export class RaycastManager {
   set holdHover(hold: boolean) { this._holdHover = hold; }
   get holdHover(): boolean { return this._holdHover; }
 
+  /**
+   * plan-529 SOL R2-4: a cursor that takes priority when this manager would
+   * RESET the cursor on un-hover — the viewer returns `'pointer'` while a linked
+   * WebLabel is under the mouse, `null` otherwise (then the reset is `''`).
+   */
+  cursorOverride: (() => string | null) | null = null;
+
   /** Install the pick-path timing sink (null to disable). */
   setMetrics(metrics: PickMetrics | null): void {
     this._metrics = metrics;
   }
 
   /**
-   * Provide the grouped BVH raycast geometry and instanced MU meshes.
-   * Called once after scene load.
+   * Install the instanced MU meshes. Called once after scene load — the
+   * model's own pick geometry is a backend (chunk pick backend for a baked
+   * load, instance pick index otherwise), never a target here.
    */
-  setRaycastGeometry(geo: RaycastGeometrySet, instancedMeshes: InstancedMesh[]): void {
-    this._raycastGeo = geo;
+  setInstancedMeshes(instancedMeshes: InstancedMesh[]): void {
     this._instancedMeshes = [...instancedMeshes];
     this._rebuildTargetList();
   }
 
-  /** The current grouped raycast geometry (null before the first scene load). */
-  get raycastGeometry(): RaycastGeometrySet | null {
-    return this._raycastGeo;
-  }
-
   /**
-   * Install (or clear) the pluggable pick backend. Editor mode installs the
-   * instance pick index here INSTEAD of merged groups; MU pools, aux targets
-   * and every gate keep working unchanged.
+   * Install (or clear) the primary pick backend (the instance pick index of
+   * a non-baked load); MU pools, aux targets and every gate keep working
+   * unchanged.
    */
   setBackend(backend: RaycastBackend | null): void {
     this._backend = backend;
@@ -327,6 +443,22 @@ export class RaycastManager {
   /** The installed pick backend (null outside editor mode). */
   get backend(): RaycastBackend | null {
     return this._backend;
+  }
+
+  /** Install an ADDITIONAL backend next to the primary one (idempotent). */
+  addBackend(backend: RaycastBackend): void {
+    if (!this._extraBackends.includes(backend)) this._extraBackends.push(backend);
+  }
+
+  /** Remove an additional backend. Safe on an unknown one. */
+  removeBackend(backend: RaycastBackend): void {
+    const i = this._extraBackends.indexOf(backend);
+    if (i >= 0) this._extraBackends.splice(i, 1);
+  }
+
+  /** Any backend installed (primary or additional)? */
+  private _hasBackend(): boolean {
+    return this._backend !== null || this._extraBackends.length > 0;
   }
 
   /**
@@ -370,12 +502,14 @@ export class RaycastManager {
    *
    * Idempotent: calling twice with the same mesh just refreshes the owner.
    */
-  addAuxRaycastTarget(mesh: Object3D, owner: Object3D): void {
+  addAuxRaycastTarget(mesh: Object3D, owner: Object3D, opts?: AuxRaycastTargetOptions): void {
     if (!this._auxOwners.has(mesh)) {
       this._auxTargets.push(mesh);
       this._targets.push(mesh);
     }
     this._auxOwners.set(mesh, owner);
+    if (opts?.onTop) this._auxOnTop.add(mesh);
+    else this._auxOnTop.delete(mesh);
   }
 
   /** Remove an auxiliary raycast target. Safe to call with an unregistered mesh. */
@@ -385,6 +519,29 @@ export class RaycastManager {
     const j = this._targets.indexOf(mesh);
     if (j >= 0) this._targets.splice(j, 1);
     this._auxOwners.delete(mesh);
+    this._auxOnTop.delete(mesh);
+  }
+
+  /**
+   * Distance order, with the on-top aux targets (drawn over everything —
+   * WebLabel billboards) moved to the front: what is painted on top is what
+   * the pointer is on, however far behind the scene geometry its sprite sits.
+   * Stable within each group; allocation-free when nothing is on top.
+   */
+  private _orderHits(hits: Intersection<Object3D>[]): Intersection<Object3D>[] {
+    hits.sort(_byDistance);
+    if (this._auxOnTopCount === 0) return hits;
+    let write = 0;
+    for (let i = 0; i < hits.length; i++) {
+      if (!this._auxOnTop.has(hits[i].object)) continue;
+      if (i !== write) {
+        const h = hits[i];
+        for (let k = i; k > write; k--) hits[k] = hits[k - 1];
+        hits[write] = h;
+      }
+      write++;
+    }
+    return hits;
   }
 
   /**
@@ -465,14 +622,37 @@ export class RaycastManager {
     path: string;
     hitPoint: [number, number, number];
     hitNormal: [number, number, number];
+    /** Set when the hit is a pooled (InstancedMesh) MU — it has no node of its own (plan-567). */
+    instancedMU?: InstancedMovingUnit;
   } | null {
     // Empty targets is NOT "nothing pickable" when a backend is installed
-    // (editor mode: no merged groups, no MU pools).
-    if (!this.registry || (this._targets.length === 0 && !this._backend)) return null;
+    // (a model without MU pools has only backend geometry).
+    if (!this.registry || (this._targets.length === 0 && !this._hasBackend())) return null;
     pointerToNDC(e.clientX, e.clientY, this.renderer.domElement, this.pointer);
 
     this.raycaster.setFromCamera(this.pointer, this.getCamera());
-    return this._resolveFirstEnabledHit(this._timedIntersect());
+    return this._resolveFirstEnabledHit(this._rankForWirePick(this._timedIntersect()));
+  }
+
+  /**
+   * Wireframe view (asset editor): rank the hits of one ray by how close the
+   * cursor is to a wire line instead of by depth, so a part seen through a
+   * cover can be hovered and clicked. Applies to the screen pick and to hover —
+   * the two paths a user points with; surface probes and arbitrary-ray picks
+   * keep their depth order. See rv-wire-pick.ts.
+   */
+  setWirePickMode(on: boolean): void {
+    this._wirePick = on;
+  }
+
+  private _wirePick = false;
+
+  private _rankForWirePick(hits: Intersection<Object3D>[]): Intersection<Object3D>[] {
+    if (this._wirePick) {
+      const el = this.renderer.domElement;
+      rankHitsByWireProximity(hits, this.raycaster.ray, this.getCamera(), el.clientWidth, el.clientHeight);
+    }
+    return hits;
   }
 
   /**
@@ -492,7 +672,7 @@ export class RaycastManager {
     hitPoint: [number, number, number];
     hitNormal: [number, number, number];
   } | null {
-    if (!this.registry || (this._targets.length === 0 && !this._backend)) return null;
+    if (!this.registry || (this._targets.length === 0 && !this._hasBackend())) return null;
     const dir = direction.clone();
     if (dir.lengthSq() === 0) return null;
     dir.normalize();
@@ -510,6 +690,102 @@ export class RaycastManager {
   }
 
   /**
+   * NAVIGATION pick (plan-515 §2.3, R2-5): the first surface under the cursor
+   * that navigation may anchor on.
+   *
+   * Same hit collection and the same resolution chain as
+   * {@link raycastForRVNodeDetailed} (exclude filters → `_resolveHit` with its
+   * visibility / isolation / allow gates) — but WITHOUT the hover-type gate
+   * (`_isTypeEnabled`): a visible, non-isolated part is a surface whether or not
+   * its type is currently hover-enabled. `RAYCAST_BLOCKED` (opaque geometry
+   * without a pick owner) answers `true` with `blocked = true` and the
+   * blocker's point/distance; transparent unowned segments and hidden nodes pass
+   * (they resolve to null / are skipped by the backend). `false` = background.
+   *
+   * Writes into the caller-owned `out` (no result allocation of its own; the
+   * shared pipeline underneath still allocates — see plan-515 R2-7). Changes
+   * no hover state.
+   */
+  raycastSurface(clientX: number, clientY: number, out: SurfaceHit): boolean {
+    pointerToNDC(clientX, clientY, this.renderer.domElement, this.pointer);
+    this.raycaster.setFromCamera(this.pointer, this.getCamera());
+    return this._surfaceFromCurrentRay(out);
+  }
+
+  /**
+   * {@link raycastSurface} along an arbitrary world-space ray (origin +
+   * direction, no pointer) — e.g. a WebLabel casting straight down to find the
+   * object it pins to. Same gates, same answer shape.
+   */
+  raycastSurfaceAlong(origin: Vector3, direction: Vector3, out: SurfaceHit): boolean {
+    this.raycaster.set(origin, direction);
+    // Sprites (label billboards) raycast against `raycaster.camera`.
+    this.raycaster.camera = this.getCamera();
+    return this._surfaceFromCurrentRay(out);
+  }
+
+  /**
+   * The FIRST hit along a world-space ray that belongs to `node` (self or a
+   * descendant), looking PAST everything else — other nodes, owner-less
+   * blocking chunk geometry, overlays. `out` receives the hit point and
+   * distance. The WebLabel pin uses it to cast straight down onto the object
+   * it names whatever is in between.
+   */
+  raycastNodeAlong(origin: Vector3, direction: Vector3, node: Object3D, out: { point: Vector3; distance: number }): boolean {
+    if (!this.registry || (this._targets.length === 0 && !this._hasBackend())) return false;
+    this.raycaster.set(origin, direction);
+    this.raycaster.camera = this.getCamera();
+    const hits = this._timedIntersect();
+    for (let i = 0; i < hits.length; i++) {
+      const hit = hits[i];
+      if (this._isExcluded(hit.object) || this._auxOnTop.has(hit.object)) continue;
+      const resolved = this._resolveHit(hit);
+      if (!resolved || resolved === RAYCAST_BLOCKED) continue;
+      let o: Object3D | null = resolved.node;
+      for (; o; o = o.parent) if (o === node) break;
+      if (!o) continue;
+      out.point.copy(hit.point);
+      out.distance = hit.distance;
+      return true;
+    }
+    return false;
+  }
+
+  private _surfaceFromCurrentRay(out: SurfaceHit): boolean {
+    if (out.ray) {
+      out.ray.origin.copy(this.raycaster.ray.origin);
+      out.ray.direction.copy(this.raycaster.ray.direction);
+    }
+    if (!this.registry || (this._targets.length === 0 && !this._hasBackend())) return false;
+    const hits = this._timedIntersect();
+    const resolveStart = this._metrics ? performance.now() : 0;
+    for (let i = 0; i < hits.length; i++) {
+      const hit = hits[i];
+      if (this._isExcluded(hit.object)) continue;
+      // An on-top overlay (WebLabel billboard) is not a surface to orbit about.
+      if (this._auxOnTop.has(hit.object)) continue;
+      const resolved = this._resolveHit(hit);
+      if (resolved === RAYCAST_BLOCKED) {
+        out.point.copy(hit.point);
+        out.distance = hit.distance;
+        out.blocked = true;
+        out.path = null;
+        if (this._metrics) this._reportPick(performance.now() - resolveStart, true);
+        return true;
+      }
+      if (!resolved) continue;
+      out.point.copy(hit.point);
+      out.distance = hit.distance;
+      out.blocked = false;
+      out.path = resolved.nodePath;
+      if (this._metrics) this._reportPick(performance.now() - resolveStart, true);
+      return true;
+    }
+    if (this._metrics) this._reportPick(performance.now() - resolveStart, false);
+    return false;
+  }
+
+  /**
    * Shared hit-selection tail: first non-excluded, resolvable, type-enabled hit.
    * Extracted (plan-705) so the screen pick and the ray pick cannot grow two
    * different copies of the gate order.
@@ -518,6 +794,7 @@ export class RaycastManager {
     path: string;
     hitPoint: [number, number, number];
     hitNormal: [number, number, number];
+    instancedMU?: InstancedMovingUnit;
   } | null {
     const resolveStart = this._metrics ? performance.now() : 0;
 
@@ -525,6 +802,8 @@ export class RaycastManager {
       if (this._isExcluded(hit.object)) continue;
 
       const resolved = this._resolveHit(hit);
+      // Opaque geometry without a pick owner ends the search (plan-756 Q5).
+      if (resolved === RAYCAST_BLOCKED) break;
       if (!resolved) continue; // Unresolved mesh — skip, don't block hits behind it
 
       if (this._isTypeEnabled(resolved.nodeType)) {
@@ -534,6 +813,7 @@ export class RaycastManager {
           path: resolved.nodePath,
           hitPoint: [hit.point.x, hit.point.y, hit.point.z],
           hitNormal: normal ? [normal.x, normal.y, normal.z] : [0, 1, 0],
+          ...(resolved.instancedMU ? { instancedMU: resolved.instancedMU } : {}),
         };
       }
     }
@@ -548,7 +828,7 @@ export class RaycastManager {
   arTapRaycast(clientX: number, clientY: number, xrCamera?: PerspectiveCamera): {
     node: Object3D; nodeType: string; nodePath: string;
   } | null {
-    if (this._targets.length === 0 && !this._backend) return null;
+    if (this._targets.length === 0 && !this._hasBackend()) return null;
     const cam = xrCamera ?? this.getCamera();
     // Map taps against the canvas rect (not the window) so picking stays correct
     // when the canvas is confined to a sub-region of the viewport.
@@ -577,6 +857,7 @@ export class RaycastManager {
         if (this._isExcluded(hit.object)) continue;
 
         const resolved = this._resolveHit(hit);
+        if (resolved === RAYCAST_BLOCKED) break;
         if (resolved && hit.distance < bestDist) {
           bestDist = hit.distance;
           bestNode = resolved.node;
@@ -594,35 +875,22 @@ export class RaycastManager {
   }
 
   dispose(): void {
+    if (this._hoverFrameHandle !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this._hoverFrameHandle);
+    }
+    this._hoverFrameHandle = null;
+    this._pointerMovedSinceRay = false;
     this.renderer.domElement.removeEventListener('pointermove', this.onPointerMove);
     this.renderer.domElement.removeEventListener('pointerleave', this.onPointerLeave);
+    this.renderer.domElement.removeEventListener('pointerdown', this.onPointerDownCapture, { capture: true } as EventListenerOptions);
     this._clearHover();
   }
 
   // ─── Private ──────────────────────────────────────────────────────
 
-  /** Rebuild the cached target list and mesh→group map from current geometry set. */
+  /** Rebuild the cached target list from the instanced meshes + aux targets. */
   private _rebuildTargetList(): void {
     this._targets = [];
-    this._meshToGroup.clear();
-    this._staticTargetCount = 0;
-    this._kinematicTargetCount = 0;
-
-    if (this._raycastGeo) {
-      if (this._raycastGeo.staticGroup) {
-        this._targets.push(this._raycastGeo.staticGroup.mesh);
-        this._meshToGroup.set(
-          this._raycastGeo.staticGroup.mesh,
-          this._raycastGeo.staticGroup,
-        );
-        this._staticTargetCount = 1;
-      }
-      for (const group of this._raycastGeo.kinematicGroups.values()) {
-        this._targets.push(group.mesh);
-        this._meshToGroup.set(group.mesh, group);
-        this._kinematicTargetCount++;
-      }
-    }
 
     for (const im of this._instancedMeshes) {
       this._targets.push(im);
@@ -644,26 +912,107 @@ export class RaycastManager {
       return;
     }
 
+    // plan-756 F7: with a `'frame'`-cadence backend installed, the ray is paced
+    // by the animation frame instead of a 50 ms clock. It is still the POINTER
+    // that triggers it — a camera move with a stationary pointer produces no
+    // pointermove, hence no ray, exactly as before this change.
+    if (this._framePacedHover()) {
+      this._pendingPointerX = e.clientX;
+      this._pendingPointerY = e.clientY;
+      this._pointerMovedSinceRay = true;
+      this._scheduleHoverFrame();
+      return;
+    }
+
     const now = performance.now();
     if (now - this.lastRaycastMs < THROTTLE_MS) return;
-    this.lastRaycastMs = now;
+    this._sampleHover(e.clientX, e.clientY);
+  }
 
-    pointerToNDC(e.clientX, e.clientY, this.renderer.domElement, this.pointer);
+  /** Is any installed backend asking for frame-paced hover (plan-756 F7)? */
+  private _framePacedHover(): boolean {
+    if (this._backend?.hoverCadence === 'frame') return true;
+    for (let i = 0; i < this._extraBackends.length; i++) {
+      if (this._extraBackends[i].hoverCadence === 'frame') return true;
+    }
+    return false;
+  }
 
+  /**
+   * Queue ONE hover sample for the next animation frame — at most one ray per
+   * frame, no matter how many pointermove events arrive in between, and none at
+   * all when the pointer did not move.
+   *
+   * It is deliberately `requestAnimationFrame` and NOT the viewer's render loop:
+   * a hover ray must never make the page render (render-on-demand, §1.4). Only a
+   * CHANGED hover result marks the scene dirty, through the highlight manager,
+   * exactly as on the throttled path. Without `requestAnimationFrame` (SSR, a
+   * bare unit-test environment) the throttle answers instead, so hover never
+   * stops working.
+   */
+  private _scheduleHoverFrame(): void {
+    if (this._hoverFrameHandle !== null) return;
+    if (typeof requestAnimationFrame !== 'function') {
+      if (performance.now() - this.lastRaycastMs < THROTTLE_MS) return;
+      this._sampleHover(this._pendingPointerX, this._pendingPointerY);
+      return;
+    }
+    this._hoverFrameHandle = requestAnimationFrame(() => {
+      this._hoverFrameHandle = null;
+      if (!this._pointerMovedSinceRay || !this._enabled) return;
+      this._sampleHover(this._pendingPointerX, this._pendingPointerY);
+    });
+  }
+
+  /** One pointer-hover ray from a client position (the only hover ray path). */
+  private _sampleHover(clientX: number, clientY: number): void {
+    this._pointerMovedSinceRay = false;
+    this._sampleNowMs = performance.now();
+    this.lastRaycastMs = this._sampleNowMs;
+    pointerToNDC(clientX, clientY, this.renderer.domElement, this.pointer);
     this.raycaster.setFromCamera(this.pointer, this.getCamera());
-    this._doRaycast();
+    this._hoverSampling = true;
+    this._hoverSkippedBackend = false;
+    try {
+      this._doRaycast();
+    } finally {
+      this._hoverSampling = false;
+      this._hoverSkippedBackend = false;
+    }
+  }
+
+  /**
+   * May `backend` answer the ray that is running right now?
+   *
+   * Only a POINTER HOVER sample can say no, and only to a `'throttled'` backend
+   * inside its own 50 ms window — which is how the old editor backend keeps its
+   * cadence while the baked one runs per frame (plan-756 F7, "per backend, not
+   * global"). Outside hover (click, AR tap, XR, explicit `raycast*`) every
+   * backend always answers.
+   */
+  private _hoverAllows(backend: RaycastBackend): boolean {
+    if (!this._hoverSampling) return true;
+    if ((backend.hoverCadence ?? 'throttled') === 'frame') return true;
+    const last = this._backendLastHoverMs.get(backend);
+    if (last !== undefined && this._sampleNowMs - last < THROTTLE_MS) {
+      this._hoverSkippedBackend = true;
+      return false;
+    }
+    this._backendLastHoverMs.set(backend, this._sampleNowMs);
+    return true;
   }
 
   /**
    * Resolve a raycast intersection to a realvirtual node.
-   * Handles both BVH group hits (face-range lookup) and InstancedMesh MU hits.
+   * Handles backend hits (chunk windows, instance pick index), aux targets
+   * and InstancedMesh MU hits.
    */
-  private _resolveHit(hit: { object: Object3D; faceIndex?: number | null; instanceId?: number }): {
+  private _resolveHit(hit: PickHit): {
     node: Object3D;
     nodeType: string;
     nodePath: string;
     instancedMU?: InstancedMovingUnit;
-  } | null {
+  } | null | typeof RAYCAST_BLOCKED {
     // Check for InstancedMesh MU pool hit
     const pool = hit.object.userData?._muPool as MUInstancePool | undefined;
     if (pool && hit.instanceId !== undefined && hit.instanceId >= 0) {
@@ -683,6 +1032,15 @@ export class RaycastManager {
     // Auxiliary target hit: resolve to registered owner node (gizmo overlays etc.)
     const auxOwner = this._auxOwners.get(hit.object);
     if (auxOwner) {
+      // A gizmo that is not drawn must not catch the pointer. three.js raycasts
+      // a target mesh regardless of a hidden ANCESTOR (the gizmo manager hides
+      // an entry by its root group, e.g. an inactive WebError flash hull), so
+      // gate on the gizmo's own effective visibility, not only the owner's —
+      // otherwise an invisible hull over a whole station steals every pick of
+      // the parts below it (editor per-part picking, plan-756 occlusion). The
+      // one deliberate exception is the EnergyChain envelope proxy, which is
+      // a pick-only mesh and invisible BY DESIGN (`_rvEnergyChainProxy`).
+      if (!hit.object.userData?.[RV_CHAIN_PROXY] && !isEffectivelyVisible(hit.object)) return null;
       const ownerPath = this.registry.getPathForNode(auxOwner);
       if (!ownerPath) return null;
       if (!isEffectivelyVisible(auxOwner)) return null;
@@ -701,24 +1059,36 @@ export class RaycastManager {
     // below applies unchanged, but the node type must come from the node
     // itself — a parent walk would relabel a plain sub-mesh as e.g. 'Drive'
     // and wrongly subject it to that type's hover gate.
+    // Node-resolving backends first (chunk pick backend, plan-753 F3): the
+    // innermost face window IS the target — no metadata promotion.
+    for (let i = 0; i < this._extraBackends.length; i++) {
+      const b = this._extraBackends[i];
+      if (!b.resolveHit) continue;
+      const node = b.resolveHit(hit);
+      // Occluding but unpickable (plan-756 Q5) — no fall-through.
+      if (node === RAYCAST_BLOCKED) return RAYCAST_BLOCKED;
+      if (node) return this._resolveFromNode(node);
+    }
+    if (this._backend?.resolveHit) {
+      const node = this._backend.resolveHit(hit);
+      if (node === RAYCAST_BLOCKED) return RAYCAST_BLOCKED;
+      if (node) return this._resolveFromNode(node);
+    }
     const backendPath = this._backend?.resolvePath(hit.object);
     if (backendPath) return this._resolveFromPath(backendPath, true);
-
-    // Look up the BVH group for this mesh
-    const group = this._meshToGroup.get(hit.object);
-    if (!group || hit.faceIndex == null) return null;
-
-    // Binary search face ranges
-    const objectPath = resolveHit(group.faceRanges, hit.faceIndex);
-    if (!objectPath) return null;
-
-    return this._resolveFromPath(objectPath);
+    for (let i = 0; i < this._extraBackends.length; i++) {
+      const p = this._extraBackends[i].resolvePath(hit.object);
+      if (p) return this._resolveFromPath(p, true);
+    }
+    // Not a backend mesh, not an aux target, not an MU pool: nothing answers.
+    return null;
   }
 
   /**
-   * Shared resolution tail for every path-resolved hit (merged-group face
-   * ranges AND the pick backend): registry lookup → ancestor overrides →
-   * metadata promotion → visibility gate → isolation gate → allow filter.
+   * Shared resolution tail for every path-resolved hit (the pick backends):
+   * registry lookup → ancestor overrides →
+   * visibility gate → isolation gate → allow filter. The node stays EXACT:
+   * no component or metadata promotion (editor contract, see below).
    */
   private _resolveFromPath(objectPath: string, ownNodeTypeOnly = false): {
     node: Object3D;
@@ -745,18 +1115,13 @@ export class RaycastManager {
       }
     }
 
-    // Promote to the NEAREST RuntimeMetadata node, including the hit object
-    // itself (an object with its own metadata counts — no walk past it). Stop at
-    // the first node up the chain that carries metadata and highlight EVERYTHING
-    // under it. No-op when there is no metadata in the chain, so non-metadata
-    // objects (drives, sensors, …) are unaffected.
-    let resolvedNode = node;
-    let resolvedPath = objectPath;
-    const meta = this._nearestMetadataAncestor(node);
-    if (meta) {
-      const metaPath = this.registry.getPathForNode(meta);
-      if (metaPath) { resolvedNode = meta; resolvedPath = metaPath; }
-    }
+    // No component promotion: the path-resolving backend (the editor's
+    // instance pick index) answers with the EXACT node, and the owning
+    // component is surfaced separately (findPickOwner). Grouping a part under
+    // its RuntimeMetadata / Drive / … owner is the bake's job (segment owner =
+    // nearest pickable ancestor), never this tail's.
+    const resolvedNode = node;
+    const resolvedPath = objectPath;
 
     // Runtime-hidden subtrees (WebVisibility signal, Groups panel) must not
     // be hoverable/clickable — returning null lets the hit loop fall through
@@ -772,18 +1137,42 @@ export class RaycastManager {
   }
 
   /**
-   * Walk up from `node` and return the FIRST node that carries RuntimeMetadata
-   * (`userData._rvMetadata`, stamped by the RVMetadata component) — including
-   * `node` itself (an object with its own metadata stops the walk immediately).
-   * Returns null when no node in the chain has metadata.
+   * Gate tail for a NODE-resolved backend hit (plan-753 F3): ancestor
+   * overrides → visibility → isolation → allow. No metadata promotion — the
+   * chunk table already answers with the innermost pick node (Decision 7). An
+   * unregistered node (a logic node `processExtras` did not register) falls
+   * back to its nearest registered ancestor so the click can still select.
    */
-  private _nearestMetadataAncestor(node: Object3D): Object3D | null {
-    let cur: Object3D | null = node;
-    while (cur) {
-      if (cur.userData?._rvMetadata) return cur;
-      cur = cur.parent;
+  private _resolveFromNode(node: Object3D): {
+    node: Object3D;
+    nodeType: string;
+    nodePath: string;
+  } | null {
+    let resolved: Object3D | null = node;
+    let path = this.registry.getPathForNode(node);
+    while (!path && resolved) {
+      resolved = resolved.parent;
+      if (resolved) path = this.registry.getPathForNode(resolved);
     }
-    return null;
+    if (!path || !resolved) return null;
+
+    for (const override of this._ancestorOverrides) {
+      const overrideNode = override(resolved);
+      if (overrideNode) {
+        const overridePath = this.registry.getPathForNode(overrideNode);
+        if (overridePath) {
+          if (!isEffectivelyVisible(overrideNode)) return null;
+          if (this._isolationGate && !this._isolationGate(overrideNode)) return null;
+          if (this._allowFilter && !this._allowFilter(overrideNode)) return null;
+          return { node: overrideNode, nodeType: this._resolveNodeType(overrideNode), nodePath: overridePath };
+        }
+      }
+    }
+
+    if (!isEffectivelyVisible(resolved)) return null;
+    if (this._isolationGate && !this._isolationGate(resolved)) return null;
+    if (this._allowFilter && !this._allowFilter(resolved)) return null;
+    return { node: resolved, nodeType: this._resolveNodeType(resolved), nodePath: path };
   }
 
   /**
@@ -801,7 +1190,7 @@ export class RaycastManager {
     if (path) {
       const types = this.registry.getComponentTypes(path);
       for (const t of types) {
-        if (getCapabilities(t).hoverable) return t;
+        if (getCapabilities(t).pick !== 'none') return t;
       }
       if (types.length > 0) return types[0];
     }
@@ -817,7 +1206,7 @@ export class RaycastManager {
 
     // Walk up parent chain to find a hoverable type — derived from the
     // capabilities registry (no hardcoded type list, no per-type special-case).
-    for (const type of getTypesWithCapability('hoverable')) {
+    for (const type of getPickableTypes()) {
       if (this.registry.findInParent(node, type)) return type;
     }
 
@@ -846,23 +1235,27 @@ export class RaycastManager {
    * only needed when the backend contributed hits.
    */
   private _collectHits(): Intersection<Object3D>[] {
-    if (!this._backend) {
-      return this.raycaster.intersectObjects(this._targets, false);
+    if (!this._hasBackend()) {
+      return this._orderHits(this.raycaster.intersectObjects(this._targets, false));
     }
     const hits: Intersection<Object3D>[] = [];
-    this._backend.raycast(this.raycaster, hits);
+    if (this._backend && this._hoverAllows(this._backend)) this._backend.raycast(this.raycaster, hits);
+    for (let i = 0; i < this._extraBackends.length; i++) {
+      const b = this._extraBackends[i];
+      if (this._hoverAllows(b)) b.raycast(this.raycaster, hits);
+    }
     for (let i = 0; i < this._targets.length; i++) {
       this.raycaster.intersectObject(this._targets[i], false, hits);
     }
-    hits.sort(_byDistance);
-    return hits;
+    return this._orderHits(hits);
   }
 
   /**
-   * `_collectHits` with per-category timing (backend/static BVH / per-drive
-   * BVHs / other). Backend time lands in the `static` slot (in editor mode
-   * the backend IS the whole scene geometry). Timings land in
-   * `_lastIntersectTimings`; the caller reports them via
+   * `_collectHits` with per-category timing (primary backend / additional
+   * backends / other). The primary backend's time lands in the `static` slot
+   * (in editor mode the instance pick index IS the whole scene geometry), the
+   * chunk pick backend's in `kinematic`, MU pools + aux targets in `other`.
+   * Timings land in `_lastIntersectTimings`; the caller reports them via
    * `_metrics.recordRaycast(...)` once the hit outcome is known.
    */
   private _timedIntersect(): Intersection<Object3D>[] {
@@ -870,17 +1263,16 @@ export class RaycastManager {
       return this._collectHits();
     }
     const hits: Intersection<Object3D>[] = [];
-    const staticEnd = this._staticTargetCount;
-    const kinematicEnd = staticEnd + this._kinematicTargetCount;
-    let i = 0;
     const t0 = performance.now();
-    this._backend?.raycast(this.raycaster, hits);
-    for (; i < staticEnd; i++) this.raycaster.intersectObject(this._targets[i], false, hits);
+    if (this._backend && this._hoverAllows(this._backend)) this._backend.raycast(this.raycaster, hits);
     const t1 = performance.now();
-    for (; i < kinematicEnd; i++) this.raycaster.intersectObject(this._targets[i], false, hits);
+    for (let b = 0; b < this._extraBackends.length; b++) {
+      const backend = this._extraBackends[b];
+      if (this._hoverAllows(backend)) backend.raycast(this.raycaster, hits);
+    }
     const t2 = performance.now();
-    for (; i < this._targets.length; i++) this.raycaster.intersectObject(this._targets[i], false, hits);
-    if (this._backend) hits.sort(_byDistance);
+    for (let i = 0; i < this._targets.length; i++) this.raycaster.intersectObject(this._targets[i], false, hits);
+    this._orderHits(hits);
     const t3 = performance.now();
     const t = this._lastIntersectTimings;
     t.static = t1 - t0;
@@ -900,12 +1292,12 @@ export class RaycastManager {
 
   /** Core raycast logic shared between pointer and XR. */
   private _doRaycast(): void {
-    if (this._targets.length === 0 && !this._backend) {
+    if (this._targets.length === 0 && !this._hasBackend()) {
       this._clearHover();
       return;
     }
 
-    const hits = this._timedIntersect();
+    const hits = this._rankForWirePick(this._timedIntersect());
     const resolveStart = this._metrics ? performance.now() : 0;
 
     let hitNode: Object3D | null = null;
@@ -918,6 +1310,8 @@ export class RaycastManager {
       if (this._isExcluded(hit.object)) continue;
 
       const resolved = this._resolveHit(hit);
+      // Opaque geometry without a pick owner ends the search (plan-756 Q5).
+      if (resolved === RAYCAST_BLOCKED) break;
       if (!resolved) continue; // Unresolved mesh — skip, don't block hits behind it
 
       // Enforce exclusive hover mode: skip nodes whose type is not enabled
@@ -934,6 +1328,14 @@ export class RaycastManager {
     if (this._metrics) this._reportPick(performance.now() - resolveStart, hitNode !== null);
 
     if (!hitNode) {
+      // A hover sample that SKIPPED a throttled backend (inside its 50 ms window,
+      // plan-756 F7) has not looked at that backend's geometry — an empty result
+      // is inconclusive, not "nothing under the pointer". Clearing here made the
+      // editor hover flicker at 50 ms once the frame-paced baked backend paced
+      // the ray per frame (2026-09-22: `_hlOverlay` / `_hlEdge` torn down and
+      // rebuilt every frame while the pointer sat on one part). Keep the state
+      // until a sample that asked every backend answers.
+      if (this._hoverSkippedBackend) return;
       this._clearHover();
       return;
     }
@@ -996,7 +1398,7 @@ export class RaycastManager {
       this._hoveredNodePath = null;
       this._hoveredHitPoint = null;
       this._hoveredInstancedMU = null;
-      this.renderer.domElement.style.cursor = '';
+      this.renderer.domElement.style.cursor = this.cursorOverride?.() ?? '';
 
       this.emitter.emit('object-unhover', { node: prevNode, nodeType: prevType });
     }

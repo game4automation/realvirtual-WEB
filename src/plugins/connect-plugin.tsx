@@ -23,6 +23,7 @@ import {
   subscribeConnectStore,
   getConnectSnapshot,
   connectToServer,
+  fetchStatus,
   canSilentlyProbeGateway,
   hasStoredServerUrl,
   hasAutoConnectOptOut,
@@ -32,11 +33,32 @@ import {
   isSourceConnectedLive,
   installConnectActiveDocumentNotifier,
   uninstallConnectActiveDocumentNotifier,
+  isModelManagedInterfaceType,
+  reconcileInterfaces,
+  clearReconcileReports,
   type ConnectInterface,
   type ConnectSnapshot,
 } from '../core/hmi/connect-store';
+import { collectModelPlcSignals } from '../core/import/rv-plc-automap';
+import { creatablePlcOnly } from '../core/import/rv-signal-reconcile';
+import {
+  clearSignalReconcileProblems,
+  reportSignalReconcileProblems,
+} from '../core/hmi/problems-store';
+import { createTrailingEdgeDebounce } from './diagnose/debounce';
 import { isConnectDataStale } from '../core/hmi/connect-staleness';
+import { ensureConnectCommandsRegistered } from '../core/hmi/connect-commands';
+import {
+  ConnectWriteGateNotice,
+  CONNECT_WRITE_GATE_NOTICE_ID,
+} from '../core/hmi/ConnectWriteGateNotice';
+import {
+  ConnectNoDataNotice,
+  CONNECT_NO_DATA_NOTICE_ID,
+} from '../core/hmi/ConnectNoDataNotice';
+import { connectNoDataWatch } from '../core/hmi/connect-no-data-watch';
 import { ISA_AMBER } from '../core/hmi/isa-colors';
+import { connectStreamBlock } from '../core/hmi/connect-stream';
 import { signalProviderKey, type SignalSourceRef } from '../core/engine/rv-signal-provider';
 import { Tooltip, IconButton, Box } from '@mui/material';
 
@@ -164,6 +186,99 @@ const BOOT_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000] as co
  */
 const WAKE_MIN_SPACING_MS = 1_000;
 
+// ── The ONE /status poll (plan-562 F5) ───────────────────────────────
+
+/** Poll cadence of `GET /status` — the rate the panel used before plan-562. */
+export const CONNECT_STATUS_POLL_MS = 2_000;
+
+/**
+ * Deadline for one `/status` request. A gateway that needs longer than this is
+ * not answering, and holding the request open would starve the write-gate and
+ * no-data notices of fresh counters for as long as the socket hangs.
+ */
+export const CONNECT_STATUS_TIMEOUT_MS = 5_000;
+
+/**
+ * The single owner of the `/status` poll.
+ *
+ * Before plan-562 the ConnectPanel owned it and gated it on "panel open", which
+ * was right while the status only drove dots inside that panel. It no longer is:
+ * the write-gate overlay and the no-data notice are the whole point of the poll
+ * and they live OVER the 3D view, where the panel is closed. So the poll moved
+ * here — one owner, running whenever the gateway is connected, panel or no panel —
+ * and the panel became a reader of the same store.
+ *
+ * Exported so the poll can be driven in a test without booting the plugin's
+ * auto-reconnect machinery.
+ */
+export class ConnectStatusPoll {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private unsubscribe: (() => void) | null = null;
+  /** Gateway the running timer belongs to; '' while stopped. */
+  private polledUrl = '';
+  private disposed = false;
+
+  /** Observe the store and poll for as long as it reports a connected gateway. */
+  start(): void {
+    if (this.unsubscribe || this.disposed) return;
+    this.unsubscribe = subscribeConnectStore(() => this.sync());
+    this.sync();
+  }
+
+  /** Start, stop or re-target the timer to match the current store state. */
+  private sync(): void {
+    if (this.disposed) return;
+    const snap = getConnectSnapshot();
+    const wanted = snap.state === 'connected' ? snap.serverUrl : '';
+    if (wanted === this.polledUrl) return;
+    this.stopTimer();
+    this.polledUrl = wanted;
+    if (!wanted) return;
+    // First tick immediately: the notices must not wait 2 s for the first
+    // counters, and the connect itself is the moment they matter most.
+    this.tick();
+    this.timer = setInterval(() => this.tick(), CONNECT_STATUS_POLL_MS);
+  }
+
+  /**
+   * One request per tick, with its own deadline. Ticks are deliberately NOT
+   * serialised on the previous one: a hanging request must not swallow the next
+   * tick, and connect-store discards any answer whose gateway generation moved on.
+   */
+  private tick(): void {
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), CONNECT_STATUS_TIMEOUT_MS);
+    void fetchStatus({ signal: controller.signal }).finally(() => clearTimeout(deadline));
+  }
+
+  private stopTimer(): void {
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.stopTimer();
+    this.polledUrl = '';
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+  }
+}
+
+// ── Reconcile trigger (plan-589 F6, §2.6) ────────────────────────────
+
+/**
+ * Quiet window before a reconcile run.
+ *
+ * Every trigger is a burst by nature: a model load registers thousands of signals, a placement
+ * adds a subtree, a CONNECT PUT is followed by the next `/status` poll. 250 ms (plan-589 §5.2) is
+ * the "has come to rest" distance — long enough that one user action produces ONE run, short
+ * enough that the badge feels immediate.
+ */
+export const RECONCILE_DEBOUNCE_MS = 250;
+
 // ── Plugin Class ─────────────────────────────────────────────────────
 
 export class ConnectPlugin implements RVViewerPlugin {
@@ -181,6 +296,19 @@ export class ConnectPlugin implements RVViewerPlugin {
     {
       slot: 'activity-bar', component: ConnectToolbarButton, order: 60,
       visibilityRule: { hiddenIn: [modeContext('viewer')] },
+    },
+    // plan-562: both notices sit OVER the 3D view, because that is where the
+    // operator is when a PLC silently drops his inputs or sends nothing back.
+    // They carry a visibility id (and no rule) so a deploy can switch them off
+    // without a code change, and they render nothing at all until the gateway
+    // actually reports a blocked write / a silent worker.
+    {
+      slot: 'overlay', component: ConnectWriteGateNotice, order: 90,
+      visibilityId: CONNECT_WRITE_GATE_NOTICE_ID,
+    },
+    {
+      slot: 'overlay', component: ConnectNoDataNotice, order: 91,
+      visibilityId: CONNECT_NO_DATA_NOTICE_ID,
     },
   ];
 
@@ -214,8 +342,52 @@ export class ConnectPlugin implements RVViewerPlugin {
   /** `Date.now()` of the last started probe — wake-trigger spacing only. */
   private lastAttemptAt = Number.NEGATIVE_INFINITY;
   private disposed = false;
+  /** plan-562: the one `/status` poll, owned here and nowhere else. */
+  private statusPoll: ConnectStatusPoll | null = null;
   private lastSeenServerUrl = '';
   private lastSeenState: ConnectSnapshot['state'] = 'disconnected';
+
+  // ── Reconcile (plan-589 F6) ──
+  /**
+   * Interface ids whose report the pending run must recompute; empty together with
+   * {@link reconcileEverything} `false` means nothing is pending. Only the AFFECTED interfaces are
+   * recomputed (§2.6): a signal added to one interface must not re-walk the other four.
+   */
+  private readonly pendingReconcile = new Set<string>();
+  /** The pending run covers every interface (model load, placement, catalog change). */
+  private reconcileEverything = false;
+  /** The `interfaces` array the last reconcile ran against — per-id identity tells us what moved. */
+  private lastReconciledInterfaces: ConnectInterface[] | null = null;
+  private readonly reconcileDebounce = createTrailingEdgeDebounce<void>(
+    RECONCILE_DEBOUNCE_MS, () => this.runReconcile(),
+  );
+  /** Unsubscribers of the model-side triggers (placement event, signal catalog). */
+  private reconcileUnsubs: (() => void)[] = [];
+
+  /**
+   * The target the live value stream ACTUALLY reached (plan-498 transport
+   * detection) — `null` unless the stream is connected. The FMU provisioning
+   * plugin compares its origin with the gateway URL: this stream, not the
+   * InterfaceManager, is what the CONNECT panel connects.
+   */
+  get streamEndpoint(): URL | null {
+    return this.wsStream?.connectedEndpoint ?? null;
+  }
+
+  /** Connection state of the live value stream (`disconnected` without a model). */
+  get streamConnectionState(): string {
+    return this.wsStream?.connectionState ?? 'disconnected';
+  }
+
+  /**
+   * Re-read the gateway's signal list on the open stream (plan-498): an
+   * interface CONNECT created AFTER the stream opened (an FMU instance) adds
+   * signals the stream neither receives nor sends until it has discovered
+   * them. No-op while the stream is not connected.
+   */
+  async rediscoverStream(): Promise<void> {
+    if (this.wsStream?.isConnected) await this.wsStream.rediscover();
+  }
 
   /** Start model-independent CONNECT discovery and state observation. */
   init(): void {
@@ -226,6 +398,12 @@ export class ConnectPlugin implements RVViewerPlugin {
     this.lastSeenServerUrl = snap.serverUrl;
     this.lastSeenState = snap.state;
     this.unsubscribe = subscribeConnectStore(() => this.onConnectStoreChanged());
+    // plan-562: one owner for the status poll and one registration for the
+    // write-gate / read-only / log commands the notices and the panel dispatch.
+    ensureConnectCommandsRegistered();
+    this.statusPoll?.dispose();
+    this.statusPoll = new ConnectStatusPoll();
+    this.statusPoll.start();
     // plan-725 §2.7 — the HMI half of the project store's dependency inversion.
     // This plugin already knows both the gateway and the project, so it is where
     // the two are introduced; the project store itself stays free of CONNECT.
@@ -409,6 +587,82 @@ export class ConnectPlugin implements RVViewerPlugin {
     }
     this.maybeStartRetries();
     this.syncStream();
+    this.noteInterfacesChanged(snap);
+  }
+
+  // ── Reconcile: triggers, debounce, run ──
+
+  /**
+   * Which interfaces changed since the last run, as a reconcile request.
+   *
+   * The store replaces an interface object only on a genuine change (that is what lets
+   * {@link syncStream} skip the metadata walk), so per-id identity is an exact "this one moved"
+   * test — including a changed signal list and a changed topic list. An interface that DISAPPEARED
+   * takes its Problems entries with it right away; its report is pruned by `reconcileInterfaces`.
+   */
+  private noteInterfacesChanged(snap: ConnectSnapshot): void {
+    if (snap.interfaces === this.lastReconciledInterfaces) return;
+    const previous = this.lastReconciledInterfaces;
+    this.lastReconciledInterfaces = snap.interfaces;
+    if (previous === null) {
+      // First look at this gateway's configuration — everything is "changed".
+      this.scheduleReconcile();
+      return;
+    }
+    const before = new Map(previous.map((i) => [i.id, i]));
+    for (const iface of snap.interfaces) {
+      if (before.get(iface.id) !== iface) this.pendingReconcile.add(iface.id);
+      before.delete(iface.id);
+    }
+    for (const goneId of before.keys()) clearSignalReconcileProblems(goneId);
+    // A deletion alone still needs a run: the report map must lose the interface.
+    if (this.pendingReconcile.size === 0 && before.size === 0) return;
+    this.reconcileDebounce.schedule(undefined);
+  }
+
+  /** Request a reconcile of EVERY interface after the quiet window. */
+  private scheduleReconcile(): void {
+    this.reconcileEverything = true;
+    this.reconcileDebounce.schedule(undefined);
+  }
+
+  /**
+   * Recompute the requested reports and restate the Problems entries.
+   *
+   * Read-only by construction: it collects the model's signals, asks `reconcileSignals` and writes
+   * nothing but the report map and the Problems list. Without a model there is nothing to compare,
+   * so the reports and their entries are dropped instead of being computed against an empty model —
+   * which would otherwise flood the panel with `plc-only` the moment a model is closed.
+   */
+  private runReconcile(): void {
+    const ids = this.reconcileEverything ? undefined : [...this.pendingReconcile];
+    this.reconcileEverything = false;
+    this.pendingReconcile.clear();
+    if (!this.viewer) {
+      clearReconcileReports();
+      clearSignalReconcileProblems();
+      return;
+    }
+    if (ids && ids.length === 0) return;
+    const model = collectModelPlcSignals(this.viewer);
+    const reports = reconcileInterfaces(model, ids);
+    for (const iface of getConnectSnapshot().interfaces) {
+      if (isModelManagedInterfaceType(iface.type)) continue;
+      const report = reports[iface.id];
+      if (!report) continue;
+      reportSignalReconcileProblems(report, creatablePlcOnly(report).map((e) => e.name));
+    }
+  }
+
+  /** Subscribe the model-side triggers; called once per attached model. */
+  private installReconcileTriggers(viewer: RVViewer): void {
+    // A placement adds signal-carrying content WITHOUT a model load, so the model-loaded hooks
+    // never see it (plan-589 §2.6) — this event is the only notice there is.
+    this.reconcileUnsubs.push(viewer.on('layout-content-added', () => this.scheduleReconcile()));
+    // Editor edits (add / delete / rename / Comment / OriginDataType) arrive here as ONE event
+    // per undo-able operation, wave-collapsed by the editor sync.
+    const offCatalog = viewer.signalStore?.onCatalogChanged(() => this.scheduleReconcile());
+    if (offCatalog) this.reconcileUnsubs.push(offCatalog);
   }
 
   /** Attach the current model to CONNECT's live signal stream. */
@@ -419,7 +673,8 @@ export class ConnectPlugin implements RVViewerPlugin {
     // names into it — a foreign file must not be able to trigger that just by
     // being linked. The REST connection state itself is model-independent and
     // stays exactly as the user left it.
-    if (!viewer.loadTrust.trusted) return;
+    // hasModel is true by construction here — onModelLoaded IS the model arriving.
+    if (connectStreamBlock(true, viewer.loadTrust.trusted) !== null) return;
     this.viewer = viewer;
     this.lastMirroredInterfaces = null;
     this.registeredProviders.clear();
@@ -434,6 +689,10 @@ export class ConnectPlugin implements RVViewerPlugin {
     viewer.signalStore?.setConnectionProvider((source) => isSourceConnectedLive(source));
 
     this.syncStream();
+    // plan-589 F6: the model is the other half of the report, so its arrival is a trigger —
+    // and its placements and editor edits are the triggers after that.
+    this.installReconcileTriggers(viewer);
+    this.scheduleReconcile();
   }
 
   /** Detach model-scoped streaming while preserving the REST connection state. */
@@ -541,6 +800,18 @@ export class ConnectPlugin implements RVViewerPlugin {
     this.streaming = false;
     this.lastMirroredInterfaces = null;
     this.viewer = null;
+    // The report is a statement about THIS model; without one it has no subject (and its
+    // `plc-only` entries would describe every configured signal as missing).
+    this.reconcileDebounce.cancel();
+    this.pendingReconcile.clear();
+    this.reconcileEverything = false;
+    this.lastReconciledInterfaces = null;
+    for (const off of this.reconcileUnsubs) {
+      try { off(); } catch { /* a dead subscription must not block teardown */ }
+    }
+    this.reconcileUnsubs = [];
+    clearReconcileReports();
+    clearSignalReconcileProblems();
   }
 
   dispose(): void {
@@ -552,6 +823,10 @@ export class ConnectPlugin implements RVViewerPlugin {
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.handleWake);
     }
+    this.statusPoll?.dispose();
+    this.statusPoll = null;
+    // The observation windows belong to a gateway session, not to the page.
+    connectNoDataWatch.reset();
     this.unsubscribe?.();
     this.unsubscribe = null;
     uninstallConnectActiveDocumentNotifier();

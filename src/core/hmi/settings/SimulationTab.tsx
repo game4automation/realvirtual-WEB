@@ -16,7 +16,7 @@
  * Rapier), regardless of authored per-surface PhysicsMode flags.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { Box, Chip, Switch, Typography } from '@mui/material';
 import { SettingsSection, FieldRow } from './settings-helpers';
 import {
@@ -24,13 +24,33 @@ import {
   usePhysicsFull, setPhysicsFull,
 } from '../visual-settings-store';
 import { getAppConfig } from '../rv-app-config';
-import { physicsDiagnostics } from '../../engine/rv-physics-registry';
+import {
+  isPhysicsEnabledByModel, physicsDiagnostics, subscribePhysicsState, type PhysicsDiagnostics,
+} from '../../engine/rv-physics-registry';
 
 /**
- * Read-only physics diagnostics line (plan-276 Phase 6): "N zones / M bodies /
- * X ms step". Rendered only while a physics world is actually built and
- * stepping (`physicsDiagnostics.active` — the private plugin mutates the
- * singleton in place per tick); polled at 2 Hz while the tab is open.
+ * The diagnostics line's text (plan-276 Phase 6): "N zones / M bodies / X ms step".
+ *
+ * The body count names its kinematic share — "17 bodies (4 kinematic)" —
+ * whenever moving machine parts are in the world (plan-467 F13). The
+ * parenthesis is dropped at zero rather than printed as "(0 kinematic)": on a
+ * scene without moving colliders that is noise, and its ABSENCE is the answer
+ * to "why does the gripper go through the part".
+ *
+ * Exported as a pure function so the wording can be asserted without mounting
+ * the tab.
+ */
+export function formatPhysicsDiagnostics(diag: PhysicsDiagnostics): string {
+  const zones = `${diag.zones} ${diag.zones === 1 ? 'zone' : 'zones'}`;
+  const kin = diag.kinematicBodies > 0 ? ` (${diag.kinematicBodies} kinematic)` : '';
+  const bodies = `${diag.bodies} ${diag.bodies === 1 ? 'body' : 'bodies'}${kin}`;
+  return `${zones} / ${bodies} / ${diag.stepMs.toFixed(1)} ms step`;
+}
+
+/**
+ * Read-only physics diagnostics line. Rendered only while a physics world is
+ * actually built and stepping (`physicsDiagnostics.active` — the private plugin
+ * mutates the singleton in place per tick); polled at 2 Hz while the tab is open.
  */
 function PhysicsDiagnosticsLine() {
   const [diag, setDiag] = useState(() => ({ ...physicsDiagnostics }));
@@ -41,7 +61,7 @@ function PhysicsDiagnosticsLine() {
   if (!diag.active) return null;
   return (
     <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', mt: 0.5, fontVariantNumeric: 'tabular-nums' }}>
-      {`${diag.zones} ${diag.zones === 1 ? 'zone' : 'zones'} / ${diag.bodies} ${diag.bodies === 1 ? 'body' : 'bodies'} / ${diag.stepMs.toFixed(1)} ms step`}
+      {formatPhysicsDiagnostics(diag)}
     </Typography>
   );
 }
@@ -74,6 +94,9 @@ export function SimulationTab() {
   // wins over the user toggle — surface that instead of a dead switch.
   const physicsAllowed = getAppConfig().simulation?.physicsEnabled !== false;
   const physicsActive = physicsOn && physicsAllowed;
+  // plan-525 F8: a loaded model with an authored physics zone switches physics
+  // on for itself even while the Browser preference is off.
+  const enabledByModel = useSyncExternalStore(subscribePhysicsState, isPhysicsEnabledByModel);
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -102,6 +125,11 @@ export function SimulationTab() {
             onChange={(_, v) => setPhysicsFull(v)}
           />
         </FieldRow>
+        {enabledByModel && (
+          <Typography data-testid="physics-enabled-by-model" sx={{ fontSize: 10, color: '#4fc3f7', mt: 0.5 }}>
+            Physics enabled by this model (it contains a physics zone)
+          </Typography>
+        )}
         <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.25)', mt: 0.75 }}>
           {physicsAllowed
             ? 'MUs that run off a conveyor end become free rigid bodies — falling, sliding and stacking. ' +

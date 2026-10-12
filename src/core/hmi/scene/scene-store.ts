@@ -59,11 +59,15 @@ import {
 // graph of anything that merely imports the SceneStore.
 type SceneGlbIo = typeof import('./rv-scene-glb-io');
 const sceneGlbIo = (): Promise<SceneGlbIo> => import('./rv-scene-glb-io');
+/** A resolved project asset, with the revision of the read (plan-546). */
+type ResolvedAssetSource = NonNullable<
+  Awaited<ReturnType<ReturnType<typeof getProjectStore>['resolveAssetSource']>>
+>;
 import {
   type SceneEditsSettings, type MaterialisedEdits,
-  COALESCE_WINDOW_MS, materialise,
+  COALESCE_WINDOW_MS, materialise, editsBeyondAuthoredTree,
 } from './rv-scene-edits';
-import { RvDocument, type RvDocumentCore } from '../../ops/rv-document';
+import { RvDocument, type RvDocumentCore, type RvHistoryInterceptor } from '../../ops/rv-document';
 import { RvUnifiedExecutor } from '../../ops/rv-unified-executors';
 import type { RvOp, RvScenePrimitiveOp } from '../../ops/rv-unified-ops';
 import { normalizePersistedSceneOps } from '../../ops/rv-unified-ops';
@@ -105,7 +109,16 @@ import { documentsOf } from '../../project/rv-project-documents';
 // `openDocument`. Storage-only module (localStorage + the shared key), so this
 // edge adds no graph the store did not already carry.
 import { rememberSession } from '../../project/rv-project-resume-store';
-import type { ProjectBackend } from '../../project/backends/project-backend';
+// plan-478 F1 — the recents RING is written by the same funnel, for the same
+// reason `rememberSession` is: `?doc=`, Save-as and MCP all open past the
+// dashboard. Storage-only module, same as the line above.
+import {
+  recordRecentForOpen,
+  retagRecentDocumentPath,
+} from '../../project/rv-project-recents-store';
+// plan-513 — the document's last-used mode, written by the same funnel for the
+// same reason. IndexedDB, best-effort, never awaited by an open.
+import { recordDocumentMode } from '../../project/rv-document-mode-store';
 import {
   isBytesSourceUrl,
   projectAssetRelPath,
@@ -127,7 +140,7 @@ import {
 import type { RvDocumentEntry } from '../../project/rv-project-types';
 import { isSupported as isFileSystemAccessSupported } from '../../engine/rv-local-filesystem';
 import { saveStartPos } from '../camera-startpos-store';
-import { deriveModelKey } from '../../../plugins/camera-startpos-plugin';
+import { deriveModelKey } from '../../engine/rv-model-key';
 
 // ─── Snapshot ───────────────────────────────────────────────────────────
 
@@ -196,6 +209,18 @@ export interface RvSceneProjectionHandover {
    * is a fact about storage, and storage keeps moving.
    */
   bytesCache(): RvDraftBytesCache | null;
+  /**
+   * How the store obtains the tree this projection is authoring, as bytes.
+   *
+   * A save can arrive WHILE the document is on loan — the editor's Save button,
+   * Ctrl+S and the MCP save tool all route a bound document to the scene writer.
+   * The store's own base bytes are then the wrong source: they predate every
+   * asset-lineage op of the session, and `materialise` has no vocabulary for
+   * those (see {@link release}). The borrowing side is the only layer that can
+   * export the tree, so it registers the exporter here and the store asks for it
+   * at save time. Null when the tree cannot be exported right now.
+   */
+  setAuthoredSource(source: (() => Promise<ArrayBuffer | null>) | null): void;
   /** Give the document back; `authoredBytes` becomes the scene's new bake source. */
   release(opts?: { authoredBytes?: ArrayBuffer }): void;
 }
@@ -255,15 +280,22 @@ function sanitizeModelFileName(name: string): string {
   return stem || 'Untitled';
 }
 
-/** Append `_1`, `_2`, … until the name is free in the project's `models/`. */
-async function uniqueModelFileName(backend: ProjectBackend, fileName: string): Promise<string> {
-  let taken: Set<string>;
-  try {
-    const models = await backend.listModels();
-    taken = new Set(models.map((m) => (m.path.split('/').pop() ?? '').toLowerCase()));
-  } catch {
-    return fileName; // Listing is a convenience; never block a bake on it.
-  }
+/**
+ * Append `_1`, `_2`, … until the name is free in the project's `models/`.
+ *
+ * Reads the project store's SNAPSHOT rather than asking the backend for a
+ * listing of its own (plan-744 §8): a bake would otherwise pay for a full
+ * directory walk to answer a filename question about a folder the store has
+ * already enumerated. A snapshot that is momentarily behind can only produce a
+ * `_1` suffix nobody needed, which is what the loop is for.
+ */
+function uniqueModelFileName(documents: readonly { path?: unknown }[], fileName: string): string {
+  const taken = new Set(
+    documents
+      .map(d => (typeof d.path === 'string' ? d.path : ''))
+      .filter(p => /^models\//i.test(p))
+      .map(p => (p.split('/').pop() ?? '').toLowerCase()),
+  );
   if (!taken.has(fileName.toLowerCase())) return fileName;
 
   const stem = fileName.replace(/\.glb$/i, '');
@@ -418,6 +450,14 @@ export class SceneStore {
   /** What {@link beginProjectionHandover} bound — checked on the way back. */
   private _handoverBase: AssetBase | null = null;
   /**
+   * The borrowing projection's tree, as bytes, on demand.
+   *
+   * Registered through the handover and valid for exactly as long as the
+   * suspension: it is what {@link _bakeAuthoredTree} saves from, because during
+   * a binding the authored tree — not this store's base bytes — is the document.
+   */
+  private _authoredSource: (() => Promise<ArrayBuffer | null>) | null = null;
+  /**
    * A change arrived while suspended and still owes a write.
    *
    * Keeps `hasUnpersistedWork()` truthful for the whole suspension (R2-Q1): the
@@ -480,6 +520,11 @@ export class SceneStore {
    * by construction: two slots, two baselines, one meaning.
    */
   private readonly _slotRevisions = new Map<string, string>();
+  /**
+   * The autosave write currently running, so a Restore can wait for it rather
+   * than swap a slot a write is about to move (plan-546 AC 14).
+   */
+  private _autosaveInFlight: Promise<void> | null = null;
 
   // Lazy-hydration pre-fetch (installed by ProjectStore; null when no project)
   private _hydrator: ((id: string) => Promise<boolean>) | null = null;
@@ -654,7 +699,18 @@ export class SceneStore {
    */
   async openDocument(
     documentId: string,
-    opts: { name?: string; updateUrl?: boolean } = {},
+    opts: {
+      name?: string;
+      updateUrl?: boolean;
+      /**
+       * plan-513 F5 — the caller has already decided the mode this open ends
+       * in and activates it itself, so the row's declared mode is NOT applied
+       * here. Opt-in: every caller that does not set it (`?doc=`, MCP, the
+       * CONNECT embed, the boot's other branches) keeps `_applyMode` exactly
+       * as before.
+       */
+      modeDecidedByCaller?: boolean;
+    } = {},
   ): Promise<void> {
     const row = await this._documentRowOrAdopt(documentId);
     if (!row) throw new Error(`Document ${documentId} not found`);
@@ -669,7 +725,9 @@ export class SceneStore {
     // property of the manifest ROW now, so it is applied here — the one place
     // every document is opened. Absent on all but the demo's example rows, and a
     // no-op when absent, so nothing else changes behaviour.
-    this._applyMode(typeof row.mode === 'string' ? row.mode : undefined);
+    if (!opts.modeDecidedByCaller) {
+      this._applyMode(typeof row.mode === 'string' ? row.mode : undefined);
+    }
     // AFTER the load, never inside it: `_loadIntoWorkspace`'s own
     // `setOpenDocumentBase` block is a pinned characterisation surface
     // (plan-716 §9.3) and Phase 4 owns the decision to rewrite it. This is the
@@ -703,7 +761,92 @@ export class SceneStore {
       row.id,
       this._viewer.modes?.activeMode ?? null,
     );
+    // The cross-project ring (plan-478 F1), beside the per-project slot and for
+    // the same reason. The two are NOT the same thing: the slot answers "where
+    // was I in THIS project" and is overwritten on every document change, the
+    // ring answers "what have I been working on lately" across all of them.
+    //
+    // Deliberately AFTER `_applyMode`: that call may have activated the row's
+    // declared mode, and the mode a recording carries must be the one the
+    // document is actually used in. It still sets no mode itself (plan-703
+    // decision 24) — it only reads the live one, or the intent of the open
+    // that is running (`withOpenIntentMode`).
+    this._recordRecentDocument(row.id, name, row.path);
     this._notify();
+  }
+
+  /**
+   * Put the document that is open RIGHT NOW at the head of the recents ring.
+   *
+   * One private helper for the three moments a document identity is taken on:
+   * an open ({@link openDocument}), a Save-as, and the first save of a draft
+   * that places a new document. The last two never pass the open funnel — no
+   * load happens, the workspace simply becomes a different document — and
+   * without them the ring would list the file the user saved AWAY from
+   * (plan-478 R3-6). An ordinary in-place save changes no identity and is
+   * deliberately not recorded.
+   *
+   * Never throws, never blocks: the store's own guards live inside
+   * `recordRecentForOpen` (kiosk lock, missing project, unwritable storage).
+   */
+  private _recordRecentDocument(
+    documentId: string,
+    documentName: string,
+    /**
+     * The project-relative path of that document (plan-482 F3). Passed IN from
+     * each of the three sites rather than looked up here: all three already
+     * hold it (`row.path`, `target.relPath`, `created.relPath` — the very
+     * strings they hand to `projectAssetUrl`/`writeDocument`), and a lookup
+     * fallback would be a silent second source that only ever fires when a
+     * future fourth site forgets the path. Better the type breaks there.
+     */
+    documentPath: string,
+  ): void {
+    const project = getProjectStore().getProject();
+    const backend = getProjectStore().getBackend()?.kind ?? null;
+    recordRecentForOpen({
+      projectId: project?.id,
+      // The verb that brings this project back — see `openProjectById`. A
+      // browser project cannot be reopened through the folder verb at all, so
+      // the backend travels IN the entry rather than being guessed at click
+      // time.
+      //
+      // Read off the LIVE backend, not off `getSnapshot()`: the snapshot is
+      // recomputed on the store's own `_notify`, and this runs inside an open
+      // that has not notified yet — a snapshot read here answers with the
+      // backend of the previous project, or with none at all on the first one.
+      backend,
+      documentId,
+      documentName,
+      documentPath,
+      projectName: project?.name ?? project?.id ?? '',
+      activeMode: this._viewer.modes?.activeMode ?? null,
+      lockedMode: this._viewer.modes?.lockedMode ?? null,
+    });
+    // The second sink (plan-513 F1/F3): the document's own last mode, with the
+    // ring's mode rule. Unlike the ring it has no size limit, and it is the ONE
+    // place a mode is read back from. A demo project records nothing and loses
+    // what it had; a kiosk records nothing. Fired, never awaited — the store
+    // decides synchronously and only writes asynchronously.
+    void recordDocumentMode({
+      projectId: project?.id,
+      backend,
+      documentId,
+      activeMode: this._viewer.modes?.activeMode ?? null,
+      lockedMode: this._viewer.modes?.lockedMode ?? null,
+      isDemo: project?.kind === 'demo',
+    });
+  }
+
+  /**
+   * The manifest row id of the open document, or null.
+   *
+   * Exposed for the recents mode tracking (plan-478 R3-5), which has to answer
+   * "which document is a `mode-changed` about" without a React snapshot — the
+   * event fires during boot, long before the HMI is mounted.
+   */
+  get openDocumentId(): string | null {
+    return this._workspace?.documentId ?? null;
   }
 
   /**
@@ -793,9 +936,12 @@ export class SceneStore {
    * project's cache rows (§2.3 step 0) and a profile whose migration has not run
    * yet — and it goes with the rest of the catalogue in Phase 6.
    */
-  async openScene(id: string): Promise<void> {
+  async openScene(id: string, opts: { modeDecidedByCaller?: boolean } = {}): Promise<void> {
+    // `modeDecidedByCaller` travels to both `openDocument` calls below
+    // (plan-513 F5): the dashboard's open chain decides the mode itself.
+    const docOpts = opts.modeDecidedByCaller ? { modeDecidedByCaller: true } : {};
     const row = await this._documentRowOrAdopt(id);
-    if (row) return this.openDocument(row.id);
+    if (row) return this.openDocument(row.id, docOpts);
     // ── The cross-project hop (plan-726 follow-up) ───────────────────────
     //
     // Since the deploy root carries a manifest, the boot's active project is
@@ -814,7 +960,7 @@ export class SceneStore {
         .readManifest().catch(() => null);
       if (workspace && documentsOf(workspace).some(d => d.id === docId)
           && await store.openWorkspaceProject()) {
-        return this.openDocument(docId);
+        return this.openDocument(docId, docOpts);
       }
     }
     // With lazy project hydration the body may not be cached yet. Without
@@ -1087,6 +1233,7 @@ export class SceneStore {
       name: this._workspace?.name ?? '',
       bakeBytes: () => this._bakeCurrent(),
       bytesCache: () => this._bytesCacheFor(),
+      setAuthoredSource: (source) => { this._authoredSource = source; },
       release: (opts) => this.endProjectionHandover(opts),
     };
   }
@@ -1110,6 +1257,9 @@ export class SceneStore {
     if (!this._projectionSuspended) return;
     const boundTo = this._handoverBase;
     this._handoverBase = null;
+    // The exporter belongs to the projection that is leaving, and so does the
+    // tree it would export.
+    this._authoredSource = null;
     // Adopt the authored tree ONLY when the workspace still is the document
     // the handover was taken from. The editor's return is asynchronous (an
     // export of the whole tree), and an open that lands in that window has
@@ -1376,11 +1526,19 @@ export class SceneStore {
     const store = getProjectStore();
     if (!store.getBackend()?.writable) return null;
     const { createDocument } = await import('../../project/rv-document-ops');
-    return createDocument(store, name, {
+    const created = await createDocument(store, name, {
       ...(bytes !== undefined ? { bytes } : {}),
       // `!== undefined`, not truthiness: '' is the project root, a real folder.
       ...(folder !== undefined ? { folder } : {}),
     });
+    // A document that was just CREATED cannot have unsaved edits. Its id is
+    // derived from the path (`stableDocumentId`), so a document deleted outside
+    // `delete()` — the dashboard tree, a file manager — leaves `draft/<id>`
+    // behind, and a new document of the same name would open resuming it.
+    await (await sceneGlbIo()).dropSceneGlbBody(`draft/${created.documentId}`).catch(() => {});
+    this._slotRevisions.delete(`draft/${created.documentId}`);
+    clearSceneDraft(created.documentId);
+    return created;
   }
 
   /**
@@ -1610,6 +1768,10 @@ export class SceneStore {
       this._busy = false;
       overlay?.hideInfoOverlay();
       this._notify();
+      // plan-546 — AFTER the load, whether it succeeded or not (AC 2, AC 10):
+      // a document with set-aside drafts reports the notice, any other open
+      // clears it. Never throws, so it cannot mask the load's own error.
+      await this._reportStaleDraftNotice(opts.document?.id, opts.transient === true);
     }
   }
 
@@ -1673,6 +1835,14 @@ export class SceneStore {
       : [slots.draft, ...(slots.saved ? [slots.saved] : [])];
     if (!transient && scene.base.kind === 'scene-glb') candidates.push(scene.base.sceneId);
 
+    // plan-546 — a DOCUMENT's draft is checked against the file before it may
+    // shadow it. Transient opens never run the check (AC 11): they own no slot.
+    const documentId = transient ? undefined : this._workspace?.documentId;
+    const documentPath = scene.base.kind === 'builtin' ? projectAssetRelPath(scene.base.url) : null;
+    // The file source the stale check already resolved, reused by the file
+    // path below instead of reading the file a second time.
+    let preResolved: ResolvedAssetSource | null = null;
+
     for (const slot of candidates) {
       let body: Awaited<ReturnType<SceneGlbIo['readSceneGlbBody']>>;
       try {
@@ -1681,6 +1851,14 @@ export class SceneStore {
         continue;
       }
       if (!body) continue;
+
+      if (documentId && documentPath !== null && slot === slots.draft) {
+        const verdict = await this._decideDocumentDraft(slot, body, documentId, documentPath);
+        if (verdict.kind === 'set-aside') {
+          preResolved = verdict.source;
+          break;
+        }
+      }
 
       this._setBaseBytes(`slot:${slot}:${body.revision}`, toArrayBuffer(body.glb));
       this._noteSlotRevision(slot, body.revision);
@@ -1699,7 +1877,7 @@ export class SceneStore {
     // No GLB body: the legacy path, unchanged. A `scene-glb` base with no
     // resolvable body is a scene whose bytes were evicted — reported rather
     // than silently shown as empty.
-    if (scene.base.kind === 'scene-glb') {
+    if (scene.base.kind === 'scene-glb' && !preResolved) {
       throw new Error(`The scene body for "${scene.name}" is no longer available.`);
     }
     this._slotRevisions.clear();
@@ -1718,10 +1896,16 @@ export class SceneStore {
       // The sentinel is the identity in both branches below: stable across
       // opens, where the object URL it replaces was a fresh UUID every time.
       const identity = scene.base.url;
-      const source = await getProjectStore().resolveAssetSource(assetPath);
+      const source = preResolved ?? await getProjectStore().resolveAssetSource(assetPath);
       if (!source) {
         this._installAssetSourceRelease(null);
         throw new Error(`"${label}" could not be read from this project.`);
+      }
+      // plan-546 AC 12 — the file revision is noted SYNCHRONOUSLY, from what the
+      // backend computed for this very read, for both source kinds: the first
+      // autosave after a plain open stamps it as the draft's `baseSha`.
+      if (source.revision) {
+        this._noteSlotRevision(SceneStore._docRevisionKey(assetPath), source.revision);
       }
       if (source.kind === 'bytes') {
         this._installAssetSourceRelease(null);
@@ -1732,7 +1916,7 @@ export class SceneStore {
         // an opened document would be an unconditional overwrite of whatever the
         // file holds by then.
         this._setBaseBytes(baseKeyOf(scene.base), source.bytes);
-        void this._noteDocumentRevisionOf(assetPath, source.bytes);
+        if (!source.revision) await this._noteDocumentRevisionOf(assetPath, source.bytes);
         // `adopt`, not `fromGlb`: a project document's bytes are a baked scene
         // GLB whose placements are reference nodes the planner must be told
         // about (2026-08-31 — the DemoPlanner deploy showed the gap: composed
@@ -1751,6 +1935,255 @@ export class SceneStore {
     }
 
     return { scene, fromGlb: false };
+  }
+
+  // ─── Stale document drafts (plan-546) ───────────────────────────────
+
+  /**
+   * May this document draft resume, or was it made on an older file?
+   *
+   * The FILE is resolved first and its revision — what the backend hashed for
+   * this read — decides (AC 2/3). Every answer that cannot be sure resumes the
+   * draft as before: an unreadable file or a source without a revision (AC 8,
+   * AC 12), a matching stamp (AC 7, which also notes the revision so a later
+   * Save is a real compare-and-swap), and a move that lost a race (AC 15).
+   *
+   * Stale: the draft is moved, compare-and-swap on its sha, to
+   * `draft/~stale/<documentId>/<sha12>` — never deleted — and the caller loads
+   * the already-resolved file. The notice is reported after the load by
+   * {@link _reportStaleDraftNotice}.
+   */
+  private async _decideDocumentDraft(
+    slot: string,
+    body: { revision: string; baseSha?: string; updatedAt?: string },
+    documentId: string,
+    relPath: string,
+  ): Promise<{ kind: 'resume' } | { kind: 'set-aside'; source: ResolvedAssetSource }> {
+    let source: ResolvedAssetSource | null = null;
+    try {
+      source = await getProjectStore().resolveAssetSource(relPath);
+    } catch {
+      source = null;
+    }
+    const resume = (): { kind: 'resume' } => {
+      if (source?.kind === 'url') source.release();
+      return { kind: 'resume' };
+    };
+    const revision = source?.revision;
+    if (!source || !revision) return resume();
+
+    if (!this._isDraftStale(body, documentId, revision)) {
+      this._noteSlotRevision(SceneStore._docRevisionKey(relPath), revision);
+      return resume();
+    }
+
+    let moved: string;
+    try {
+      const io = await sceneGlbIo();
+      moved = io.moveSceneGlbBody(
+        slot,
+        io.setAsideSlotFor(documentId, body.revision),
+        body.revision,
+        { movedAt: new Date().toISOString() },
+      );
+    } catch {
+      // An IO without the move (an older module, a test double) cannot set
+      // anything aside, and a draft that cannot be kept must not be hidden.
+      return resume();
+    }
+    if (moved !== 'moved' && moved !== 'same') return resume();
+    this._noteSlotRevision(slot, null);
+    if (this._bytesCache?.slot === slot) this._bytesCache = null;
+    return { kind: 'set-aside', source };
+  }
+
+  /**
+   * Is a draft with this pointer older than the file `revision`?
+   *
+   * Stamped (`baseSha`): a plain comparison. Legacy (no stamp): stale only when
+   * the row knows the file's `mtimeMs` and the draft was written before it;
+   * anything unparsable resumes (AC 3).
+   */
+  private _isDraftStale(
+    body: { baseSha?: string; updatedAt?: string },
+    documentId: string,
+    revision: string,
+  ): boolean {
+    if (body.baseSha) return body.baseSha.toLowerCase() !== revision.toLowerCase();
+    const mtimeMs = this._documentRow(documentId)?.mtimeMs;
+    const written = Date.parse(body.updatedAt ?? '');
+    return typeof mtimeMs === 'number'
+      && Number.isFinite(mtimeMs)
+      && Number.isFinite(written)
+      && written < mtimeMs;
+  }
+
+  /** The project-relative path of the open document's file, or null. */
+  private _openDocumentPath(): string | null {
+    const ws = this._workspace;
+    if (!ws?.documentId) return null;
+    if (ws.documentPath) return ws.documentPath;
+    return ws.base.kind === 'builtin' ? projectAssetRelPath(ws.base.url) : null;
+  }
+
+  /**
+   * The `baseSha` a body written to `slot` carries (plan-546 AC 1).
+   *
+   * Only a document's own draft slot is stamped, and with the revision of the
+   * FILE this session last saw (`doc:<relPath>`) — kept current across open,
+   * in-place save and rename. Never derived from `_baseBytes`, which hold the
+   * draft itself after a resume.
+   */
+  private _draftBaseShaFor(slot: string): string | undefined {
+    const documentId = this._workspace?.documentId;
+    if (!documentId || slot !== `draft/${documentId}`) return undefined;
+    const relPath = this._openDocumentPath();
+    return relPath ? this._slotRevisions.get(SceneStore._docRevisionKey(relPath)) : undefined;
+  }
+
+  /**
+   * Report — or clear — the stale-draft notice after an open (AC 2, AC 10).
+   *
+   * Runs after every open, the load succeeded or not: a document with
+   * set-aside entries reports the notice, worded after its NEWEST entry
+   * (AC 14); any other open clears it.
+   */
+  private async _reportStaleDraftNotice(documentId: string | undefined, transient: boolean): Promise<void> {
+    try {
+      const live = await import('./rv-scene-live-sync');
+      if (transient || !documentId) {
+        live.clearStaleDraftNotice();
+        return;
+      }
+      // A later open already took over; it reports for itself.
+      if (this._workspace?.documentId !== documentId) return;
+      let entries: ReturnType<SceneGlbIo['listSetAsideBodies']> = [];
+      try {
+        entries = (await sceneGlbIo()).listSetAsideBodies(documentId);
+      } catch {
+        entries = [];
+      }
+      const newest = entries[0];
+      if (!newest) {
+        live.clearStaleDraftNotice();
+        return;
+      }
+      const relPath = this._openDocumentPath();
+      const current = relPath ? this._slotRevisions.get(SceneStore._docRevisionKey(relPath)) : undefined;
+      const variant = newest.baseSha && current && newest.baseSha.toLowerCase() === current.toLowerCase()
+        ? 'other-changes'
+        : 'older-file';
+      live.reportStaleDraft(documentId, this._workspace?.name || documentId, variant);
+    } catch {
+      // A notice that cannot be shown loses nothing: the entries stay and the
+      // next open of the document reports them again.
+    }
+  }
+
+  /**
+   * Can this store write drafts right now? The rule the autosave follows, and
+   * the one the stale-draft notice uses to offer Restore (plan-546).
+   */
+  canWriteDrafts(): boolean {
+    return this._workspace?.transient !== true && !this._projectionSuspended;
+  }
+
+  /**
+   * Bring back the newest set-aside draft of `documentId` (plan-546 AC 4, 14).
+   *
+   * Flushes — never cancels — a pending autosave first, then SWAPS whatever
+   * `draft/<documentId>` holds by now into a set-aside slot (never deletes it),
+   * moves the newest entry into the draft slot re-stamped with the current file
+   * revision, and (re)opens the document with it. Acts on `documentId` only;
+   * when another document is open, that document is replaced by this one.
+   *
+   * @returns false when nothing was restored (no entry, or a slot changed
+   *          underneath — in which case nothing was touched).
+   */
+  async restoreStaleDraft(documentId: string): Promise<boolean> {
+    const io = await sceneGlbIo();
+    const entries = io.listSetAsideBodies(documentId);
+    const newest = entries[0];
+    const row = this._documentRow(documentId);
+    if (!newest || !row) return false;
+
+    if (this._workspace?.documentId === documentId) await this._flushAutosave();
+    else if (this._autosaveInFlight) await this._autosaveInFlight;
+
+    const draftSlot = `draft/${documentId}`;
+    const now = new Date().toISOString();
+    const live = io.sceneGlbBodyPointer(draftSlot);
+    if (live) {
+      const swapped = io.moveSceneGlbBody(
+        draftSlot, io.setAsideSlotFor(documentId, live.sha), live.sha, { movedAt: now },
+      );
+      if (swapped === 'conflict') return false;
+    }
+
+    const revision = await this._currentDocumentRevision(documentId, row.path);
+    const restored = io.moveSceneGlbBody(newest.slot, draftSlot, newest.sha, {
+      // `null` when the file cannot be read: an unstamped draft written NOW
+      // resumes under the legacy rule instead of being set aside again.
+      baseSha: revision ?? null,
+      movedAt: null,
+      updatedAt: now,
+    });
+    if (restored === 'conflict') return false;
+
+    this._cancelAutosave();
+    this._noteSlotRevision(draftSlot, null);
+    if (this._bytesCache?.slot === draftSlot) this._bytesCache = null;
+    this._baseBytes = null;
+    await this.openDocument(row.id);
+    return true;
+  }
+
+  /**
+   * Drop every set-aside draft of `documentId` — pointers and (reference-safe)
+   * blobs — and nothing else (plan-546 AC 5). Clears the notice when it is
+   * about this document.
+   *
+   * @returns how many entries were removed.
+   */
+  async discardStaleDraft(documentId: string): Promise<number> {
+    const io = await sceneGlbIo();
+    const entries = io.listSetAsideBodies(documentId);
+    for (const entry of entries) await io.dropSceneGlbBody(entry.slot);
+    const { clearStaleDraftNotice } = await import('./rv-scene-live-sync');
+    clearStaleDraftNotice(documentId);
+    return entries.length;
+  }
+
+  /** The revision of a document's file now, or undefined when unreadable. */
+  private async _currentDocumentRevision(documentId: string, relPath: string): Promise<string | undefined> {
+    if (this._workspace?.documentId === documentId) {
+      const known = this._slotRevisions.get(SceneStore._docRevisionKey(this._openDocumentPath() ?? relPath));
+      if (known) return known;
+    }
+    try {
+      const source = await getProjectStore().resolveAssetSource(relPath);
+      if (source?.kind === 'url') source.release();
+      return source?.revision;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Run a pending debounced autosave NOW and wait for any write in flight.
+   * The work is kept, never dropped — the difference to `_cancelAutosave`.
+   */
+  private async _flushAutosave(): Promise<void> {
+    if (this._draftAutosaveTimer !== null) {
+      clearTimeout(this._draftAutosaveTimer);
+      this._draftAutosaveTimer = null;
+      const ws = this._workspace;
+      if (ws && !ws.transient && !this._projectionSuspended
+        && (this.canUndo() || this.canRedo() || !this._saved)) {
+        await this._autosaveBody();
+      }
+    }
+    if (this._autosaveInFlight) await this._autosaveInFlight;
   }
 
   /**
@@ -2008,6 +2441,12 @@ export class SceneStore {
    * body slot and a catalogue row.
    */
   private async _resolveSaveTarget(): Promise<SaveTarget | null> {
+    // The manifest is the authority on where the open document lives. A rename
+    // or move through the dashboard tree rewrites the row but not this
+    // workspace, and a save against the stale `documentPath` wrote a SECOND file
+    // under the old name while reporting success (field finding 2026-09-17:
+    // "saved" landed in Untitled.glb, the renamed document stayed empty).
+    this.adoptDocumentRename();
     const ws = this._workspace;
     if (!ws) return null;
     if (ws.documentId && ws.documentPath) {
@@ -2125,7 +2564,15 @@ export class SceneStore {
     const floorAtBakeStart = this._doc.opCount;
     this._cancelAutosave();
 
-    const bytes = await this._bakeCurrent();
+    // plan-711 R2-Q1, the explicit-save half. While another projection holds
+    // the document, `_bakeCurrent` is the wrong writer for the same two reasons
+    // the autosave is suspended: its source predates the session's asset-lineage
+    // ops, and `materialise` drops those without a word. The autosave can wait
+    // for the handback; a save the user asked for cannot, so it is taken from
+    // the authored tree instead.
+    const projected = this._projectionSuspended;
+    const baseBytesAtStart = this._baseBytes?.bytes ?? null;
+    const bytes = projected ? await this._bakeAuthoredTree() : await this._bakeCurrent();
     if (!bytes) {
       console.error('[scene-store] the document could not be baked — nothing was written.');
       return 'no-op';
@@ -2187,7 +2634,23 @@ export class SceneStore {
       // The bytes just written ARE what the next bake starts from. Without this
       // the changed base key would send `_ensureBaseBytes` back to the backend
       // for a file it already has in hand.
-      this._setBaseBytes(baseKeyOf(documentBase), toArrayBuffer(bytes));
+      //
+      // Not for a save out of a bound projection: those bytes already contain
+      // the session's asset-lineage ops, and the projection rebuilds its tree as
+      // "bake, then replay the asset half" — onto them it would apply that half
+      // twice. The source it was bound with stays, under the new key, until the
+      // handback installs the authored tree through `adoptProjectedBaseBytes`.
+      this._setBaseBytes(
+        baseKeyOf(documentBase),
+        projected && baseBytesAtStart ? baseBytesAtStart : toArrayBuffer(bytes),
+      );
+      // A draft just BECAME a document (plan-478 R3-6). No load happened, so
+      // the open funnel never saw it — but the thing the user is working on now
+      // has an identity it did not have a moment ago, and a ring that still
+      // named the draft's origin would send the next click to the wrong file.
+      // Inside the `plannedName` branch only: an in-place save changes no
+      // identity and must leave the ring's order alone.
+      this._recordRecentDocument(target.entryId, target.plannedName, target.relPath);
     }
 
     const saved: RvScene = {
@@ -2379,7 +2842,9 @@ export class SceneStore {
     if (!this._workspace) throw new Error('No scene is open.');
 
     if (!opts.embedReferences) {
-      const bytes = await this._bakeCurrent();
+      const bytes = this._projectionSuspended
+        ? await this._bakeAuthoredTree()
+        : await this._bakeCurrent();
       if (!bytes) throw new Error('The scene could not be exported.');
       return bytes;
     }
@@ -2390,15 +2855,29 @@ export class SceneStore {
     const frames = this._viewer.lastLoadResult?.composition?.frames ?? [];
     const { markReferencesEmbedded, unmarkReferencesEmbedded } =
       await import('../../engine/rv-glb-flatten');
-    const { objectToGlb } = await import('../../import/rv-import-object');
+    const { objectToGlb, sceneMirroringLoad } = await import('../../import/rv-import-object');
+
+    // The uber bake's `rmPacked` is a WebViewer-private encoding and has no
+    // business in a file this path hands out as self-contained (plan-752 I2).
+    // Same mark/restore shape as the reference marks right below it.
+    const { stripUberPrivateAttributes } = await import('../../engine/rv-uber-material');
+    const uberShield = stripUberPrivateAttributes(root);
 
     markReferencesEmbedded(frames);
     try {
-      return new Uint8Array(await objectToGlb(root));
+      // The model root IS the document's scene, so it is exported as one and
+      // not as a node inside an invented wrapper (plan-752 F4) — a take-away
+      // file has the same shape as the document it came from.
+      // `sceneMirroringLoad` BORROWS the children; it never re-parents, so the
+      // live scene is untouched by this call.
+      return new Uint8Array(await objectToGlb(sceneMirroringLoad(root)));
     } finally {
       // Always — an export that threw must not leave the live scene claiming
-      // its references are already inlined.
+      // its references are already inlined, nor rendering without the
+      // per-vertex roughness/metalness it was baked with.
       unmarkReferencesEmbedded(frames);
+      uberShield.restore();
+      this._viewer.markRenderDirty?.();
     }
   }
 
@@ -2433,6 +2912,50 @@ export class SceneStore {
     return result.glb;
   }
 
+  /**
+   * The document as bytes while ANOTHER projection is authoring it.
+   *
+   * The counterpart of {@link _bakeCurrent} for the span of a binding, and the
+   * same rule `endProjectionHandover` applies on the way back, stated for a save
+   * that does not wait for it: the authored tree is the node-level truth, so the
+   * bytes start from its export and only what a tree cannot carry is baked on
+   * top ({@link editsBeyondAuthoredTree}). No resolver and no `expectedNames` —
+   * `viewer.registry` indexes the bytes that tree was loaded from, not this
+   * export, and nothing node-level is left to address.
+   *
+   * This store's base bytes are deliberately NOT replaced here. The projection
+   * rebuilds its tree from them plus a replay of the asset half of the log
+   * (undo-by-recompose); bytes that already contain that half would receive it
+   * twice. Adoption stays where it is, in the handback.
+   *
+   * Throws rather than falling back to `_bakeCurrent`: that fallback is a save
+   * that reports success and leaves the editor's work out of the file.
+   */
+  private async _bakeAuthoredTree(): Promise<Uint8Array | null> {
+    const source = this._authoredSource;
+    if (!source) {
+      throw new Error(
+        'This document is open in the editor, which has not said how to export it — '
+        + 'leave the editor and save again.',
+      );
+    }
+    const authored = await source();
+    if (!authored) return null;
+
+    const { bakeIntoGlb } = await import('./rv-scene-glb-bake');
+    const result = await bakeIntoGlb(
+      authored,
+      editsBeyondAuthoredTree(materialise(this._ops)),
+      { locate: () => null },
+      {
+        settings: { ...this._settings },
+        clearCameraWhenUnset: true,
+      },
+    );
+    for (const warning of result.warnings) console.warn('[scene-store]', warning);
+    return result.glb;
+  }
+
   /** Save under a new name — always creates a new id. */
   async saveAs(name: string): Promise<string> {
     return this._doc.runExclusive(() => this._saveAs(name));
@@ -2461,7 +2984,10 @@ export class SceneStore {
     // Bake FIRST, then place: the copy carries the CURRENT state, and a document
     // created before a bake that then fails would leave an empty row behind.
     const floorAtBakeStart = this._doc.opCount;
-    const bytes = await this._bakeCurrent();
+    // Same writer choice and same base-bytes rule as `_saveIntoDocument`.
+    const projected = this._projectionSuspended;
+    const baseBytesAtStart = this._baseBytes?.bytes ?? null;
+    const bytes = projected ? await this._bakeAuthoredTree() : await this._bakeCurrent();
     if (!bytes) throw new Error('The document could not be saved under a new name.');
 
     if (
@@ -2510,7 +3036,10 @@ export class SceneStore {
       documentId: created.documentId,
       documentPath: created.relPath,
     };
-    this._setBaseBytes(baseKeyOf(base), toArrayBuffer(bytes));
+    this._setBaseBytes(
+      baseKeyOf(base),
+      projected && baseBytesAtStart ? baseBytesAtStart : toArrayBuffer(bytes),
+    );
     this._saved = saved;
     this._publishDocumentIdentity();
     this._doc.markSaved({ floor: floorAtBakeStart });
@@ -2524,6 +3053,10 @@ export class SceneStore {
     }
     this._viewer.currentScene = saved;
     updateUrlDocumentParam(created.documentId);
+    // Save-as: the workspace IS the copy now, and the copy is what the user
+    // will come back to (plan-478 R3-6). The source keeps its own, older ring
+    // entry — a "save as" is a fork, not a move, and both files are real.
+    this._recordRecentDocument(created.documentId, name, created.relPath);
     void store.rescanDocuments();
     this._notify();
     return created.documentId;
@@ -2531,6 +3064,20 @@ export class SceneStore {
 
   /** Revert to the last-saved state (or to bare base for fresh drafts). */
   async discard(): Promise<void> {
+    // plan-546 AC 6 — the slot the autosave actually writes. For a DOCUMENT
+    // that is `draft/<documentId>`, which neither spelling below names: without
+    // it "Discard changes" reopened the document and resumed the very draft it
+    // was meant to throw away. Dropped in both branches.
+    const documentDraft = this._workspace?.documentId ? this._bodySlots().draft : null;
+    if (documentDraft) this._cancelAutosave();
+    const dropDocumentDraft = async () => {
+      if (!documentDraft) return;
+      // A write already running would land after the drop and bring it back.
+      if (this._autosaveInFlight) await this._autosaveInFlight;
+      await (await sceneGlbIo()).dropSceneGlbBody(documentDraft);
+      this._noteSlotRevision(documentDraft, null);
+      if (this._bytesCache?.slot === documentDraft) this._bytesCache = null;
+    };
     if (this._saved) {
       // Clear the per-saved-scene draft slot BEFORE re-opening — without
       // this, openScene would just restore the same draft we're trying to
@@ -2539,6 +3086,7 @@ export class SceneStore {
       clearSceneDraft(this._saved.id);
       await (await sceneGlbIo()).dropSceneGlbBody(`draft/${this._saved.id}`);
       this._noteSlotRevision(`draft/${this._saved.id}`, null);
+      await dropDocumentDraft();
       this._baseBytes = null;
       await this.openScene(this._saved.id);
     } else if (this._workspace) {
@@ -2546,6 +3094,7 @@ export class SceneStore {
       clearDraft(base);
       await (await sceneGlbIo()).dropSceneGlbBody(`draft/${baseKeyOf(base)}`);
       this._noteSlotRevision(`draft/${baseKeyOf(base)}`, null);
+      await dropDocumentDraft();
       this._baseBytes = null;
       if (base.kind === 'builtin') await this.openBuiltin(base.url, base.label);
       else if (base.kind === 'empty') await this.newEmpty();
@@ -2698,6 +3247,17 @@ export class SceneStore {
       // the editor announce a document nobody can find under that title.
       this._publishDocumentIdentity();
     }
+    // The recents ring holds a RECORDED path (plan-482 §2.7), and this verb has
+    // just made that copy wrong. Outside the workspace block on purpose: the
+    // renamed document need not be the one that is open — the ring's whole
+    // point is telling two same-named rows in different folders apart, and a
+    // stale path in the middle of the list is exactly the lie the field exists
+    // to prevent. Only the path moves; order, mode and `openedAt` stay, because
+    // a rename is not an open. No manifest is loaded for this: the id comes
+    // from the row that was just written and the project is the open one.
+    if (target) {
+      retagRecentDocumentPath(store.getProject()?.id, row.id, target.relPath);
+    }
     this._notify();
   }
 
@@ -2838,7 +3398,10 @@ export class SceneStore {
     try {
       // The deduplicated name is the ONLY name from here on: reporting the
       // requested one would tell the user about a file that does not exist.
-      const fileName = await uniqueModelFileName(backend, `${sanitizeModelFileName(name)}.glb`);
+      const fileName = uniqueModelFileName(
+        documentsOf(getProjectStore().getProject()),
+        `${sanitizeModelFileName(name)}.glb`,
+      );
       const relPath = `models/${fileName}`;
 
       // Re-fetched rather than retained: holding a 35 MB source buffer for the
@@ -2859,7 +3422,7 @@ export class SceneStore {
       );
 
       // `expectedRevision: null` — create only (plan-709 §2.3, path 4). The
-      // name was just deduplicated against `listModels()`, and this closes the
+      // name was just deduplicated against the project snapshot, and this closes the
       // window between that listing and this write: if anything is at the path
       // by now the write is refused instead of silently replacing a file the
       // dedup was there to protect.
@@ -2964,6 +3527,16 @@ export class SceneStore {
   /** Redo the most-recently undone op. */
   redo(): Promise<void> {
     return this._doc.redo();
+  }
+
+  /**
+   * Route undo/redo of journaled entries (`meta.journalId`, plan-590 signal
+   * rename) to `interceptor` — the signal-rename coordinator. {@link undo} and
+   * {@link redo} reach it through the document before anything is applied.
+   * `null` removes it.
+   */
+  setHistoryInterceptor(interceptor: RvHistoryInterceptor | null): void {
+    this._doc.setHistoryInterceptor(interceptor);
   }
 
   canUndo(): boolean { return this._doc.canUndo(); }
@@ -3130,6 +3703,9 @@ export class SceneStore {
     // reaches here by another route. `save()`/`saveAs()` clear the flag *before*
     // committing, because converting to persistent is exactly what they mean.
     if (this._workspace.transient) return null;
+    // plan-546 AC 1 — read with the floor, before the bake: the file revision
+    // these bytes are based on is the one known when the bake starts.
+    const baseSha = this._draftBaseShaFor(slot);
     const source = await this._ensureBaseBytes();
     if (!source) return null;
 
@@ -3157,6 +3733,7 @@ export class SceneStore {
       glb: result.glb,
       expectedRevision,
       createdAt: this._workspace.createdAt,
+      ...(baseSha ? { baseSha } : {}),
     });
 
     // plan-703 §2.5 — the imprint hangs HERE, on the persistence step, and not
@@ -3208,7 +3785,16 @@ export class SceneStore {
    * shows nothing at all. A run that succeeds withdraws the notice again, so
    * the banner tracks the current state rather than the worst one ever seen.
    */
-  private async _autosaveBody(): Promise<void> {
+  private _autosaveBody(): Promise<void> {
+    const run = this._autosaveBodyInner();
+    this._autosaveInFlight = run;
+    void run.finally(() => {
+      if (this._autosaveInFlight === run) this._autosaveInFlight = null;
+    });
+    return run;
+  }
+
+  private async _autosaveBodyInner(): Promise<void> {
     const slot = this._bodySlots().draft;
     try {
       // `?? null` — for the DRAFT slot "I have never seen one" and "there is

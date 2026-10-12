@@ -21,6 +21,7 @@ import { RVViewerProvider } from '../src/hooks/use-viewer';
 import { setAppConfig } from '../src/core/rv-app-config';
 import { activateContext, deactivateContext } from '../src/core/hmi/ui-context-store';
 import { _resetHelpTopicRegistryForTests, registerHelpTopic } from '../src/core/hmi/help-topic-registry';
+import { modeManagerDouble } from './fixtures/mode-manager-double';
 
 const layout = vi.hoisted(() => ({ mobile: false }));
 
@@ -48,16 +49,10 @@ function createViewer(setup?: (lpm: LeftPanelManager) => void) {
     togglePanel: vi.fn(),
     setSettingsOpen: vi.fn(),
   };
-  let activeMode: string | null = null;
   return {
     leftPanelManager,
     uiRegistry: new UIPluginRegistry(),
-    modes: {
-      get activeMode() { return activeMode; },
-      setActive(id: string | null) { activeMode = id; },
-      subscribe: () => () => undefined,
-      getSnapshot: () => 0,
-    },
+    modes: modeManagerDouble(),
     applyVisualSettings: vi.fn(),
     clearModel: vi.fn(),
     renderBackend: 'three',

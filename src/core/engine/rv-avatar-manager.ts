@@ -39,6 +39,7 @@ import {
   BufferGeometry,
   Float32BufferAttribute,
 } from 'three';
+import { applyLabelSpriteContract, createLabelMaterial, createLabelTexture } from './rv-label-sprite';
 import type { Scene, Camera } from 'three';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -151,9 +152,12 @@ export class AvatarManager {
 
     // ── Billboard card ──
     const cardTexture = this._createCardTexture(info.name, info.color);
-    const cardMaterial = new SpriteMaterial({ map: cardTexture, depthTest: false, transparent: true });
+    const cardMaterial = createLabelMaterial(cardTexture);
     const cardSprite = new Sprite(cardMaterial);
     cardSprite.scale.set(CARD_SIZE, CARD_SIZE, 1);
+    // Label contract (rv-label-sprite.ts): overlay layer, no tone mapping —
+    // otherwise the name card is dimmed/smeared by the AO + bloom passes.
+    applyLabelSpriteContract(cardSprite);
 
     // ── Group ──
     const group = new Group();
@@ -437,7 +441,7 @@ export class AvatarManager {
     const displayName = name.length > 14 ? name.substring(0, 13) + '\u2026' : name;
     ctx.fillText(displayName, cx, S * 0.78);
 
-    return new CanvasTexture(canvas);
+    return createLabelTexture(canvas);
   }
 
   private _disposeAvatar(avatar: AvatarInstance): void {

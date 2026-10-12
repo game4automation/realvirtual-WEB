@@ -180,7 +180,7 @@ registerComponent({
   schema: RVWebDiagnostics.schema,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    badgeColor: '#ef5350',   // error red — matches the diagnosis card accent
+    ui: { badge: '#ef5350' },   // error red — matches the diagnosis card accent
   },
   create: (node) => new RVWebDiagnostics(node),
   afterCreate: (inst, node) => {

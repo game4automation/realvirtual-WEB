@@ -83,9 +83,9 @@ export function TransferTargetDialog({
             ? 'No other writable project is open. Add a workspace folder, or open a project '
               + 'folder, to have somewhere to send this to.'
             : isMove
-              ? `"${request?.documentName}" moves into the target's library; the original goes `
+              ? `"${request?.documentName}" moves to the target project's root; the original goes `
                 + 'to the source project’s trash.'
-              : `"${request?.documentName}" is copied into the target's library as a new document.`}
+              : `"${request?.documentName}" is copied to the target project's root as a new document.`}
         </DialogContentText>
         {targets.length > 0 && (
           <List dense sx={{ mt: 1 }} aria-label="Transfer targets">

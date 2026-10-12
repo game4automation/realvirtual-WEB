@@ -79,6 +79,11 @@ class MockPhysicsProvider implements PhysicsProvider {
   step(): void {}
   syncPoses(): void {}
   getSettledBodies(): string[] { return []; }
+  // plan-467 moving colliders — this mock does not exercise them; the methods
+  // exist so the mock still satisfies the PhysicsProvider contract.
+  addKinematicBody(): void {}
+  setKinematicPose(): void {}
+  forEachContactLoad(): void {}
 
   /** Ids of implicit static boxes (excludes the synthetic floor plate). */
   get implicitIds(): string[] {

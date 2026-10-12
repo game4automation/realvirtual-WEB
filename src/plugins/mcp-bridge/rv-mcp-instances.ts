@@ -25,14 +25,23 @@ import { McpViewTools } from './rv-mcp-view-tools';
 import { McpObserveTools } from './rv-mcp-observe-tools';
 import { McpEditorTools } from './rv-mcp-editor-tools';
 import { McpSignalBindTools } from './rv-mcp-signal-bind-tools';
+import { McpSignalAutoMapTools } from './rv-mcp-signal-automap-tools';
+import { McpSignalUsageTools } from './rv-mcp-signal-usage-tools';
 import { McpKnowledgeTools } from './rv-mcp-knowledge-tools';
+import { McpDocumentInfoTools } from './rv-mcp-document-info-tools';
 import { McpProjectTools } from './rv-mcp-project-tools';
 import { McpDescribeTool } from './rv-mcp-describe-tool';
 import { McpLinkTools } from './rv-mcp-link-tools';
 import { McpHelpTool } from './rv-mcp-help-tool';
+import { McpComponentSchemaTool } from './rv-mcp-component-schema-tool';
 import { McpRuntimeTools } from './rv-mcp-runtime-tools';
 import { McpSceneTools } from './rv-mcp-scene-tools';
 import { McpDesPlcTools } from './rv-mcp-desplc-tools';
+import { McpPromptTools } from './rv-mcp-prompt-tools';
+import { McpGroupsTools } from './rv-mcp-groups-tools';
+import { McpCollisionTools } from './rv-mcp-collision-tools';
+import { McpSimModeTool } from './rv-mcp-sim-mode-tool';
+import { McpVideoTools } from './rv-mcp-video-tools';
 
 /** Accessor the delegates share; `undefined` before a viewer is bound. */
 export type ViewerAccessor = () => RVViewer | undefined;
@@ -50,13 +59,27 @@ export function createMcpDelegates(getViewer: ViewerAccessor): Record<string, ob
     McpObserveTools: new McpObserveTools(getViewer),
     McpEditorTools: new McpEditorTools(getViewer),
     McpSignalBindTools: new McpSignalBindTools(getViewer),
+    // plan-545: model PLC signals -> S7 / PLCSIM interface signals (check / apply).
+    McpSignalAutoMapTools: new McpSignalAutoMapTools(getViewer),
+    // plan-566: the signal cross-reference list (web_signal_usage).
+    McpSignalUsageTools: new McpSignalUsageTools(getViewer),
     McpKnowledgeTools: new McpKnowledgeTools(getViewer),
+    McpDocumentInfoTools: new McpDocumentInfoTools(getViewer),
     McpProjectTools: new McpProjectTools(getViewer),
     McpDescribeTool: new McpDescribeTool(getViewer),
     McpLinkTools: new McpLinkTools(getViewer),
     McpRuntimeTools: new McpRuntimeTools(getViewer),
     McpSceneTools: new McpSceneTools(getViewer),
     McpDesPlcTools: new McpDesPlcTools(getViewer),
+    // plan-486: the prompt queue. No viewer accessor — the queue belongs to the
+    // browser tab, not to a loaded model.
+    McpPromptTools: new McpPromptTools(),
+    McpGroupsTools: new McpGroupsTools(getViewer),
+    McpCollisionTools: new McpCollisionTools(getViewer),
+    McpSimModeTool: new McpSimModeTool(getViewer),
+    // plan-537: deterministic MP4 recording of the 3D canvas.
+    McpVideoTools: new McpVideoTools(getViewer),
     McpHelpTool: new McpHelpTool(),
+    McpComponentSchemaTool: new McpComponentSchemaTool(),
   };
 }

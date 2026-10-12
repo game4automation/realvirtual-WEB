@@ -32,6 +32,7 @@ import {
   runBuild,
   stageFilteredSourceTree,
 } from './_workspace-lib.mjs';
+import { compileProjectDir } from './compile-project-scripts.mjs';
 import { knownProjectKeys } from './_rv-guards.mjs';
 import { recordPublishProvenance } from './_rv-provenance.mjs';
 
@@ -178,6 +179,59 @@ function previousCoreCommit(clone) {
  * @param replaceProjects  project folders `--projects` named, already resolved
  * @param force            apply the replace unattended, without the confirmation
  */
+/**
+ * Build the `.js` sibling of every `scriptRef`, in the STAGED copy (plan-479 Phase 7).
+ *
+ * ## Why here and not in `deliver.mjs`
+ *
+ * A `scriptRef` is resolved two ways: the build glob (for a project that was
+ * bundled with the app) and the runtime loader, which imports a compiled `.js`
+ * sitting next to the referenced `.ts`. The first shadows the second, so a
+ * missing sibling is invisible in-house and only shows up at a customer, as a
+ * plugin that silently loads nothing.
+ *
+ * The obvious fix — a `--check` gate before the push — cannot work: there is no
+ * compiled sibling anywhere in the project tree, so the gate would fail every
+ * delivery on its first run and it can only ever report, never produce. And
+ * building in the SOURCE tree is worse than it looks: `deliver.mjs` asserts a
+ * clean private tree and states outright that it never auto-commits, so a build
+ * against `privateRoot` would run after that check, leave the tree dirty, and
+ * break the NEXT delivery instead of this one.
+ *
+ * The staged copy has neither problem. It is a throwaway tree this script
+ * already assembles and whose contents are committed into the customer clone a
+ * few steps later, so the artefact travels with the delivery, no `.js` is ever
+ * written into the private repository, and the source tree stays untouched —
+ * which `tests/compile-project-scripts.node.test.ts` pins with
+ * `git status --porcelain`.
+ *
+ * A failure THROWS: an unbuildable plugin delivered anyway is a customer
+ * discovering a dead feature, which is precisely the outcome this exists to
+ * prevent. `--check` keeps its own job as the CI verification between deliveries.
+ */
+export async function compileStagedProjectScripts(workspaceRoot, projectKeys) {
+  const failures = [];
+  for (const key of projectKeys) {
+    const dir = join(workspaceRoot, 'projects', key);
+    if (!existsSync(join(dir, 'project.json'))) continue;
+    const { status, reason, results } = await compileProjectDir(dir);
+    if (status === 'skipped') {
+      console.log(`[project-scripts] skip ${key}: ${reason}`);
+      continue;
+    }
+    for (const r of results) {
+      if (r.status === 'failed') failures.push(`${key}/${r.ref}: ${r.reason}`);
+      else console.log(`[project-scripts] ${r.status} ${key}/${r.out ?? r.ref}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      'project scripts did not compile, so the delivery was stopped before anything was '
+      + `committed or pushed:\n  ${failures.join('\n  ')}`,
+    );
+  }
+}
+
 export function snapshotPush({
   workspaceRoot, remote, version, plasticChangeset = null,
   push = false, coreRoot = null, replaceProjects = [], force = false, acceptNewPrivateFiles = false,
@@ -321,6 +375,11 @@ async function main() {
     // repository is not a substitute: without a repo the LFS clean filter never
     // runs, so the staged side would hash the real GLB while the clone hashes its
     // pointer, and every vendor file would report as a conflict forever.
+    // BEFORE the index and before every write to the customer clone: the `.js`
+    // siblings have to exist while the staged tree is being hashed and copied,
+    // and a compile failure must stop the delivery while nothing has been
+    // committed. See compileStagedProjectScripts.
+    await compileStagedProjectScripts(staged.workspaceRoot, staged.projectKeys);
     initializeLfsIndex(staged.workspaceRoot);
     const stagedProjects = Object.fromEntries(staged.projectKeys.map((key) =>
       [key, JSON.parse(readFileSync(join(staged.workspaceRoot, 'projects', key, 'project.json'), 'utf8'))]));

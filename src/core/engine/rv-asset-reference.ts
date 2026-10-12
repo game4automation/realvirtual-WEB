@@ -37,6 +37,7 @@
 import type { Object3D } from 'three';
 import type { ModelCameraStart } from '../hmi/camera-startpos-types';
 import { getNodeId } from './rv-node-id';
+import { RV_DRIVE_HOME_KEY, type DriveHomePose } from './rv-pre-bake-keys';
 
 // ─── Component keys ──────────────────────────────────────────────────────
 
@@ -247,6 +248,17 @@ export function applyTrsOverride(node: Object3D, trs: TrsOverride): boolean {
   }
   if (trs.scale) { node.scale.set(trs.scale[0], trs.scale[1], trs.scale[2]); changed = true; }
   if (changed) node.updateMatrix();
+  // plan-757 §2.4 / R11 — a shift of a node shifts its home stamp. A baked
+  // asset's Drive node carries the `Drive` hook's home pose (JSON-cloned into
+  // every instance) and `initDrive()` prefers that stamp over the live
+  // transform; without this the first `applyToNode()` would silently undo the
+  // saved move (found by tests/placement-content-edit-roundtrip.test.ts).
+  const home = changed ? node.userData?.[RV_DRIVE_HOME_KEY] as DriveHomePose | undefined : undefined;
+  if (home) {
+    if (trs.position) home.p = [trs.position[0], trs.position[1], trs.position[2]];
+    if (trs.quaternion) home.q = [trs.quaternion[0], trs.quaternion[1], trs.quaternion[2], trs.quaternion[3]];
+    if (trs.scale) home.s = [trs.scale[0], trs.scale[1], trs.scale[2]];
+  }
   return changed;
 }
 
@@ -816,6 +828,53 @@ export function setPlacementMeta(node: Object3D, meta: PlacementMeta | null): vo
 /** True when this node was written as a layout placement. */
 export function isPlacementNode(node: Object3D): boolean {
   return isPlainObject(extrasOf(node)?.[RV_PLACEMENT_META_KEY]);
+}
+
+// ─── Deferred placement (plan-753, Reload = Planner-Instanzen) ──────────
+
+/**
+ * Session-only marker (`userData`, never `realvirtual` extras) on a placement
+ * root whose referenced asset composition did NOT graft: the loader leaves the
+ * root empty and the layout planner instantiates the asset's shared
+ * `BakedAsset` under it after the load — the same door a live placement takes.
+ *
+ * Lives in `userData` so it can never reach a file: `objectToGlb` writes
+ * `userData` as extras, but a save rebuilds placement nodes from their records
+ * (`rv-scene-glb-bake.ts`), and the planner clears the mark the moment it takes
+ * the node over.
+ */
+export const RV_DEFERRED_PLACEMENT_KEY = '_rvDeferredPlacement';
+
+export interface DeferredPlacementMark {
+  /** The occurrence chain composition assigned — the missing-reference problem id. */
+  occurrence: string;
+  /**
+   * The reference's `path` resolved against the containing file (plan-757
+   * Phase 2b, `DeferredReference.resolvedPath`); absent when the reference has
+   * no path or the mark predates the field. The instancer prefers it over the
+   * raw `path`, so a RELATIVE path of a deferred document reference resolves
+   * exactly as the graft would have resolved it.
+   */
+  resolvedPath?: string;
+}
+
+/** Mark a placement root as "pending instantiate" (composition skipped it). */
+export function markDeferredPlacement(node: Object3D, occurrence: string, resolvedPath?: string): void {
+  node.userData[RV_DEFERRED_PLACEMENT_KEY] = resolvedPath ? { occurrence, resolvedPath } : { occurrence };
+}
+
+/** The deferred mark on a node, or null. */
+export function getDeferredPlacement(node: Object3D): DeferredPlacementMark | null {
+  const raw = node.userData[RV_DEFERRED_PLACEMENT_KEY];
+  if (!isPlainObject(raw)) return null;
+  const mark: DeferredPlacementMark = { occurrence: typeof raw.occurrence === 'string' ? raw.occurrence : '' };
+  if (typeof raw.resolvedPath === 'string' && raw.resolvedPath) mark.resolvedPath = raw.resolvedPath;
+  return mark;
+}
+
+/** Remove the deferred mark — the planner owns the node from here on. */
+export function clearDeferredPlacement(node: Object3D): void {
+  delete node.userData[RV_DEFERRED_PLACEMENT_KEY];
 }
 
 // ─── SceneSettings ───────────────────────────────────────────────────────

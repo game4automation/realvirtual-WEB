@@ -2,7 +2,9 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * rv-asset-draft-storage — the SHAPE of an asset-editor draft. Types only.
+ * rv-asset-draft-storage — the SHAPE of an asset-editor draft (types), plus
+ * the one binary side-store a draft needs: FMU packages by SHA (plan-498, see
+ * the section at the end of this file).
  *
  * ## What this file stopped being (plan-710 Phase 2)
  *
@@ -412,4 +414,76 @@ export function stableDocumentIdOfPath(path: string): string {
 function stemOfPath(path: string): string {
   const file = path.split('/').pop() ?? path;
   return file.replace(/\.glb$/i, '') || file;
+}
+
+// ─── FMU packages of an unsaved draft (plan-498 F13) ────────────────────
+
+/**
+ * An attached FMU lives in the op log only as its SHA (`attach-fmu` records the
+ * extras, never the bytes — ops are JSON). Until the document is SAVED the
+ * bytes exist nowhere else, so a page reload before the first save would
+ * replay an attach whose package is gone. The package is therefore put here,
+ * content-addressed, at attach time and read back before a draft replay
+ * (`restoreFmuPackagesForOps`, rv-fmu-ops.ts).
+ *
+ * Cache API (the same durable tier the CAD GLB cache falls back to), keyed by a
+ * synthetic URL; an in-memory map stands in where the Cache API is absent
+ * (insecure context, some embeds) so the session still recovers from an undo.
+ */
+const FMU_DRAFT_BUCKET = 'rv-draft-fmu-packages';
+const _fmuDraftMemory = new Map<string, Uint8Array>();
+
+function fmuDraftKey(sha256: string): string {
+  return `https://rv-draft.invalid/fmu/${sha256}`;
+}
+
+async function fmuDraftCache(): Promise<Cache | null> {
+  try {
+    if (typeof caches === 'undefined') return null;
+    return await caches.open(FMU_DRAFT_BUCKET);
+  } catch {
+    return null;
+  }
+}
+
+/** Persist a package for draft recovery. Returns false when only memory holds it. */
+export async function putDraftFmuPackage(sha256: string, bytes: Uint8Array): Promise<boolean> {
+  _fmuDraftMemory.set(sha256, bytes);
+  const cache = await fmuDraftCache();
+  if (!cache) return false;
+  try {
+    await cache.put(fmuDraftKey(sha256), new Response(bytes.slice().buffer as ArrayBuffer, {
+      headers: { 'Content-Type': 'application/octet-stream' },
+    }));
+    return true;
+  } catch (e) {
+    console.warn('[asset-draft] FMU package could not be persisted for draft recovery:', e);
+    return false;
+  }
+}
+
+/** Read a package persisted by {@link putDraftFmuPackage}; null when unknown. */
+export async function getDraftFmuPackage(sha256: string): Promise<Uint8Array | null> {
+  const mem = _fmuDraftMemory.get(sha256);
+  if (mem) return mem;
+  const cache = await fmuDraftCache();
+  if (!cache) return null;
+  try {
+    const res = await cache.match(fmuDraftKey(sha256));
+    return res ? new Uint8Array(await res.arrayBuffer()) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Drop a persisted package (after a save embedded it, or in tests). */
+export async function deleteDraftFmuPackage(sha256: string): Promise<void> {
+  _fmuDraftMemory.delete(sha256);
+  const cache = await fmuDraftCache();
+  try { await cache?.delete(fmuDraftKey(sha256)); } catch { /* best effort */ }
+}
+
+/** Test seam: forget the in-memory tier only (simulates a page reload). */
+export function _forgetDraftFmuMemoryForTesting(): void {
+  _fmuDraftMemory.clear();
 }

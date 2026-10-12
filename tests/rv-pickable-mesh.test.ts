@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { BoxGeometry, BufferGeometry, Mesh, MeshBasicMaterial, Skeleton, SkinnedMesh } from 'three';
-import { isPickableMesh } from '../src/core/engine/rv-raycast-geometry';
+import { isPickableMesh } from '../src/core/engine/rv-pick-utils';
 
 function mesh(): Mesh {
   return new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial());
@@ -21,11 +21,9 @@ describe('isPickableMesh', () => {
     expect(isPickableMesh(mesh())).toBe(true);
   });
 
-  it('rejects batch outputs and BVH artifacts', () => {
-    const a = mesh(); a.userData._rvBatchedRender = true;
-    const b = mesh(); b.userData._rvRaycastBVH = true;
+  it('rejects bake chunk meshes (pipeline outputs)', () => {
+    const a = mesh(); a.userData._rvBakeChunk = true;
     expect(isPickableMesh(a)).toBe(false);
-    expect(isPickableMesh(b)).toBe(false);
   });
 
   it('rejects overlay / visualization meshes', () => {

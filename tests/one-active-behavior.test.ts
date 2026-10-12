@@ -11,6 +11,7 @@ import {
   processExtras,
   traverseAndRegister,
 } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import {
   attachDriveBehaviorByCode,
   type DriveBehaviorHostViewer,
@@ -65,13 +66,9 @@ describe('one active Drive_* behavior', () => {
     const signalStore = new SignalStore();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-    const result = processExtras(
-      root,
-      registry,
-      signalStore,
-      new RVTransportManager(),
-      scene,
-    );
+    const result = processExtras(root, buildInitContext({
+      registry, signalStore, transportManager: new RVTransportManager(), scene,
+    }));
 
     expect(result.componentsCreated).toBe(1);
     expect(registry.getAll('Drive_Simple')).toHaveLength(1);
@@ -89,7 +86,7 @@ describe('one active Drive_* behavior', () => {
     scene.add(axis);
     const registry = new NodeRegistry();
     const signalStore = new SignalStore();
-    processExtras(axis, registry, signalStore, new RVTransportManager(), scene);
+    processExtras(axis, buildInitContext({ registry, signalStore, transportManager: new RVTransportManager(), scene }));
     const viewer = { registry, signalStore, scene } satisfies DriveBehaviorHostViewer;
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 

@@ -135,7 +135,10 @@ function fakeProjectStore(): FakeProjectStore {
     getBackend: () => (project ? ({
       kind: 'folder',
       writable: true,
-      listLibrary: async () => library,
+      // plan-744 F1: the ONE listing. This double used to implement
+      // `listLibrary` only, which the provider had a fallback for; both are
+      // gone.
+      listDocuments: async () => library,
       readDocumentUrl: async (relPath: string) => ({
         url: 'blob:' + relPath,
         release: () => { api.released++; },
@@ -230,7 +233,7 @@ describe('active project as a library source', () => {
       getBackend: () => ({
         kind: 'folder',
         writable: true,
-        listLibrary: async () => { throw new Error('disk gone'); },
+        listDocuments: async () => { throw new Error('disk gone'); },
         readDocumentUrl: async () => null,
       } as never),
     };

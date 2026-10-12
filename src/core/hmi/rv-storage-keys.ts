@@ -15,6 +15,25 @@ export const CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY = 'rv-connect-embed-signal-hint-
 export const AI_BRIDGE_CONSENT_KEY = 'rv-ai-bridge-consent';
 
 /**
+ * Settings > AI Bridge > "Follow agent" (plan-520): `'1'` / `'0'`, per device.
+ * Absent reads as ON — the camera follows the agent's node edits while the user
+ * is not using the view. Owned by `follow-agent-store.ts`.
+ */
+export const MCP_FOLLOW_AGENT_KEY = 'rv-mcp-follow-agent';
+
+/**
+ * "Read only, don't ask again" per CONNECT gateway + interface (plan-562 F8).
+ *
+ * Holds a JSON map of `<serverUrl>|<interfaceId>` → `true`, i.e. only the
+ * EXCEPTION: an interface the user decided must never be written to from this
+ * viewer. An unknown key reads as "not decided yet", so the write-gate overlay
+ * still asks once — which is the whole point of the prompt. Keyed by gateway as
+ * well as id because the same interface id on another CONNECT is another machine.
+ * Owned by `connect-write-gate-store.ts`.
+ */
+export const CONNECT_WRITE_GATE_READONLY_KEY = 'rv-connect-writegate-readonly';
+
+/**
  * Which Assets-tab library sections are COLLAPSED (plan-702 F2).
  *
  * Stores the exception, not the norm: an unknown `groupKey` reads as expanded,
@@ -41,7 +60,18 @@ export const PROJECTS_CARD_SIZE_KEY = 'rv-projects-card-size';
  */
 export const EDITOR_LAST_ASSET_KEY = 'rv-editor-last-asset';
 
+/**
+ * The cross-project ring of recently opened documents (plan-478).
+ *
+ * Declared as a literal here — the constant itself lives beside the store that
+ * owns it (`core/project/rv-project-recents-store.ts`,
+ * `LS_KEY_RECENT_DOCUMENTS`) so this list stays a leaf. Spelled
+ * `rv-project/recent-DOCUMENTS`, never `rv-project/recent`: that other key is
+ * the retired workspace recents list and `rv-project-legacy-cleanup.ts` deletes
+ * it on every boot, so a ring stored under it would be empty at every start.
+ */
 export const ALL_RV_STORAGE_KEYS = [
+  'rv-project/recent-documents',
   'rv-visual-settings',
   'rv-visual-presets',
   'rv-search-settings',
@@ -55,8 +85,11 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-extras-editor-width',
   'rv-projects-card-size',
   'rv-extras-editor-open',
-  'rv-extras-editor-selected',
+  // NB: no `rv-extras-editor-selected`. Selection is not persisted since
+  // plan-754 D10 — the key was global across documents, so it restored a path
+  // from one model into whichever model happened to load next.
   'rv-hierarchy-expanded',
+  'rv-hierarchy-show-runtime',
   'rv-hierarchy-type-filter',
   'rv-hierarchy-signal-sort',
   'rv-inspector-collapsed',
@@ -102,9 +135,11 @@ export const ALL_RV_STORAGE_KEYS = [
   'rv-welcome-dismissed',  // WelcomeModal "Got it" flag (ButtonPanel) — reset re-shows the welcome box
   'rv-auto-quality-applied',  // auto-quality boot seed already picked a preset on this device
   CONNECT_EMBED_SIGNAL_HINT_SEEN_KEY,
+  CONNECT_WRITE_GATE_READONLY_KEY,
   AI_BRIDGE_CONSENT_KEY,
   ASSETS_SECTIONS_COLLAPSED_KEY,
   EDITOR_LAST_ASSET_KEY,
+  MCP_FOLLOW_AGENT_KEY,
 ] as const;
 
 /** Read the CONNECT standalone hint flag without failing when storage is unavailable. */
@@ -174,6 +209,7 @@ export const RV_DYNAMIC_PREFIXES = [
   'rv-measurements-',
   'rv-panel-',
   'rv-panel-geo:',
+  'rv-panel-collapsed:',  // FloatingPanel collapsed state (plan-477 F2/F16)
   'rv-order-',
   'rv-camera-start:',
   'rv-sig-unlock:',

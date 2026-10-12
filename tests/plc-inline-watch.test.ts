@@ -184,8 +184,8 @@ describe('lookupWatchIdentifier', () => {
     });
   });
 
-  it('returns null for anything that is not a declared external / FB instance', () => {
-    expect(lookupWatchIdentifier(CODE, new Map(), 'count')).toBeNull();
+  it('resolves a plain VAR; null for anything undeclared', () => {
+    expect(lookupWatchIdentifier(CODE, new Map(), 'count')).toMatchObject({ identifier: 'count', kind: 'var' });
     expect(lookupWatchIdentifier(CODE, new Map(), 'nonexistent')).toBeNull();
   });
 });

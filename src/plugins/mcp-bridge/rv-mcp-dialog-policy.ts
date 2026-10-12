@@ -33,8 +33,8 @@
  * | `shelved-drafts` | `{action:'later'}` | Touch nothing; the offer comes back. |
  * | `save-problem` | `cancel` | Never trigger a browser download nobody asked for. The tool reports the real reason instead. |
  * | `name` | `null` | An agent that wanted a name passed one (`web_editor_save name=`). Being asked means it did not — cancel and say so. |
- * | `reimport-report`, `cad-missing`, `stack-problem`, `merge-unapplied` | dismiss | Informational. Auto-dismissed but carried back in `autoAnsweredDialogs` WITH their detail, so the diagnostic is never lost. |
- * | `separate-preview`, `merge-preview` | decline | Interactive previews driven by a human flow; an agent has no business confirming a destructive mesh operation from a dialog it cannot see. |
+ * | `reimport-report`, `cad-missing`, `stack-problem`, `merge-unapplied`, `separate-failed` | dismiss | Informational. Auto-dismissed but carried back in `autoAnsweredDialogs` WITH their detail, so the diagnostic is never lost. |
+ * | `merge-preview` | decline | Interactive preview driven by a human flow; an agent has no business confirming a destructive mesh operation from a dialog it cannot see. |
  *
  * ## TWO stores since plan-719 §2.4
  *
@@ -101,6 +101,7 @@ export async function installMcpDialogPolicy(): Promise<DialogPolicyRelease> {
           case 'cad-missing':
           case 'stack-problem':
           case 'merge-unapplied':
+          case 'separate-failed':
             return DIALOG_AUTO_DISMISS;
           default:
             // Interactive previews and anything added later: let the human decide.

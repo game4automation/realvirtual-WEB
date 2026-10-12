@@ -13,14 +13,22 @@
  *   <bold>section header</bold>     — bold section header
  *   <text>paragraph</text>          — plain text
  *   <value label="Label">text</value> — labeled value row (static)
- *   <link url="url">click text</link> — button (relative URL = doc link, absolute = web link)
+ *   <link url="url">click text</link> — button: absolute URL = web link; a relative path
+ *                                      that names a file of the OPEN project = that file
+ *                                      (PDF in the built-in viewer — a machine's manuals next
+ *                                      to the model); any other relative URL = doc-site link
+ *                                      (see metadata-link-resolver.ts)
  *   <signal>signalName</signal>     — labeled value row bound to live signal value
  */
 
 import type { Object3D } from 'three';
-import { useMemo, useCallback } from 'react';
+import { useMemo, useCallback, useEffect, useRef, useState } from 'react';
 import { Box, Typography, Button } from '@mui/material';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
+import PictureAsPdfIcon from '@mui/icons-material/PictureAsPdf';
+import { getProjectStore } from '../../project/project-store';
+import { openPdfViewer } from '../pdf-viewer-store';
+import { isAbsoluteHttpUrl, resolveMetadataLink, type MetadataLinkTarget } from './metadata-link-resolver';
 import ShoppingCartIcon from '@mui/icons-material/ShoppingCart';
 import { SignalRow, useSignalValues } from '../rv-signal-badge';
 import { useCustomBranding } from '../branding-store';
@@ -29,8 +37,6 @@ import type { TooltipContentProps } from './tooltip-registry';
 import { tooltipRegistry } from './tooltip-registry';
 import type { TooltipData } from './tooltip-store';
 import type { OrderManagerConfig, OrderManagerPluginAPI } from '../../types/plugin-types';
-const DOC_BASE_URL = 'https://doc.realvirtual.io/';
-
 /** Data shape for metadata tooltips. */
 export interface MetadataTooltipData extends TooltipData {
   type: 'metadata';
@@ -122,13 +128,6 @@ export function findValueByLabels(tags: readonly ParsedTag[], candidates: readon
  * Resolve a link URL. Relative URLs are prefixed with the documentation base URL
  * (matching Unity's RuntimeMetadata behavior where relative = doc link).
  */
-function resolveUrl(url: string): string {
-  if (url.startsWith('http://') || url.startsWith('https://')) {
-    return url;
-  }
-  return `${DOC_BASE_URL}${url}`;
-}
-
 // ── Row helper ──
 
 function Row({ label, value }: { label: string; value: string }) {
@@ -146,18 +145,62 @@ function Row({ label, value }: { label: string; value: string }) {
 
 // ── Link button ──
 
+/**
+ * A `<link url>` of the metadata. The target is resolved ONCE on mount (see
+ * metadata-link-resolver.ts): a file of the open project opens in the built-in
+ * PDF viewer (or a new tab for a non-PDF), an absolute URL in a new tab, and a
+ * relative path the project does not hold on the documentation site. The click
+ * itself is synchronous, so popup blockers never interfere.
+ */
 function LinkButton({ url, text }: { url: string; text: string }) {
-  const resolved = resolveUrl(url);
-  const isDoc = !url.startsWith('http://') && !url.startsWith('https://');
+  const [target, setTarget] = useState<MetadataLinkTarget | null>(null);
+  // A project object URL handed to the PDF viewer is owned by the viewer from
+  // then on; otherwise it is released with the tooltip.
+  const handedOver = useRef(false);
+
+  useEffect(() => {
+    let alive = true;
+    let resolvedTarget: MetadataLinkTarget | null = null;
+    handedOver.current = false;
+    void resolveMetadataLink(url, getProjectStore().getBackend()).then((t) => {
+      if (!alive) { if (t.kind === 'project') t.release(); return; }
+      resolvedTarget = t;
+      setTarget(t);
+    });
+    return () => {
+      alive = false;
+      if (resolvedTarget?.kind === 'project' && !handedOver.current) resolvedTarget.release();
+    };
+  }, [url]);
+
+  const isProject = target?.kind === 'project';
+  const isDoc = !isAbsoluteHttpUrl(url) && !isProject;
+  const href = target && target.kind !== 'project' ? target.href : undefined;
+
+  const onClick = useCallback((e: React.MouseEvent) => {
+    if (!target || target.kind !== 'project') return; // plain anchor navigation
+    e.preventDefault();
+    if (target.isPdf) {
+      handedOver.current = true;
+      openPdfViewer(text, { type: 'url', url: target.url }, { ownsUrl: true });
+    } else {
+      window.open(target.url, '_blank', 'noopener,noreferrer');
+    }
+  }, [target, text]);
 
   return (
     <Button
+      component="a"
       size="small"
       variant="text"
-      href={resolved}
-      target="_blank"
-      rel="noopener noreferrer"
-      endIcon={<OpenInNewIcon sx={{ fontSize: '12px !important' }} />}
+      href={href}
+      target={href ? '_blank' : undefined}
+      rel={href ? 'noopener noreferrer' : undefined}
+      disabled={target === null}
+      onClick={onClick}
+      endIcon={isProject && target.isPdf
+        ? <PictureAsPdfIcon sx={{ fontSize: '12px !important' }} />
+        : <OpenInNewIcon sx={{ fontSize: '12px !important' }} />}
       sx={{
         pointerEvents: 'auto',
         color: isDoc ? '#64b5f6' : '#81c784',

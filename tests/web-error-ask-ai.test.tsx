@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { ThemeProvider } from '@mui/material/styles';
 import { rvDarkTheme } from '../src/core/hmi/theme';
@@ -32,11 +32,14 @@ function makeViewer() {
     },
     parent: null,
   };
+  const ribbonNode = { ...node };
   const viewer = {
     errorStore,
+    highlighter: { flash: vi.fn() },
+    fitToNodes: vi.fn(),
     selectionManager: { getSnapshot: () => ({ primaryPath: null }) },
     registry: {
-      getNode: (path: string) => path === 'Line/Drive' ? node : null,
+      getNode: (path: string) => path === 'Line/Drive' ? node : path === 'Line/Ribbon' ? ribbonNode : null,
       getComponentTypes: () => ['Drive'],
     },
     signalStore: null,
@@ -93,5 +96,24 @@ describe('WebErrorPanel Ask AI', () => {
       docHints: ['docs/motor.pdf'],
     });
     expect(received[0].machineContext).toContain('Drive: TargetSpeed=250');
+  });
+});
+
+describe('alarm card focus', () => {
+  it('shows separate cards and focuses from the body and the focus icon with multiple alarms', () => {
+    const { viewer } = makeViewer();
+    viewer.errorStore.setActive('Line/Ribbon', true, 'Fabric torn');
+    renderPanel(viewer);
+    const first = screen.getByText('Motor overload').closest('.MuiPaper-root')!;
+    const second = screen.getByText('Fabric torn').closest('.MuiPaper-root')!;
+    expect(second.getBoundingClientRect().top).toBeGreaterThanOrEqual(first.getBoundingClientRect().bottom);
+    fireEvent.click(screen.getByText('Motor overload'));
+    expect(viewer.fitToNodes).toHaveBeenCalledWith([viewer.registry!.getNode('Line/Drive')]);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Focus related object' })[1]);
+    expect(viewer.fitToNodes).toHaveBeenNthCalledWith(2, [viewer.registry!.getNode('Line/Ribbon')]);
+    expect(viewer.fitToNodes).toHaveBeenCalledTimes(2);
+    expect(viewer.highlighter.flash).toHaveBeenCalledTimes(2);
+    // Clicking a card does not collapse the list over the next target.
+    expect(second.getBoundingClientRect().top).toBeGreaterThanOrEqual(first.getBoundingClientRect().bottom);
   });
 });

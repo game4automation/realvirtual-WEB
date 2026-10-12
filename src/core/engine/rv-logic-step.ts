@@ -9,6 +9,7 @@ import {
 } from './rv-signal-store';
 import type { RVSensor } from './rv-sensor';
 import type { RVGrip } from './rv-grip';
+import type { RVZone } from './rv-zone';
 import { debug } from './rv-debug';
 import { isSignalLiveControlled } from './rv-slot-authority';
 
@@ -21,6 +22,30 @@ export enum StepState {
   Finished = 'Finished',
 }
 
+// ─── Root context (plan-538) ─────────────────────────────────────
+
+/**
+ * What a step sees of the top-level root it belongs to (plan-538 F1d/F1f).
+ * Set by `RVLogicEngine` on every step of a registered root. A step that
+ * commands a drive reports it here, so the engine knows which root moved the
+ * axis LAST — deactivating a root only stops drives it still commands, never a
+ * drive an active root took over since.
+ */
+export interface LogicRootContext {
+  /** Record that `drive` was just commanded by a step of this root. */
+  noteDriveCommand(drive: RVDrive): void;
+  /** True when the LAST command on `drive` came from a step of this root. */
+  isLastCommander(drive: RVDrive): boolean;
+}
+
+/** Optional edge mode of `LogicStep_WaitForSignalBool` (plan-538 F5). */
+export type SignalEdge = 'Level' | 'Rising' | 'Falling';
+
+/** Parse the `Edge` field; anything unknown is `'Level'` (today's behaviour). */
+export function parseSignalEdge(raw: unknown): SignalEdge {
+  return raw === 'Rising' || raw === 'Falling' ? raw : 'Level';
+}
+
 // ─── Base Class ──────────────────────────────────────────────────
 
 export abstract class RVLogicStep {
@@ -30,6 +55,22 @@ export abstract class RVLogicStep {
   name = '';
   /** Full hierarchy path (set by engine during build) */
   hierarchyPath = '';
+  /** Root this step belongs to — set by the engine (plan-538), null for a loose step. */
+  rootContext: LogicRootContext | null = null;
+
+  /**
+   * True for a step type that starts motion (a drive, a robot path). A root
+   * whose `Active` is not `Always` warns at load for such a step WITHOUT a
+   * {@link cancel} hook — deactivating the root could not stop its motion.
+   */
+  get startsMotion(): boolean { return false; }
+
+  /**
+   * Optional cancel hook (plan-538 F1g): called by the engine when the root is
+   * DEACTIVATED, BEFORE the root is reset to Idle. Stops the motion this step
+   * started and that is still running; later ticks must not move it again.
+   */
+  cancel?(): void;
 
   /** Called by container when this step should begin executing */
   abstract start(): void;
@@ -60,10 +101,19 @@ export abstract class RVLogicStep {
 
 // ─── Containers ──────────────────────────────────────────────────
 
-/**
- * SerialContainer - Executes children one after another.
- * When autoLoop is true, restarts from first child after last finishes.
- */
+/** Web-native step completed explicitly by a sandboxed WebComponent script. */
+export class RVJavaScriptStep extends RVLogicStep {
+  runId = 0;
+  start(): void { this.runId++; this.state = StepState.Active; }
+  fixedUpdate(_dt: number): void { /* The web script host drives execution. */ }
+  complete(): void {
+    if (this.state !== StepState.Active) throw new Error('JavaScript step is not active');
+    this.finish();
+  }
+  get progress(): number { return this.state === StepState.Finished ? 100 : 0; }
+}
+
+/** Executes children in order, optionally restarting after the last finishes. */
 export class RVSerialContainer extends RVLogicStep {
   children: RVLogicStep[];
   currentIndex = 0;
@@ -133,10 +183,13 @@ export class RVSerialContainer extends RVLogicStep {
     if (child.state === StepState.Finished) {
       this.currentIndex++;
 
-      // Start next child (may finish immediately -> keep advancing)
+      // Start next child (may finish immediately -> keep advancing). Read the started child BEFORE
+      // starting it: a JumpOnSignal moves currentIndex to target-1 inside start(), and re-reading
+      // children[currentIndex] afterwards stalled a forward jump on a never-started step and read
+      // children[-1] on a jump to the first step.
       while (this.currentIndex < this.children.length) {
-        this.startChild(this.currentIndex);
         const next = this.children[this.currentIndex];
+        this.startChild(this.currentIndex);
         if (next.state === StepState.Finished) {
           this.currentIndex++;
         } else {
@@ -327,17 +380,41 @@ export class RVSetSignalBool extends RVLogicStep {
   fixedUpdate(_dt: number): void {}
 }
 
-/** WaitForSignalBool - polls until a boolean signal matches the expected value */
+/**
+ * WaitForSignalBool - waits until a boolean signal matches the expected value.
+ *
+ * plan-538 F5 — `edge`:
+ * - `'Level'` (default, today's behaviour): finishes as soon as the signal
+ *   equals `waitForTrue` — immediately when it already does at start.
+ * - `'Rising'` / `'Falling'`: the value is sampled at step start; the step
+ *   finishes on the FIRST false→true (true→false) transition after that. An
+ *   already-high (low) level at start does not count. `waitForTrue` is
+ *   ignored. Transitions are caught through a store subscription while the
+ *   step waits, so a pulse shorter than one tick is not lost.
+ */
 export class RVWaitForSignalBool extends RVLogicStep {
   signalAddress: string | null;
   waitForTrue: boolean;
+  readonly edge: SignalEdge;
   private signalStore: SignalStore;
+  /** Last value seen by the edge detector (sampled at start). */
+  private _edgePrev = false;
+  /** Latched: the wanted transition happened while waiting. */
+  private _edgeSeen = false;
+  private _edgeUnsub: (() => void) | null = null;
+  /** Created once — no closure allocation per start. */
+  private readonly _onEdgeValue = (value: boolean | number): void => {
+    const cur = value === true;
+    if (this.edge === 'Rising' ? (!this._edgePrev && cur) : (this._edgePrev && !cur)) this._edgeSeen = true;
+    this._edgePrev = cur;
+  };
 
-  constructor(signalAddress: string | null, waitForTrue: boolean, signalStore: SignalStore) {
+  constructor(signalAddress: string | null, waitForTrue: boolean, signalStore: SignalStore, edge: SignalEdge = 'Level') {
     super();
     this.signalAddress = signalAddress;
     this.waitForTrue = waitForTrue;
     this.signalStore = signalStore;
+    this.edge = edge;
   }
 
   get progress(): number {
@@ -353,6 +430,14 @@ export class RVWaitForSignalBool extends RVLogicStep {
       return;
     }
     this.state = StepState.Waiting;
+    if (this.edge !== 'Level') {
+      // Sample at start; only a transition AFTER this point finishes the step.
+      this._dropEdgeSubscription();
+      this._edgePrev = this.signalStore.getBoolByPath(this.signalAddress);
+      this._edgeSeen = false;
+      this._edgeUnsub = this.signalStore.subscribeByPath(this.signalAddress, this._onEdgeValue);
+      return;
+    }
     // Check immediately
     if (this.signalStore.getBoolByPath(this.signalAddress) === this.waitForTrue) {
       this.finish();
@@ -361,9 +446,36 @@ export class RVWaitForSignalBool extends RVLogicStep {
 
   fixedUpdate(_dt: number): void {
     if (this.state !== StepState.Waiting || !this.signalAddress) return;
+    if (this.edge !== 'Level') {
+      // Polling fallback for a store without notification on this path.
+      this._onEdgeValue(this.signalStore.getBoolByPath(this.signalAddress));
+      if (this._edgeSeen) {
+        debug('logic', `WaitForSignalBool "${this.name}": ${this.signalAddress} ${this.edge} edge`);
+        this.finish();
+      }
+      return;
+    }
     if (this.signalStore.getBoolByPath(this.signalAddress) === this.waitForTrue) {
       debug('logic', `WaitForSignalBool "${this.name}": ${this.signalAddress} matched (${this.waitForTrue})`);
       this.finish();
+    }
+  }
+
+  protected finish(): void {
+    this._dropEdgeSubscription();
+    super.finish();
+  }
+
+  reset(): void {
+    super.reset();
+    this._dropEdgeSubscription();
+    this._edgeSeen = false;
+  }
+
+  private _dropEdgeSubscription(): void {
+    if (this._edgeUnsub) {
+      this._edgeUnsub();
+      this._edgeUnsub = null;
     }
   }
 }
@@ -373,7 +485,7 @@ export class RVWaitForSensor extends RVLogicStep {
   sensor: RVSensor | null;
   waitForOccupied: boolean;
 
-  constructor(sensor: RVSensor | null, waitForOccupied: boolean) {
+  constructor(sensor: RVSensor | null, waitForOccupied: boolean, readonly waitForStopped = false) {
     super();
     this.sensor = sensor;
     this.waitForOccupied = waitForOccupied;
@@ -392,15 +504,61 @@ export class RVWaitForSensor extends RVLogicStep {
       return;
     }
     this.state = StepState.Waiting;
-    if (this.sensor.occupied === this.waitForOccupied) {
+    if (this.matches()) {
       this.finish();
     }
   }
 
   fixedUpdate(_dt: number): void {
     if (this.state !== StepState.Waiting || !this.sensor) return;
-    if (this.sensor.occupied === this.waitForOccupied) {
+    if (this.matches()) {
       debug('logic', `WaitForSensor "${this.name}": sensor "${this.sensor.node.name}" ${this.waitForOccupied ? 'occupied' : 'cleared'}`);
+      this.finish();
+    }
+  }
+
+  private matches(): boolean {
+    return this.sensor?.occupied === this.waitForOccupied
+      && (!this.waitForOccupied || !this.waitForStopped || this.sensor?.occupiedMU?.blocked === true);
+  }
+}
+
+/**
+ * WaitForZone (plan-521) — waits until a Zone reports occupied (or free).
+ * Reads the zone's Detect result (`RVZone.occupied`); pattern RVWaitForSensor.
+ * A missing zone reference is reported (warning) and the step finishes, so a
+ * broken reference never stalls the sequence silently.
+ */
+export class RVWaitForZone extends RVLogicStep {
+  zone: RVZone | null;
+  waitForOccupied: boolean;
+
+  constructor(zone: RVZone | null, waitForOccupied: boolean) {
+    super();
+    this.zone = zone;
+    this.waitForOccupied = waitForOccupied;
+  }
+
+  get progress(): number {
+    if (this.state === StepState.Finished) return 100;
+    if (this.state === StepState.Waiting) return 50;
+    return 0;
+  }
+
+  start(): void {
+    if (!this.zone) {
+      console.warn(`[LogicStep] WaitForZone "${this.name}": no Zone referenced — skipping`);
+      this.state = StepState.Finished;
+      return;
+    }
+    this.state = StepState.Waiting;
+    if (this.zone.occupied === this.waitForOccupied) this.finish();
+  }
+
+  fixedUpdate(_dt: number): void {
+    if (this.state !== StepState.Waiting || !this.zone) return;
+    if (this.zone.occupied === this.waitForOccupied) {
+      debug('logic', `WaitForZone "${this.name}": zone "${this.zone.node.name}" ${this.waitForOccupied ? 'occupied' : 'free'}`);
       this.finish();
     }
   }
@@ -454,6 +612,7 @@ export class RVDriveTo extends RVLogicStep {
 
     this.targetPosition = dest;
     this.drive.startMove(dest);
+    this.rootContext?.noteDriveCommand(this.drive);
     this.state = StepState.Active;
 
     // Check if already at target
@@ -472,6 +631,27 @@ export class RVDriveTo extends RVLogicStep {
       this.finish();
     }
   }
+
+  get startsMotion(): boolean { return true; }
+
+  /** plan-538 F1g — a running move of this step stops and holds its position. */
+  cancel(): void {
+    const drive = this.drive;
+    if (!drive || this.state !== StepState.Active) return;
+    if (this.rootContext && !this.rootContext.isLastCommander(drive)) return;
+    holdDrive(drive);
+  }
+}
+
+/**
+ * Stop a drive and hold it where it stands (plan-538 F1d): no running move,
+ * no jog, the target set to the current position so a later `startMove()`
+ * without argument cannot resume the old destination.
+ */
+export function holdDrive(drive: RVDrive): void {
+  drive.positionOverwrite = false;
+  drive.stop();
+  drive.targetPosition = drive.currentPosition;
 }
 
 /** SetDriveSpeed - changes a drive's target speed and finishes immediately */
@@ -568,11 +748,32 @@ export class RVStartDriveTo extends RVLogicStep {
     }
 
     this.drive.startMove(dest);
+    this._commandedTarget = dest;
+    this.rootContext?.noteDriveCommand(this.drive);
     debug('logic', `StartDriveTo "${this.name}": drive → ${dest}`);
     this.state = StepState.Finished;
   }
 
   fixedUpdate(_dt: number): void {}
+
+  /** Target of the move this step started (survives the container's per-cycle reset). */
+  private _commandedTarget: number | null = null;
+
+  get startsMotion(): boolean { return true; }
+
+  /**
+   * plan-538 F1g — the step finishes at once, but the move it started keeps
+   * running: stop it while it is still under way toward this step's target and
+   * no other root commanded the drive since.
+   */
+  cancel(): void {
+    const drive = this.drive;
+    const target = this._commandedTarget;
+    this._commandedTarget = null;
+    if (!drive || target === null || !drive.isRunning || drive.targetPosition !== target) return;
+    if (this.rootContext && !this.rootContext.isLastCommander(drive)) return;
+    holdDrive(drive);
+  }
 }
 
 /** WaitForDrivesAtTarget - waits until all drives in the list have reached their targets */

@@ -26,6 +26,9 @@
  * 2. the active project's `docs.basePath` / `aasx.basePath`;
  * 3. the deployment-wide `projectAssetsPath` fallback.
  *
+ * For `aasx` the result is the `aasx/` directory itself (plan-596), for `docs`
+ * the docs base — see {@link resolveAssetsBase}.
+ *
  * Falling back rather than failing matters: a bundled deploy has no project
  * manifest at all, and its datasheets must keep working exactly as before.
  */
@@ -76,6 +79,12 @@ export function resolveAssetsBase(opts: {
   fallbackBase: string;
 }): string {
   const { explicit, project, kind, fallbackBase } = opts;
-  if (typeof explicit === 'string' && explicit.trim()) return withTrailingSlash(explicit.trim());
-  return projectAssetsBase(project, kind, fallbackBase) ?? withTrailingSlash(fallbackBase);
+  // plan-596: for `aasx` the answer is the aasx DIRECTORY itself (the folder
+  // that holds index.json and the .aasx files). `explicit` and `fallbackBase`
+  // are assets ROOTS, so `aasx/` is appended to them; a project's
+  // `aasx.basePath` already names the directory. Before this the AAS chain
+  // appended `aasx/` a second time to a project path (`…/aasx/aasx/index.json`).
+  const dir = (root: string) => (kind === 'aasx' ? `${withTrailingSlash(root)}aasx/` : withTrailingSlash(root));
+  if (typeof explicit === 'string' && explicit.trim()) return dir(explicit.trim());
+  return projectAssetsBase(project, kind, fallbackBase) ?? dir(fallbackBase);
 }

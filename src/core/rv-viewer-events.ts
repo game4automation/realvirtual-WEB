@@ -25,10 +25,27 @@ import type { RenderMode } from './rv-render-modes';
 import type { Object3D } from 'three';
 import type { SignatureState } from './persistence/rv-sig-verify';
 import type { ModelProvenance } from './rv-model-provenance';
+import type { PlacementsSettledInfo, PlacementsState } from './engine/rv-placement-instancer';
 
 export interface ViewerEvents {
   // ── Existing events (unchanged) ──
+  /**
+   * The document's own GLB is loaded and announced to the plugins. The scene
+   * may still be INCOMPLETE: the placed references of a layout document are
+   * materialised asynchronously after this event (plan-753). Whoever needs the
+   * whole scene joins on `placements-materialized` / `viewer.whenSceneReady()`.
+   */
   'model-loaded': { result: LoadResult };
+  /**
+   * The deferred placements of the current load settled — fired exactly ONCE
+   * per load, right after `model-loaded` for a document without references,
+   * else when the last one is instantiated (or failed into its placeholder).
+   * `aborted: true` when the document changed first. Promise form:
+   * `viewer.whenSceneReady()`; live state: `viewer.placements.state`.
+   */
+  'placements-materialized': PlacementsSettledInfo;
+  /** `viewer.placements.state` flipped (busy indicator, DevTools). */
+  'placements-state-changed': { state: PlacementsState };
   /** Geometry/HMI lifecycle remains on model-loaded; executable model logic
    *  binds only when this event fires (immediately for none/valid, or after an
    *  explicit late activation for invalid/unverifiable signatures). */
@@ -125,6 +142,10 @@ export interface ViewerEvents {
    *  capabilities (e.g. the Environment tab hiding Reflection in toon) listens
    *  here to stay in sync without polling. */
   'render-mode-changed': { mode: RenderMode };
+
+  /** Fired when the editor's wireframe view toggle changes (`viewer.wireframe`).
+   *  `on` is the toggle itself; it only draws while editor mode is active. */
+  'wireframe-changed': { on: boolean };
 
   // ── Generic component event ──
   /** Emitted by any RVComponent (drive, sensor, MU, custom plugin component) when
@@ -272,6 +293,11 @@ export interface ViewerEvents {
    *  reflects the modifier state at drag-start — listeners may treat this
    *  as a per-drag override (e.g. snap-point plugin treats ALT-held as
    *  "drag solo + detach all connections of the moved asset"). */
+  /** A materialised placement's content is in the scene and registered — fired
+   *  once PER placement, so listeners can bring that subtree to life (snap
+   *  re-scan, AAS resolution). The whole scene is only complete at
+   *  `placements-materialized`. */
+  'layout-content-added': { root: Object3D; chunks?: unknown; keep?: unknown };
   'layout-drag-start': { node: Object3D; altKey?: boolean };
   /** Fired once per drag frame (FloorGizmo onChange) AFTER the gizmo has
    *  applied its own transform but BEFORE the next render. Listeners may
@@ -316,11 +342,22 @@ export interface ViewerEvents {
    *  components added/removed. Listeners rebuild caches (hierarchy panel
    *  editableNodes etc.) and should coalesce — one emit per top-level op. */
   'editor-structure-changed': { source: 'asset-editor' };
+  /** Fired after a scalar Inspector edit has reached its live component. */
+  'component-field-changed': { nodePath: string; componentType: string; fieldName: string };
+  /**
+   * Fired when a placement's `LayoutObject.Locked` was written (context menu,
+   * hierarchy glyph, inspector — all through one write path). `LayoutObject`
+   * is metadata, not a registered component, so `component-field-changed`
+   * never fires for it; the planner listens here to drop the gizmo from a
+   * placement that was locked while selected.
+   */
+  'layout-lock-changed': { path: string; locked: boolean };
 
   /** Fired when Group memberships changed through editing (Group component
    *  added/removed/renamed, grouped node deleted/restored — both op directions,
    *  undo/redo included). Listeners re-read `viewer.groups`. */
-  'groups-changed': { source: 'editor' };
+  /** The viewer-wide GroupRegistry changed: an editor op, or a placement merged its groups (plan-757). */
+  'groups-changed': { source: 'editor' | 'placement' };
 
   /** Fired at the START of every asset save/export flow, BEFORE the scene is
    *  cloned for GLB export. Listeners must restore any ephemeral live-preview

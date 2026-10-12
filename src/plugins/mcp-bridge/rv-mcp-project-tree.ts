@@ -89,7 +89,7 @@ export async function loadProjectTree(
   // config and knowledge lists — so an MCP client and the screen beside it
   // disagreed about what the project contains, and `plainFiles` would have
   // made the gap wider still.
-  const { configs, knowledge, plainFiles } = await listProjectFiles(backend);
+  const { configs, knowledge, scripts, plainFiles } = await listProjectFiles(backend);
 
   const tree = buildDashboardTree({
     project: {
@@ -100,6 +100,7 @@ export async function loadProjectTree(
       attachments,
       configs,
       knowledge,
+      scripts,
       plainFiles,
       folders: readProjectFolders(project),
     },

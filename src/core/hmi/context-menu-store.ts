@@ -56,6 +56,21 @@ export interface ContextMenuItem {
   order?: number;
   danger?: boolean;
   dividerBefore?: boolean;
+  /**
+   * plan-499 F7: the item is a VIEW of a registry command. `ContextMenuLayer`
+   * dispatches `execute(id, args(target))` — origin `ui` for a mouse click,
+   * `shortcut` for the open-menu chord — instead of calling `action`. The
+   * item keeps its own label and its single-character `shortcut`; the full
+   * chord (`S>I`) lives on the command descriptor.
+   */
+  command?: ContextMenuCommand;
+}
+
+/** The command a menu item dispatches; `args` receives the right-click target (e.g. as seed). */
+export interface ContextMenuCommand {
+  id: string;
+  args: (target: ContextMenuTarget) => unknown;
+  buttonKey?: string;
 }
 
 /** Resolved item in snapshot — labels pre-resolved to strings, submenus resolved. */
@@ -63,6 +78,8 @@ export interface ResolvedContextMenuItem {
   id: string;
   resolvedLabel: string;
   action?: (target: ContextMenuTarget) => void;
+  /** plan-499: dispatched through the command registry by ContextMenuLayer. */
+  command?: ContextMenuCommand;
   children?: ResolvedContextMenuItem[];
   input?: ContextMenuInputSpec;
   shortcut?: string;
@@ -210,7 +227,7 @@ export class ContextMenuStore {
       }
 
       // Drop submenu parents that resolved empty and have no own behavior
-      if (item.children && (!children || children.length === 0) && !item.action && !item.input) {
+      if (item.children && (!children || children.length === 0) && !item.action && !item.input && !item.command) {
         continue;
       }
 
@@ -218,6 +235,7 @@ export class ContextMenuStore {
         id: item.id,
         resolvedLabel,
         action: item.action,
+        ...(item.command ? { command: item.command } : {}),
         children,
         input: item.input,
         shortcut: item.shortcut,

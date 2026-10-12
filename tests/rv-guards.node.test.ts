@@ -29,12 +29,15 @@ import {
   knownProjectKeys,
   assertNoSecrets,
   secretContentViolation,
-  containsHighEntropyFragment,
+  containsHighEntropyFragment,
   isAllowedSecretSchemaPath,
   isCredentialPropertyName,
   isSecretReferenceValue,
   plaintextSecretPaths,
-  collectSecretRefKeys,
+  collectSecretRefKeys,
+  parseProjectIgnoreRules,
+  hostedDeployDenyReason,
+  isHostedDeployDenied,
 } from '../scripts/_rv-guards.mjs';
 
 const SCRIPTS = resolve(__dirname, '../scripts');
@@ -101,6 +104,8 @@ describe('denied project artefacts', () => {
   it('separates the shallow skip list from the recursive artefact rule', () => {
     expect(isProjectAssetSkipDir('models')).toBe(true);
     expect(isProjectAssetSkipDir('scripts')).toBe(true);
+    // CAD sources never travel: case-insensitive, the editor writes `CAD/`.
+    expect(isProjectAssetSkipDir('CAD')).toBe(true);
     expect(isProjectAssetSkipDir('docs')).toBe(false);
     // The same name one level down is content, not machinery:
     expect(isDeniedProjectArtifactPath('docs/scripts/x.md')).toBe(false);
@@ -341,5 +346,57 @@ describe('secret references (plan-718)', () => {
       B: [{ Token: { $secretRef: 'mqtt.token' } }],
       C: { $secretRef: '   ' },
     }).sort()).toEqual(['mqtt.token', 'plc.pw']);
+  });
+});
+
+// ─── plan-759: hosted deploy deny list + .rvprojectignore ─────────────────
+
+describe('hosted deploy deny list (plan-759 F1)', () => {
+  const rules = parseProjectIgnoreRules('# derived\n.trash/\n*.log\n\n.env\nbuild/out/\n');
+
+  it('parses the gitignore-lite template and refuses negation', () => {
+    expect(rules.map((r) => r.source)).toEqual(['.trash/', '*.log', '.env', 'build/out/']);
+    expect(rules[0].dirOnly).toBe(true);
+    expect(rules[1].dirOnly).toBe(false);
+    expect(rules[3].anchored).toBe(true);
+    expect(() => parseProjectIgnoreRules('!keep.glb')).toThrow(/negation/);
+  });
+
+  it('never removes project.json and lets ordinary project content travel', () => {
+    for (const rel of ['project.json', 'models/a.glb', 'cad/deep/b.glb', 'scenes/c.scene.glb',
+      'assets/branding/logo.png', 'docs/manual.pdf', 'settings/project-settings.json', '.rvprojectignore']) {
+      expect(hostedDeployDenyReason(rel, { ignoreRules: rules }), rel).toBeNull();
+    }
+  });
+
+  it('names a reason for everything it removes', () => {
+    const reason = (rel: string, isDir = false) => hostedDeployDenyReason(rel, { isDir, ignoreRules: rules });
+    expect(reason('secrets.local.json')).toBe('secret');
+    expect(reason('connect/.env.local')).toBe('secret');
+    expect(reason('.trash', true)).toBe('denied-dir');
+    expect(reason('.trash/x.glb')).toBe('denied-dir');
+    expect(reason('sub/.git/config')).toBe('denied-dir');
+    expect(reason('.cad-cache/x.bin')).toBe('denied-dir');
+    expect(reason('plugins/index.ts')).toBe('denied-file');
+    expect(reason('plugins/Panel.tsx')).toBe('denied-file');
+    expect(reason('tsconfig.json')).toBe('denied-file');
+    expect(reason('cad/old/project.json.bak')).toBe('denied-file');
+    // CAD source formats in the top-level CAD/ folder never travel (any case);
+    // GLB documents there still do, and a deeper cad/ folder is ordinary content.
+    expect(reason('CAD/machine.step')).toBe('cad-source');
+    expect(reason('cad/sub/part.JT')).toBe('cad-source');
+    expect(reason('CAD/converted.glb')).toBeNull();
+    expect(reason('docs/cad/drawing.step')).toBeNull();
+    expect(reason('foo.tmp')).toBe('denied-file');   // built-in editor-leftover rule wins
+    expect(reason('debug.log')).toBe('ignore:*.log'); // the project's own .rvprojectignore
+    expect(reason('build/out/x.js')).toBe('ignore:build/out/');
+    expect(reason('build/out', true)).toBe('ignore:build/out/');
+    // the publish/embed artefact rule still applies — except to the manifest
+    expect(reason('connect/project-config.json')).toBe('artifact');
+    expect(reason('llm.json')).toBe('artifact');
+    expect(reason('docs/nested/hidden.KEY')).toBe('artifact');
+    expect(reason('index/state.bin')).toBe('artifact');
+    expect(isHostedDeployDenied('project.json')).toBe(false);
+    expect(isHostedDeployDenied('secret.key')).toBe(true);
   });
 });

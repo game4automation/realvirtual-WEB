@@ -128,44 +128,6 @@ export interface GeometryGroupSpec {
   materialIndex: number;
 }
 
-/**
- * Worker request. Carries an `id` that increases monotonically — the client drops any
- * response whose `id` is no longer the latest one.
- *
- * The arrays in a request are **copied**, never transferred. Transferring would detach
- * the `ArrayBuffer` of the **live** source geometry and take rendering and raycasting
- * down with it. Only responses are transferred, because those buffers are freshly built
- * inside the worker and belong to nobody else.
- */
-export type SeparateRequest =
-  | {
-      id: number;
-      phase: 'analyze';
-      mode: SeparateMode;
-      position: Float32Array;
-      index: Uint32Array | null;
-      resolution: number;
-      groups?: GeometryGroupSpec[];
-    }
-  | {
-      id: number;
-      phase: 'extract';
-      attributes: Record<string, SerializedAttribute>;
-      index: Uint32Array | null;
-      partitions: number[][];
-    };
-
-/** Worker response. */
-export type SeparateResponse =
-  | { id: number; ok: true; phase: 'analyze'; partitions: number[][] }
-  | {
-      id: number;
-      ok: true;
-      phase: 'extract';
-      parts: { attributes: Record<string, SerializedAttribute>; index: Uint32Array }[];
-    }
-  | { id: number; ok: false; error: string };
-
 // ─── Guards ─────────────────────────────────────────────────────────────
 
 /**
@@ -180,8 +142,7 @@ export type SeparateResponse =
  *                   {@link DEFAULT_WELD_THRESHOLD}, so the documented one-argument
  *                   signature stays valid.
  *
- * Callers that already hold a partition list (the worker path computes it off-thread)
- * should skip the analysis here and compare against {@link REASON_SINGLE_PART} themselves
+ * Callers that already hold a partition list should skip the analysis here and compare against {@link REASON_SINGLE_PART} themselves
  * rather than paying for a second union-find.
  */
 export function islandModeIneligibility(
@@ -630,27 +591,8 @@ export function extractSubGeometry(geom: BufferGeometry, triangleIndices: number
 
 // ─── Worker payload serialization ───────────────────────────────────────
 //
-// Shared by the worker entry point and its client wrapper so the two cannot drift.
-
-/**
- * Copies the position attribute into a tight, denormalized `Float32Array`.
- *
- * Tight on purpose: a structured clone of the raw attribute array would clone its whole
- * backing `ArrayBuffer`, which in a GLB is typically shared by every attribute of every
- * mesh in the file.
- */
-export function serializePositions(geom: BufferGeometry): Float32Array {
-  const pos = geom.getAttribute('position');
-  if (!pos) throw new RangeError('serializePositions: geometry has no position attribute');
-  const out = new Float32Array(pos.count * 3);
-  for (let i = 0; i < pos.count; i++) {
-    const o = i * 3;
-    out[o] = pos.getX(i);
-    out[o + 1] = pos.getY(i);
-    out[o + 2] = pos.getZ(i);
-  }
-  return out;
-}
+// Used by the mesh-merge worker and its client (`rv-mesh-merge*.ts`). The separator
+// itself runs on the main thread and needs none of it.
 
 /** Copies the index into a tight `Uint32Array`, or `null` for non-indexed geometry. */
 export function serializeIndex(geom: BufferGeometry): Uint32Array | null {

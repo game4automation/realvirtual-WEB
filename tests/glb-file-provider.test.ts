@@ -8,7 +8,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { createGlbFileProvider, resolveGlbFiles, glbBaseName } from '../src/plugins/unified-import/glb-file-provider';
-import { remediationFor } from '../src/plugins/unified-import/UnifiedImportDialog';
+import { licenseCtaFor, remediationFor } from '../src/plugins/unified-import/UnifiedImportDialog';
 import { resolveProviderSafe } from '../src/core/import/rv-import-provider';
 import { UnifiedImportPlugin } from '../src/plugins/unified-import';
 import { evaluateVisibilityRule } from '../src/core/hmi/ui-context-store';
@@ -95,5 +95,20 @@ describe('remediationFor', () => {
 
   it('returns null for messages it cannot improve', () => {
     expect(remediationFor('Nothing to import — the source resolved to no items.')).toBeNull();
+  });
+});
+
+describe('licensed CAD size — the one failure with a shop, not a fix', () => {
+  const refusal = 'Import stopped at the Free license limit of 25 MB per STEP file. This file is 40 MB. '
+    + 'A commercial license removes the STEP limit and converts complete cells and plants natively on CONNECT.';
+
+  it('offers the upgrade as the next step and a link to get it', () => {
+    expect(remediationFor(refusal)).toMatch(/commercial license/i);
+    expect(licenseCtaFor(refusal)).toEqual({ label: 'Get a license', href: 'https://realvirtual.io/en/products/connect/' });
+  });
+
+  it('never shows a shop link for the gateway capacity limit', () => {
+    expect(licenseCtaFor('STEP file exceeds the CONNECT upload limit.')).toBeNull();
+    expect(licenseCtaFor('RuntimeError: memory access out of bounds')).toBeNull();
   });
 });

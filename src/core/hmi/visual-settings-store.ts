@@ -13,9 +13,8 @@ import {
   PHYSICS_FULL_FLAG_KEY,
   isPhysicsFlagEnabled,
   isFullPhysicsFlagEnabled,
-  computePhysicsEnabled,
-  computeFullPhysics,
-  physicsSettings,
+  physicsInputs,
+  recomputePhysics,
 } from '../engine/rv-physics-registry';
 
 const STORAGE_KEY = 'rv-visual-settings';
@@ -38,6 +37,20 @@ export type ShadowQuality = 'low' | 'medium' | 'high';
 export const SHADOW_QUALITY_OPTIONS: readonly ShadowQuality[] = ['low', 'medium', 'high'] as const;
 
 export type ProjectionType = 'perspective' | 'orthographic';
+
+/** Render frame-rate limit in frames per second; 0 = Off (plan-568). */
+export type FpsCap = 0 | 30 | 60;
+export const FPS_CAP_OPTIONS: readonly FpsCap[] = [0, 30, 60] as const;
+
+/** True when `v` is one of the supported {@link FpsCap} values. */
+export function isFpsCap(v: unknown): v is FpsCap {
+  return v === 0 || v === 30 || v === 60;
+}
+
+/** Minimum seconds between two renders for a cap (0 = uncapped). */
+export function fpsCapToFrameInterval(cap: FpsCap): number {
+  return cap > 0 ? 1 / cap : 0;
+}
 
 /** Ambient-occlusion backend selection.
  *  - `'off'`  : AO disabled entirely.
@@ -80,6 +93,10 @@ export interface VisualSettings {
   shadowRadius: number;
   /** Maximum device pixel ratio (1.0 = performance, 1.5 = balanced, native = quality). */
   maxDpr: number;
+  /** Render frame-rate limit (0 = Off, 30, 60). The simulation is unaffected;
+   *  never applied in XR, during video capture or perf measurements. Not part
+   *  of visual presets. */
+  fpsCap: FpsCap;
   /** FPV walk speed in m/s. */
   fpvSpeed: number;
   /** FPV sprint speed in m/s. */
@@ -157,6 +174,10 @@ export interface VisualSettings {
   /** Whether the drive axis gizmo (double arrow / rotation ring) is shown on
    *  selected Drive nodes (plan-249). */
   showDriveAxisGizmo: boolean;
+  /** Whether the AI agent's camera-body cone ("AI eye") is drawn in the scene
+   *  (plan-740). Off also disables its double-click attach; the agent's own
+   *  navigation and captures are unaffected. */
+  showAgentEye: boolean;
   /** Zoom factor for the React HMI overlay (0.5–2.0, default 1.0). */
   uiZoom: number;
   /** Dimensionless scale for every HMI `backdrop-filter` blur radius (0.1–1,
@@ -173,8 +194,17 @@ export interface VisualSettings {
   /** OrbitControls damping factor — inertia feel (0.01–0.5, default 0.2).
    *  Higher = more direct (shorter glide after the mouse stops). */
   orbitDampingFactor: number;
-  /** Distance-adaptive navigation: scales zoom/pan speed proportionally to camera–target distance (opt-in). */
-  distanceAdaptiveNav?: boolean;
+  /** Mouse-wheel zoom anchor: true (default) = zoom toward the point under the
+   *  mouse cursor, false = zoom toward the middle of the viewport. A trackpad
+   *  or touch pinch always zooms under the fingers. */
+  wheelZoomToCursor: boolean;
+  /** Orbit / pan anchor: false (default) = orbit about the fixed focus point and
+   *  pan in the plane through it (the classic OrbitControls feel), true = orbit
+   *  about and pan by the surface point under the cursor. */
+  navigateAroundCursorPoint: boolean;
+  // `distanceAdaptiveNav` (Adaptive Nav checkbox) was removed by plan-515: a stored
+  // value is simply not read any more (the aoMode/ssaoEnabled precedent) and drops
+  // out of storage with the next save.
 }
 
 /** Single source of truth for OrbitControls navigation-sensitivity ranges (UI sliders + clamping). */
@@ -230,6 +260,7 @@ const DEFAULTS: VisualSettings = {
   shadowMapSize: 1024,
   shadowRadius: 2,
   maxDpr: 1.5,
+  fpsCap: 0,
   fpvSpeed: 2.5,
   fpvSprintSpeed: 5.0,
   fpvSensitivity: 0.002,
@@ -265,13 +296,15 @@ const DEFAULTS: VisualSettings = {
   envReflectionsEnabled: false,
   envReflectionsIntensity: 0.3,
   showDriveAxisGizmo: true,
+  showAgentEye: true,
   uiZoom: 1.0,
   uiBlurScale: DEFAULT_UI_BLUR_SCALE,
   orbitRotateSpeed: 1.0,
   orbitPanSpeed: 1.0,
   orbitZoomSpeed: 1.0,
   orbitDampingFactor: 0.2,
-  distanceAdaptiveNav: false,
+  wheelZoomToCursor: true,
+  navigateAroundCursorPoint: false,
 };
 
 function migrateToneMapping(raw: unknown, mode: RenderMode): ToneMappingType {
@@ -325,6 +358,7 @@ export function loadVisualSettings(): VisualSettings {
     shadowMapSize: fromStorage.shadowMapSize,
     shadowRadius: fromStorage.shadowRadius,
     maxDpr: fromStorage.maxDpr,
+    fpsCap: fromStorage.fpsCap,
     fpvSpeed: fromStorage.fpvSpeed,
     fpvSprintSpeed: fromStorage.fpvSprintSpeed,
     fpvSensitivity: fromStorage.fpvSensitivity,
@@ -360,6 +394,7 @@ export function loadVisualSettings(): VisualSettings {
     envReflectionsEnabled: fromStorage.envReflectionsEnabled,
     envReflectionsIntensity: fromStorage.envReflectionsIntensity,
     showDriveAxisGizmo: fromStorage.showDriveAxisGizmo,
+    showAgentEye: fromStorage.showAgentEye,
     uiZoom: fromStorage.uiZoom,
     uiBlurScale: fromStorage.uiBlurScale,
     orbitRotateSpeed: clampNavNumber(
@@ -382,7 +417,10 @@ export function loadVisualSettings(): VisualSettings {
       NAVIGATION_RANGES.dampingFactor,
       fromStorage.orbitDampingFactor,
     ),
-    distanceAdaptiveNav: fromStorage.distanceAdaptiveNav,
+    wheelZoomToCursor: typeof override.wheelZoomToCursor === 'boolean'
+      ? override.wheelZoomToCursor : fromStorage.wheelZoomToCursor,
+    navigateAroundCursorPoint: typeof override.navigateAroundCursorPoint === 'boolean'
+      ? override.navigateAroundCursorPoint : fromStorage.navigateAroundCursorPoint,
   };
 }
 
@@ -410,6 +448,8 @@ function loadFromLocalStorage(): VisualSettings {
     const maxDprRaw = (parsed as Record<string, unknown>).maxDpr;
     const maxDpr = (typeof maxDprRaw === 'number' && maxDprRaw >= 0.5 && maxDprRaw <= 4)
       ? maxDprRaw : DEFAULTS.maxDpr;
+    const fpsCapRaw = (parsed as Record<string, unknown>).fpsCap;
+    const fpsCap: FpsCap = isFpsCap(fpsCapRaw) ? fpsCapRaw : DEFAULTS.fpsCap;
     const fpvSpeedRaw = (parsed as Record<string, unknown>).fpvSpeed;
     const fpvSpeed = (typeof fpvSpeedRaw === 'number' && fpvSpeedRaw >= 0.5 && fpvSpeedRaw <= 20)
       ? fpvSpeedRaw : DEFAULTS.fpvSpeed;
@@ -519,6 +559,11 @@ function loadFromLocalStorage(): VisualSettings {
     const showDriveAxisGizmoRaw = (parsed as Record<string, unknown>).showDriveAxisGizmo;
     const showDriveAxisGizmo = typeof showDriveAxisGizmoRaw === 'boolean'
       ? showDriveAxisGizmoRaw : DEFAULTS.showDriveAxisGizmo;
+    // A blob written before plan-740 carries no `showAgentEye`; the default
+    // (true) then shows the cone, which is the intended first impression.
+    const showAgentEyeRaw = (parsed as Record<string, unknown>).showAgentEye;
+    const showAgentEye = typeof showAgentEyeRaw === 'boolean'
+      ? showAgentEyeRaw : DEFAULTS.showAgentEye;
     const uiZoomRaw = (parsed as Record<string, unknown>).uiZoom;
     const uiZoom = (typeof uiZoomRaw === 'number' && uiZoomRaw >= 0.5 && uiZoomRaw <= 2)
       ? uiZoomRaw : DEFAULTS.uiZoom;
@@ -548,6 +593,12 @@ function loadFromLocalStorage(): VisualSettings {
       NAVIGATION_RANGES.dampingFactor,
       DEFAULTS.orbitDampingFactor,
     );
+    const wheelZoomToCursorRaw = (parsed as Record<string, unknown>).wheelZoomToCursor;
+    const wheelZoomToCursor = typeof wheelZoomToCursorRaw === 'boolean'
+      ? wheelZoomToCursorRaw : DEFAULTS.wheelZoomToCursor;
+    const navigateAroundCursorPointRaw = (parsed as Record<string, unknown>).navigateAroundCursorPoint;
+    const navigateAroundCursorPoint = typeof navigateAroundCursorPointRaw === 'boolean'
+      ? navigateAroundCursorPointRaw : DEFAULTS.navigateAroundCursorPoint;
     return {
       renderMode: mode,
       modeSettings,
@@ -558,6 +609,7 @@ function loadFromLocalStorage(): VisualSettings {
       shadowMapSize,
       shadowRadius,
       maxDpr,
+      fpsCap,
       fpvSpeed,
       fpvSprintSpeed,
       fpvSensitivity,
@@ -593,29 +645,61 @@ function loadFromLocalStorage(): VisualSettings {
       envReflectionsEnabled,
       envReflectionsIntensity,
       showDriveAxisGizmo,
+      showAgentEye,
       uiZoom,
       uiBlurScale,
       orbitRotateSpeed,
       orbitPanSpeed,
       orbitZoomSpeed,
       orbitDampingFactor,
-      distanceAdaptiveNav: typeof (parsed as Record<string, unknown>).distanceAdaptiveNav === 'boolean'
-        ? (parsed as Record<string, unknown>).distanceAdaptiveNav as boolean
-        : DEFAULTS.distanceAdaptiveNav,
+      wheelZoomToCursor,
+      navigateAroundCursorPoint,
     };
   } catch {
     return { ...DEFAULTS, modeSettings: { simple: { ...MODE_DEFAULTS.simple }, default: { ...MODE_DEFAULTS.default }, toon: { ...MODE_DEFAULTS.toon } }, cameras: [...DEFAULTS.cameras] };
   }
 }
 
+/** Listeners of {@link subscribeVisualSettings}. */
+const _settingsListeners = new Set<() => void>();
+
+/**
+ * Subscribe to EVERY persisted visual-settings change (plan-591).
+ *
+ * Notified from {@link saveVisualSettings}, so it covers a preset apply, a
+ * single slider, the antialias switch and the auto-quality watchdog alike —
+ * the generic persistence channel, deliberately not a preset-specific event.
+ *
+ * Two things need exactly this: the reload hint, which derives
+ * `settings.antialias !== viewer.antialiasActive` and cannot notice a change
+ * nobody tells it about; and the quality rows' active marking after a single
+ * slider move, which walks the state to "Custom" without emitting
+ * `render-mode-changed`.
+ *
+ * A listener MUST produce a primitive snapshot (same rule as the render-mode
+ * snapshot in `RenderModeBar`) — an object would re-render in a loop under
+ * `useSyncExternalStore`.
+ */
+export function subscribeVisualSettings(cb: () => void): () => void {
+  _settingsListeners.add(cb);
+  return () => { _settingsListeners.delete(cb); };
+}
+
 export function saveVisualSettings(settings: VisualSettings): void {
   lsSave(STORAGE_KEY, settings);
   // Every settings change funnels through here (preset apply, Visual tab,
   // auto-quality watchdog), so pushing the blur factor to the CSS custom
-  // property at this one point is what makes the token reactive — no new
-  // subscription mechanism, and no MUI theme rebuild (the theme is memoised on
-  // the branding colors only, App.tsx).
+  // property at this one point is what makes the token reactive — and no MUI
+  // theme rebuild (the theme is memoised on the branding colors only, App.tsx).
   applyUIBlurScale(settings.uiBlurScale);
+  // plan-591: the comment above used to end with "no new subscription
+  // mechanism" as an explicit design intent. That intent is now DELIBERATELY
+  // changed: a derived UI state (the antialias reload hint) cannot exist
+  // without being told that the settings moved, and a second, preset-specific
+  // event would have been the worse answer. This stays the ONE channel.
+  for (const l of _settingsListeners) {
+    try { l(); } catch { /* a listener never breaks a save */ }
+  }
 }
 
 /** True when the user already has persisted visual settings (i.e. NOT a fresh
@@ -799,10 +883,15 @@ export function setPhysicsWholeScene(enabled: boolean): void {
     /* quota exceeded or storage disabled — ignore */
   }
   // Keep the load-time gate coherent for the NEXT model load (the settings.json
-  // kill-switch still wins — same AND as the boot block in main.ts). The
+  // kill-switch still wins — same inputs as the boot block in main.ts). The
   // derived full gate (F17) depends on `enabled`, so it is re-evaluated too.
-  physicsSettings.enabled = computePhysicsEnabled(getAppConfig().simulation?.physicsEnabled);
-  physicsSettings.full = computeFullPhysics(getAppConfig().simulation?.physicsEnabled);
+  // plan-525 §2.6: the toggle is the Browser PREFERENCE — write the input and
+  // let the one central computation derive the effective gate (a loaded zone
+  // model keeps physics on; the preference applies after the model switch).
+  physicsInputs.deployAllowed = getAppConfig().simulation?.physicsEnabled !== false;
+  physicsInputs.userPref = enabled;
+  physicsInputs.userFullPref = _physicsFull;
+  recomputePhysics();
   for (const l of _physicsListeners) l();
 }
 
@@ -840,7 +929,10 @@ export function setPhysicsFull(enabled: boolean): void {
   } catch {
     /* quota exceeded or storage disabled — ignore */
   }
-  physicsSettings.full = computeFullPhysics(getAppConfig().simulation?.physicsEnabled);
+  physicsInputs.deployAllowed = getAppConfig().simulation?.physicsEnabled !== false;
+  physicsInputs.userPref = _physicsWholeScene;
+  physicsInputs.userFullPref = enabled;
+  recomputePhysics();
   for (const l of _physicsFullListeners) l();
 }
 

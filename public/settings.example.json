@@ -11,7 +11,9 @@
     "orbitRotateSpeed": 1.0,
     "orbitPanSpeed": 1.0,
     "orbitZoomSpeed": 1.0,
-    "orbitDampingFactor": 0.08
+    "orbitDampingFactor": 0.08,
+    "wheelZoomToCursor": true,
+    "navigateAroundCursorPoint": false
   },
 
   "interface": {

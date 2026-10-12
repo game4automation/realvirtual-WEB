@@ -73,7 +73,7 @@ import type { PathSegmentSpec } from '../core/engine/rv-path';
 import { getComponentInstances } from '../core/engine/rv-component-registry';
 import { persistFieldOp } from '../core/hmi/scene/scene-field-ops';
 import { pointerToNDC } from '../core/engine/rv-pointer-utils';
-import { markAsOverlay } from '../core/engine/rv-group-registry';
+import { markAsOverlay, markNoAO } from '../core/engine/rv-group-registry';
 
 const PLAIN_HEX = 0x26a69a;  // Path badge teal
 const ZONE_HEX = 0xffa726;   // zoned path orange
@@ -528,7 +528,9 @@ export class PathVisualizerPlugin implements RVViewerPlugin {
       line.renderOrder = 500;
       line.frustumCulled = false;
       line.userData._rvPathId = path.id;
-      markAsOverlay(line); // in-scene UI — keep out of the SSAO pass
+      // In-scene UI on the floor: out of the SSAO pass, but depth-occluded so a
+      // vehicle driving over its path hides the line (markAsOverlay drew it on top).
+      markNoAO(line);
       this.root.add(line);
       this.lines.set(path.id, line);
     }

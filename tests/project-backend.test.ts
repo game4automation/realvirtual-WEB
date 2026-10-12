@@ -28,14 +28,23 @@ import {
 } from '../src/core/project/backends/project-backend';
 import { isSupported } from '../src/core/engine/rv-local-filesystem';
 import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
-import {
-  assetDocumentsOf,
-  sceneDocumentsOf,
-} from '../src/core/project/rv-project-documents';
+import { assetDocumentsOf, sceneDocumentsOf } from './helpers/document-sections';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
+
+/**
+ * The documents of one FOLDER — what `listModels()`/`listLibrary()` answered
+ * before plan-744 retired them.
+ *
+ * Recursive, which is the behaviour change the retirement brings with it: the
+ * models listing walked one level and the library listing walked the tree, so
+ * a GLB in `models/sub/` fell out of both. There is one walk now.
+ */
+async function listIn(backend: ProjectBackend, prefix: string) {
+  return (await backend.listDocuments()).filter(d => d.path.startsWith(`${prefix}/`));
+}
 
 const scene = (id: string, name: string): RvScene => ({
   id,
@@ -154,7 +163,7 @@ describe('BundledBackend', () => {
       fetchImpl: fakeFetch({}),
       models: [{ url: '/models/Demo.glb', label: 'Demo' }],
     });
-    expect(await b.listModels()).toEqual([]);
+    expect(await listIn(b, 'models')).toEqual([]);
     expect(await b.listDocuments()).toEqual([]);
     expect(sceneDocumentsOf(await b.readManifest())).toEqual([]);
   });
@@ -202,7 +211,7 @@ describe('BundledBackend', () => {
       }),
       models: [{ url: '/models/Demo.glb', label: 'Demo' }],
     });
-    expect(await b.listModels()).toEqual([]);
+    expect(await listIn(b, 'models')).toEqual([]);
     expect((await b.readManifest())?.id).toBe('prj_deploy');
   });
 
@@ -277,7 +286,7 @@ describe('BundledBackend without a filesystem API', () => {
     });
     expect(await b.readManifest()).not.toBeNull();
     expect(sceneDocumentsOf(await b.readManifest())).toHaveLength(1);
-    expect(await b.listModels()).toHaveLength(1);
+    expect(await listIn(b, 'models')).toHaveLength(1);
     await b.activate();
     expect(b.isActive).toBe(true);
   });
@@ -319,7 +328,7 @@ describe('FolderBackend', () => {
     root.seedDir('models').seedText('press.glb', 'GLB');           // a model, not library
     const b = new FolderBackend(asDirHandle(root), { writable: true });
 
-    expect((await b.listLibrary()).map(e => e.path)).toEqual([
+    expect((await listIn(b, 'library')).map(e => e.path)).toEqual([
       'library/Custom/gripper.glb',
       'library/PalletHandling/Pallet.glb',
     ]);
@@ -341,12 +350,19 @@ describe('FolderBackend', () => {
     const models = root.seedDir('models');
     models.seedText('press.glb', 'GLB');
     models.seedText('undeclared.glb', 'GLB');
-    models.seedText('notes.txt', 'text');            // non-GLB — never a model
-    models.seedDir('library').seedText('part.glb', 'GLB');  // catalog, not a base model
+    models.seedText('notes.txt', 'text');            // non-GLB — never a document
+    models.seedDir('sub').seedText('part.glb', 'GLB');
     const b = new FolderBackend(asDirHandle(root), { writable: true });
 
-    const listed = await b.listModels();
-    expect(listed.map(e => e.path)).toEqual(['models/press.glb', 'models/undeclared.glb']);
+    const listed = await listIn(b, 'models');
+    // plan-744 F2: `models/sub/part.glb` is IN. The retired `listModels()`
+    // walked one level, so a GLB in a subfolder was on disk, in the manifest,
+    // and in no list — the depth divergence this plan removes.
+    // Files of a folder first (sorted), then its subfolders — the walk's own
+    // depth-first order, which is now the listing's order.
+    expect(listed.map(e => e.path)).toEqual([
+      'models/press.glb', 'models/undeclared.glb', 'models/sub/part.glb',
+    ]);
     // The manifest declares models/press.glb; its label rides along.
     expect(listed.find(e => e.path === 'models/press.glb')?.label).toBeDefined();
   });
@@ -354,7 +370,7 @@ describe('FolderBackend', () => {
   it('drops a manifest model whose file is gone, rather than listing a phantom', async () => {
     const b = new FolderBackend(asDirHandle(folderWith([scene('scn_a', 'A')])), { writable: true });
     // The fixture manifest names models/press.glb but seeds no models/ folder.
-    expect(await b.listModels()).toEqual([]);
+    expect(await listIn(b, 'models')).toEqual([]);
   });
 
   it('an unreadable manifest yields null, not a throw', async () => {
@@ -411,8 +427,8 @@ describe('contract', () => {
 });
 
 // Libraries are explicit-only: no boot path reads the deploy catalog on its
-// own. `listLibrary` returns exactly what a deployed manifest declares as
-// `library[]` — a deploy that declares nothing has no library, even when a
+// own. The listing returns exactly what a deployed manifest declares under
+// `library/` — a deploy that declares nothing has no library, even when a
 // `library/catalog.json` sits on the deploy root.
 describe('BundledBackend library', () => {
   const catalog = {
@@ -424,12 +440,12 @@ describe('BundledBackend library', () => {
 
   it('never reads the deploy catalog implicitly — undeclared means empty', async () => {
     const b = new BundledBackend({ fetchImpl: fakeFetch({ 'library/catalog.json': catalog }) });
-    expect(await b.listLibrary()).toEqual([]);
+    expect(await listIn(b, 'library')).toEqual([]);
   });
 
   it('yields an empty library when the deploy root has no catalog', async () => {
     const b = new BundledBackend({ fetchImpl: fakeFetch({}) });
-    expect(await b.listLibrary()).toEqual([]);
+    expect(await listIn(b, 'library')).toEqual([]);
   });
 
   it('a manifest that declares its own library[] keeps it', async () => {
@@ -442,7 +458,7 @@ describe('BundledBackend library', () => {
         'library/catalog.json': catalog,
       }),
     });
-    expect((await b.listLibrary()).map(e => e.path)).toEqual(['library/only-this.glb']);
+    expect((await listIn(b, 'library')).map(e => e.path)).toEqual(['library/only-this.glb']);
   });
 
   it('declares no library subscription in the synthetic demo manifest', async () => {
@@ -463,10 +479,17 @@ describe('listDocuments / statDocuments', () => {
     const docs = await b.listDocuments();
     // The path is the whole answer since plan-736 — a row no longer restates
     // its folder in a second field that could disagree with it.
+    //
+    // The ORDER is the walk's since plan-744: alphabetical, depth-first. It
+    // used to be scenes-then-models-then-library, because the scan bucketed
+    // its own paths back into three arrays before handing them to
+    // `documentsFromLists`. Nothing downstream ever depended on that grouping
+    // — the dashboard and the catalog both sort for themselves — and it was
+    // the last thing making the listing's shape a function of the folder name.
     expect(docs.map(d => d.path)).toEqual([
-      sceneGlbRelPathFor(scene('scn_a', 'A')),
-      'models/press.glb',
       'library/Custom/gripper.glb',
+      'models/press.glb',
+      sceneGlbRelPathFor(scene('scn_a', 'A')),
     ]);
     // Every document has an id — the mandatory one of F2, minted from the path
     // where the legacy entry had none.

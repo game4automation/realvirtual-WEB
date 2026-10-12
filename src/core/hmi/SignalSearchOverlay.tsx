@@ -72,6 +72,8 @@ export interface SignalSearchItem {
   comment?: string;
   /** Source group (plan-325): 'internal' = model signal; default CONNECT. */
   origin?: 'connect' | 'internal';
+  /** Unit of the signal's raw value as its source names it (plan-512 F9, e.g. "m"). */
+  unit?: string;
 }
 
 /** Instrument Blue — the one accent of the product (DESIGN.md). */
@@ -460,6 +462,7 @@ export function SignalSearchOverlay({
                       interfaceId={s.interfaceId}
                       topic={s.topic}
                       origin={s.origin}
+                      unit={s.unit}
                       role="option"
                       ariaLabel={s.name}
                       optionId={optionId(ordinal)}

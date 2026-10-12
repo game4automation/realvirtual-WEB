@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   DEFAULT_NEWS_API_URL,
-  generatePrivateSettings,
+  generateHostedSettings,
   injectNewsIntoSettings,
   loadConfig,
 } from '../scripts/_bunny-lib.mjs';
@@ -73,10 +73,7 @@ describe('public-hosted news deployment configuration', () => {
   });
 
   it('keeps private customer settings news-free', () => {
-    const settings = JSON.parse(generatePrivateSettings(
-      { name: 'Customer', code: 'customer', settings: { defaultModel: 'machine.glb' } },
-      'customer',
-    ));
+    const settings = JSON.parse(generateHostedSettings());
     expect(settings.news).toBeUndefined();
   });
 });

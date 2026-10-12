@@ -38,6 +38,7 @@ import {
   Box3,
   Box3Helper,
   BufferGeometry,
+  Sphere,
 } from 'three';
 import type { Scene } from 'three';
 import type { InstancedMovingUnit } from './rv-mu';
@@ -49,6 +50,9 @@ import type { PickMetrics, HighlightStrategy } from './rv-pick-metrics';
 import type { HighlightProfile, HighlightVisual } from './rv-highlight-profiles';
 import { resolveOutlineTargets } from './rv-status-outline';
 import { subscribeOverlayVisibility, isOverlayVisible } from '../overlay-visibility-store';
+import { makeRangeProxyGeometry } from './rv-bake-chunk';
+import { NO_AO_LAYER } from './rv-constants';
+import { RV_BAKE_CHUNK_KEY, type ChunkHighlightSource, type ChunkHighlightTarget, type PlacementInstance } from './rv-bake-registry';
 
 // ─── Highlight Style ──────────────────────────────────────────────────
 
@@ -127,7 +131,22 @@ const BUILTIN_PROFILE: HighlightProfile = Object.freeze({
 // ─── Strategy resolver (pure — the single decision point) ─────────────
 
 /** Rendering strategy resolved for one highlight root. */
-export type ResolvedStrategy = 'outline' | 'overlay' | 'fill-proxy' | 'bbox' | 'mu-overlay';
+export type ResolvedStrategy = 'outline' | 'chunk-outline' | 'chunk-overlay' | 'overlay' | 'bbox' | 'mu-overlay';
+
+/** Options for {@link RVHighlightManager.setAuxEmphasis}. */
+export interface AuxEmphasisOptions {
+  /** Draw this set in its own color (fill + edges, selection opacities)
+   *  instead of the mode's selection style. The OutlinePass side stays the
+   *  shared selection channel. */
+  color?: number;
+}
+
+/** One registered aux-emphasis set (see {@link RVHighlightManager.setAuxEmphasis}). */
+interface AuxEmphasisSet {
+  roots: Object3D[];
+  /** Own overlay style when the set was registered with a color. */
+  style?: HighlightStyle;
+}
 
 /** Options for {@link RVHighlightManager.highlightSelection}. */
 export interface SelectionHighlightOptions {
@@ -149,8 +168,6 @@ export interface StrategyContext {
   outlineAvailable: boolean;
   /** Root subtree has ≥1 camera-rendered mesh (OutlinePass precondition). */
   hasRenderedMesh: boolean;
-  /** A proxy provider covers this root AND its edge arena is ready. */
-  proxyAvailable: boolean;
   /** Collected mesh count of the root subtree. */
   meshCount: number;
   /** Overlay mesh budget — above it, bounding-box wireframe. */
@@ -163,14 +180,15 @@ export interface StrategyContext {
  * | desired  | condition                                   | resolved     |
  * |----------|---------------------------------------------|--------------|
  * | outline  | outline available AND ≥1 rendered mesh      | outline      |
- * | outline  | outline unavailable OR root fully batched   | overlay*     |
- * | overlay  | proxy windows + edge arena ready            | fill-proxy   |
- * | overlay  | otherwise, meshCount ≤ maxMeshes            | overlay      |
+ * | outline  | outline unavailable OR root fully baked     | overlay*     |
+ * | overlay  | meshCount ≤ maxMeshes                       | overlay      |
  * | overlay* | meshCount > maxMeshes                       | bbox         |
  *
- * `fallback` is true when the resolved strategy is not the desired visual
- * (outline→overlay downgrade, or the bbox budget cap).
- * In 'overlay' mode the outline branch is NEVER taken — batched and unbatched
+ * Roots that resolve to chunk targets (baked placements, the baked in-place
+ * model) never reach this table — `_resolve` routes them to `chunk-outline`
+ * / `chunk-overlay` first. `fallback` is true when the resolved strategy is
+ * not the desired visual (outline→overlay downgrade, or the bbox budget cap).
+ * In 'overlay' mode the outline branch is NEVER taken — baked and unbaked
  * content look identical in HMI/DES.
  */
 export function resolveStrategy(ctx: StrategyContext): { strategy: ResolvedStrategy; fallback: boolean } {
@@ -182,37 +200,20 @@ export function resolveStrategy(ctx: StrategyContext): { strategy: ResolvedStrat
 }
 
 function resolveOverlayFamily(ctx: StrategyContext, fallback: boolean): { strategy: ResolvedStrategy; fallback: boolean } {
-  if (ctx.proxyAvailable) return { strategy: 'fill-proxy', fallback };
   if (ctx.meshCount <= ctx.maxMeshes) return { strategy: 'overlay', fallback };
   return { strategy: 'bbox', fallback: true };
 }
 
 /** Map a resolved strategy onto the PickMetrics vocabulary. */
 function toMetricsStrategy(s: ResolvedStrategy): HighlightStrategy {
-  return s === 'overlay' ? 'overlay-legacy' : s;
+  if (s === 'chunk-outline') return 'outline';
+  return s;
 }
 
-// ─── Overlay provider seam (§4.2 drawRange proxies plug in here) ──────
-
-/** Channel a provider overlay belongs to (release grouping + style source). */
-export type OverlayChannel = 'hover' | 'selection' | 'aux' | 'flash';
-
-/** Handle to one provider-acquired overlay; release() returns it to the pool. */
-export interface OverlayHandle {
-  release(): void;
-}
-
-/**
- * Pluggable overlay source. The proxy provider (rv-highlight-proxy.ts)
- * serves zero-copy drawRange proxies over the merged pick geometry;
- * when it can't handle a target the manager builds legacy per-mesh pairs.
- */
-export interface HighlightOverlayProvider {
-  /** True when this provider can fully visualize `target` right now. */
-  canHandle(target: Object3D): boolean;
-  /** Create (or reuse from pool) the overlay visuals for `target`. */
-  acquire(target: Object3D, channel: OverlayChannel, style: HighlightStyle): OverlayHandle;
-}
+/** One fully invisible material shared by every chunk window proxy: draws no
+ *  color, writes no depth — it exists for the OutlinePass mask pass only
+ *  (same contract as the status-outline proxies). */
+const CHUNK_PROXY_MATERIAL = new MeshBasicMaterial({ colorWrite: false, depthWrite: false });
 
 // ─── Constants ────────────────────────────────────────────────────────
 
@@ -226,6 +227,9 @@ const PING_PULSES = 3;
  *  drew practically every tessellation edge on curved parts (full wireframe).
  *  30° matches the gizmo mesh-edges look and the proxy edge arena. */
 const EDGE_THRESHOLD_DEG = 30;
+
+/** Wireframe mode: line opacity = the style's edge opacity × this (capped at 1). */
+const WIREFRAME_HIGHLIGHT_OPACITY_GAIN = 1.5;
 
 /** Default max meshes for hover highlight — above this, show bounding-box wireframe instead. */
 const DEFAULT_MAX_HOVER_MESHES = 200;
@@ -241,6 +245,23 @@ const FLASH_EDGE_OPACITY = 0.65;
 
 /** WeakMap cache for EdgesGeometry — avoids recomputing edges for the same BufferGeometry */
 const edgeGeometryCache = new WeakMap<BufferGeometry, EdgesGeometry>();
+
+/**
+ * The crease-edge geometry for a mesh geometry, from the SAME cache the hover
+ * and selection overlays use — so an agent x-ray render (rv-eye-channels) and
+ * the interactive highlight share one EdgesGeometry per source geometry and
+ * draw identical lines. Threshold in degrees; the default is the highlight's.
+ */
+export function cachedEdgesGeometry(
+  geometry: BufferGeometry, thresholdDeg: number = EDGE_THRESHOLD_DEG,
+): EdgesGeometry {
+  let edgeGeo = edgeGeometryCache.get(geometry);
+  if (!edgeGeo) {
+    edgeGeo = new EdgesGeometry(geometry, thresholdDeg);
+    edgeGeometryCache.set(geometry, edgeGeo);
+  }
+  return edgeGeo;
+}
 
 /** Drop the cached EdgesGeometry for a source geometry after an in-place
  *  mutation (the cache would otherwise serve stale silhouettes). */
@@ -307,11 +328,7 @@ class OverlayBuilder {
 
     let edgeLines: LineSegments | null = null;
     if (showEdges) {
-      let edgeGeo = edgeGeometryCache.get(geometry);
-      if (!edgeGeo) {
-        edgeGeo = new EdgesGeometry(geometry, thresholdDeg);
-        edgeGeometryCache.set(geometry, edgeGeo);
-      }
+      const edgeGeo = cachedEdgesGeometry(geometry, thresholdDeg);
       edgeLines = this._freeEdges.pop() ?? this._newEdge();
       edgeLines.geometry = edgeGeo;
       edgeLines.material = edgeMaterial;
@@ -413,20 +430,34 @@ export class RVHighlightManager {
    *  'outline' visual + the flash outline channel). */
   private _outlineManager: RVOutlineManager | null = null;
 
-  /** Optional §4.2 proxy overlay provider (zero-copy drawRange proxies). */
-  private _proxyProvider: HighlightOverlayProvider | null = null;
-
-  /** Provider handles per channel (released together with the channel). */
-  private _hoverProxyHandles: OverlayHandle[] = [];
-  private _selectionProxyHandles: OverlayHandle[] = [];
-  private _auxProxyHandles: OverlayHandle[] = [];
+  /**
+   * Chunk highlight source (plan-753 Phase 3, strategy `chunk-outline`): a
+   * baked placement's root or logic node is outlined through its chunk meshes
+   * — whole chunks directly, node windows via pooled WRAPPER proxies with
+   * their own `drawRange` (never the chunk geometry's, S1). No `EdgesGeometry`
+   * is ever built for a placement.
+   */
+  private _chunkSource: ChunkHighlightSource | null = null;
+  private _offChunkRelease: (() => void) | null = null;
+  /** Free window proxies (attributes detached). */
+  private readonly _chunkProxyPool: Mesh[] = [];
+  /** Live window proxies per channel. */
+  private _hoverChunkProxies: Mesh[] = [];
+  private _selectionChunkProxies: Mesh[] = [];
+  private _auxChunkProxies: Mesh[] = [];
+  private _flashChunkProxies: Mesh[] = [];
+  /** proxy → the chunk mesh whose matrixWorld it mirrors (per-frame sync). */
+  private readonly _chunkProxySource = new WeakMap<Mesh, Mesh>();
 
   /** Roots currently on the selection outline channel (unioned with aux). */
   private _selectionOutlineRoots: Object3D[] = [];
   /** Aux roots currently rendered through the outline channel. */
   private _auxOutlineRoots: Object3D[] = [];
   /** Named aux emphasis sets (e.g. 'planner-ghost'). */
-  private readonly _auxSets = new Map<string, Object3D[]>();
+  private readonly _auxSets = new Map<string, AuxEmphasisSet>();
+  /** Per-set fill/edge materials of the CURRENT aux application (sets with an
+   *  own style only) — rebuilt by `_applyAux`, disposed before the next one. */
+  private _auxSetMats: Array<{ fill: MeshBasicMaterial; edge: LineBasicMaterial }> = [];
 
   /** Active flash state, or null. */
   private _flashState: {
@@ -434,7 +465,6 @@ export class RVHighlightManager {
     fillMat: MeshBasicMaterial;
     edgeMat: LineBasicMaterial;
     disposeProxies: (() => void) | null;
-    proxyHandles: OverlayHandle[];
   } | null = null;
 
   /** Overlay builder + pool (legacy per-mesh pairs). */
@@ -484,9 +514,179 @@ export class RVHighlightManager {
     return !!this._outlineManager && this._outlineManager.available;
   }
 
-  /** Install the §4.2 proxy overlay provider (null to remove). */
-  setProxyProvider(provider: HighlightOverlayProvider | null): void {
-    this._proxyProvider = provider;
+  /**
+   * Install the chunk highlight source (the viewer's `BakeRegistry`), or null
+   * to remove it. Subscribes to instance release so every proxy over a
+   * released placement leaves the scene BEFORE the asset may dispose its
+   * geometry (provider before geometry, §4.2).
+   */
+  setChunkSource(source: ChunkHighlightSource | null): void {
+    this._offChunkRelease?.();
+    this._offChunkRelease = null;
+    this._chunkSource = source;
+    if (source) this._offChunkRelease = source.onRelease((inst) => this._onInstanceReleased(inst));
+  }
+
+  /** Free window proxies (test/diagnostic view). */
+  get chunkProxyPoolSize(): number {
+    return this._chunkProxyPool.length;
+  }
+
+  /** Live window proxies across all channels (test/diagnostic view). */
+  get activeChunkProxies(): readonly Mesh[] {
+    return [...this._hoverChunkProxies, ...this._selectionChunkProxies, ...this._auxChunkProxies, ...this._flashChunkProxies];
+  }
+
+  /** Objects for the OutlinePass channel: whole chunk meshes directly, node
+   *  windows through pooled wrapper proxies (recorded in `into` for release). */
+  private _chunkOutlineObjects(root: Object3D, into: Mesh[]): Object3D[] {
+    const targets = this._chunkSource?.chunkTargetsOf(root);
+    const out: Object3D[] = [];
+    if (!targets) return out;
+    for (const t of targets) {
+      if (!t.range) { out.push(t.mesh); continue; }
+      const proxy = this._acquireChunkProxy(t);
+      into.push(proxy);
+      out.push(proxy);
+    }
+    return out;
+  }
+
+  private _acquireChunkProxy(target: ChunkHighlightTarget): Mesh {
+    let proxy = this._chunkProxyPool.pop();
+    if (!proxy) {
+      proxy = new Mesh(new BufferGeometry(), CHUNK_PROXY_MATERIAL);
+      proxy.name = '__hlChunkProxy';
+      proxy.matrixAutoUpdate = false;
+      proxy.frustumCulled = false;
+      proxy.castShadow = false;
+      proxy.receiveShadow = false;
+      proxy.raycast = () => {};
+      proxy.userData._highlightOverlay = true;
+      proxy.layers.set(NO_AO_LAYER);
+    }
+    // Wrapper geometry: shares the chunk's position + index, own drawRange.
+    if (target.range) {
+      makeRangeProxyGeometry(target.mesh.geometry, target.range, proxy.geometry);
+    } else {
+      // Whole chunk: full range, the chunk's own sphere.
+      const src = target.mesh.geometry;
+      const g = proxy.geometry;
+      const pos = src.getAttribute('position');
+      if (g.getAttribute('position') !== pos) g.setAttribute('position', pos);
+      if (g.getIndex() !== src.index) g.setIndex(src.index);
+      g.setDrawRange(0, Infinity);
+      if (!src.boundingSphere) src.computeBoundingSphere();
+      g.boundingSphere = (g.boundingSphere ?? new Sphere()).copy(src.boundingSphere!);
+    }
+    target.mesh.updateWorldMatrix(true, false);
+    proxy.matrix.copy(target.mesh.matrixWorld);
+    proxy.matrixWorld.copy(target.mesh.matrixWorld);
+    this._chunkProxySource.set(proxy, target.mesh);
+    this.scene.add(proxy);
+    return proxy;
+  }
+
+  /**
+   * Fill proxies for the overlay family (`chunk-overlay`, plan-753 Phase 4a):
+   * one pooled wrapper per chunk target — a node window through
+   * `makeRangeProxyGeometry`, a whole chunk through a full-range wrapper with
+   * the chunk's own bounding sphere (no per-vertex sweep over a 7M-triangle
+   * static chunk). The wrapper draws with the channel's overlay FILL material
+   * on the highlight overlay layer, exactly where a legacy fill pair draws;
+   * edges are not built (no `EdgesGeometry` outside the editor).
+   */
+  private _chunkOverlayObjects(root: Object3D, into: Mesh[], fillMat: MeshBasicMaterial, renderOrder: number): void {
+    const targets = this._chunkSource?.chunkTargetsOf(root);
+    if (!targets) return;
+    for (const t of targets) {
+      const proxy = this._acquireChunkProxy(t);
+      proxy.material = fillMat;
+      proxy.renderOrder = renderOrder;
+      proxy.layers.set(HIGHLIGHT_OVERLAY_LAYER);
+      proxy.userData._chunkFill = true;
+      into.push(proxy);
+    }
+  }
+
+  /** Undo the `chunk-overlay` styling so a pooled proxy is an invisible
+   *  outline stand-in again. */
+  private _resetChunkProxy(p: Mesh): void {
+    if (!p.userData._chunkFill) return;
+    delete p.userData._chunkFill;
+    p.material = CHUNK_PROXY_MATERIAL;
+    p.renderOrder = 0;
+    p.layers.set(NO_AO_LAYER);
+  }
+
+  /** Return proxies to the pool (no dispose — the attributes are the chunk's). */
+  private _releaseChunkProxies(list: Mesh[]): void {
+    for (const p of list) {
+      p.parent?.remove(p);
+      this._resetChunkProxy(p);
+      this._chunkProxyPool.push(p);
+    }
+    list.length = 0;
+  }
+
+  /** Detach a pooled/active proxy from chunk attributes it must not outlive. */
+  private _detachChunkProxy(p: Mesh): void {
+    p.geometry.deleteAttribute('position');
+    p.geometry.setIndex(null);
+    p.geometry.boundingSphere = null;
+    this._chunkProxySource.delete(p);
+  }
+
+  /** Instance released: its proxies leave the scene now; when this was the
+   *  asset's last instance, every wrapper over its chunks is detached too. */
+  private _onInstanceReleased(inst: PlacementInstance): void {
+    const chunkMeshes = new Set<Mesh>(inst.chunks);
+    const chunkGeometries = new Set<BufferGeometry>();
+    const lastInstance = inst.baked.instances <= 1;
+    if (lastInstance) for (const c of inst.baked.chunks) chunkGeometries.add(c.geometry);
+    const gone = new Set<Object3D>(inst.chunks);
+    const scrub = (list: Mesh[]): void => {
+      for (let i = list.length - 1; i >= 0; i--) {
+        const p = list[i];
+        const src = this._chunkProxySource.get(p);
+        if (src && chunkMeshes.has(src)) {
+          p.parent?.remove(p);
+          if (lastInstance) this._detachChunkProxy(p);
+          this._resetChunkProxy(p);
+          this._chunkProxyPool.push(p);
+          list.splice(i, 1);
+          gone.add(p);
+        }
+      }
+    };
+    scrub(this._hoverChunkProxies);
+    scrub(this._selectionChunkProxies);
+    scrub(this._auxChunkProxies);
+    scrub(this._flashChunkProxies);
+    if (lastInstance) {
+      for (const p of this._chunkProxyPool) {
+        const pos = p.geometry.getAttribute('position');
+        if (!pos) continue;
+        for (const g of chunkGeometries) {
+          if (g.getAttribute('position') === pos) { this._detachChunkProxy(p); break; }
+        }
+      }
+    }
+    // Drop released chunk meshes AND their window proxies from the outline channels.
+    const prune = (arr: Object3D[]): Object3D[] => arr.filter((o) => !gone.has(o));
+    this._selectionOutlineRoots = prune(this._selectionOutlineRoots);
+    this._auxOutlineRoots = prune(this._auxOutlineRoots);
+    this._pushSelectionOutline();
+  }
+
+  /** Per-frame: window proxies follow their (possibly moving) chunk mesh. */
+  private _syncChunkProxies(list: Mesh[]): void {
+    for (const p of list) {
+      const src = this._chunkProxySource.get(p);
+      if (!src) continue;
+      p.matrix.copy(src.matrixWorld);
+      p.matrixWorld.copy(src.matrixWorld);
+    }
   }
 
   /** Install the highlight-apply timing sink (null to disable). */
@@ -568,7 +768,43 @@ export class RVHighlightManager {
 
   // ─── Private helpers ─────────────────────────────────────────────────
 
+  /**
+   * Wireframe view (asset editor, Shift+Z): hover and selection light up the
+   * part's own wire lines instead of drawing a fill plus crease edges — the
+   * overlay becomes a triangle wireframe in the style's EDGE colour and the
+   * EdgesGeometry line mesh is skipped. Applies to every overlay style (mode
+   * profile, per-call override, aux, flash). The caller re-applies the
+   * selection afterwards; hover is dropped here.
+   */
+  setWireframeMode(on: boolean): void {
+    if (this._wireframeMode === on) return;
+    this._wireframeMode = on;
+    this.clear();
+    this._setHoverStyle(this._hoverStyle);
+    this._setSelectionStyle(this._selectionStyle);
+    this._overrideKey = '';
+  }
+
+  get wireframeMode(): boolean { return this._wireframeMode; }
+
+  private _wireframeMode = false;
+
   private _buildOverlayMat(style: HighlightStyle, name: string): MeshBasicMaterial {
+    if (this._wireframeMode) {
+      // The fill opacity is tuned for a surface tint (0.1–0.2) and far too
+      // faint for 1 px lines over the document's own wires — use the edge look.
+      const opacity = Math.min(1, style.edgeOpacity * WIREFRAME_HIGHLIGHT_OPACITY_GAIN);
+      const wire = new MeshBasicMaterial({
+        color: style.edgeColor,
+        transparent: opacity < 1.0,
+        opacity,
+        wireframe: true,
+        depthTest: false,
+        depthWrite: false,
+      });
+      wire.name = name;
+      return wire;
+    }
     const mat = new MeshBasicMaterial({
       color: style.overlayColor,
       transparent: style.overlayOpacity < 1.0,
@@ -594,11 +830,22 @@ export class RVHighlightManager {
 
   /** Resolve the strategy for one root (shared by all channels). */
   private _resolve(root: Object3D, meshes: Mesh[], desired: HighlightVisual): { strategy: ResolvedStrategy; fallback: boolean } {
+    // Baked placement root / logic node (plan-753): chunk outline when the
+    // OutlinePass is available, bounding box otherwise — never per-mesh pairs.
+    // Phase 4a: the HMI/DES profile (desired 'overlay') keeps its fill look
+    // through window proxies over the chunk (`chunk-overlay`, no
+    // EdgesGeometry); the planner's outline profile goes to the OutlinePass.
+    if (this._chunkSource) {
+      const targets = this._chunkSource.chunkTargetsOf(root);
+      if (targets && targets.length > 0) {
+        if (desired === 'outline' && this._useOutline()) return { strategy: 'chunk-outline', fallback: false };
+        return { strategy: 'chunk-overlay', fallback: desired === 'outline' };
+      }
+    }
     return resolveStrategy({
       desired,
       outlineAvailable: this._useOutline(),
       hasRenderedMesh: meshes.some(isRenderedMesh),
-      proxyAvailable: this._proxyProvider?.canHandle(root) ?? false,
       meshCount: meshes.length,
       maxMeshes: this.maxHoverMeshes,
     });
@@ -634,7 +881,9 @@ export class RVHighlightManager {
       into.push(this._builder.acquirePair(
         mesh.geometry, mesh.matrixWorld, mesh, mesh.name + nameSuffix, EDGE_THRESHOLD_DEG,
         fillMat, edgeMat, renderOrderBase,
-        style.showOverlay, style.showEdges,
+        // Wireframe mode: the (wire) overlay IS the highlight — no edge mesh,
+        // so no EdgesGeometry is built for it either.
+        style.showOverlay || this._wireframeMode, style.showEdges && !this._wireframeMode,
       ));
     }
   }
@@ -671,8 +920,11 @@ export class RVHighlightManager {
         // subtrees don't need the bounding-box fallback.
         this._outlineManager!.setHoverOutlined([root]);
         return;
-      case 'fill-proxy':
-        this._hoverProxyHandles.push(this._proxyProvider!.acquire(root, 'hover', this._hoverStyle));
+      case 'chunk-outline':
+        this._outlineManager!.setHoverOutlined(this._chunkOutlineObjects(root, this._hoverChunkProxies));
+        return;
+      case 'chunk-overlay':
+        this._chunkOverlayObjects(root, this._hoverChunkProxies, this._hoverOverlayMat, 1000);
         return;
       case 'bbox':
         this.hoverTracked = track;
@@ -750,9 +1002,10 @@ export class RVHighlightManager {
       if (fallback) this._lastFallback = true;
       switch (strategy) {
         case 'outline': outlineRoots.push(root); break;
-        case 'fill-proxy':
+        case 'chunk-outline': outlineRoots.push(...this._chunkOutlineObjects(root, this._hoverChunkProxies)); break;
+        case 'chunk-overlay':
           anyProxy = true;
-          this._hoverProxyHandles.push(this._proxyProvider!.acquire(root, 'hover', this._hoverStyle));
+          this._chunkOverlayObjects(root, this._hoverChunkProxies, this._hoverOverlayMat, 1000);
           break;
         default: overlayEntries.push({ root, meshes }); anyOverlay = true;
       }
@@ -762,7 +1015,7 @@ export class RVHighlightManager {
       this._lastStrategy = 'outline';
       this._outlineManager!.setHoverOutlined(outlineRoots);
     } else if (anyProxy) {
-      this._lastStrategy = 'fill-proxy';
+      this._lastStrategy = 'chunk-overlay';
     }
     if (overlayEntries.length === 0) return;
 
@@ -777,7 +1030,7 @@ export class RVHighlightManager {
         this._buildPairs(meshes, this.hoverPairs, this._hoverOverlayMat, this._hoverEdgeMat, this._hoverStyle, 1000);
       }
     }
-    if (anyOverlay) this._lastStrategy = anyBbox ? 'bbox' : 'overlay-legacy';
+    if (anyOverlay) this._lastStrategy = anyBbox ? 'bbox' : 'overlay';
   }
 
   // ─── Ping API (short attention pulse) ───────────────────────────────
@@ -832,8 +1085,7 @@ export class RVHighlightManager {
   /** Remove hover highlight overlays only. Selection persists. */
   clear(): void {
     this._builder.releasePairs(this.hoverPairs);
-    for (const h of this._hoverProxyHandles) h.release();
-    this._hoverProxyHandles = [];
+    this._releaseChunkProxies(this._hoverChunkProxies);
     this.hoverTracked = false;
     this._outlineManager?.clearHover();
   }
@@ -841,7 +1093,7 @@ export class RVHighlightManager {
   /** Whether any hover highlight is currently active. */
   get isActive(): boolean {
     return this.hoverPairs.length > 0
-      || this._hoverProxyHandles.length > 0
+      || this._hoverChunkProxies.length > 0
       || (this._outlineManager?.hoverPass?.selectedObjects?.length ?? 0) > 0;
   }
 
@@ -861,6 +1113,7 @@ export class RVHighlightManager {
     this._lastStrategy = 'none';
     this._lastFallback = false;
     this._highlightSelectionImpl(roots, options);
+    performance.measure('rv:highlightSelection[' + this._lastStrategy + (this._lastFallback ? '+fallback' : '') + ']', { start: t0 });
     this._recordHighlight(t0);
   }
 
@@ -896,15 +1149,21 @@ export class RVHighlightManager {
     const outlineRoots: Object3D[] = [];
     const overlayEntries: { root: Object3D; meshes: Mesh[] }[] = [];
     let anyProxy = false;
+    let anyBbox = false;
     for (const root of roots) {
       const meshes = this.collectMeshes(root, includeSensorViz, includeChildDrives);
       const { strategy, fallback } = this._resolve(root, meshes, desired);
       if (fallback) this._lastFallback = true;
       switch (strategy) {
         case 'outline': outlineRoots.push(root); break;
-        case 'fill-proxy':
+        case 'chunk-outline': outlineRoots.push(...this._chunkOutlineObjects(root, this._selectionChunkProxies)); break;
+        case 'chunk-overlay':
           anyProxy = true;
-          this._selectionProxyHandles.push(this._proxyProvider!.acquire(root, 'selection', style));
+          this._chunkOverlayObjects(root, this._selectionChunkProxies, mats.overlay, 900);
+          break;
+        case 'bbox':
+          anyBbox = true;
+          this._highlightBoundingBox(root, this.selectionPairs);
           break;
         default: overlayEntries.push({ root, meshes });
       }
@@ -915,10 +1174,13 @@ export class RVHighlightManager {
       this._selectionOutlineRoots = outlineRoots;
       this._pushSelectionOutline();
     } else if (anyProxy) {
-      this._lastStrategy = 'fill-proxy';
+      this._lastStrategy = 'chunk-overlay';
+    } else if (anyBbox) {
+      this._lastStrategy = 'bbox';
+      this.selectionTracked = true;
     }
     if (overlayEntries.length === 0) return;
-    this._lastStrategy = 'overlay-legacy';
+    this._lastStrategy = 'overlay';
     this.selectionTracked = true;
 
     for (const { meshes } of overlayEntries) {
@@ -929,8 +1191,7 @@ export class RVHighlightManager {
   /** Remove selection highlight overlays only. Hover and aux persist. */
   clearSelection(): void {
     this._builder.releasePairs(this.selectionPairs);
-    for (const h of this._selectionProxyHandles) h.release();
-    this._selectionProxyHandles = [];
+    this._releaseChunkProxies(this._selectionChunkProxies);
     this.selectionTracked = false;
     this._selectionOutlineRoots = [];
     this._pushSelectionOutline();
@@ -939,7 +1200,7 @@ export class RVHighlightManager {
   /** Whether any selection highlight is currently active. */
   get isSelectionActive(): boolean {
     return this.selectionPairs.length > 0
-      || this._selectionProxyHandles.length > 0
+      || this._selectionChunkProxies.length > 0
       || this._selectionOutlineRoots.length > 0;
   }
 
@@ -954,18 +1215,25 @@ export class RVHighlightManager {
    * In outline modes the aux roots join the selection OutlinePass channel;
    * in overlay modes they get selection-style fill+edges pairs.
    */
-  setAuxEmphasis(id: string, roots: readonly Object3D[] | null): void {
-    if (!roots || roots.length === 0) this._auxSets.delete(id);
-    else this._auxSets.set(id, [...roots]);
+  setAuxEmphasis(id: string, roots: readonly Object3D[] | null, opts?: AuxEmphasisOptions): void {
+    if (!roots || roots.length === 0) {
+      if (!this._auxSets.delete(id)) return; // nothing was shown — no rebuild
+    } else {
+      const style = opts?.color === undefined
+        ? undefined
+        : { ...this._selectionStyle, overlayColor: opts.color, edgeColor: opts.color };
+      this._auxSets.set(id, { roots: [...roots], style });
+    }
     this._applyAux();
   }
 
   private _applyAux(): void {
-    // Release previous aux visuals.
+    // Release previous aux visuals (and the per-set materials that drew them).
     this._builder.releasePairs(this.auxPairs);
-    for (const h of this._auxProxyHandles) h.release();
-    this._auxProxyHandles = [];
+    this._releaseChunkProxies(this._auxChunkProxies);
     this._auxOutlineRoots = [];
+    for (const m of this._auxSetMats) { m.fill.dispose(); m.edge.dispose(); }
+    this._auxSetMats = [];
 
     if (this._catHidden || this._auxSets.size === 0) {
       this._pushSelectionOutline();
@@ -973,22 +1241,43 @@ export class RVHighlightManager {
     }
 
     const desired = this._profile.visual;
-    for (const roots of this._auxSets.values()) {
-      for (const root of roots) {
+    for (const [id, set] of this._auxSets) {
+      // A set with an own color draws with its own fill/edge materials (the
+      // selection look in that color — WebError's red X-ray overlay); the
+      // outline channel stays the shared selection channel in every mode.
+      let fillMat = this._selectionOverlayMat;
+      let edgeMat = this._selectionEdgeMat;
+      let style = this._selectionStyle;
+      // The color IS the point of a colored set, and only the overlay family
+      // carries one (the OutlinePass channel has the shared selection color):
+      // a colored set draws fill + edges / chunk-overlay in EVERY profile,
+      // outline profiles (planner, editor) included.
+      let desiredForSet = desired;
+      if (set.style) {
+        style = set.style;
+        fillMat = this._buildOverlayMat(style, `_auxOverlay:${id}`);
+        edgeMat = this._buildEdgeMat(style);
+        this._auxSetMats.push({ fill: fillMat, edge: edgeMat });
+        desiredForSet = 'overlay';
+      }
+      for (const root of set.roots) {
         const meshes = this.collectMeshes(root, false);
-        const { strategy } = this._resolve(root, meshes, desired);
+        const { strategy } = this._resolve(root, meshes, desiredForSet);
         switch (strategy) {
           case 'outline':
             this._auxOutlineRoots.push(root);
             break;
-          case 'fill-proxy':
-            this._auxProxyHandles.push(this._proxyProvider!.acquire(root, 'aux', this._selectionStyle));
+          case 'chunk-outline':
+            this._auxOutlineRoots.push(...this._chunkOutlineObjects(root, this._auxChunkProxies));
+            break;
+          case 'chunk-overlay':
+            this._chunkOverlayObjects(root, this._auxChunkProxies, fillMat, 900);
             break;
           case 'bbox':
             this._highlightBoundingBox(root, this.auxPairs);
             break;
           default:
-            this._buildPairs(meshes, this.auxPairs, this._selectionOverlayMat, this._selectionEdgeMat, this._selectionStyle, 900, '_aux');
+            this._buildPairs(meshes, this.auxPairs, fillMat, edgeMat, style, 900, '_aux');
         }
       }
     }
@@ -1006,7 +1295,7 @@ export class RVHighlightManager {
   /** Whether any aux emphasis is currently shown (tracked pairs need syncing). */
   get isAuxActive(): boolean {
     return this.auxPairs.length > 0
-      || this._auxProxyHandles.length > 0
+      || this._auxChunkProxies.length > 0
       || this._auxOutlineRoots.length > 0;
   }
 
@@ -1032,17 +1321,20 @@ export class RVHighlightManager {
     const fillMat = this._buildOverlayMat(flashStyle, '_flashOverlay');
     const edgeMat = this._buildEdgeMat(flashStyle);
 
-    // Fill + edges on every root — the SAME rendering paths as hover: the
-    // drawRange proxy when it covers the root (correct 30° crease edges),
-    // legacy pooled pairs otherwise (budget-capped so a mis-targeted flash on
-    // a huge assembly can't build thousands of pairs).
-    const proxyHandles: OverlayHandle[] = [];
+    // Fill + edges on every root — the SAME rendering paths as hover: pooled
+    // pairs on the source meshes (budget-capped so a mis-targeted flash on a
+    // huge assembly can't build thousands of pairs).
     let budget = this.maxHoverMeshes;
+    // Baked placements (plan-753): outline channel only, via chunk objects.
+    const chunkOutlineObjects: Object3D[] = [];
+    const plainRoots: Object3D[] = [];
     for (const root of roots) {
-      if (this._proxyProvider?.canHandle(root)) {
-        proxyHandles.push(this._proxyProvider.acquire(root, 'flash', flashStyle));
+      const targets = this._chunkSource?.chunkTargetsOf(root);
+      if (targets && targets.length > 0) {
+        chunkOutlineObjects.push(...this._chunkOutlineObjects(root, this._flashChunkProxies));
         continue;
       }
+      plainRoots.push(root);
       if (budget <= 0) continue;
       const meshes = this.collectMeshes(root, false).slice(0, budget);
       budget -= meshes.length;
@@ -1066,8 +1358,9 @@ export class RVHighlightManager {
         const b = Math.round((c & 0xff) * f);
         return (r << 16) | (g << 8) | b;
       };
-      const resolved = resolveOutlineTargets(this.scene, roots as Object3D[]);
+      const resolved = resolveOutlineTargets(this.scene, plainRoots);
       disposeProxies = resolved.dispose;
+      resolved.targets.push(...chunkOutlineObjects);
       om.setFlashStyle({
         visibleEdgeColor: opts.color,
         hiddenEdgeColor: dark(opts.color),
@@ -1082,7 +1375,6 @@ export class RVHighlightManager {
       fillMat,
       edgeMat,
       disposeProxies,
-      proxyHandles,
     };
   }
 
@@ -1090,7 +1382,7 @@ export class RVHighlightManager {
   clearFlash(): void {
     if (!this._flashState) return;
     this._builder.releasePairs(this.flashPairs);
-    for (const h of this._flashState.proxyHandles) h.release();
+    this._releaseChunkProxies(this._flashChunkProxies);
     this._outlineManager?.clearFlash();
     this._flashState.disposeProxies?.();
     this._flashState.fillMat.dispose();
@@ -1119,6 +1411,11 @@ export class RVHighlightManager {
     if (this.auxPairs.length > 0) {
       this._syncPairs(this.auxPairs);
     }
+    // Chunk window proxies mirror their chunk mesh (mover chunks move).
+    if (this._hoverChunkProxies.length > 0) this._syncChunkProxies(this._hoverChunkProxies);
+    if (this._selectionChunkProxies.length > 0) this._syncChunkProxies(this._selectionChunkProxies);
+    if (this._auxChunkProxies.length > 0) this._syncChunkProxies(this._auxChunkProxies);
+    if (this._flashChunkProxies.length > 0) this._syncChunkProxies(this._flashChunkProxies);
     if (this._pingState && performance.now() - this._pingState.start >= PING_DURATION_MS) {
       this.clearPing();
     }
@@ -1147,6 +1444,10 @@ export class RVHighlightManager {
   dispose(): void {
     this._offOverlay();
     this.clearAll();
+    this._offChunkRelease?.();
+    this._offChunkRelease = null;
+    for (const p of this._chunkProxyPool) this._detachChunkProxy(p);
+    this._chunkProxyPool.length = 0;
     this._hoverOverlayMat.dispose();
     this._hoverEdgeMat.dispose();
     this._selectionOverlayMat.dispose();
@@ -1193,7 +1494,11 @@ export class RVHighlightManager {
       if (
         (node as Mesh).isMesh &&
         !node.userData?._highlightOverlay &&
-        !node.userData?._driveHoverOverlay
+        !node.userData?._driveHoverOverlay &&
+        !node.userData?._rvRaycastBVH &&
+        // Chunk meshes of a baked placement are never overlay sources (plan-753:
+        // `collectMeshes` covers keep meshes only there).
+        !node.userData?.[RV_BAKE_CHUNK_KEY]
       ) {
         const isSensorViz = node.name.endsWith('_sensorViz');
         if (!isSensorViz || includeSensorViz) {

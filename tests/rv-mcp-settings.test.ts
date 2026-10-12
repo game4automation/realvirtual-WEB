@@ -78,6 +78,7 @@ type PluginInternals = {
   _sendDiscover: () => void;
   _emitChanged: () => void;
   _scheduleReconnect: () => void;
+  _handleMessage: (raw: string) => Promise<void>;
 };
 
 function internals(plugin: McpBridgePlugin): PluginInternals {
@@ -98,20 +99,32 @@ function createFakeWs() {
   };
 }
 
+/** A bridge status frame — plan-541: only this makes the bridge "connected". */
+const STATUS_FRAME = JSON.stringify({
+  type: 'status',
+  status: {
+    pid: 1, port: 5100, uptimeMs: 1000, clientName: null, clientVersion: null,
+    clientConnected: false, lastRequestAgoMs: null,
+  },
+});
+
 // ── Tests ──
 
 describe('McpBridgePlugin - State Extension', () => {
-  it('_emitChanged fires with correct snapshot shape on WS open', () => {
+  it('_emitChanged fires with correct snapshot shape once the bridge is ready', async () => {
     const { plugin, viewer } = setupPlugin();
     const p = internals(plugin);
 
-    // Simulate a WS open event
+    // Simulate a WS open event followed by the server's first status frame
+    // (plan-541: a transport open alone is not "connected").
     const fakeWs = createFakeWs();
     p._ws = fakeWs;
     p._dispatcher = buildToolDispatcher(plugin);
     p._destroyed = false;
+    await p._handleMessage(STATUS_FRAME);
+    viewer.emit.mockClear();
 
-    // Call _emitChanged (as would happen in onopen)
+    // Call _emitChanged (as would happen on any later transition)
     p._emitChanged();
 
     expect(viewer.emit).toHaveBeenCalledOnce();
@@ -236,7 +249,7 @@ describe('McpBridgePlugin - State Extension', () => {
     connectSpy.mockRestore();
   });
 
-  it('getters return correct values in various states', () => {
+  it('getters return correct values in various states', async () => {
     const { plugin } = setupPlugin();
     const p = internals(plugin);
 
@@ -251,11 +264,14 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(plugin.mcpToolCount).toBe(0);
     expect(plugin.mcpEnabled).toBe(true);
 
-    // Simulate WS open with dispatcher
+    // Simulate WS open with dispatcher — transport open alone is NOT connected
+    // (plan-541), the first status frame is.
     const fakeWs = createFakeWs();
     p._ws = fakeWs;
     p._dispatcher = buildToolDispatcher(plugin);
+    expect(plugin.mcpConnected).toBe(false);
 
+    await p._handleMessage(STATUS_FRAME);
     expect(plugin.mcpConnected).toBe(true);
     expect(plugin.mcpToolCount).toBeGreaterThan(0);
 
@@ -278,23 +294,25 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(plugin.mcpToolCount).toBe(expectedSize);
   });
 
-  it('snapshot contains all 8 McpBridgeSnapshot fields with correct types', () => {
+  it('snapshot contains all 12 McpBridgeSnapshot fields with correct types', async () => {
     const { plugin, viewer } = setupPlugin();
     const p = internals(plugin);
 
     p._ws = createFakeWs();
     p._destroyed = false;
     p._currentPort = '19999';
+    p._dispatcher = buildToolDispatcher(plugin);
+    await p._handleMessage(STATUS_FRAME); // ready → resets the backoff
     p._reconnectAttempt = 3;
     p._reconnectDelay = 4000;
-    p._dispatcher = buildToolDispatcher(plugin);
+    viewer.emit.mockClear();
 
     p._emitChanged();
 
     expect(viewer.emit).toHaveBeenCalledOnce();
     const snapshot = viewer.emit.mock.calls[0][1] as McpBridgeSnapshot;
 
-    // Verify all 8 fields exist and have correct types
+    // Verify all 12 fields exist and have correct types
     expect(typeof snapshot.connected).toBe('boolean');
     expect(typeof snapshot.port).toBe('string');
     expect(typeof snapshot.toolCount).toBe('number');
@@ -302,8 +320,13 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(typeof snapshot.enabled).toBe('boolean');
     expect(typeof snapshot.reconnectAttempt).toBe('number');
     expect(typeof snapshot.reconnectDelay).toBe('number');
-    // serverStatus is the bridge's full-chain health frame — null until received.
-    expect(snapshot.serverStatus).toBeNull();
+    // serverStatus is the bridge's full-chain health frame — the one just received.
+    expect(snapshot.serverStatus?.pid).toBe(1);
+    // plan-541: the resolved target (never with ?apikey) and the failure cause.
+    expect(typeof snapshot.target).toBe('string');
+    expect(snapshot.target).toContain('/webviewer');
+    expect(snapshot.target).not.toContain('apikey');
+    expect(snapshot.failure).toBe('none');
 
     // Verify specific values
     expect(snapshot.connected).toBe(true);
@@ -314,10 +337,14 @@ describe('McpBridgePlugin - State Extension', () => {
     expect(snapshot.reconnectAttempt).toBe(3);
     expect(snapshot.reconnectDelay).toBe(4000);
 
-    // Verify exactly 8 keys (no extra, no missing)
-    expect(Object.keys(snapshot)).toHaveLength(8);
+    // plan-564: ownership of this tab (no role in the frame = a gateway without standby).
+    expect(snapshot.role).toBeNull();
+    expect(snapshot.claimed).toBe(false);
+
+    // Verify exactly 12 keys (no extra, no missing)
+    expect(Object.keys(snapshot)).toHaveLength(12);
     expect(Object.keys(snapshot).sort()).toEqual(
-      ['connected', 'enabled', 'port', 'reconnectAttempt', 'reconnectDelay', 'serverStatus', 'toolCount', 'toolNames'],
+      ['claimed', 'connected', 'enabled', 'failure', 'port', 'reconnectAttempt', 'reconnectDelay', 'role', 'serverStatus', 'target', 'toolCount', 'toolNames'],
     );
   });
 });

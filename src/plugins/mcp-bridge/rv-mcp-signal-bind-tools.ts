@@ -48,6 +48,7 @@ import { getActiveEditTarget } from '../../core/hmi/rv-edit-target';
 import { collectBindingInventory, mergeAppliedMappings } from '../signal-bind/binding-inventory';
 import { emitSignalBindingApplied } from '../signal-bind/binding-applied-pulse';
 import { enumerateAllBindableTargets } from '../signal-bind/bindable-targets';
+import { bindWithUnitScale, describeUnitStatus } from '../signal-bind/unit-scale';
 import { createSignalBindingPersistence } from '../signal-bind/signal-binding-persistence';
 import { signalBindTargetId, type SignalBindTarget } from '../signal-bind/signal-bind-target';
 import {
@@ -295,20 +296,24 @@ export class McpSignalBindTools {
     if (blocked) return err(blocked, { persisted: false });
 
     const persistence = createSignalBindingPersistence(viewer, resolved.entry.target);
-    const next = upsertMappingForRow(persistence.read(), resolved.slot, source);
-    if (!next) return err('The signal carries no provider identity — it cannot be linked');
+    if (!upsertMappingForRow(persistence.read(), resolved.slot, source)) {
+      return err('The signal carries no provider identity — it cannot be linked');
+    }
 
-    const applied = manager.applyMappings(
-      signalBindTargetId(resolved.entry.target),
-      resolved.entry.node as Parameters<typeof manager.applyMappings>[1],
-      next,
-    );
-    const bound = applied.some((m) =>
-      m.slot === resolved.slot.slot && m.componentPath === resolved.slot.componentPath);
-    if (!bound) return err('The slot refused the binding at apply time', { persisted: false });
-    // Broken links on the same target survive an unrelated bind — see
-    // mergeAppliedMappings. Persisting `applied` alone would delete them.
-    persistence.write(mergeAppliedMappings(next, applied));
+    // plan-512: the SAME unit-aware bind as the inspector — mapping and unit
+    // factor in one undo step, queued behind any bind already running on this
+    // document, verified from the resulting state (broken links on the same
+    // target survive, as before: the helper merges them).
+    const result = await bindWithUnitScale(viewer, resolved.entry.target, persistence, resolved.slot, source);
+    if (!result) return err('The signal carries no provider identity — it cannot be linked');
+    const bound = manager.getBindingLiveness(
+      resolved.entry.id, resolved.slot.slot, resolved.slot.componentPath) !== undefined;
+    if (!result.persisted || !bound) {
+      return err('The slot refused the binding', {
+        persisted: false,
+        ...(result.error ? { reason: result.error } : {}),
+      });
+    }
     // The agent-initiated half of the F8 boundary. A watching operator sees the
     // same pulse they would have seen had they dropped the signal themselves —
     // which is the only feedback a bind made from outside the browser gives.
@@ -321,10 +326,12 @@ export class McpSignalBindTools {
 
     // Confirm from the persisted state, not from the intent: the whole point of
     // the pre-check is that "I wrote it" and "it is there" are different claims.
-    const saved = persistence.read().some((m) =>
+    const savedMapping = persistence.read().find((m) =>
       m.slot === resolved.slot.slot
       && m.componentPath === resolved.slot.componentPath
       && m.signal === signal);
+    const saved = !!savedMapping;
+    const unitStatus = result.status;
     return JSON.stringify({
       targetId: resolved.entry.id,
       componentPath: resolved.slot.componentPath,
@@ -336,6 +343,11 @@ export class McpSignalBindTools {
       liveness: manager.getBindingLiveness(
         resolved.entry.id, resolved.slot.slot, resolved.slot.componentPath),
       persisted: saved,
+      // plan-512: what the unit logic did — the written factor's provenance
+      // (absent when nothing was written) and the evaluated state of the slot.
+      ...(savedMapping?.unitScale ? { unitScale: savedMapping.unitScale } : {}),
+      unitStatus: unitStatus.kind,
+      ...(unitStatus.kind !== 'none' ? { unitDetail: describeUnitStatus(unitStatus, signal) } : {}),
     });
   }
 

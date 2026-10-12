@@ -182,17 +182,22 @@ describe('T15 — manager registry and the context slot', () => {
 
   it('every ComponentContext construction path in the loader reads the slot', async () => {
     // Structural guard for the lifecycle matrix (SOL finding 3): the loader must
-    // populate `kinematicManager` on ALL FOUR paths — initial load (loadGLB),
-    // asset placement (processExtras), createRuntimeNode and
-    // constructComponentOnNode. Threading it as an option is exactly what gets
-    // forgotten on the runtime paths, which is why it is read from the singleton
-    // at each site and why that count is asserted here.
+    // populate `kinematicManager` on EVERY ComponentContext construction path.
+    // Threading it as an option is exactly what gets forgotten on the runtime
+    // paths, which is why it is read from the singleton at each site and why
+    // that count is asserted here.
+    //
+    // THREE sites since plan-754 F13/D19, not four: `loadGLB` and
+    // `processExtras` no longer build a context each — they share the ONE
+    // `initSubtree`. The remaining two are `createRuntimeNode` and
+    // `constructComponentOnNode`. A DROP below three means a path stopped
+    // reading the slot; a RISE means a fourth context was hand-rolled again.
     //
     // The dev server serves TRANSFORMED modules, so TS type annotations
     // (`: ComponentContext`) are already stripped — only the runtime object
     // property survives, and that is what this counts.
     const source = await fetch('/src/core/engine/rv-scene-loader.ts').then((r) => r.text());
     const reads = source.match(/kinematicManager:\s*getKinematicManager\(\)/g) ?? [];
-    expect(reads.length).toBe(4);
+    expect(reads.length).toBe(3);
   });
 });

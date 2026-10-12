@@ -73,6 +73,7 @@ import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { HorizontalBlurShader } from 'three/addons/shaders/HorizontalBlurShader.js';
 import { VerticalBlurShader } from 'three/addons/shaders/VerticalBlurShader.js';
 import { FLOOR_FADE_START_RATIO, FLOOR_FADE_END_RATIO } from './rv-ground-plane';
+import { drawCallsOf, addNestedDelta, getActiveFrameStats, type RenderInfoLike } from './rv-frame-stats';
 
 /** Overlay-blend gray that reproduces an unmodified ("full") reflection. */
 const FULL_MIRROR_GRAY = 0.5;
@@ -103,11 +104,23 @@ interface ReflectionControl {
   vMat: ShaderMaterial;
   /** Number of iterated H+V blur pairs; 0 = sharp (blur skipped). */
   blurIterations: number;
+  /** `[sharpRT, blurRT1, blurRT2]` — cached for the render-target census. */
+  renderTargets: readonly WebGLRenderTarget[];
 }
 
 function getControl(reflector: Reflector): ReflectionControl {
   return (reflector.userData as { _rvReflection: ReflectionControl })._rvReflection;
 }
+
+/**
+ * The render targets a ground reflector owns (mirror + the two half-res blur
+ * ping-pong targets), for `countRenderTargets` — the mirror texture is one of
+ * the `info.memory.textures` the DevTools tab has to explain.
+ */
+export function getReflectorRenderTargets(reflector: Reflector | null): readonly WebGLRenderTarget[] {
+  return reflector ? getControl(reflector).renderTargets : EMPTY_TARGETS;
+}
+const EMPTY_TARGETS: readonly WebGLRenderTarget[] = [];
 
 /**
  * Create the floor reflection mirror, or `null` on WebGPU (WebGL-only feature).
@@ -163,16 +176,39 @@ export function createGroundReflector(isWebGPU: boolean, checkerMesh: Mesh): Ref
   });
   const fsQuad = new FullScreenQuad();
 
-  const ctrl: ReflectionControl = { sharpRT, blurRT1, blurRT2, fsQuad, hMat, vMat, blurIterations: 0 };
+  const ctrl: ReflectionControl = {
+    sharpRT, blurRT1, blurRT2, fsQuad, hMat, vMat, blurIterations: 0,
+    renderTargets: [sharpRT, blurRT1, blurRT2],
+  };
   reflector.userData._rvReflection = ctrl;
 
   // ── Wrap onBeforeRender: exclude the checker from the reflection pass, then
   //    optionally blur the rendered mirror in place. ──
+  //
+  // Frame accounting (rv-frame-stats.ts): three fires `onBeforeRender` in
+  // EVERY `renderer.render` whose render list holds this mesh — the
+  // RenderPass, the AO gbuffer renders and the OutlinePass depth pass (an
+  // `overrideMaterial` does not suppress it; the stock Reflector only guards
+  // against recursion by setting `scope.visible = false` around its inner
+  // render). Each firing re-renders the whole scene into the mirror target,
+  // so the delta of this wrapper (mirror render + blur quads) is booked to
+  // `reflection` and taken out of the pass bucket that is running.
   const origOnBeforeRender = reflector.onBeforeRender;
   reflector.onBeforeRender = function (renderer, scene, camera, geometry, material, group) {
+    const stats = getActiveFrameStats();
+    const info = renderer.info as unknown as RenderInfoLike;
+    const c0 = drawCallsOf(info);
+    const t0 = info.render.triangles;
+    try {
+      renderReflection(renderer, scene, camera, geometry, material, group);
+    } finally {
+      if (stats) addNestedDelta(stats, 'reflection', info, c0, t0);
+    }
+  };
+  const renderReflection: Reflector['onBeforeRender'] = (renderer, scene, camera, geometry, material, group) => {
     const checkerWasVisible = checkerMesh.visible;
     checkerMesh.visible = false;
-    origOnBeforeRender.call(this, renderer, scene, camera, geometry, material, group); // fills sharpRT
+    origOnBeforeRender.call(reflector, renderer, scene, camera, geometry, material, group); // fills sharpRT
     checkerMesh.visible = checkerWasVisible;
 
     const iterations = ctrl.blurIterations;

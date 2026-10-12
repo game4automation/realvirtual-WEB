@@ -83,3 +83,39 @@ export const PHYSICS_STATIC_BOX_MAX_SCENE_FRACTION = 0.9;
  * fewer than two comparable axes the guard fails OPEN (box is registered).
  */
 export const PHYSICS_SCENE_AXIS_EPSILON = 0.001; // m
+
+// ── Moving colliders & contact loads (plan-467) ─────────────────────────────
+
+/**
+ * Maximum number of vertices fed into `ColliderDesc.convexHull()` for a
+ * MeshCollider part (plan-467 F2). CAD meshes routinely carry >10k vertices and
+ * parry's hull cost grows steeply with vertex count (~27 ms at 1000 points),
+ * while the hull itself is built ONCE per zone build — the cap keeps a
+ * pathological model from stalling the build.
+ *
+ * Decimation is a uniform STRIDE over the vertex buffer, so the result is a
+ * SUBSET of the true hull: a slightly smaller shape, never a larger one. An
+ * under-estimated collider lets an MU approach a millimetre closer; an
+ * over-estimated one would push it away through thin air.
+ */
+export const PHYSICS_HULL_MAX_POINTS = 512;
+
+/**
+ * Contact loads below this magnitude (N) are treated as zero and never reported
+ * (plan-467 F6). Rapier's solver leaves sub-newton impulse noise on resting
+ * contacts; without a floor every kinematic body would report a permanent
+ * jitter load and the "External load" row in the mechanism panel would never
+ * settle. 0.05 N is ~0.5 % of the weight of the 1 kg reference MU.
+ */
+export const PHYSICS_CONTACT_FORCE_THRESHOLD_N = 0.05;
+
+/**
+ * Mass (kg) of a dynamic MU when neither the MU (`PhysicsMassKg` extras) nor
+ * its zone (`muMassKg`) says otherwise (plan-467 F16).
+ *
+ * A mass is MANDATORY: Rapier derives mass from collider DENSITY, which gives
+ * the standard 0.2 m demo cube 8 g — a payload three orders of magnitude too
+ * light to show up in a drive-sizing chart. 1 kg is the neutral, recognisable
+ * unit value; authored masses always win.
+ */
+export const PHYSICS_DEFAULT_MU_MASS_KG = 1;

@@ -19,9 +19,9 @@ import { describe, it, expect } from 'vitest';
 import { BundledBackend } from '../src/core/project/backends/bundled-backend';
 import { BackendNotWritableError } from '../src/core/project/backends/project-backend';
 import { ProjectStore } from '../src/core/project/project-store';
-import { assetDocumentsOf } from '../src/core/project/rv-project-documents';
+import { assetDocumentsOf } from './helpers/document-sections';
 import { WORKSPACE_DEFAULT_PROJECT_ID } from '../src/core/project/rv-workspace-default';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 
 const REMOTE = 'https://cdn.example.test/customer/';
@@ -65,7 +65,8 @@ describe('BundledBackend against a foreign baseUrl', () => {
       [`${REMOTE}project.json`]: DEPLOYED_MANIFEST,
       [`${REMOTE}models.json`]: ['Press.glb', 'Cell.glb'],
     });
-    const models = await backend.listModels();
+    // plan-744 F1: the one listing; discovered rows carry the foreign absolute URL.
+    const models = await backend.listDocuments();
     expect(models.map(m => m.path)).toEqual([`${REMOTE}models/Press.glb`, `${REMOTE}models/Cell.glb`]);
     expect(models[0]!.label).toBe('Press');
   });
@@ -96,7 +97,7 @@ describe('BundledBackend against a foreign baseUrl', () => {
       [`${REMOTE}project.json`]: { ...DEPLOYED_MANIFEST, models: [{ path: 'models/Only.glb', label: 'Only' }] },
       [`${REMOTE}models.json`]: ['Press.glb'],
     });
-    expect((await backend.listModels()).map(m => m.path)).toEqual(['models/Only.glb']);
+    expect((await backend.listDocuments()).map(m => m.path)).toEqual(['models/Only.glb']);
   });
 
   it('resolves blob URLs against the foreign base', async () => {
@@ -126,7 +127,7 @@ describe('BundledBackend against a foreign baseUrl', () => {
       expect(await backend.readManifest()).toBeNull();
       expect(backend.hasDeployedManifest()).toBe(false);
       // `models.json` alone is NOT a project — that is the whole degradation.
-      expect(await backend.listModels()).toEqual([]);
+      expect(await backend.listDocuments()).toEqual([]);
       expect(warnings.join('\n')).toMatch(/project\.json could not be read/);
     } finally {
       console.warn = warn;

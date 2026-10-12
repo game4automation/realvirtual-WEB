@@ -37,7 +37,9 @@
 import type { RVViewer } from '../../core/rv-viewer';
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 import { arrayBufferOf } from '../../core/project/rv-scene-record';
+import type { DocumentRefField } from '../../core/project/rv-project-refs';
 import { builtinSources } from '../../core/rv-model-catalog';
+import { sceneReadyFields } from './rv-mcp-scene-ready';
 import {
   publishedUrlNameOf,
   resolvePublishedAlias,
@@ -45,20 +47,36 @@ import {
 } from '../../core/hmi/scene/rv-published-scenes';
 
 /**
- * The two folder fields every document row of these tools reports.
+ * The folder field every document row of these tools reports.
  *
  * `folder` is the first path segment — `''` at the project root — read off the
- * path and nowhere else (plan-736 F7). `section` carries the identical value
- * and is deprecated: it used to be `sectionOfDocument()`, a stored field with a
- * three-way path heuristic behind it, which answered `'library'` for a
- * root-level file and for a browser scene alike. An agent prompt written
- * against `section` keeps working for one release; new ones read `folder`.
+ * path and nowhere else (plan-736 F7).
+ *
+ * The `section` alias that travelled beside it for one release is GONE
+ * (plan-744 F9). It was already carrying the identical value, so nothing an
+ * agent could read changes; what goes is the suggestion that the two are
+ * different questions. Before it was removed, `rg` found no consumer outside
+ * this repo — not in CONNECT's C#, not in `unity_mcp_server.py`.
  */
-export function folderFields(path: unknown): { folder: string; section: string } {
+export function folderFields(path: unknown): { folder: string } {
   const p = typeof path === 'string' ? path : '';
-  const folder = p.includes('/') ? p.slice(0, p.indexOf('/')) : '';
-  return { folder, section: folder };
+  return { folder: p.includes('/') ? p.slice(0, p.indexOf('/')) : '' };
 }
+
+/**
+ * What `web_document_bind` accepts for `field` (plan-479 Phase 6).
+ *
+ * The manifest names are the truth and are listed first; the short aliases
+ * exist because an agent reading the UI sees CONNECT, PLUGIN and KNOWLEDGE on
+ * the card and would otherwise have to guess that the third one is spelled
+ * `scriptRef`. A wrong spelling is answered with the full list rather than
+ * silently mapped to a default — binding the wrong field is worse than failing.
+ */
+const REF_FIELD_ALIASES: Readonly<Record<string, DocumentRefField>> = {
+  connectref: 'connectRef', connect: 'connectRef',
+  scriptref: 'scriptRef', script: 'scriptRef', plugin: 'scriptRef',
+  knowledgeref: 'knowledgeRef', knowledge: 'knowledgeRef',
+};
 
 /** Normalised match key: case- and separator-insensitive. */
 function matchKey(s: string): string {
@@ -115,26 +133,27 @@ export class McpProjectTools {
   }
 
   @McpTool(
-    'List the PROJECTS available in the configured workspace, plus which one is currently open. '
+    'List the LINKED PROJECTS of this browser, plus which one is currently open. '
     + 'Each row: slug (the id web_project_open takes), name, folderName, id, and `current`. '
     + 'Use this to find out where you are and what you can switch to — every project-relative '
     + 'path (cad/, library/, knowledge/, models/) resolves against the OPEN project. Returns an '
-    + 'empty list with a hint when no workspace folder has been granted.',
+    + 'empty list with a hint when no project folder has been linked yet.',
     { readOnly: true, timeoutMs: 60_000 },
   )
   async webProjectList(): Promise<string> {
-    const [{ scanStoredWorkspace }, { getProjectStore }] = await Promise.all([
-      import('../../core/project/rv-project-workspace'),
+    const [{ listLinkedProjects }, { getProjectStore }] = await Promise.all([
+      import('../../core/project/rv-project-linked'),
       import('../../core/project/project-store'),
     ]);
     const store = getProjectStore();
     const open = store.getProject();
     const backend = store.getBackend();
 
-    // prompt:false — an MCP call has no user gesture to spend on a permission
-    // dialog; an ungranted workspace must answer "nothing to list", not hang.
-    const discovery = await scanStoredWorkspace({ prompt: false });
-    const projects = discovery.projects.map((p) => ({
+    // A listing, so no permission is spent: an MCP call has no user gesture to
+    // pay a browser dialog with. A row whose grant has lapsed is still listed —
+    // web_project_open is where that shows up, with an actionable message.
+    const linked = await listLinkedProjects();
+    const projects = linked.map((p) => ({
       slug: p.slug,
       name: p.name,
       folderName: p.folderName,
@@ -152,10 +171,10 @@ export class McpProjectTools {
           }
         : null,
       projects,
-      warnings: discovery.warnings,
+      warnings: [],
       hint: projects.length === 0
-        ? 'No workspace projects found. A workspace folder must be granted once in the UI '
-          + '(Projects dashboard); MCP cannot open the folder picker itself.'
+        ? 'No linked projects. A project folder must be added once in the UI (Projects '
+          + 'dashboard → Add); MCP cannot open the folder picker itself.'
         : 'Switch with web_project_open(project=<slug>). This switches IN PLACE — no page '
           + 'reload, so the bridge connection and this MCP session survive it.',
     });
@@ -164,8 +183,8 @@ export class McpProjectTools {
   @McpTool(
     'List the DOCUMENTS of the open project — THE one list. Asset, model and scene are one '
     + 'thing: a GLB document. Each row: id, name, path, folder, sizeBytes, modified. `folder` '
-    + 'is the first path segment (`""` at the root) — a place, not a type; `section` is a '
-    + 'deprecated alias carrying the same value. `builtins` are read-only SOURCES; saving one '
+    + 'is the first path segment (`""` at the root) — a place, not a type. '
+    + '`builtins` are read-only SOURCES; saving one '
     + 'materialises a new document. `published` lists the DEV-ONLY documents (`devOnly: true` '
     + 'in the manifest) — repo fixtures no delivered channel ships, and ordinary `documents` '
     + 'rows. filter: case-insensitive substring of name/path; withNodeCount adds nodeCount by '
@@ -193,17 +212,20 @@ export class McpProjectTools {
 
     // plan-716 §2.7 — the ONE list, read where it lives. `listScenes()` was the
     // `scenes/`-section-shaped half of it and is gone (Phase 6); an agent asking
-    // "what can I open" must not be shown a third of the answer. Since the
-    // web_library_assets merge, size/mtime and the unadopted library files come
-    // from the SAME call: the manifest rows carry identity, `statDocuments()`
-    // carries bytes on disk, and `listLibrary()` sees a GLB dropped into the
-    // folder by hand before anything adopts it. Neither alone is the whole list.
+    // "what can I open" must not be shown a third of the answer.
+    //
+    // Since the web_library_assets merge, identity and bytes come from two
+    // sources that are merged here: the manifest rows carry identity, and
+    // `statDocuments()` carries what is on disk — including a GLB dropped into
+    // the folder by hand before anything adopted it. That second half used to
+    // be a third call, `listLibrary()`, which saw only `library/**` and is gone
+    // with the method (plan-744 F1); `statDocuments()` already walks the whole
+    // tree, so the unadopted rows below come from it instead and now include
+    // the ones outside `library/`.
     interface DocumentRow {
       id: string | null; name: string; path: string;
       /** First path segment, '' at the project root. */
       folder: string;
-      /** @deprecated plan-736 — identical to `folder`. */
-      section: string;
       sizeBytes: number | null; modified: string | null; nodeCount?: number;
     }
     const byPath = new Map<string, DocumentRow>();
@@ -222,18 +244,19 @@ export class McpProjectTools {
         modified: d.modifiedAt ?? (stat?.mtime ? new Date(stat.mtime).toISOString() : null),
       });
     }
-    const libEntries = typeof backend?.listLibrary === 'function'
-      ? await backend.listLibrary().catch(() => []) : [];
-    for (const e of libEntries) {
-      if (byPath.has(e.path)) continue;
-      const stat = statByPath.get(e.path);
-      byPath.set(e.path, {
-        id: e.id ?? null,
-        name: e.label || listing.glbStem(e.path),
-        path: e.path,
-        ...folderFields(e.path),
-        sizeBytes: e.sizeBytes ?? stat?.size ?? null,
-        modified: stat?.mtime ? new Date(stat.mtime).toISOString() : null,
+    // Files on disk the manifest does not (yet) list. Asset endings only — a
+    // `*.knowledge.md` is a file, not a document, and `web_editor_project_files`
+    // is where it belongs.
+    for (const stat of stats) {
+      if (byPath.has(stat.path)) continue;
+      if (!/\.(glb|gltf|splat|ksplat|ply)$/i.test(stat.path)) continue;
+      byPath.set(stat.path, {
+        id: null,
+        name: listing.glbStem(stat.path),
+        path: stat.path,
+        ...folderFields(stat.path),
+        sizeBytes: stat.size ?? null,
+        modified: stat.mtime ? new Date(stat.mtime).toISOString() : null,
       });
     }
 
@@ -289,7 +312,8 @@ export class McpProjectTools {
     + 'the import UNDER it — the new document silently adopts the whole scene, and a save '
     + 'would write the demo scene plus your part. '
     + 'Refused while the asset editor is open: the editor keeps its document (and its save '
-    + 'path) bound to the previous file — call web_editor_close first.',
+    + 'path) bound to the previous file — call web_editor_close first. '
+    + '`placements.pending` > 0: references still loading.',
     { readOnly: false, timeoutMs: 180_000 },
   )
   async webDocumentOpen(
@@ -366,6 +390,7 @@ export class McpProjectTools {
       return JSON.stringify({
         opened: true, kind: 'builtin', url: builtin.url, label: builtin.label,
         currentModel: this.viewer?.currentModelUrl ?? null,
+        ...(await sceneReadyFields(this.viewer)),
       });
     }
 
@@ -388,6 +413,7 @@ export class McpProjectTools {
         name: doc.name,
         path: doc.path,
         ...folderFields(doc.path),
+        ...(await sceneReadyFields(this.viewer)),
       });
     }
 
@@ -407,6 +433,7 @@ export class McpProjectTools {
         name: aliased.name,
         path: aliased.path,
         ...folderFields(aliased.path),
+        ...(await sceneReadyFields(this.viewer)),
         note: 'Resolved through the legacy published:<name> alias — prefer the document id.',
       });
     }
@@ -423,7 +450,7 @@ export class McpProjectTools {
   }
 
   @McpTool(
-    'OPEN a project from the workspace IN PLACE — no page reload, so the MCP bridge connection '
+    'OPEN a linked project IN PLACE — no page reload, so the MCP bridge connection '
     + 'survives (unlike the ?project= deep link, which reloads into a new tab and drops the '
     + 'editor document). `project` matches a slug, name or folder name from web_project_list, '
     + 'case- and separator-insensitively. Refuses when the current project has unsaved work '
@@ -442,15 +469,17 @@ export class McpProjectTools {
       return JSON.stringify({ error: 'project is required — call web_project_list for the available slugs.' });
     }
 
-    const [{ scanStoredWorkspace }, { getProjectStore }] = await Promise.all([
-      import('../../core/project/rv-project-workspace'),
-      import('../../core/project/project-store'),
-    ]);
+    const [{ listLinkedProjects }, { getProjectStore }, { getFolderHandle, projectHandleKey }] =
+      await Promise.all([
+        import('../../core/project/rv-project-linked'),
+        import('../../core/project/project-store'),
+        import('../../core/engine/rv-local-filesystem'),
+      ]);
     const store = getProjectStore();
-    const discovery = await scanStoredWorkspace({ prompt: false });
+    const linked = await listLinkedProjects();
 
     const key = matchKey(wanted);
-    const entry = discovery.projects.find((p) =>
+    const entry = linked.find((p) =>
       matchKey(p.slug) === key
       || matchKey(p.name) === key
       || matchKey(p.folderName) === key
@@ -458,9 +487,9 @@ export class McpProjectTools {
 
     if (!entry) {
       return JSON.stringify({
-        error: `No workspace project matches "${wanted}".`,
-        available: discovery.projects.map((p) => p.slug),
-        warnings: discovery.warnings,
+        error: `No linked project matches "${wanted}".`,
+        available: linked.map((p) => p.slug || p.name),
+        warnings: [],
       });
     }
 
@@ -497,10 +526,21 @@ export class McpProjectTools {
       });
     }
 
-    // skipPermissionRequest mirrors the by-id path used for recent projects:
-    // the workspace grant already covers this subfolder, and requesting write
-    // access outside a user gesture would silently degrade to read-only.
-    const ok = await store.openProjectFolder(entry.dir, {
+    // The folder handle is resolved HERE and without a prompt: an MCP call has
+    // no user gesture, so a lapsed grant must become an actionable message
+    // rather than a dialog nobody can answer.
+    const dir = await getFolderHandle(projectHandleKey(entry.id), { prompt: false });
+    if (!dir) {
+      return JSON.stringify({
+        error: `The folder grant for "${entry.name}" has lapsed — cannot open it from MCP.`,
+        remedy: 'Open the project once in the Projects dashboard to renew the grant, then retry.',
+      });
+    }
+
+    // skipPermissionRequest because the grant was just verified above, and
+    // requesting write access outside a user gesture would silently degrade the
+    // project to read-only.
+    const ok = await store.openProjectFolder(dir, {
       skipPermissionRequest: true,
       skipDirtyGuard: true,
     });
@@ -513,6 +553,7 @@ export class McpProjectTools {
       projectKind: backend?.kind ?? null,
       writable: backend?.writable === true,
       forced: force === true,
+      ...(ok ? await sceneReadyFields(this.viewer) : {}),
       next: ok
         ? 'Project switched in place. Project-relative paths (cad/, library/, knowledge/) now '
           + 'resolve against it. Open a document with web_editor_open.'
@@ -638,5 +679,157 @@ export class McpProjectTools {
       refsRepointed: outcome.refRows,
       note: 'Document ids are unchanged — references keep resolving.',
     });
+  }
+
+  @McpTool(
+    'BIND or UNBIND one reference field of a document — the project.json edit the dashboard\'s '
+    + 'reference slots make. field=connectRef takes a *.connect.json, field=scriptRef a PLUGIN '
+    + '(.ts/.tsx under plugins/, loaded with the document), field=knowledgeRef a *.md. ref="" '
+    + 'clears it. document is a project-relative path, id or name (web_document_list). Touches '
+    + 'no file and deletes nothing: writes the field, reads it back, reports the stored state. '
+    + 'Refused for a read-only project, a bundled document, a ref leaving the project or a path '
+    + 'the field\'s rule rejects. Renaming or deleting the FILES is web_document_update.',
+    { readOnly: false, timeoutMs: 60_000 },
+  )
+  async webDocumentBind(
+    @McpParam('document', 'Project-relative path, document id or name of the document to bind (from web_document_list).')
+    document: string,
+    @McpParam('field', 'connectRef | scriptRef | knowledgeRef (aliases: connect | plugin | knowledge)')
+    field: string,
+    @McpParam('ref', 'Project-relative path of the file to bind. Empty string (or omitted) clears the binding.', 'string', false)
+    ref?: string,
+  ): Promise<string> {
+    const [{ getProjectStore }, refs, docs, listing] = await Promise.all([
+      import('../../core/project/project-store'),
+      import('../../core/project/rv-project-refs'),
+      import('../../core/project/rv-project-documents'),
+      import('./rv-mcp-asset-listing'),
+    ]);
+
+    // The check order of `webDocumentUpdate` (§2.2), and for the same reason:
+    // each step is only answerable once the one before it held, so any other
+    // order produces a message about the wrong problem.
+    const store = getProjectStore();
+    const backend = store.getBackend();
+    if (!backend) {
+      return JSON.stringify({ error: 'No project is open — open one with web_project_open.' });
+    }
+    if (!backend.writable) {
+      return JSON.stringify({ error: 'This project is read-only — its bindings cannot be changed.' });
+    }
+
+    const resolvedField = REF_FIELD_ALIASES[(field ?? '').trim().toLowerCase()];
+    if (!resolvedField) {
+      return JSON.stringify({
+        error: `Unknown field "${field}". Use ${refs.DOCUMENT_REF_FIELDS.join(', ')} `
+          + '(aliases: connect, plugin, knowledge).',
+      });
+    }
+
+    const wanted = (document ?? '').trim();
+    const rows = docs.documentsOf(store.getProject());
+    const row = rows.find(d => d.id === wanted)
+      ?? rows.find(d => listing.samePath(d.path, wanted))
+      ?? rows.find(d => (d.name ?? '') === wanted)
+      ?? rows.find(d => matchKey(d.name ?? '') === matchKey(wanted));
+    if (!row) {
+      return JSON.stringify({
+        error: `No document "${document}" in this project — see web_document_list.`,
+      });
+    }
+
+    const value = (ref ?? '').trim();
+    if (value !== '') {
+      // The rule per field, stated as a REASON rather than as a bare refusal: a
+      // caller told only "no" reaches for project.json again, which is the
+      // habit this tool exists to end.
+      const rule = {
+        connectRef: {
+          ok: refs.isConnectConfigPath,
+          why: `a CONNECT configuration ends in "${refs.CONNECT_CONFIG_SUFFIX}"`,
+        },
+        scriptRef: {
+          ok: refs.isProjectScriptPath,
+          why: `a plugin is a ${refs.PROJECT_SCRIPT_SUFFIXES.join('/')} file under `
+            + `"${refs.PROJECT_SCRIPT_FOLDER}/"`,
+        },
+        knowledgeRef: {
+          ok: refs.isKnowledgeFilePath,
+          why: `a knowledge file ends in "${refs.KNOWLEDGE_FILE_SUFFIX}" or `
+            + `"${refs.MARKDOWN_FILE_SUFFIX}"`,
+        },
+      }[resolvedField];
+      if (!rule.ok(value)) {
+        return JSON.stringify({
+          error: `"${value}" cannot be bound as ${resolvedField}: ${rule.why}.`,
+        });
+      }
+      // Containment is enforced again inside the store, but a throw there would
+      // reach the bridge as a stack trace instead of as an answer — so it is
+      // asked here, where the refusal can be a sentence.
+      if (!refs.isContainedRef(value)) {
+        return JSON.stringify({
+          error: `"${value}" leaves the project — a reference must be a project-relative path `
+            + 'with no "..", no leading "/" and no URL scheme.',
+        });
+      }
+    }
+
+    const write = resolvedField === 'connectRef' ? store.setDocumentConnectRef
+      : resolvedField === 'scriptRef' ? store.setDocumentScriptRef
+        : store.setDocumentKnowledgeRef;
+    try {
+      await write.call(store, row.id, value === '' ? null : value);
+    } catch (e) {
+      // A bundled (read-only) document and a lost manifest both land here. The
+      // store's own sentence is the good one; wrapping it would only bury it.
+      return JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    }
+
+    // Read the state BACK rather than echo the intent (the McpKnowledgeTools
+    // rule): a write that was normalised, refused downstream or landed on a
+    // different row must not be reported as the write that was asked for.
+    const after = store.getSnapshot().documents.find(d => d.id === row.id) ?? null;
+    const stored = after ? refs.readDocumentRef(after, resolvedField) : null;
+    const fileInProject = stored === null ? null : await this.refExists(resolvedField, stored);
+    return JSON.stringify({
+      bound: stored !== null,
+      document: row.name ?? row.path ?? row.id,
+      documentId: row.id,
+      field: resolvedField,
+      ref: stored,
+      fileInProject,
+      note: stored === null
+        ? 'The binding is cleared.'
+        : fileInProject === false
+          ? 'Written — but no file at that path is in the project yet, so the document reports a '
+            + 'missing reference until one is.'
+          : 'Written and read back from the manifest.',
+    });
+  }
+
+  /**
+   * Does the bound file actually exist in the project?
+   *
+   * `null` when the backend cannot say — a listing a backend does not implement
+   * is an UNKNOWN, and reporting an unknown as "missing" would make the tool
+   * warn about perfectly correct bindings in the bundled and browser backends.
+   */
+  private async refExists(
+    field: DocumentRefField,
+    ref: string,
+  ): Promise<boolean | null> {
+    const { getProjectStore } = await import('../../core/project/project-store');
+    const backend = getProjectStore().getBackend();
+    if (!backend) return null;
+    const list = field === 'connectRef' ? backend.listConnectConfigs
+      : field === 'scriptRef' ? backend.listProjectScripts
+        : backend.listKnowledgeFiles;
+    if (!list) return null;
+    try {
+      return (await list.call(backend)).includes(ref);
+    } catch {
+      return null;
+    }
   }
 }

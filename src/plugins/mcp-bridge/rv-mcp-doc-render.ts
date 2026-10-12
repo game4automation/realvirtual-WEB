@@ -69,7 +69,7 @@ export function domainOf(name: string): string {
   // no family, and the lint's ROOT_TOOLS list is the arbiter of which is which.
   const ROOT_NAMES = new Set([
     'web_status', 'web_logs', 'web_errors', 'web_help',
-    'web_measure', 'web_render', 'web_describe',
+    'web_measure', 'web_describe',
     // plan-716 Phase 5: `McpProjectTools` joined the shared instance list and
     // brought its throttle probe with it. Root-level like `web_status` — "is
     // the tab alive" belongs to no family, and a one-tool `ping` domain in the
@@ -198,7 +198,8 @@ export const DOC_FAMILIES: readonly FamilySpec[] = [
   },
   {
     marker: 'tool-reference editor',
-    file: 'src/plugins/mcp-bridge/help/editor.md',
+    // The editor guide IS the kinematize recipe since the help fold (web_help(editor) serves it).
+    file: 'recipes/kinematize-cad-import.md',
     match: (n) => n.startsWith('web_editor_'),
     render: renderToolTable,
   },
@@ -213,8 +214,9 @@ export const DOC_FAMILIES: readonly FamilySpec[] = [
   {
     marker: 'tool-reference simulation',
     file: 'src/plugins/mcp-bridge/help/simulation.md',
+    // plan-567: `web_mu_*` (remove / move a workpiece carrier) belongs to the material flow.
     match: (n) => startsWithAny(n, ['web_drive_', 'web_signal_', 'web_sensor_', 'web_sim_',
-      'web_transport_', 'web_logic_']),
+      'web_transport_', 'web_logic_', 'web_mu_']),
     render: renderToolTable,
   },
   {

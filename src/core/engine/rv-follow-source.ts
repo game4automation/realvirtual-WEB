@@ -33,6 +33,20 @@ export interface FollowSource {
   isAlive(): boolean;
   /** Readable label for logging / UI. */
   readonly label: string;
+  /**
+   * Optional: the follow mode this source was driving has ended.
+   *
+   * Called by `CameraManager.stopFollowMode` AFTER the mode is already off and
+   * the source detached, so a handler may safely call `stopFollowMode` again
+   * (it returns immediately) — but before any restore flight, so a handler that
+   * wants to suppress that still can.
+   *
+   * It exists because follow can now end from inside the CameraManager itself:
+   * `animateCameraTo` releases an agent-eye follow before flying (plan-740
+   * D-A6b), and the owner of that source has no other way to learn about it —
+   * an OrbitControls `'start'` event is never fired for a programmatic flight.
+   */
+  onFollowStopped?(): void;
 }
 
 // Pre-allocated decompose scratch (module-level, never escapes synchronously).

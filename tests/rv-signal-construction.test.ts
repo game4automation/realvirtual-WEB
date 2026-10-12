@@ -6,6 +6,7 @@ import { Object3D } from 'three';
 import {
   registerSignal,
   constructDrive,
+  addSignal,
   SIGNAL_TYPES,
   DRIVE_BEHAVIOR_MAP,
 } from '../src/core/engine/rv-signal-construction';
@@ -30,15 +31,21 @@ describe('rv-signal-construction', () => {
   describe('DRIVE_BEHAVIOR_MAP', () => {
     it('exposes the known drive behaviors', () => {
       expect(Object.keys(DRIVE_BEHAVIOR_MAP).sort()).toEqual([
+        'Drive_ContinousDestination',
         'Drive_Cylinder',
         'Drive_DestinationMotor',
         'Drive_ErraticPosition',
+        'Drive_FestoFHPP',
         'Drive_FollowPosition',
         'Drive_Gear',
         'Drive_PositionSwitch',
+        'Drive_ProfidrivePos',
+        'Drive_ProfidriveSpeed',
+        'Drive_ProportionalValve',
         'Drive_SEWMovilink',
         'Drive_Simple',
         'Drive_Speed',
+        'Drive_UniDriveMotor',
       ]);
     });
   });
@@ -220,6 +227,42 @@ describe('rv-signal-construction', () => {
       expect(result!.drive.Behaviors).toEqual(['Drive_Unknown']);
       // But no pending behavior instance is created (no entry in DRIVE_BEHAVIOR_MAP)
       expect(result!.pendingBehaviors).toEqual([]);
+    });
+  });
+
+  describe('addSignal — leafName (plan-498)', () => {
+    it('defaults the leaf to the signal name', () => {
+      const store = new SignalStore();
+      const registry = new NodeRegistry();
+      const root = new Object3D(); root.name = 'Root';
+      const owner = new Object3D(); owner.name = 'Hyd'; root.add(owner);
+      const h = addSignal(owner, 'Hyd.p', 'PLCOutputFloat', store, registry, { at: owner, ownerPath: 'Root/Hyd' });
+      expect(h.node.name).toBe('Hyd.p');
+      expect(h.path).toBe('Root/Hyd/Signals/Hyd.p');
+    });
+
+    it('names the leaf apart from the wire name, and two owners with the same leaf never collide', () => {
+      const store = new SignalStore();
+      const registry = new NodeRegistry();
+      const root = new Object3D(); root.name = 'Root';
+      const a = new Object3D(); a.name = 'A'; root.add(a);
+      const b = new Object3D(); b.name = 'B'; root.add(b);
+      const ha = addSignal(a, 'A.x', 'PLCInputFloat', store, registry, { at: a, leafName: 'x', ownerPath: 'Root/A', seed: 1 });
+      const hb = addSignal(b, 'B.x', 'PLCInputFloat', store, registry, { at: b, leafName: 'x', ownerPath: 'Root/B', seed: 2 });
+      expect(ha.node.name).toBe('x');
+      expect(hb.node.name).toBe('x');
+      expect(ha.path).toBe('Root/A/Signals/x');
+      expect(hb.path).toBe('Root/B/Signals/x');
+      expect(ha.name).toBe('A.x');
+      expect(hb.name).toBe('B.x');
+      expect(store.get('A.x')).toBe(1);
+      expect(store.get('B.x')).toBe(2);
+      store.set('A.x', 5);
+      expect(store.get('B.x')).toBe(2);
+      // Idempotent: re-adding reuses the leaf.
+      const again = addSignal(a, 'A.x', 'PLCInputFloat', store, registry, { at: a, leafName: 'x', ownerPath: 'Root/A' });
+      expect(again.node).toBe(ha.node);
+      expect(a.children.find((c) => c.name === 'Signals')!.children).toHaveLength(1);
     });
   });
 });

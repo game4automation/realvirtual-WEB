@@ -1,0 +1,31 @@
+{
+  "recording": { "width": 1920, "height": 1080, "maxDurationSec": 180 },
+  "batches": [
+    [
+      { "type": "waitFor", "selector": "[data-testid=welcome-dismiss]", "timeoutMs": 60000 },
+      { "type": "click", "selector": "[data-testid=welcome-dismiss]" },
+      { "type": "waitFor", "selector": "#loading-overlay.hidden", "state": "attached", "timeoutMs": 60000 },
+      { "type": "waitFor", "selector": "[role=region][aria-label=\"Ribbon Tension\"]", "timeoutMs": 30000 },
+      { "type": "waitFor", "selector": "[data-testid=serve-session-badge]", "state": "hidden" }
+    ],
+    [
+      { "type": "drag", "button": "right", "fromX": 1100, "fromY": 550, "toX": 1015, "toY": 515, "durationMs": 1500 },
+      { "type": "wheel", "x": 980, "y": 560, "deltaY": -1300 },
+      { "type": "wait", "ms": 1000 },
+      { "type": "drag", "button": "middle", "fromX": 1100, "fromY": 550, "toX": 1280, "toY": 510, "durationMs": 1200 },
+      { "type": "click", "selector": "button:has-text(\"Reset\")" },
+      { "type": "click", "selector": "button:has-text(\"Measurements\")" },
+      { "type": "click", "selector": ".MuiSlider-thumb:has(input[aria-label=\"Dancer\"])" },
+      { "type": "press", "key": "End" },
+      { "type": "waitFor", "selector": "input[aria-label=\"Dancer\"][aria-valuenow=\"200\"]" },
+      { "type": "wait", "ms": 1500 }
+    ],
+    [
+      { "type": "wait", "ms": 9000 },
+      { "type": "drag", "button": "right", "fromX": 1150, "fromY": 550, "toX": 1175, "toY": 545, "durationMs": 6000 },
+      { "type": "wait", "ms": 8000 },
+      { "type": "drag", "button": "right", "fromX": 1175, "fromY": 545, "toX": 1150, "toY": 550, "durationMs": 6000 },
+      { "type": "wait", "ms": 6500 }
+    ]
+  ]
+}

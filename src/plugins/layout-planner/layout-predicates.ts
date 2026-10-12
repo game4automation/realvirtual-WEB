@@ -24,9 +24,21 @@ export function isMuSelectable(obj: Object3D): boolean {
   return obj.userData?._muSelectable === true;
 }
 
-/** True if the Object3D can be selected in the planner (layout OR spawned MU). */
+/**
+ * True if the Object3D is a simulation object of the scene that must stay
+ * clickable while an authoring mode (planner, DES) filters picks — e.g. an Agv
+ * vehicle, whose inspector and DES statistics are the point of selecting it.
+ * Set by the component on its own node (`_rvSimSelectable`). Unlike
+ * `_muSelectable` it is authored content: persisted, exported, never deleted —
+ * and, like an MU, never movable (no `_layoutId`, so no transform gizmo).
+ */
+export function isSimSelectable(obj: Object3D): boolean {
+  return obj.userData?._rvSimSelectable === true;
+}
+
+/** True if the Object3D can be selected in the planner (layout, spawned MU or sim object). */
 export function isPlannerSelectable(obj: Object3D): boolean {
-  return isLayoutInstance(obj) || isMuSelectable(obj);
+  return isLayoutInstance(obj) || isMuSelectable(obj) || isSimSelectable(obj);
 }
 
 /** Walk parent chain to the nearest planner-selectable ancestor (layout or MU). */

@@ -22,6 +22,7 @@ import {
   RVDriveTo,
   RVSetDriveSpeed,
   RVEnable,
+  RVJumpOnSignal,
 } from '../src/core/engine/rv-logic-step';
 import type { RVSensor } from '../src/core/engine/rv-sensor';
 
@@ -846,5 +847,52 @@ describe('stepByPath and getStepInfo', () => {
     expect(delay.elapsed).toBeCloseTo(0.3);
     expect(delay.duration).toBe(1.0);
     expect(delay.progress).toBeCloseTo(30, 0);
+  });
+});
+
+// ─── JumpOnSignal inside a SerialContainer ──────────────────
+
+describe('RVJumpOnSignal in RVSerialContainer', () => {
+  /** [S0 Delay 0.1] [J jump?] [S2 Delay 0.1] [S3 Delay 0.1] [S4 Delay 0.1], looping. */
+  function build(jumpOn: boolean, target: string, value: boolean) {
+    const store = new SignalStore();
+    store.register('sig/j', 'sig/j', value);
+    const s0 = new RVDelay(0.1); s0.name = 'S0';
+    const s2 = new RVDelay(0.1); s2.name = 'S2';
+    const s3 = new RVDelay(0.1); s3.name = 'S3';
+    const s4 = new RVDelay(0.1); s4.name = 'S4';
+    const container = new RVSerialContainer([], true);
+    const jump = new RVJumpOnSignal('sig/j', jumpOn, target, store, container);
+    jump.name = 'J';
+    container.children = [s0, jump, s2, s3, s4];
+    return { container, s0, s2, s3, s4 };
+  }
+
+  it('a FORWARD jump starts the target step and does not stall on the skipped one (plan-569)', () => {
+    const { container, s2, s3, s4 } = build(true, 'S4', true);
+    container.start();
+    container.fixedUpdate(0.1); // S0 finishes → J jumps over S2 and S3
+    expect(container.children[container.currentIndex].name).toBe('S4');
+    expect(s4.state).toBe(StepState.Active);
+    expect(s2.state).toBe(StepState.Idle);
+    expect(s3.state).toBe(StepState.Idle);
+    container.fixedUpdate(0.1); // S4 finishes → the cycle completes and loops
+    expect(container.completedCycles).toBe(1);
+  });
+
+  it('a jump to the FIRST step restarts the sequence instead of reading children[-1]', () => {
+    const { container, s0 } = build(true, 'S0', true);
+    container.start();
+    expect(() => container.fixedUpdate(0.1)).not.toThrow(); // S0 finishes → J jumps back to S0
+    expect(container.currentIndex).toBe(0);
+    expect(s0.state).toBe(StepState.Active);
+  });
+
+  it('a jump that does not fire continues with the next step', () => {
+    const none = build(true, 'S4', false);
+    none.container.start();
+    none.container.fixedUpdate(0.1); // J does not fire → S2 runs next
+    expect(none.container.children[none.container.currentIndex].name).toBe('S2');
+    expect(none.s2.state).toBe(StepState.Active);
   });
 });

@@ -38,3 +38,16 @@ export function isSearchShortcut(e: SearchShortcutEvent): boolean {
   if (!isSlash && !isCtrlK) return false;
   return !isEditableTarget(e.target);
 }
+
+/**
+ * A search shortcut nobody claimed yet — what a bubble-phase consumer asks.
+ *
+ * The open Projects dashboard claims `/` and Ctrl/Cmd+K for its own search
+ * field in the capture phase and marks the event with `preventDefault()`
+ * (plan-507 F12). The global search (BottomBar) listens in the bubble phase on
+ * the same document, so without this guard one key press would focus two
+ * fields and the scene search, mounted later, would win.
+ */
+export function isUnclaimedSearchShortcut(e: SearchShortcutEvent & { defaultPrevented: boolean }): boolean {
+  return !e.defaultPrevented && isSearchShortcut(e);
+}

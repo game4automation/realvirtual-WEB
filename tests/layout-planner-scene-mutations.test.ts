@@ -14,9 +14,11 @@ import { describe, test, expect, vi } from 'vitest';
 import { Group, Mesh, BoxGeometry, MeshBasicMaterial, Scene } from 'three';
 import type { Object3D } from 'three';
 
+import { getProblems, resetProblemsForTests } from '../src/core/hmi/problems-store';
 import {
   addPlacedToScene,
   addSplatPlacedToScene,
+  adoptPlacedNode,
   removePlacedFromScene,
   resolveUniqueName,
   prepPlacedVisual,
@@ -270,18 +272,62 @@ describe('layout-planner/scene-mutations', () => {
       expect(clone.name).toBe('belt');
     });
 
-    test('suffixes _2, _3, ... when siblings share the base name', () => {
+    test('suffixes _1, _2, ... when siblings share the base name (plan-758: first free, from 1)', () => {
       const h = makeHarness();
       // Pre-populate model root with siblings that already use "belt".
       const sibling1 = makeClone('belt');
-      const sibling2 = makeClone('belt_2');
+      const sibling2 = makeClone('belt_1');
       h.modelRoot.add(sibling1);
       h.modelRoot.add(sibling2);
 
       const clone = makeClone('belt');
       h.modelRoot.add(clone);
       resolveUniqueName(h.deps, clone);
-      expect(clone.name).toBe('belt_3');
+      expect(clone.name).toBe('belt_2');
+    });
+
+    test('fills a gap rather than taking max+1', () => {
+      const h = makeHarness();
+      h.modelRoot.add(makeClone('belt'));
+      h.modelRoot.add(makeClone('belt_2'));
+
+      const clone = makeClone('belt');
+      h.modelRoot.add(clone);
+      resolveUniqueName(h.deps, clone);
+      expect(clone.name).toBe('belt_1');
+    });
+
+    test('counts a placement root that lives under ANOTHER parent (reloaded document)', () => {
+      // A reloaded document keeps its placements one level below the model
+      // root; a live drop lands directly under it. The two must still not
+      // share a name (2026-09-30: multi-select paste after reload).
+      const h = makeHarness();
+      const layout = new Group();
+      layout.name = 'Layout';
+      h.modelRoot.add(layout);
+      const reloaded = makeClone('belt');
+      layout.add(reloaded);
+      h.objectMap.set('reloaded', reloaded);
+
+      const clone = makeClone('belt');
+      h.modelRoot.add(clone);
+      resolveUniqueName(h.deps, clone);
+      expect(clone.name).toBe('belt_1');
+    });
+
+    test('never strips a digit suffix the asset itself carries', () => {
+      const h = makeHarness();
+      const clone = makeClone('Conveyor_2000');
+      h.modelRoot.add(clone);
+      resolveUniqueName(h.deps, clone);
+      expect(clone.name).toBe('Conveyor_2000');
+    });
+
+    test('returns silently when there is no model root', () => {
+      const h = makeHarness({ withModelRoot: false });
+      const clone = makeClone('belt');
+      resolveUniqueName(h.deps, clone);
+      expect(clone.name).toBe('belt');
     });
 
     test('falls back to the catalog label when the GLB root is a glTF wrapper', () => {
@@ -314,6 +360,58 @@ describe('layout-planner/scene-mutations', () => {
       resolveUniqueName(h.deps, clone);
       // No throw, name unchanged
       expect(clone.name).toBe('belt');
+    });
+  });
+
+  describe("naming: 'keep' (plan-758 — record is the truth)", () => {
+    test('registerPlaced with keep leaves a colliding name alone and reports it', () => {
+      resetProblemsForTests();
+      const h = makeHarness();
+      h.viewer.signalStore = null;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      h.modelRoot.add(makeClone('belt'));
+      const clone = makeClone('belt');
+      h.modelRoot.add(clone);
+
+      registerPlaced(h.deps, clone, 'id-keep', 'belt', 'cat:belt', 'full', { naming: 'keep' });
+
+      expect(clone.name).toBe('belt');
+      const problems = getProblems().filter((p) => p.code === 'placement-name-collision');
+      expect(problems.map((p) => p.id)).toEqual(['placement-name-collision:id-keep']);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('placement name collision "belt"'));
+      warn.mockRestore();
+    });
+
+    test('registerPlaced with keep is silent when the recorded name is free', () => {
+      resetProblemsForTests();
+      const h = makeHarness();
+      h.viewer.signalStore = null;
+      const clone = makeClone('belt_7');
+      h.modelRoot.add(clone);
+
+      registerPlaced(h.deps, clone, 'id-keep', 'belt_7', 'cat:belt', 'full', { naming: 'keep' });
+
+      expect(clone.name).toBe('belt_7');
+      expect(getProblems().filter((p) => p.code === 'placement-name-collision')).toHaveLength(0);
+    });
+
+    test('adoptPlacedNode reports a duplicate among adopted siblings and renames nothing', () => {
+      resetProblemsForTests();
+      const h = makeHarness();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const a = makeClone('Belt');
+      const b = makeClone('Belt');
+      h.modelRoot.add(a);
+      h.modelRoot.add(b);
+
+      adoptPlacedNode(h.deps, a, 'id-a', 'Belt', 'cat:belt');
+      adoptPlacedNode(h.deps, b, 'id-b', 'Belt', 'cat:belt');
+
+      expect(a.name).toBe('Belt');
+      expect(b.name).toBe('Belt');
+      const ids = getProblems().filter((p) => p.code === 'placement-name-collision').map((p) => p.id).sort();
+      expect(ids).toEqual(['placement-name-collision:id-a', 'placement-name-collision:id-b']);
+      warn.mockRestore();
     });
   });
 

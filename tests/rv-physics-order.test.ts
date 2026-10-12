@@ -13,6 +13,18 @@
  *     second call instanced MUs would render one tick behind (review finding).
  *  3. Instanced and clone MUs receive the identical physics pose (dual
  *     pattern from transport-accumulation.test.ts).
+ *
+ * plan-467 test 9.4 extends this with the MOVING-COLLIDER contract:
+ *     mechanism write-back -> setKinematicPose -> step -> forEachContactLoad
+ *                          -> syncPoses
+ * Every one of those edges is load-bearing and none of them is enforced by a
+ * type: Rapier derives a kinematic body's contact velocity from
+ * `next - current`, so a pose pushed AFTER `step()` is one tick late and pushes
+ * nothing at all; and a contact load read after `syncPoses` would describe the
+ * world before the MU poses were applied. Today the order is right by
+ * construction (the physics plugin is a POST plugin, the mechanism ticks in
+ * TickStage.SIM at order 200) - this test makes it a checked contract instead
+ * of an accident a future re-ordering could quietly undo.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -38,6 +50,11 @@ import {
 } from '../src/core/engine/rv-physics-registry';
 import type { ComponentContext } from '../src/core/engine/rv-component-registry';
 import { PhysicsZonePlugin } from '@rv-private/plugins/physics-zone-plugin';
+import { setKinematicManager } from '../src/core/engine/rv-kinematic-registry';
+import type {
+  KinematicManagerLike,
+  KinematicMechanismHandle,
+} from '../src/core/engine/rv-kinematic-registry';
 import type { RVViewer } from '../src/core/rv-viewer';
 import type { LoadResult } from '../src/core/engine/rv-scene-loader';
 
@@ -59,17 +76,24 @@ class MockPhysicsProvider implements PhysicsProvider {
   async init(): Promise<void> { this.ready = true; }
   dispose(): void { this.ready = false; }
   addZone(_id: string, _aabb: PhysicsAABB, _cfg: PhysicsZoneConfig): void {}
-  addStaticBox(): void {}
+  addStaticBox(id: string): void { this.staticIds.push(id); }
   addConveyor(): void {}
   setConveyorVelocity(): void {}
   addDynamicMU(muId: string, pose: { pos: PhysicsVec3; quat: PhysicsQuat }): void {
     this.poses.set(muId, { pos: { ...pose.pos }, quat: { ...pose.quat } });
   }
-  removeBody(muId: string): void { this.poses.delete(muId); }
+  removeBody(muId: string): void { this.removedIds.push(muId); this.poses.delete(muId); }
   addSensorBox(): void {}
   castRay(): PhysicsRayHit | null { return null; }
-  step(): void { this.stepCalls++; this.onStep?.(); }
+  /** Call log for the plan-467 9.4 order contract. */
+  calls: string[] = [];
+  kinematicPoses: Array<{ id: string; x: number; y: number; z: number }> = [];
+  kinematicIds: string[] = [];
+  staticIds: string[] = [];
+  removedIds: string[] = [];
+  step(): void { this.stepCalls++; this.calls.push('step'); this.onStep?.(); }
   syncPoses(out: (muId: string, pos: PhysicsVec3, quat: PhysicsQuat) => void): void {
+    this.calls.push('syncPoses');
     for (const [muId, p] of this.poses) {
       this._outPos.x = p.pos.x; this._outPos.y = p.pos.y; this._outPos.z = p.pos.z;
       this._outQuat.x = p.quat.x; this._outQuat.y = p.quat.y;
@@ -78,6 +102,13 @@ class MockPhysicsProvider implements PhysicsProvider {
     }
   }
   getSettledBodies(): string[] { return []; }
+  // plan-467 moving colliders - recorded, so the tick order below is checkable.
+  addKinematicBody(id: string): void { this.kinematicIds.push(id); }
+  setKinematicPose(id: string, pose: { pos: PhysicsVec3 }): void {
+    this.calls.push('setKinematicPose');
+    this.kinematicPoses.push({ id, x: pose.pos.x, y: pose.pos.y, z: pose.pos.z });
+  }
+  forEachContactLoad(): void { this.calls.push('forEachContactLoad'); }
 }
 
 function makeTM(): RVTransportManager {
@@ -97,9 +128,10 @@ function makeZone(): RVPhysicsZone {
   return zone;
 }
 
-function fakeViewer(tm: RVTransportManager): RVViewer {
+function fakeViewer(tm: RVTransportManager, drives: Array<{ node: Object3D }> = []): RVViewer {
   const emitter = new EventEmitter();
   return {
+    drives,
     transportManager: tm,
     registry: { getNode: () => null },
     gizmoManager: undefined,
@@ -120,9 +152,15 @@ function fakeLoadResult(tm: RVTransportManager): LoadResult {
   } as unknown as LoadResult;
 }
 
-async function builtPlugin(tm: RVTransportManager, _mock: MockPhysicsProvider): Promise<PhysicsZonePlugin> {
+async function builtPlugin(
+  tm: RVTransportManager,
+  _mock: MockPhysicsProvider,
+  opts: { root?: Object3D; drives?: Array<{ node: Object3D }> } = {},
+): Promise<PhysicsZonePlugin> {
   const plugin = new PhysicsZonePlugin();
-  plugin.onModelLoaded(fakeLoadResult(tm), fakeViewer(tm));
+  const result = fakeLoadResult(tm);
+  if (opts.root) (result as { root: Object3D }).root = opts.root;
+  plugin.onModelLoaded(result, fakeViewer(tm, opts.drives ?? []));
   await plugin.buildPromise;
   return plugin;
 }
@@ -147,6 +185,7 @@ afterEach(() => {
   RVPhysicsZone.clearAll();
   physicsRegistry.register(null);
   physicsSettings.enabled = false;
+  setKinematicManager(null);
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -196,7 +235,7 @@ describe('physics tick order (plan-276 §2.4)', () => {
     tm.mus.push(imu);
     // Wire the pool the way production does: `updatePoolMatrices()` reaches
     // pools through the sources list (fake source — never spawns).
-    tm.sources.push({ pool, node: new Object3D(), update: () => null } as unknown as (typeof tm.sources)[number]);
+    tm.sources.push({ pool, node: new Object3D(), update: () => null, drainGenerated: () => [] } as unknown as (typeof tm.sources)[number]);
 
     let poolMatrixCalls = 0;
     const origPool = tm.updatePoolMatrices.bind(tm);
@@ -285,5 +324,142 @@ describe('physics tick order (plan-276 §2.4)', () => {
 
     plugin.dispose();
     pool.dispose();
+  });
+});
+
+// --- plan-467 9.4: moving-collider tick contract ---------------------------
+
+/** A drive node carrying one solid BoxCollider child - the minimal moving part. */
+function driveWithCollider(name: string): { root: Object3D; driveNode: Object3D; part: Object3D } {
+  const root = new Object3D();
+  root.name = 'Root';
+  const driveNode = new Object3D();
+  driveNode.name = name;
+  const part = new Object3D();
+  part.name = name + 'Plate';
+  part.userData.realvirtual = {
+    colliders: [{
+      type: 'BoxCollider',
+      center: { x: 0, y: 0, z: 0 },
+      size: { x: 0.5, y: 0.5, z: 0.5 },
+      enabled: true,
+      isTrigger: false,
+    }],
+  };
+  driveNode.add(part);
+  root.add(driveNode);
+  root.updateMatrixWorld(true);
+  return { root, driveNode, part };
+}
+
+/**
+ * Install a mechanism manager whose single mechanism owns `link` as link 0 —
+ * the minimal setup in which the payload channel is live at all.
+ */
+function installMechanismManager(link: Object3D): void {
+  const mechanism: KinematicMechanismHandle = {
+    node: link,
+    topologyVersion: 1,
+    forEachOwnedNode(cb: (node: Object3D, linkIndex: number) => void): void {
+      link.traverse((n) => cb(n, 0));
+    },
+  };
+  setKinematicManager({
+    register(): void {},
+    unregister(): void {},
+    get size(): number { return 1; },
+    listMechanisms: () => [mechanism],
+    setExternalLinkLoad(): void {},
+  } as unknown as KinematicManagerLike);
+}
+
+describe('moving-collider tick order (plan-467 F4 / 9.4)', () => {
+  it('setKinematicPose runs BEFORE step, and forEachContactLoad between step and syncPoses', async () => {
+    const tm = makeTM();
+    makeZone();
+    // A LINK-owned part, not a drive-only one: the contact-load query only
+    // exists for parts that have a link to attribute a payload to, so that is
+    // the fixture in which the step -> forEachContactLoad -> syncPoses edge is
+    // real (a drive-only world skips the query entirely, on purpose).
+    const { driveNode } = driveWithCollider('Gripper');
+    installMechanismManager(driveNode);
+    const plugin = await builtPlugin(tm, mock, {});
+
+    expect(mock.kinematicIds).toHaveLength(1); // the part became a kinematic body
+
+    mock.calls.length = 0;
+    plugin.onFixedUpdatePost(DT);
+
+    // A pose written after step() would be one tick late and push nothing;
+    // a load read after syncPoses would describe the pre-sync world.
+    expect(mock.calls).toEqual(['setKinematicPose', 'step', 'forEachContactLoad', 'syncPoses']);
+
+    plugin.dispose();
+  });
+
+  it('a drive-only world skips the contact query entirely (nothing can consume it)', async () => {
+    const tm = makeTM();
+    makeZone();
+    const { driveNode } = driveWithCollider('Pusher');
+    const plugin = await builtPlugin(tm, mock, { drives: [{ node: driveNode }] });
+
+    mock.calls.length = 0;
+    plugin.onFixedUpdatePost(DT);
+    expect(mock.calls).toEqual(['setKinematicPose', 'step', 'syncPoses']);
+
+    plugin.dispose();
+  });
+
+  it('pushes THIS tick pose - the drive moved before the plugin hook ran', async () => {
+    const tm = makeTM();
+    makeZone();
+    const { driveNode } = driveWithCollider('Pusher');
+    const plugin = await builtPlugin(tm, mock, { drives: [{ node: driveNode }] });
+
+    // Stand-in for the drive / mechanism write-back in TickStage.SIM, which
+    // always runs before the POST plugin hook.
+    driveNode.position.set(0.25, 0, 0);
+    driveNode.updateMatrixWorld(true);
+    plugin.onFixedUpdatePost(DT);
+
+    expect(mock.kinematicPoses).toHaveLength(1);
+    expect(mock.kinematicPoses[0].x).toBeCloseTo(0.25, 6);
+
+    driveNode.position.set(0.5, 0, 0);
+    driveNode.updateMatrixWorld(true);
+    plugin.onFixedUpdatePost(DT);
+    expect(mock.kinematicPoses[1].x).toBeCloseTo(0.5, 6);
+
+    plugin.dispose();
+  });
+
+  it('a moving part is NOT also registered as an implicit static box (F1, SOL R1 #5)', async () => {
+    const tm = makeTM();
+    makeZone();
+    const { root, driveNode, part } = driveWithCollider('Pusher');
+    // The plugin traverses `result.root` for implicit statics - hand it the
+    // same subtree the drive owns, which is the real-model situation.
+    const plugin = await builtPlugin(tm, mock, { root, drives: [{ node: driveNode }] });
+
+    expect(mock.kinematicIds).toHaveLength(1);
+    // Without the exclusion the part would ALSO be a fixed box and would leave
+    // a ghost wall at its start position the moment the drive moved away.
+    expect(mock.staticIds.filter((id) => id.includes(part.name))).toHaveLength(0);
+
+    plugin.dispose();
+  });
+
+  it('teardown frees the kinematic bodies and stops pushing poses', async () => {
+    const tm = makeTM();
+    makeZone();
+    const { driveNode } = driveWithCollider('Pusher');
+    const plugin = await builtPlugin(tm, mock, { drives: [{ node: driveNode }] });
+    expect(mock.kinematicIds).toHaveLength(1);
+
+    plugin.dispose();
+    mock.calls.length = 0;
+    plugin.onFixedUpdatePost(DT);
+    expect(mock.calls).toEqual([]); // plugin inactive - nothing pushed, nothing stepped
+    expect(mock.removedIds).toContain(mock.kinematicIds[0]);
   });
 });

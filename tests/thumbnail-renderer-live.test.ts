@@ -33,6 +33,7 @@ import {
   WebGLRenderer,
 } from 'three';
 import { ThumbnailRenderer } from '../src/core/thumbnails/thumbnail-renderer';
+import { HIGHLIGHT_OVERLAY_LAYER } from '../src/core/engine/rv-group-registry';
 
 /** Real renderer + live main scene. DPR 2 on purpose — renderLive must size
  *  its private target itself, not inherit the canvas DPR. */
@@ -148,6 +149,44 @@ describe('ThumbnailRenderer.renderLive', () => {
       expect(dataUrl.startsWith('data:image/png')).toBe(true);
       const { pixelAt } = await decodeDataUrl(dataUrl);
       expect(pixelAt(64, 64).a).toBeLessThan(8);
+    } finally {
+      tr.dispose();
+      renderer.dispose();
+    }
+  });
+
+  /**
+   * plan-740 P2.1 parity. `renderLive` now goes through the shared
+   * `OffscreenCapture` instead of its own target + save/restore, and the two
+   * contract details that migration could have silently dropped are pinned
+   * here: the output is byte-identical across calls (so the same model always
+   * yields the same card), and the private camera stays on LAYER 0 ONLY, which
+   * is what keeps isolate wireframes, measurement markers and the agent's own
+   * cone out of a thumbnail.
+   */
+  it('is byte-identical across calls and renders layer 0 only', async () => {
+    const { renderer, scene } = makeRendererAndScene();
+    const tr = new ThumbnailRenderer(renderer, scene);
+    try {
+      const { root } = addLiveModel(scene);
+      // An overlay-layer object big enough to fill the frame if it were drawn.
+      const overlay = new Mesh(
+        new BoxGeometry(20, 20, 20),
+        new MeshStandardMaterial({ color: 0xff00ff }),
+      );
+      overlay.layers.set(HIGHLIGHT_OVERLAY_LAYER);
+      scene.add(overlay);
+
+      const a = tr.renderLive(root, 128)!;
+      const b = tr.renderLive(root, 128)!;
+      // Same PNG data URL, character for character.
+      expect(a).toEqual(b);
+
+      // The magenta overlay is not in the picture — the subject still is.
+      const img = await decodeDataUrl(a);
+      const centre = img.pixelAt(img.width >> 1, img.height >> 1);
+      expect(centre.a).toBeGreaterThan(0);
+      expect(centre.r === 255 && centre.g === 0 && centre.b === 255).toBe(false);
     } finally {
       tr.dispose();
       renderer.dispose();

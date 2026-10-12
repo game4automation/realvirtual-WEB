@@ -203,6 +203,25 @@ describe('RVRibbonBandMesh', () => {
     band.dispose();
   });
 
+  it('a shorter write leaves no stale vertex in the undrawn tail', () => {
+    // A path that loses a sample (e.g. the web shortens while a rewinder grows)
+    // must not leave its former end behind outside the draw range: the bounding
+    // sphere, raycasts and vertex-walking checks all read the whole buffer.
+    const band = new RVRibbonBandMesh(8, 500);
+    const three = new Float32Array(3 * RIBBON_BAND_SAMPLE_STRIDE);
+    three.set(twoSamples(), 0);
+    three.set([5000, 0, 0, 1, 0, 0, 0, 0, 1], 2 * RIBBON_BAND_SAMPLE_STRIDE);
+    band.write(three, 3, 500);
+    band.write(twoSamples(), 2, 500);
+
+    const p = band.mesh.geometry.getAttribute('position') as BufferAttribute;
+    // Every vertex past the drawn two samples sits on the last drawn sample (x = 1 m),
+    // not at the 5 m of the earlier write nor at the zero-initialised origin.
+    for (let v = 4; v < p.count; v++) expect(p.getX(v)).toBeCloseTo(1, 6);
+    expect(band.mesh.geometry.drawRange.count).toBe(6);
+    band.dispose();
+  });
+
   it('halves samplesPerMeter instead of reallocating when capacity is exceeded', () => {
     // A 10 m path at 64 samples/m wants ~640 samples; the fixture's default
     // capacity is derived from the length, so force the overflow with a long

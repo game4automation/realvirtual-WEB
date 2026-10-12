@@ -61,6 +61,8 @@ const QUICKJS_ALLOWED = new Set([
  *  bundle. New Monaco consumers must go through this loader. */
 const MONACO_ALLOWED = new Set([
   'core/hmi/script/monaco-loader.ts',
+  // plan-555: the JSON inspector-field loader (same lazy contract).
+  'core/hmi/json-editor/rv-json-monaco-loader.ts',
 ]);
 
 function toPosix(p: string): string {
@@ -150,12 +152,51 @@ describe('PLC import boundary (plan-242 build guard)', () => {
   it('the script editor UI reaches monaco only through the loader (no direct monaco imports)', () => {
     // The panel / save pipeline / stores must depend on the loader module,
     // never on 'monaco-editor' directly — one lazy entry point (MONACO_ALLOWED).
-    const scriptDir = join(SRC, 'core/hmi/script');
-    for (const entry of readdirSync(scriptDir)) {
-      const rel = `core/hmi/script/${entry}`;
-      if (MONACO_ALLOWED.has(rel) || !/\.(ts|tsx)$/.test(entry)) continue;
-      const imports = importLines(readFileSync(join(scriptDir, entry), 'utf-8'));
-      expect(MONACO_PATTERN.test(imports), `${rel} must import monaco via the loader only`).toBe(false);
+    // plan-555: the same holds for the JSON field editor and the shared worker
+    // registry.
+    for (const dir of ['core/hmi/script', 'core/hmi/json-editor', 'core/hmi/monaco']) {
+      for (const entry of readdirSync(join(SRC, dir))) {
+        const rel = `${dir}/${entry}`;
+        if (MONACO_ALLOWED.has(rel) || !/\.(ts|tsx)$/.test(entry)) continue;
+        const imports = importLines(readFileSync(join(SRC, rel), 'utf-8'));
+        expect(MONACO_PATTERN.test(imports), `${rel} must import monaco via the loader only`).toBe(false);
+      }
+    }
+  });
+
+  it('the worker registry imports nothing from monaco-editor (negative control, plan-555)', () => {
+    const source = readFileSync(join(SRC, 'core/hmi/monaco/rv-monaco-workers.ts'), 'utf-8');
+    expect(importLines(source).trim()).toBe('');
+    expect(source).not.toMatch(MONACO_PATTERN);
+  });
+
+  it('the operator panel host loads the JSON editor only lazily (plan-555)', () => {
+    // WebOperatorPanelHost is imported statically by App.tsx: anything it
+    // imports statically lands in the entry chunk.
+    const host = readFileSync(join(SRC, 'core/hmi/operator-devices/WebOperatorPanelHost.tsx'), 'utf-8');
+    const staticImports = (host.match(/^import\s[\s\S]*?from\s+['"][^'"]+['"];?/gm) ?? []).join('\n');
+    expect(staticImports).not.toMatch(/json-editor\//);
+    expect(staticImports).not.toMatch(/['"]jsonc-parser['"]/);
+    expect(staticImports).not.toMatch(/operator-panel-json-context/);
+    expect(staticImports).not.toMatch(MONACO_PATTERN);
+    // …and it does reach the editor, through a dynamic import.
+    expect(host).toMatch(/import\(\s*['"]\.\/operator-panel-json-context['"]\s*\)/);
+  });
+
+  it('the new JSON-editor UI files carry no hex / rgba colour literals (plan-555)', () => {
+    const files: string[] = [];
+    for (const dir of ['core/hmi/json-editor', 'core/hmi/operator-devices']) {
+      for (const entry of readdirSync(join(SRC, dir))) {
+        if (entry.endsWith('.tsx')) files.push(`${dir}/${entry}`);
+      }
+    }
+    const scanned = files.filter((f) => f.startsWith('core/hmi/json-editor/') || f.endsWith('WebOperatorPanelHost.tsx'));
+    expect(scanned.length).toBeGreaterThan(1);
+    for (const rel of scanned) {
+      const code = readFileSync(join(SRC, rel), 'utf-8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, '');
+      expect(code, `${rel} must take colours from shared-sx.ts`).not.toMatch(/#[0-9a-fA-F]{3,8}\b|rgba?\(/);
     }
   });
 

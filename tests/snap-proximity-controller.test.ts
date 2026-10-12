@@ -10,6 +10,7 @@ import {
 import {
   SnapPointController,
   DEFAULT_PIXEL_THRESHOLD,
+  DEFAULT_CLICK_RADIUS_PX,
 } from '../src/plugins/snap-point/snap-point-controller';
 import { SnapMarkerRenderer } from '../src/plugins/snap-point/snap-marker-renderer';
 import { snapHoverStore } from '../src/plugins/snap-point/snap-hover-store';
@@ -150,6 +151,88 @@ describe('SnapPointController proximity detection', () => {
     for (let i = 0; i < ITER; i++) controller.tick(400, 300);
     const elapsed = performance.now() - t0;
     expect(elapsed).toBeLessThan(200); // generous CI margin
+  });
+
+  // ── The picker opens on a CLICK, never on a drag (2026-09-25) ─────────
+  //
+  // Field finding: grabbing a conveyor within the marker radius both moved it
+  // (the planner arms its drag on the same press) and opened the picker, which
+  // then swallowed the next press — "the conveyor cannot be moved".
+
+  // Canvas-relative like `tick()`: every test appends its own canvas to the
+  // body, so the client offset of THIS canvas is not zero.
+  function pressAt(x: number, y: number): void {
+    const r = canvas.getBoundingClientRect();
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: r.left + x, clientY: r.top + y, button: 0, bubbles: true }));
+  }
+  function releaseAt(x: number, y: number): void {
+    const r = canvas.getBoundingClientRect();
+    window.dispatchEvent(new MouseEvent('mouseup', { clientX: r.left + x, clientY: r.top + y, button: 0, bubbles: true }));
+  }
+
+  it('a press on a marker does not open the picker by itself', () => {
+    registerSnapAtWorld(registry, scene, 'a', [0, 0, 0]);
+    renderer.rebuild(registry.size);
+    controller.activate();
+    controller.tick(400, 300);
+    expect(snapHoverStore.getState().hovered).not.toBeNull();
+
+    pressAt(400, 300);
+    expect(snapHoverStore.getState().pickerOpen).toBe(false);
+  });
+
+  it('press + release in place opens the picker for the hovered snap', () => {
+    const a = registerSnapAtWorld(registry, scene, 'a', [0, 0, 0]);
+    renderer.rebuild(registry.size);
+    controller.activate();
+    controller.tick(400, 300);
+
+    pressAt(400, 300);
+    releaseAt(402, 301);                       // a click has jitter; still a click
+    const st = snapHoverStore.getState();
+    expect(st.pickerOpen).toBe(true);
+    expect(st.pickerAnchor?.id).toBe(a.id);
+  });
+
+  it('a press on the PART near a marker, outside the click radius, opens nothing', () => {
+    registerSnapAtWorld(registry, scene, 'a', [0, 0, 0]);
+    renderer.rebuild(registry.size);
+    controller.activate();
+    controller.tick(400 + 25, 300);            // hovered: inside the 36 px hover radius
+    expect(snapHoverStore.getState().hovered).not.toBeNull();
+
+    expect(25).toBeGreaterThan(DEFAULT_CLICK_RADIUS_PX);
+    expect(25).toBeLessThan(DEFAULT_PIXEL_THRESHOLD);
+    pressAt(400 + 25, 300);                    // …but outside DEFAULT_CLICK_RADIUS_PX
+    releaseAt(400 + 25, 300);
+    expect(snapHoverStore.getState().pickerOpen).toBe(false);
+  });
+
+  it('a press that turns into a drag never opens the picker', () => {
+    registerSnapAtWorld(registry, scene, 'a', [0, 0, 0]);
+    renderer.rebuild(registry.size);
+    controller.activate();
+    controller.tick(400, 300);
+
+    pressAt(400, 300);
+    releaseAt(400 + 60, 300);                  // well past DRAG_THRESHOLD_PX
+    expect(snapHoverStore.getState().pickerOpen).toBe(false);
+
+    // The candidate is consumed: a later release out of nowhere opens nothing.
+    releaseAt(400, 300);
+    expect(snapHoverStore.getState().pickerOpen).toBe(false);
+  });
+
+  it('a snap paired during the press does not get a picker', () => {
+    const a = registerSnapAtWorld(registry, scene, 'a', [0, 0, 0]);
+    renderer.rebuild(registry.size);
+    controller.activate();
+    controller.tick(400, 300);
+
+    pressAt(400, 300);
+    a.occupied = true;
+    releaseAt(400, 300);
+    expect(snapHoverStore.getState().pickerOpen).toBe(false);
   });
 
   it('deactivate clears DOM listeners + hover state without crashing', () => {

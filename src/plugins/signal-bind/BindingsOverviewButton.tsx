@@ -16,6 +16,7 @@ import { Suspense, lazy, useState } from 'react';
 import { IconButton, Tooltip } from '@mui/material';
 import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import type { UISlotProps } from '../../core/rv-ui-plugin';
+import { ICON_SIZE } from '../../core/hmi/shared-sx';
 
 const BindingsOverviewPanel = lazy(() =>
   import('./BindingsOverviewPanel').then((m) => ({ default: m.BindingsOverviewPanel })));
@@ -34,7 +35,7 @@ export function BindingsOverviewButton({ viewer }: UISlotProps) {
           onClick={() => setOpen(true)}
           sx={{ p: 0.75, color: open ? 'primary.main' : 'text.disabled' }}
         >
-          <AccountTreeIcon sx={{ fontSize: 18 }} />
+          <AccountTreeIcon sx={{ fontSize: ICON_SIZE.lg }} />
         </IconButton>
       </Tooltip>
       {open && (

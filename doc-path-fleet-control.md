@@ -1,5 +1,9 @@
 # Path-Based Vehicles & Fleet Control (AGV/FTS)
 
+> **Applies to:** Path and fleet runtime APIs are in Community. DES execution requires the commercial beta DES feature; browser asset authoring may require commercial modules.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 How autonomous vehicles ride the path graph, how traffic works in both
 simulation kernels, and — most importantly — **where project-specific logic
 (work plans, dispatching, stations) hooks in**. The engine ships mechanics
@@ -92,7 +96,7 @@ non-goal. Dragging a shared vertex updates BOTH adjacent line segments in one
 step, so the chain never tears. The pure maths lives in
 `src/core/engine/rv-path-edit.ts` (`derivePathHandles` / `movePathHandle` /
 `snapDragTarget`); handles are picked as AUX RAYCAST TARGETS
-(`addAuxRaycastTarget`, doc-render-picking.md §2.3) — never via layer bits.
+(`addAuxRaycastTarget`, [public picking and cleanup contract](doc-extending-webviewer.md#picking-and-cleanup)) — never via layer bits.
 While dragging, only the preview geometry is rebuilt; on release the new
 segment list is committed as an ordinary `setField` op on the generic `'json'`
 field `segments`, so undo/redo and the save roundtrip come for free.
@@ -185,26 +189,26 @@ prediction and the actual hand-off):
 
 ## 5. Traffic — both kernels
 
-**Continuous (60 Hz):** 1D arc-length car-following. The follower ramps down
+**Legacy step mode (`UseAcceleration = false`, continuous):** 1D arc-length car-following. The follower ramps down
 to standstill at `SafetyDistance` behind its leader (hard floor `MinGap` —
 never penetration), restarts smoothly; zones are claimed within `LookAhead`
 before entry (queue-order aware: a follower never claims across its leader).
 Service/destination stops are positioning stops — the drive ramp decelerates
 into them.
 
-**DES (events):** feature parity through the agreed simplification —
-**braking/stopping happens at path ends only**:
+**Since plan-558 both kernels run the SAME trajectory-based moving block**
+(`rv-movement-authority.ts`, see doc-webviewer.md › Path Simulation): closed-form
+speed profiles (braking exactly into the stop, curve and docking limits), a
+follower keeps `SafetyGap` behind the leader's rear along its planned
+trajectory, zones are claimed before the front enters and released when the
+rear has left, a release wakes the waiters. The DES kernel schedules one leg
+event per plan (no per-segment occupancy rule, no re-poll); queues close up
+with a constant gap. The continuous car-following above remains the
+`UseAcceleration = false` mode.
 
-- travel = one event per path leg (`length/speed`), visible via path tween;
-- occupied zone at the boundary → hold + discrete re-poll;
-- **segment occupancy**: one vehicle per segment; a follower waits AT the
-  boundary until the segment frees. Finer queues = split the path into
-  shorter segments. Arrival ORDER and throughput converge with continuous
-  mode; momentary trajectories intentionally do not.
-
-Rule of thumb for DES layouts: zone the station/dock segments
-(`zoneCapacity: 1`) and segment the approach as finely as your queue analysis
-needs.
+Rule of thumb for layouts: give every merge one common zone (the merging
+pieces and the successor) — the load-time check reports merges without one in
+the Problems panel. Splitting long paths into pieces is no longer needed.
 
 ## 6. Docks — the generic path↔station adapter
 
@@ -230,27 +234,22 @@ getDefaultPathDockRegistry().register('StationPath7', {
 
 ## 7. Where project code hooks in
 
-**TypeScript (full engine, typed — for anything complex):**
-`projects/<Project>/plugins/index.ts` in the private repo. Discovered at build
-time via `import.meta.glob` (no import anywhere in app code — see
-`doc-extending-webviewer.md` §13 for matching + lifecycle). Reference example:
-`projects/DiscreteEventSimulation/plugins/index.ts` (round-robin work plan +
-dock station).
+**Native TypeScript:** bind a module under your project's `plugins/` folder through
+`documents[].scriptRef`. Start with the public
+[project plugin example](doc-project-plugin-example.md), including the registration
+pair, compilation and cleanup. No private repository or collecting index is required.
 
-```ts
-import { getDefaultAgvFleet, type AgvTask } from '@rv/core/engine/rv-agv-fleet';
-import { getDefaultPathDockRegistry } from '@rv/core/engine/rv-path-dock';
-import { getDefaultPathNetwork } from '@rv/core/engine/rv-path-network';
+For engine-level fleet logic, the public source APIs are
+[`rv-agv-fleet.ts`](src/core/engine/rv-agv-fleet.ts),
+[`rv-path-dock.ts`](src/core/engine/rv-path-dock.ts) and
+[`rv-path-network.ts`](src/core/engine/rv-path-network.ts). Integrate those as a
+viewer-build extension so it uses the host's registry instances. Do not bundle
+copies of these singleton registries into a runtime project module. Build-time
+private project packs are a maintainer integration route, not a Community prerequisite.
 
-export const models = ['MyModel'];
-export function registerModelPlugins(viewer: RVViewer): void {
-  const fleet = getDefaultAgvFleet();
-  viewer.on('simulation-start', () => {
-    for (const agv of fleet.all()) agv.assign(firstTaskFor(agv.id));
-  });
-  fleet.onIdle((id) => fleet.get(id)?.assign(nextOrderFor(id)));
-}
-```
+Dispose the unsubscribe functions returned by event/fleet subscriptions when your
+plugin unregisters. See [Extending WEB](doc-extending-webviewer.md) for the distinction
+between application extensions and project modules.
 
 **JS-in-GLB (sandboxed, ships with the file — for light logic):** a
 `WebComponent` script declaring `routing.*` handlers (`selectNextPath`,
@@ -262,6 +261,8 @@ Both meet the same seams; a registered central router always wins the junction
 decision.
 
 ## 8. Known limitations (plan-921 state)
+
+Projects that need arcade vehicle dynamics can use `PathTraveler` directly while retaining `RVPathNetwork`, its central router and `nextHopToward` routing; the private `agv-maze` project is an example. It omits the `Agv` behavior's acceleration, spacing and fleet-task/DES coupling. Its player decides whether to stop before `advance()` and reports node arrival itself, because a routing hook cannot hold a traveler at a junction. Moving meshes are loaded separately from the document's static batching pipeline, and project teardown releases the router, paths and owned rendering resources.
 
 - **Scene-based projects**: model-plugin matching is keyed to the loaded MODEL
   name; a planner SCENE loads under its scene body URL, so project plugins do

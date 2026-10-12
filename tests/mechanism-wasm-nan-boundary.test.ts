@@ -33,21 +33,23 @@ import { fourBarRig, topologyOf } from './_mechanism-rigs';
 /**
  * SHA-256 and size of the wasm artefact this tree ships, copied from
  * `<releaseDLLs>/rv-kinematic-solver/BUILD-PROVENANCE.md`
- * → *2026-08-08 — plan-412 Phases 1–2* → *Artefact — wasm*.
+ * → *ABI v4 — external link wrenches (plan-467)* → *Artefact — wasm*.
  *
  * The manifest lives out-of-repo (the crate is not in this git tree), so the
  * pin has to travel WITH the test. When the crate is rebuilt, both values move
  * here and in the manifest together — a mismatch means the tree carries a
  * binary nobody recorded, and the NaN assertions below would be about it.
  *
- * The NaN guard this file tests is unchanged by plan-412 (`solve.rs` and
- * `solve_inverse.rs` are byte-identical to the plan-411 entry); only the
- * enclosing binary moved, because the crate gained the dynamics kernel.
+ * The NaN guard this file tests is unchanged by plan-412 and plan-467
+ * (`solve.rs` and `solve_inverse.rs` are still byte-identical to the plan-411
+ * entry); only the enclosing binary moved — first for the dynamics kernel, now
+ * for the ABI-v4 `link_wrench` parameter.
  */
 const PROVENANCE = {
-  sha256: '2ca57895cd615ff19f54a91db83c0276048aa9d13f1d5dd94aa629f035fe72bd',
-  bytes: 124336,
-  builtFrom: 'solve_inverse.rs 058f0460…, solve.rs e6256081… (unchanged), dynamics.rs 14e81855…',
+  sha256: '24fdda765eb6a7744ac905a56ee930811e48b16265ffce16dc0d1ab92447d59d',
+  bytes: 126431,
+  builtFrom: 'solve_inverse.rs 058f0460…, solve.rs e6256081… (both unchanged), '
+    + 'dynamics.rs e0d0e843…, lib.rs db2de56a… (ABI v4)',
 };
 
 let provider: KinematicSolverProvider;

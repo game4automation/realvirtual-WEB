@@ -14,6 +14,7 @@ const FULL: RVVersionInfo = {
   webBuild: '1247',
   commit: 'a1b2c3d',
   buildDate: '2026-07-01',
+  buildTime: '',
 };
 
 describe('rv-version formatting', () => {
@@ -35,6 +36,28 @@ describe('rv-version formatting', () => {
       .toBe('v6.3.0 · web build 1247 (a1b2c3d)');
   });
 
+  it('shows the build time to the minute when one was injected', () => {
+    expect(formatVersionFull({ ...FULL, buildTime: '2026-09-17 21:34' }))
+      .toBe('v6.3.0 · web build 1247 (a1b2c3d) · 2026-09-17 21:34');
+  });
+
+  it('prefers the build time over the commit date', () => {
+    // Two builds of the same commit on the same day must still be tellable apart,
+    // so the timestamp of THIS build wins over the date of the commit.
+    const label = formatVersionFull({ ...FULL, buildTime: '2026-09-17 21:34' });
+    expect(label).not.toContain('2026-07-01');
+  });
+
+  it('falls back to the commit date when no build time was injected', () => {
+    expect(formatVersionFull({ ...FULL, buildTime: '' }))
+      .toBe('v6.3.0 · web build 1247 (a1b2c3d) · 2026-07-01');
+  });
+
+  it('omits the trailing segment when neither time nor date is available', () => {
+    expect(formatVersionFull({ ...FULL, buildTime: '', buildDate: '' }))
+      .toBe('v6.3.0 · web build 1247 (a1b2c3d)');
+  });
+
   it('exposes the injected build constants at runtime', () => {
     // Values come from Vite `define`; assert shape, not exact (build-dependent) values.
     expect(typeof RV_VERSION.version).toBe('string');
@@ -42,5 +65,6 @@ describe('rv-version formatting', () => {
     expect(typeof RV_VERSION.webBuild).toBe('string');
     expect(typeof RV_VERSION.commit).toBe('string');
     expect(typeof RV_VERSION.buildDate).toBe('string');
+    expect(typeof RV_VERSION.buildTime).toBe('string');
   });
 });

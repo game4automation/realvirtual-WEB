@@ -213,8 +213,25 @@ describe('"Untitled" is a name, not a state (field decision 2026-08-19)', () => 
 });
 
 describe('"Save as…" is the only fork', () => {
-  it('the explicit verb copies into the Custom library under the picked name', async () => {
+  it('the explicit verb copies BESIDE the original under the picked name', async () => {
     const base = documentBase('doc_belt', 'Belt', 'Belt.glb');
+    const { ctx } = context('Belt', base);
+    const { off } = watchNamePrompts('Belt Copy');
+    try {
+      expect(await runSaveFlow(ctx, { forceNamePrompt: true })).toBe(true);
+    } finally { off(); }
+    // The source lives at the project ROOT (`Belt.glb`), so the copy does
+    // too. `library/Custom` was the fallback for a document with no folder of
+    // its own, and plan-744 F7 replaced it with the root: it was the last
+    // place the save path treated a folder as a type, and it filed a first
+    // save under "library" whatever the thing was.
+    expect(writes).toEqual(['Belt Copy.glb']);
+  });
+
+  it('a document that HAS a folder still copies into that folder', async () => {
+    // The other half of the same rule, and the one that did not change: a
+    // save-as copies BESIDE the original, wherever the original is.
+    const base = documentBase('doc_belt', 'Belt', 'library/Custom/Belt.glb');
     const { ctx } = context('Belt', base);
     const { off } = watchNamePrompts('Belt Copy');
     try {

@@ -27,9 +27,10 @@ export const LEGACY_DOCUMENT_KEYS: readonly string[];
 export function sectionOfDocument(entry: unknown): RvDocumentSection;
 export function documentsOf(manifest: unknown): RvManifestDocument[];
 export function documentsInSection(manifest: unknown, section: RvDocumentSection): RvManifestDocument[];
+export function projectDemos(manifest: unknown): { hmi?: string; planner?: string };
 
 export function stableDocumentId(path: string): string;
-export function documentOfLegacyEntry(entry: RvManifestDocument, section: RvDocumentSection): RvManifestDocument;
+export function documentOfLegacyEntry(entry: RvManifestDocument): RvManifestDocument;
 export function withoutLegacyArrays<T>(manifest: T): T;
 export function withDerivedDocuments<T>(manifest: T): T;
 export function deriveDocuments(

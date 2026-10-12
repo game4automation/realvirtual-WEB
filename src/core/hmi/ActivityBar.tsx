@@ -18,9 +18,12 @@
  */
 
 import { useState, useEffect, useSyncExternalStore, type ReactNode } from 'react';
-import { Box, Paper, IconButton, Tooltip, Divider, Menu, MenuItem, ListItemIcon, ListItemText } from '@mui/material';
-import { FolderOpen, AccountTree, PushPin, Settings, ViewInAr, Memory, MoreVert, Bolt, HelpOutline } from '@mui/icons-material';
+import { Box, Paper, IconButton, Tooltip, Divider, Menu, MenuItem, ListItemIcon, ListItemText, Badge } from '@mui/material';
+import { FolderOpen, AccountTree, PushPin, Settings, ViewInAr, Memory, MoreVert, Bolt, HelpOutline, ReportProblemOutlined } from '@mui/icons-material';
+import { useMode } from '../../hooks/use-mode';
+import { openRecentDocumentsOnHover, scheduleRecentDocumentsClose } from './projects/projects-dashboard-store';
 import { useMcpBridge } from '../../hooks/use-mcp-bridge';
+import { setAgentActivityAnchor } from './AgentActivityRow';
 import { useAiActivity } from './ai-activity-store';
 import { probeConnectReachable } from './ai-consent-store';
 import { AiBridgeDownloadDialog } from './AiBridgeGate';
@@ -49,6 +52,7 @@ import {
 import { LogoBadge } from './ButtonPanel';
 import { MultiuserButton } from './MultiuserPanel';
 import { DirtyDot } from './rv-dirty-dot';
+import { useProblems, useProblemsPanelOpen, toggleProblemsPanel } from './ProblemsPanel';
 import type { WebXRPluginAPI } from '../types/plugin-types';
 
 /** Stand-in subscribe for the boot window in which there is no scene store. */
@@ -82,13 +86,19 @@ export function projectsEntryTitle(
  * Tooltip of the AI Bridge entry — the icon's accent says "connected", the
  * tooltip says to what. While a tool call is running the label rides along, so
  * the button alone answers "is something driving my scene right now?" even when
- * the AiActivityOverlay pill is off-screen or covered.
+ * the AiActivityOverlay pill is off-screen or covered. `connected` means READY
+ * (first status frame, plan-541); an open CONNECT approval prompt is named.
  */
 export function aiBridgeTitle(
-  mcp: { connected: boolean; enabled: boolean; toolCount: number },
+  mcp: { connected: boolean; enabled: boolean; toolCount: number; failure?: string },
   activity: string | null,
 ): string {
-  if (!mcp.connected) return mcp.enabled ? 'AI Bridge — connecting…' : 'AI Bridge — off';
+  if (!mcp.connected) {
+    if (!mcp.enabled) return 'AI Bridge — off';
+    return mcp.failure === 'pairing-pending'
+      ? 'AI Bridge — waiting for approval in the CONNECT tray'
+      : 'AI Bridge — connecting…';
+  }
   const base = `AI Bridge — connected (${mcp.toolCount} tools)`;
   return activity ? `${base} · ${activity}` : base;
 }
@@ -141,8 +151,64 @@ function HelpButton({ placement }: { placement: 'right' | 'top' }) {
   );
 }
 
+/**
+ * Problems entry — present only while there is something to report, like the
+ * panel it toggles. The red count is the one number on the rail: it answers
+ * "is anything wrong with this document?" even while the panel is closed.
+ */
+function ProblemsButton({ placement }: { placement: 'right' | 'top' }) {
+  const problems = useProblems();
+  const open = useProblemsPanelOpen();
+  if (problems.length === 0) return null;
+  const n = problems.length;
+  const title = `${open ? 'Hide' : 'Show'} problems (${n})`;
+  return (
+    <Tooltip title={title} placement={placement}>
+      <IconButton
+        size="medium"
+        color={open ? 'primary' : 'inherit'}
+        aria-label={title}
+        aria-pressed={open}
+        data-testid="activity-problems"
+        onClick={toggleProblemsPanel}
+      >
+        <Badge
+          badgeContent={n}
+          max={99}
+          color="error"
+          sx={{
+            '& .MuiBadge-badge': {
+              fontSize: 10, fontWeight: 600, height: 15, minWidth: 15, px: 0.4,
+              top: 2, right: 1,
+              // Ring in the rail colour so the badge reads as cut out of the icon.
+              boxShadow: '0 0 0 1.5px rgba(38,38,38,0.95)',
+              fontVariantNumeric: 'tabular-nums',
+            },
+          }}
+        >
+          <ReportProblemOutlined />
+        </Badge>
+      </IconButton>
+    </Tooltip>
+  );
+}
+
+/** Mobile "⋮" menu row for the Problems panel; absent while the list is empty. */
+function ProblemsMenuItem({ onClick }: { onClick: () => void }) {
+  const n = useProblems().length;
+  const open = useProblemsPanelOpen();
+  if (n === 0) return null;
+  return (
+    <MenuItem onClick={onClick} sx={{ fontSize: 13 }}>
+      <ListItemIcon><ReportProblemOutlined fontSize="small" /></ListItemIcon>
+      <ListItemText>{`${open ? 'Hide' : 'Show'} problems (${n})`}</ListItemText>
+    </MenuItem>
+  );
+}
+
 export type ActivityBarEntryId =
   | 'about'
+  | 'problems'
   | 'models'
   | 'hierarchy'
   | 'annotations'
@@ -275,6 +341,7 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   // "scene" left panel. The dashboard owns its own open state (it is a
   // full-screen overlay with no width to negotiate), so this no longer goes
   // through the LeftPanelManager.
+  const { locked: recentModeLocked } = useMode();
   const toggleScene = () => toggleProjectsDashboard();
   const toggleHierarchy = () => plugin?.togglePanel();
   const toggleAnnotations = () => lpm.toggle('annotations', ANNOTATION_PANEL_WIDTH);
@@ -326,6 +393,9 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
   const coreTop = (
     <>
       {isEntryShown('models') && sceneStore && (
+        <Box data-recent-documents-trigger
+          onMouseEnter={() => { if (!recentModeLocked) openRecentDocumentsOnHover(); }}
+          onMouseLeave={scheduleRecentDocumentsClose}>
         <ActivityButton
           title={projectsEntryTitle(projectSnapshot.project?.name ?? null, sceneDirty, sceneTransient)}
           active={dashboardSnapshot.open}
@@ -357,6 +427,7 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
             />
           )}
         </ActivityButton>
+        </Box>
       )}
       {isEntryShown('hierarchy') && plugin && !isMobile && (
         <ActivityButton title="Hierarchy" active={editorState.panelOpen} onClick={toggleHierarchy} placement={placement}>
@@ -436,6 +507,7 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
               <ListItemText>Annotations</ListItemText>
             </MenuItem>
           )}
+          {isEntryAllowed('problems') && <ProblemsMenuItem onClick={run(toggleProblemsPanel)} />}
           {settingsButton && (
             <MenuItem onClick={run(toggleSettings)} sx={{ fontSize: 13 }}>
               <ListItemIcon><Settings fontSize="small" /></ListItemIcon>
@@ -480,11 +552,14 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
       {pluginButtons}
       {/* Spacer pushes the bottom group (Multiuser, Settings) down (VSCode convention). */}
       <Box sx={{ flex: 1 }} />
+      {/* Lowest-left entry above the bottom group — next to where the panel opens. */}
+      {isEntryAllowed('problems') && <ProblemsButton placement={placement} />}
       {isEntryShown('multiuser') && <MultiuserButton placement={placement} />}
       {isEntryShown('omniverse') && <OmniverseButton placement={placement} />}
       {/* Always offered — except where a deploy removed the entry through the
           feature matrix; `isEntryAllowed` still beats "always visible". */}
       {isEntryShown('ai-bridge') && (
+        <Box sx={{ position: 'relative', display: 'flex', justifyContent: 'center', width: '100%' }}>
         <ActivityButton
           title={aiBridgeTitle(mcp, aiActivity)}
           active={mcp.connected}
@@ -493,6 +568,10 @@ export function ActivityBar({ entryAllowlist }: ActivityBarProps = {}) {
         >
           <Memory />
         </ActivityButton>
+          <Box ref={setAgentActivityAnchor} data-agent-activity-anchor
+            sx={{ position: 'absolute', left: 'calc(100% + 6px)', top: '50%',
+              transform: 'translateY(-50%)', pointerEvents: 'none' }} />
+        </Box>
       )}
       {settingsButton}
       {/* Bottom-most entry — the way out of the product into the documentation. */}

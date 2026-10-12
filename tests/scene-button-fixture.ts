@@ -54,6 +54,7 @@ import {
   Scene,
 } from 'three';
 import { processExtras, runOnSceneReady } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import { freezeStaticMatrices } from '../src/core/engine/rv-freeze-static';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
@@ -275,22 +276,9 @@ export function buildButtonScene(options: {
   transportManager.scene = scene;
   const sceneButtonManager = new SceneButtonManager();
 
-  processExtras(
-    root,
-    registry,
-    signalStore,
-    transportManager,
-    scene,
-    undefined,          // gizmoManager
-    undefined,          // events
-    undefined,          // errorStore
-    undefined,          // instructionStore
-    undefined,          // options
-    undefined,          // outlineManager
-    undefined,          // lampManager
-    undefined,          // energyChainManager
-    sceneButtonManager,
-  );
+  processExtras(root, buildInitContext({
+    registry, signalStore, transportManager, scene, sceneButtonManager,
+  }));
 
   // ── Loader Phase 11: freezeStaticMatrices() — AFTER construction ──
   // The real shipping pass, so the mover closure under test is the product's.

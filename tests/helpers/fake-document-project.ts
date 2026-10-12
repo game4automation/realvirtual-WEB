@@ -114,8 +114,9 @@ export function installFakeDocumentProject(opts: {
     isActive: true,
     async readManifest() { return manifest; },
     async writeManifest(next: RvProject) { manifest = next; },
-    async listModels() { return []; },
-    async listLibrary() { return []; },
+    // ONE listing (plan-744 F1). `listModels()`/`listLibrary()` used to sit
+    // here answering `[]`, which is what a double implementing a retired
+    // method looks like once the interface stops asking for it.
     async listDocuments() { return [...(manifest.documents ?? [])]; },
     async statDocuments() { return []; },
     async activate() {},

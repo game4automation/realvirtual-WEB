@@ -24,6 +24,7 @@ import {
   buildRibbonVectors,
   readFixtureCases,
   RIBBON_VECTOR_FILES,
+  // @ts-expect-error — plain JS Node module, no type declarations by design.
 } from '../scripts/export-ribbon-vectors.mjs';
 
 describe('ribbon test vectors', () => {
@@ -55,9 +56,45 @@ describe('ribbon test vectors', () => {
       expect(cases, `group ${group} missing`).toHaveProperty(group);
     }
     // Degenerate cases are the ones a transcription gets wrong, so their presence is asserted
-    // rather than left to the generator's good intentions.
-    expect(cases.tangentBetween.some((c) => c.tangent === null)).toBe(true);
-    expect(cases.buildRibbonSegments.some((c) => c.error !== null)).toBe(true);
-    expect(cases.sampleArcLength.some((c) => c.resultStepMm > c.stepMm)).toBe(true);
+    // rather than left to the generator's good intentions. The generator is an untyped `.mjs`,
+    // so every callback parameter is annotated here rather than inferred.
+    expect(cases.tangentBetween.some((c: { tangent: unknown }) => c.tangent === null)).toBe(true);
+    expect(cases.buildRibbonSegments.some((c: { error: string | null }) => c.error !== null)).toBe(true);
+    expect(cases.sampleArcLength.some((c: { resultStepMm: number; stepMm: number }) => c.resultStepMm > c.stepMm))
+      .toBe(true);
+  });
+
+  it('pins the plan-468 end-wrap cases the Unity port has to reproduce', async () => {
+    const cases = await buildRibbonVectors();
+    type SegmentCase = {
+      name: string;
+      rollers: Array<{ r: number; side: number; wrapRad?: number }>;
+      error: string | null;
+      lengthMm?: number;
+      segments?: Array<{ kind: string; sweep?: number; lengthMm: number }>;
+    };
+    const wrapped: SegmentCase[] = cases.buildRibbonSegments
+      .filter((c: SegmentCase) => c.rollers.some((r) => (r.wrapRad ?? 0) > 0));
+    // A pre-arc on a CCW end, a post-arc on a CW one, both ends at once, and a
+    // wrap past a full turn — the four shapes a transcription can get wrong on
+    // its own (sweep sign, `a0` derivation, and the missing [0, 2pi) folding).
+    expect(wrapped.length).toBeGreaterThanOrEqual(4);
+    for (const c of wrapped) {
+      expect(c.error, `${c.name} must build`).toBeNull();
+      const segments = c.segments!;
+      const first = c.rollers[0];
+      const last = c.rollers[c.rollers.length - 1];
+      if ((first.wrapRad ?? 0) > 0) {
+        expect(segments[0].kind, `${c.name}: leading segment`).toBe('arc');
+        expect(segments[0].lengthMm).toBeCloseTo(first.r * first.wrapRad!, 9);
+        expect(Math.sign(segments[0].sweep!)).toBe(Math.sign(first.side));
+      }
+      if ((last.wrapRad ?? 0) > 0) {
+        const tail = segments[segments.length - 1];
+        expect(tail.kind, `${c.name}: trailing segment`).toBe('arc');
+        expect(tail.lengthMm).toBeCloseTo(last.r * last.wrapRad!, 9);
+        expect(Math.sign(tail.sweep!)).toBe(Math.sign(last.side));
+      }
+    }
   });
 });

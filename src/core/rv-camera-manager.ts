@@ -25,9 +25,46 @@ import type { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import type { ProjectionType } from './hmi/visual-settings-store';
 import type { LeftPanelManager } from './hmi/left-panel-manager';
 import type { FollowSource } from './engine/rv-follow-source';
+import { chunkBoundsOfNode } from './engine/rv-traverse-utils';
+// Value import (not `type`): the animateCameraTo guard needs the constructor
+// for its `instanceof` check. Same direction as the FollowSource import above —
+// core → core/engine — so no cycle (plan-740 D-A6).
+import { AgentEyeFollowSource } from './engine/rv-agent-eye-follow-source';
 
 /** Follow/Sit-On tracking mode. */
 export type CameraFollowMode = 'off' | 'follow' | 'siton';
+
+/**
+ * Distance a camera with `fovDeg` / `aspect` needs so `maxDim` fits BOTH axes,
+ * scaled by `margin`. The canonical fit formula, lifted out of
+ * {@link CameraManager.fitDistanceBothAxes} so the AI agent's camera — which
+ * has its own lens and no OrbitControls — can frame with the identical maths
+ * instead of a second copy of it (plan-740 P1.6).
+ */
+export function fitDistanceBothAxesFor(
+  maxDim: number, fovDeg: number, aspect: number, margin = 1,
+): number {
+  const fov = fovDeg * (Math.PI / 180);
+  const halfTan = Math.tan(fov / 2);
+  const distV = maxDim / (2 * halfTan);
+  const distH = maxDim / (2 * halfTan * aspect);
+  return Math.max(distV, distH) * margin;
+}
+
+/** Frame rate at which an OrbitControls `dampingFactor` is defined (plan-568). */
+export const DAMPING_REFERENCE_HZ = 60;
+
+/**
+ * Per-update OrbitControls damping factor for a frame of `dtSec` seconds, so a
+ * `dampingFactor` defined per 60 Hz frame decays over the SAME wall time at
+ * any render rate (plan-568: 30 FPS cap, 144 Hz displays):
+ * `1 - (1 - factor)^(dtSec * 60)`. At exactly 1/60 s it returns `factor`.
+ */
+export function timeScaledDampingFactor(factor: number, dtSec: number): number {
+  if (!(factor > 0) || factor >= 1) return factor;
+  if (!(dtSec > 0)) return 0;
+  return 1 - Math.pow(1 - factor, dtSec * DAMPING_REFERENCE_HZ);
+}
 
 /**
  * Follow smoothing rate (per second) for the frame-rate-independent damping
@@ -70,6 +107,8 @@ export interface CameraAnimation {
   elapsed: number;
   duration: number;
   easing: CameraEasing;
+  /** Who started the flight (plan-520) — lets a user gesture cancel only the MCP follow flight. */
+  tag?: string;
 }
 
 /** Camera-flight easing. `easeOut` = snappy response to a user click (default);
@@ -100,6 +139,8 @@ export class CameraManager {
   private state: ViewerCameraState;
   cameraAnim: CameraAnimation | null = null;
   projectionAnim: ProjectionAnimation | null = null;
+  /** See {@link cameraEpoch}. */
+  private _cameraEpoch = 0;
 
   // ─── Follow / Sit-On state ────────────────────────────────────────
   private _followMode: CameraFollowMode = 'off';
@@ -127,6 +168,17 @@ export class CameraManager {
     this.state = state;
   }
 
+  /**
+   * plan-515 Phase 2: counts the camera take-overs of this manager — a camera
+   * flight (`animateCameraTo`: fitToNodes / F / focus / bookmarks), a
+   * projection switch or tween, Follow / Sit-On start and stop. The
+   * NavigationController compares it before it acts: a change resets its orbit
+   * pivot to `controls.target` and stops its inertia. (Direct writers of
+   * `controls.target` — view-state restore, multiuser, annotations — are
+   * detected by the controller from the target itself.)
+   */
+  get cameraEpoch(): number { return this._cameraEpoch; }
+
   // ─── FOV ──────────────────────────────────────────────────────────
 
   get fov(): number { return this.state.perspCamera.fov; }
@@ -149,6 +201,13 @@ export class CameraManager {
     const isPersp = this.state._activeCamera === this.state.perspCamera;
     if (wantPersp === isPersp) return;
 
+    // plan-515 (R2-2): fold an ortho wheel zoom into camera distance BEFORE
+    // the swap, so the perspective camera shows the same extent at the target
+    // plane, and enter ortho at zoom 1 (a stale zoom scaled the frustum).
+    if (wantPersp) this._normalizeOrthoPose();
+    else this.state.orthoCamera.zoom = 1;
+
+    this._cameraEpoch++;
     const oldCam = this.state._activeCamera;
     const newCam = wantPersp ? this.state.perspCamera : this.state.orthoCamera;
 
@@ -213,12 +272,9 @@ export class CameraManager {
    * and horizontal (aspect-corrected) fit distances, scaled by `margin`.
    */
   fitDistanceBothAxes(maxDim: number, margin = 1): number {
-    const fov = this.state.perspCamera.fov * (Math.PI / 180);
-    const halfTan = Math.tan(fov / 2);
-    const aspect = this.state.perspCamera.aspect;
-    const distV = maxDim / (2 * halfTan);
-    const distH = maxDim / (2 * halfTan * aspect);
-    return Math.max(distV, distH) * margin;
+    return fitDistanceBothAxesFor(
+      maxDim, this.state.perspCamera.fov, this.state.perspCamera.aspect, margin,
+    );
   }
 
   // ─── Camera Animation ─────────────────────────────────────────────
@@ -226,17 +282,35 @@ export class CameraManager {
   /** Whether a camera animation is currently in progress. */
   get isCameraAnimating(): boolean { return this.cameraAnim !== null; }
 
-  /** Cancel any in-progress camera animation. */
-  cancelCameraAnimation(): void {
+  /**
+   * Cancel the in-progress camera animation. Without `tag` any animation is
+   * cancelled (the historical behaviour); with `tag` only an animation started
+   * with that same tag (plan-520: the controls `'start'` gesture cancels the
+   * `'follow-agent'` flight and leaves bookmarks / focus flights alone).
+   */
+  cancelCameraAnimation(tag?: string): void {
+    if (tag !== undefined && this.cameraAnim?.tag !== tag) return;
     this.cameraAnim = null;
   }
 
   /**
    * Smoothly animate the camera to a new position and orbit target.
+   * `tag` names the flight's owner so {@link cancelCameraAnimation} can target it.
    */
-  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6, easing: CameraEasing = 'easeOut'): void {
+  animateCameraTo(position: Vector3, target: Vector3, duration = 0.6, easing: CameraEasing = 'easeOut', tag?: string): void {
     const xr = (this.state.renderer as unknown as Record<string, unknown>).xr as Record<string, unknown> | undefined;
     if (xr?.isPresenting) return;
+    this._cameraEpoch++;
+    // plan-740 D-A6(b): a viewport riding the AI agent's eye must let go when
+    // anything else flies the camera — a bookmark, a view preset, fitToNodes, a
+    // focus double-click. None of those fire an OrbitControls `'start'` event,
+    // so the (a) auto-detach would never see them and `tickFollow` would fight
+    // the animation frame by frame. Not re-entrant: `stopFollowMode` sets
+    // `_followMode = 'off'` BEFORE its own restore call, so the restore flight
+    // re-enters here with the guard already false.
+    if (this._followMode === 'follow' && this._source instanceof AgentEyeFollowSource) {
+      this.stopFollowMode(false);
+    }
     // In ortho the visible scale must follow camera distance (the frustum is
     // re-synced every animation tick) — fold any wheel zoom into distance
     // first so the flight starts from the exact same visible framing.
@@ -249,6 +323,7 @@ export class CameraManager {
       elapsed: 0,
       duration,
       easing,
+      tag,
     };
   }
 
@@ -256,7 +331,8 @@ export class CameraManager {
   tickCameraAnimation(dtSec: number): void {
     if (!this.cameraAnim) return;
     this.cameraAnim.elapsed += dtSec;
-    const t = Math.min(this.cameraAnim.elapsed / this.cameraAnim.duration, 1);
+    // duration 0 = jump (plan-520 reduced motion) — never 0/0 = NaN on a zero-dt frame.
+    const t = this.cameraAnim.duration > 0 ? Math.min(this.cameraAnim.elapsed / this.cameraAnim.duration, 1) : 1;
     // easeOut (cubic): instant response, smooth stop — right for user clicks.
     // easeInOut (cubic): smooth start AND stop — right for scripted flights.
     const e = this.cameraAnim.easing === 'easeInOut'
@@ -285,6 +361,7 @@ export class CameraManager {
    * orbiting/zooming around the moving target (delta-pattern in tickFollow).
    */
   startFollow(src: FollowSource): void {
+    this._cameraEpoch++;
     this.cancelCameraAnimation();
     this._source = src;
     this._followMode = 'follow';
@@ -300,6 +377,7 @@ export class CameraManager {
    */
   startSitOn(src: FollowSource, seatLocalOffset?: Vector3): void {
     if (this.projection === 'orthographic') this.projection = 'perspective';
+    this._cameraEpoch++;
     this.cancelCameraAnimation();
     this._source = src;
     this._followMode = 'siton';
@@ -323,9 +401,19 @@ export class CameraManager {
    */
   stopFollowMode(restore = true): void {
     if (this._followMode === 'off') return;
+    const stopped = this._source;
+    this._cameraEpoch++;
     this._followMode = 'off';
     this._source = null;
     this.state.controls.enabled = true;
+    // Tell the source it is no longer being followed (plan-740). Follow can now
+    // end from inside this class — `animateCameraTo` releases an agent-eye
+    // follow before flying — and no OrbitControls event announces that, so an
+    // owner watching only `'start'` would keep a stale "attached" flag and a
+    // hidden gizmo. Fired with the mode already off, so a handler calling
+    // `stopFollowMode` again is a no-op, and a throwing handler must not stop
+    // the restore.
+    try { stopped?.onFollowStopped?.(); } catch { /* a faulty owner is not our problem */ }
     if (restore) this.animateCameraTo(this._savedCamPos, this._savedCamTarget, 0.4);
   }
 
@@ -412,6 +500,7 @@ export class CameraManager {
     const wantPersp = v === 'perspective';
     const isPersp = this.projection === 'perspective';
     if (wantPersp === isPersp && !this.projectionAnim) return;
+    this._cameraEpoch++;
 
     // The driver camera is the one we keep rendering with for the duration of
     // the tween — its projectionMatrix gets overwritten each frame. We always
@@ -419,6 +508,10 @@ export class CameraManager {
     // mid-frame swap; the actual swap happens at t=1.
     const driveCam = this.state._activeCamera;
     const targetCam = wantPersp ? this.state.perspCamera : this.state.orthoCamera;
+
+    // plan-515 (R2-2): same ortho normalisation as the instant switch.
+    if (wantPersp) this._normalizeOrthoPose();
+    else this.state.orthoCamera.zoom = 1;
 
     // Bring the target into sync so its projection matrix is the visual
     // endpoint we're lerping toward.
@@ -437,6 +530,63 @@ export class CameraManager {
     };
   }
 
+  /**
+   * plan-515 (R2-1): set near/far on BOTH cameras. A camera's projection
+   * matrix is only rebuilt when its near or far moved by more than 1 %. While a
+   * projection animation runs, the lerp reads STORED matrix copies
+   * (`fromMatrix` / `toMatrix`), so a changed clipping must refresh those
+   * endpoints too — otherwise the next tick overwrites the new clipping with the
+   * old one. Returns true when anything changed.
+   */
+  applyClipping(persp: { near: number; far: number }, ortho: { near: number; far: number }): boolean {
+    // Records, not four number arguments: a double crossing a non-inlined call
+    // is boxed into a fresh HeapNumber (plan-515 R3-5, zero-allocation tick).
+    // 1 % hysteresis, written out (no helper call) for the same reason.
+    const p = this.state.perspCamera;
+    const o = this.state.orthoCamera;
+    let changed = false;
+    if (Math.abs(persp.near - p.near) > 0.01 * Math.abs(p.near) || Math.abs(persp.far - p.far) > 0.01 * Math.abs(p.far)) {
+      p.near = persp.near; p.far = persp.far;
+      p.updateProjectionMatrix();
+      changed = true;
+    }
+    if (Math.abs(ortho.near - o.near) > 0.01 * Math.abs(o.near) || Math.abs(ortho.far - o.far) > 0.01 * Math.abs(o.far)) {
+      o.near = ortho.near; o.far = ortho.far;
+      o.updateProjectionMatrix();
+      changed = true;
+    }
+    if (changed && this.projectionAnim) this.refreshProjectionAnimation();
+    return changed;
+  }
+
+  /**
+   * plan-515 (R2-1): rebuild the stored endpoint matrices of a running
+   * projection animation from the cameras' CURRENT state (pose, clipping, ortho
+   * extent). Call after anything changed the camera during the tween — the
+   * clipping, or a navigation move. The drive camera's live (lerped) matrix is
+   * rewritten by the next `tickProjectionAnimation`.
+   */
+  refreshProjectionAnimation(): void {
+    const anim = this.projectionAnim;
+    if (!anim) return;
+    const driveCam = anim.driveCam;
+    const toPersp = anim.toType === 'perspective';
+    const targetCam = toPersp ? this.state.perspCamera : this.state.orthoCamera;
+    if (targetCam === driveCam) return;
+    if (toPersp) this._normalizeOrthoPose();
+    targetCam.position.copy(driveCam.position);
+    targetCam.quaternion.copy(driveCam.quaternion);
+    targetCam.updateMatrixWorld();
+    if (!toPersp) {
+      this.state.orthoCamera.zoom = 1;
+      this.syncOrthoFrustum();
+    }
+    driveCam.updateProjectionMatrix();
+    targetCam.updateProjectionMatrix();
+    anim.fromMatrix.copy(driveCam.projectionMatrix);
+    anim.toMatrix.copy(targetCam.projectionMatrix);
+  }
+
   /** Cancel any in-progress projection animation; leaves whichever camera
    *  is currently active in place (matrix is restored by the next render
    *  pass via updateProjectionMatrix when needed). */
@@ -445,6 +595,20 @@ export class CameraManager {
     // Restore the drive camera's matrix so it isn't left mid-lerp.
     this.projectionAnim.driveCam.updateProjectionMatrix();
     this.projectionAnim = null;
+  }
+
+  /**
+   * plan-515 (R3-3): jump a running projection animation to its END state and
+   * commit the camera swap now. Navigation input calls this before it acts —
+   * during the tween the live matrix is a blend of both projections, so a pick
+   * would land up to ~36 px beside the cursor. No-op when nothing animates.
+   */
+  completeProjectionAnimation(): void {
+    const anim = this.projectionAnim;
+    if (!anim) return;
+    anim.elapsed = Math.max(anim.duration, 1e-9);
+    if (!(anim.duration > 0)) anim.duration = 1e-9;
+    this.tickProjectionAnimation(0);
   }
 
   /** Advance projection animation by frame delta. */
@@ -468,6 +632,9 @@ export class CameraManager {
       // Commit the actual camera swap (rebinds OrbitControls, restores the
       // target camera's clean projection matrix).
       this.projectionAnim = null;
+      // The drive camera leaves the view now — give it back its own clean
+      // matrix, so a later switch back does not render with the lerp endpoint.
+      anim.driveCam.updateProjectionMatrix();
       this.projection = anim.toType;
     }
   }
@@ -494,24 +661,40 @@ export class CameraManager {
    *  buffer and ignores the per-instance matrices that place the copies, so on
    *  a CAD import scaled 0.001 it reads ~1000x too large and the fit camera
    *  ends up far outside the part. The source meshes stay in the graph and
-   *  carry the true bounds. Same rule as RVViewer._computeContentBounds(). */
+   *  carry the true bounds. Same rule as RVViewer._computeContentBounds().
+   *
+   *  The geometry bbox is read from the cache and computed only when missing
+   *  (as `computeContentBoundsInto` does): SceneScale calls this every 500 ms
+   *  for all drive subtrees while the simulation runs, and an unconditional
+   *  `computeBoundingBox()` is a full vertex scan of every moving mesh. */
   computeNodeBounds(nodes: Object3D[]): Box3 {
     const box = new Box3();
+    const mb = _tmpNodeBox;
     for (const node of nodes) {
       node.updateWorldMatrix(true, true);
+      let hasMesh = false;
       node.traverse((child) => {
         const m = child as Mesh;
         if ((m as unknown as { isBatchedMesh?: boolean }).isBatchedMesh) return;
         if (m.isMesh && m.geometry) {
-          m.geometry.computeBoundingBox();
+          if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
           if (m.geometry.boundingBox) {
-            const mb = m.geometry.boundingBox.clone();
-            mb.applyMatrix4(m.matrixWorld);
+            mb.copy(m.geometry.boundingBox).applyMatrix4(m.matrixWorld);
             box.union(mb);
+            hasMesh = true;
           }
         }
       });
+      // A node of a BAKED model keeps no meshes of its own — its geometry lives
+      // in an ancestor's chunk (plan-754). Its segment boxes are the bounds
+      // then (plan-756 F6), exactly as `computeSubtreeAABB` resolves them;
+      // without this an alarm card's "focus" on a station framed nothing.
+      // `chunkBoundsOfNode` UNIONS into its target — start from an empty box,
+      // the scratch still holds the last mesh box (or a previous call's).
+      mb.makeEmpty();
+      if (!hasMesh && chunkBoundsOfNode(node, mb)) box.union(mb);
     }
     return box;
   }
 }
+const _tmpNodeBox = new Box3();

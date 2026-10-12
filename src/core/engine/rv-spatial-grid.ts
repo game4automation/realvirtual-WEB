@@ -25,6 +25,11 @@ interface GridEntry<T> {
   /** Tick stamp of the last query that already emitted this entry — allocation-free
    *  deduplication for items spanning multiple cells (no Set per query). */
   lastQueryId: number;
+  /** `aabb.max.y` as of the last (re)indexing — the change detector that keeps
+   *  the per-cell `maxTopY` metadata honest for surfaces that only move in Y
+   *  (a lift, a raised chain) and therefore never change their cell span
+   *  (plan-469 §2.4 / SOL R1#1). */
+  maxY: number;
 }
 
 /** Cell coordinates are clamped to ±(CELL_RANGE-1); beyond that the packed key
@@ -84,6 +89,25 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
   /** One-time long-span warning latch (per grid instance). */
   private _largeSpanWarned = false;
 
+  // ── plan-469 metadata (spike) ────────────────────────────────────
+  /** Cell key -> tick at which the cell's CONTENT last changed (insert, update
+   *  that moved the item, remove, rebuild/clear). Read by the plan-469 cell-union
+   *  cache to decide whether a cached stage-1 union is still exact. Cells that
+   *  never changed report `-1`, which is below every real tick stamp. */
+  private readonly _cellChangeTick = new Map<number, number>();
+  /** Cell key -> max `aabb.max.y` over the cell's entries, or `NaN` when the
+   *  cached value is stale and must be recomputed from the bucket on read.
+   *  Only meaningful for the SURFACE grid; the MU grid simply never asks. */
+  private readonly _cellMaxTopY = new Map<number, number>();
+  /** Tick stamp written into `_cellChangeTick` by the next mutation. The owner
+   *  (RVTransportManager) advances it once per fixed step. */
+  currentTick = 0;
+  /** Tick of the last `clear()`/`rebuild()`. `clear()` drops the per-cell change
+   *  stamps together with the cells, so cells that ended up EMPTY would report
+   *  "never changed" afterwards; the epoch is folded into every
+   *  `maxCellChangeTick()` so a wholesale rebuild invalidates every cache. */
+  private _epochTick = -1;
+
   private readonly _cellSize: number;
   private readonly _invCellSize: number;
 
@@ -120,6 +144,7 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
       cellMaxZ: this._cellCoord(aabb.max.z),
       seq: this._seqCounter++,
       lastQueryId: -1,
+      maxY: aabb.max.y,
     };
     this._entries.set(item, entry);
     this._addToCells(entry);
@@ -132,11 +157,11 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
    * lazily inserted (self-healing against external array pushes). The new span
    * is always derived from the CURRENT AABB, so multi-cell jumps are exact.
    */
-  update(item: T): void {
+  update(item: T): boolean {
     const entry = this._entries.get(item);
     if (!entry) {
       this.insert(item);
-      return;
+      return true;
     }
     const aabb = entry.aabb;
     const minX = this._cellCoord(aabb.min.x);
@@ -147,15 +172,21 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
       minX === entry.cellMinX && minZ === entry.cellMinZ &&
       maxX === entry.cellMaxX && maxZ === entry.cellMaxZ
     ) {
-      return; // same cell span — nothing to move
+      // Same cell span — nothing to move. A pure Y change still has to refresh
+      // the per-cell `maxTopY` metadata (plan-469): a lift raising a chain never
+      // changes its XZ footprint, but it does change which surface is "on top".
+      if (aabb.max.y !== entry.maxY) this._noteMaxYChanged(entry, aabb.max.y);
+      return false;
     }
     this._removeFromCells(entry);
     entry.cellMinX = minX;
     entry.cellMinZ = minZ;
     entry.cellMaxX = maxX;
     entry.cellMaxZ = maxZ;
+    entry.maxY = aabb.max.y;
     this._addToCells(entry);
     this._warnLargeSpan(entry);
+    return true;
   }
 
   /** Remove `item` from the index (uses the STORED cell span, so removal is
@@ -185,6 +216,9 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
     }
     this._cells.clear();
     this._entries.clear();
+    this._cellChangeTick.clear();
+    this._cellMaxTopY.clear();
+    this._epochTick = this.currentTick;
     this._seqCounter = 0;
   }
 
@@ -245,6 +279,166 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
     return count;
   }
 
+  // ─── plan-469 spike: cell metadata + stage-1 union ──────────────────
+
+  /**
+   * Stage 1 of {@link queryXZ} alone: the deduplicated, seq-sorted UNION of the
+   * entries of every cell the query AABB's span touches — WITHOUT the exact
+   * per-item AABB test and without any caller filter.
+   *
+   * This is the only part of a query that is a pure function of (cell span,
+   * cell content), and therefore the only part the plan-469 cell-union cache may
+   * keep across ticks (SOL R2#1: stage 2 depends on the exact query AABB, which
+   * moves inside an unchanged span). Callers MUST re-run the exact overlap test
+   * and every exclusion on the returned union on every single call.
+   */
+  queryCellUnion(aabb: AABB, out: T[]): number {
+    out.length = 0;
+    if (this._entries.size === 0) return 0;
+    const minX = this._cellCoord(aabb.min.x);
+    const minZ = this._cellCoord(aabb.min.z);
+    const maxX = this._cellCoord(aabb.max.x);
+    const maxZ = this._cellCoord(aabb.max.z);
+    const queryId = ++this._queryId;
+    const scratch = this._queryScratch;
+    scratch.length = 0;
+    for (let cx = minX; cx <= maxX; cx++) {
+      const rowKey = cx * KEY_STRIDE + CELL_RANGE;
+      for (let cz = minZ; cz <= maxZ; cz++) {
+        const bucket = this._cells.get(rowKey + cz);
+        if (!bucket) continue;
+        for (let i = 0; i < bucket.length; i++) {
+          const entry = bucket[i];
+          if (entry.lastQueryId === queryId) continue;
+          entry.lastQueryId = queryId;
+          let j = scratch.length - 1;
+          scratch.length = scratch.length + 1;
+          while (j >= 0 && scratch[j].seq > entry.seq) {
+            scratch[j + 1] = scratch[j];
+            j--;
+          }
+          scratch[j + 1] = entry;
+        }
+      }
+    }
+    for (let i = 0; i < scratch.length; i++) out.push(scratch[i].item);
+    const count = scratch.length;
+    scratch.length = 0;
+    return count;
+  }
+
+  /**
+   * Collision-free packing of the cell span of `aabb` into ONE safe integer.
+   *
+   * Layout (52 bits, inside Number's 2^53 exact range):
+   * `((minX + CELL_RANGE) * 2^18 + (minZ + CELL_RANGE)) * 2^16 + dx * 2^8 + dz`
+   * with `dx = maxX - minX`, `dz = maxZ - minZ`.
+   *
+   * `minX`/`minZ` are already clamped to +-(CELL_RANGE-1) by `_cellCoord`, so the
+   * biased values fit 18 bits exactly. The two extents get 8 bits each; a span
+   * wider than 255 cells is FOLDED to 255 and therefore only ever produces a
+   * FALSE EQUALITY between two >=255-cell spans sharing a corner — such spans
+   * already trip the `LARGE_SPAN_WARN_CELLS` diagnostic (a 255-cell run is a
+   * 255 m belt on the 1 m MU grid) and never occur in a transport scene.
+   *
+   * (Deviation from the plan's "4x16-bit" sketch, which is NOT collision-free
+   * over the documented +-131071 cell range: 4x16 = 64 bits > 53.)
+   */
+  spanKey(aabb: AABB): number {
+    const minX = this._cellCoord(aabb.min.x);
+    const minZ = this._cellCoord(aabb.min.z);
+    let dx = this._cellCoord(aabb.max.x) - minX;
+    let dz = this._cellCoord(aabb.max.z) - minZ;
+    if (dx > 255) dx = 255;
+    if (dz > 255) dz = 255;
+    const bx = minX + CELL_RANGE;
+    const bz = minZ + CELL_RANGE;
+    return (bx * 0x40000 + bz) * 0x10000 + dx * 0x100 + dz;
+  }
+
+  /** Tick at which the given cell's content last changed (`-1` if never). */
+  cellLastChangeTick(cx: number, cz: number): number {
+    const t = this._cellChangeTick.get(cx * KEY_STRIDE + CELL_RANGE + cz);
+    return t === undefined ? -1 : t;
+  }
+
+  /** Highest `cellLastChangeTick` over every cell of `aabb`'s span (`-1` when
+   *  none of them ever changed). The cell-union cache is valid exactly while
+   *  this is BELOW the tick the cache was stamped at. */
+  maxCellChangeTick(aabb: AABB): number {
+    const minX = this._cellCoord(aabb.min.x);
+    const minZ = this._cellCoord(aabb.min.z);
+    const maxX = this._cellCoord(aabb.max.x);
+    const maxZ = this._cellCoord(aabb.max.z);
+    let latest = this._epochTick;
+    for (let cx = minX; cx <= maxX; cx++) {
+      const rowKey = cx * KEY_STRIDE + CELL_RANGE;
+      for (let cz = minZ; cz <= maxZ; cz++) {
+        const t = this._cellChangeTick.get(rowKey + cz);
+        if (t !== undefined && t > latest) latest = t;
+      }
+    }
+    return latest;
+  }
+
+  /** Max `aabb.max.y` over the entries of one cell (`-Infinity` when empty).
+   *  Lazily recomputed when a removal invalidated the cached value. */
+  cellMaxTopY(cx: number, cz: number): number {
+    return this._cellMaxTopYByKey(cx * KEY_STRIDE + CELL_RANGE + cz);
+  }
+
+  /** Max `aabb.max.y` over every cell touched by `aabb`'s span
+   *  (`-Infinity` when the span is empty) — the fast-path's `topYUpper`. */
+  maxTopYOverSpan(aabb: AABB): number {
+    const minX = this._cellCoord(aabb.min.x);
+    const minZ = this._cellCoord(aabb.min.z);
+    const maxX = this._cellCoord(aabb.max.x);
+    const maxZ = this._cellCoord(aabb.max.z);
+    let top = -Infinity;
+    for (let cx = minX; cx <= maxX; cx++) {
+      const rowKey = cx * KEY_STRIDE + CELL_RANGE;
+      for (let cz = minZ; cz <= maxZ; cz++) {
+        const t = this._cellMaxTopYByKey(rowKey + cz);
+        if (t > top) top = t;
+      }
+    }
+    return top;
+  }
+
+  private _cellMaxTopYByKey(key: number): number {
+    const cached = this._cellMaxTopY.get(key);
+    if (cached !== undefined && !Number.isNaN(cached)) return cached;
+    const bucket = this._cells.get(key);
+    if (!bucket || bucket.length === 0) return -Infinity;
+    let top = -Infinity;
+    for (let i = 0; i < bucket.length; i++) {
+      if (bucket[i].maxY > top) top = bucket[i].maxY;
+    }
+    this._cellMaxTopY.set(key, top);
+    return top;
+  }
+
+  /** A pure Y move (unchanged cell span): refresh the metadata of every cell the
+   *  entry occupies and stamp them as changed. */
+  private _noteMaxYChanged(entry: GridEntry<T>, newMaxY: number): void {
+    const rising = newMaxY > entry.maxY;
+    entry.maxY = newMaxY;
+    for (let cx = entry.cellMinX; cx <= entry.cellMaxX; cx++) {
+      const rowKey = cx * KEY_STRIDE + CELL_RANGE;
+      for (let cz = entry.cellMinZ; cz <= entry.cellMaxZ; cz++) {
+        const key = rowKey + cz;
+        this._cellChangeTick.set(key, this.currentTick);
+        if (rising) {
+          const top = this._cellMaxTopY.get(key);
+          if (top === undefined || newMaxY > top) this._cellMaxTopY.set(key, newMaxY);
+        } else {
+          // The entry may have BEEN the maximum -> recompute lazily on read.
+          this._cellMaxTopY.set(key, NaN);
+        }
+      }
+    }
+  }
+
   // ─── internals ─────────────────────────────────────────────────────
 
   /** World coordinate → clamped integer cell coordinate. */
@@ -270,6 +464,11 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
           this._cells.set(key, bucket);
         }
         bucket.push(entry);
+        this._cellChangeTick.set(key, this.currentTick);
+        const top = this._cellMaxTopY.get(key);
+        // undefined (fresh cell) or a smaller max -> this entry defines it;
+        // a NaN sentinel stays NaN (recomputed lazily on read).
+        if (top === undefined || entry.maxY > top) this._cellMaxTopY.set(key, entry.maxY);
       }
     }
   }
@@ -288,9 +487,14 @@ export class SpatialGridXZ<T extends { readonly aabb: AABB }> {
           bucket[idx] = bucket[bucket.length - 1];
           bucket.pop();
         }
+        this._cellChangeTick.set(key, this.currentTick);
         if (bucket.length === 0) {
           this._cells.delete(key);
+          this._cellMaxTopY.delete(key);
           this._arrayPool.push(bucket);
+        } else if (idx >= 0) {
+          // The removed entry may have been the maximum — invalidate.
+          this._cellMaxTopY.set(key, NaN);
         }
       }
     }

@@ -31,6 +31,7 @@ import { EventEmitter } from '../src/core/rv-events';
 import { AABB } from '../src/core/engine/rv-aabb';
 import { RVMovingUnit } from '../src/core/engine/rv-mu';
 import { RVSensor } from '../src/core/engine/rv-sensor';
+import { RVSink } from '../src/core/engine/rv-sink';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 import { RVPhysicsZone } from '../src/core/engine/rv-physics-zone';
 import {
@@ -57,6 +58,7 @@ import {
   type RapierVec3,
 } from '@rv-private/physics/rapier-lib-loader';
 import {
+  PHYSICS_DEFAULT_MU_MASS_KG,
   PHYSICS_FIXED_DT,
   PHYSICS_SETTLE_FRAMES,
   PHYSICS_SETTLE_LIN_VEL,
@@ -94,6 +96,13 @@ class FakeBody implements RapierRigidBody {
   linvel(): RapierVec3 { return this.vel; }
   setLinvel(vel: RapierVec3, _wakeUp: boolean): void { this.vel = { ...vel }; }
   setTranslation(t: RapierVec3, _wakeUp: boolean): void { this.pos = { ...t }; }
+  // plan-467 additions to the RapierRigidBody surface. This suite drives no
+  // kinematic moving parts (rv-physics-kinematic-body.test.ts does) — these
+  // exist so the fake still satisfies the interface the provider calls through.
+  mass(): number { return 1; }
+  isSleeping(): boolean { return false; }
+  setNextKinematicTranslation(t: RapierVec3): void { this.pos = { ...t }; }
+  setNextKinematicRotation(r: RapierQuat): void { this.rot = { ...r }; }
 }
 
 class FakeDesc implements RapierRigidBodyDesc {
@@ -104,6 +113,9 @@ class FakeDesc implements RapierRigidBodyDesc {
   setTranslation(x: number, y: number, z: number): FakeDesc { this.pos = { x, y, z }; return this; }
   setRotation(q: RapierQuat): FakeDesc { this.rot = { ...q }; return this; }
   setLinvel(x: number, y: number, z: number): FakeDesc { this.vel = { x, y, z }; return this; }
+  /** plan-467 F16: CCD on the dynamic MU (recorded, not simulated). */
+  ccd = false;
+  setCcdEnabled(e: boolean): FakeDesc { this.ccd = e; return this; }
 }
 
 class FakeColliderDesc implements RapierColliderDesc {
@@ -117,6 +129,11 @@ class FakeColliderDesc implements RapierColliderDesc {
   setRestitution(r: number): FakeColliderDesc { this.restitution = r; return this; }
   setSensor(s: boolean): FakeColliderDesc { this.sensor = s; return this; }
   setActiveEvents(e: number): FakeColliderDesc { this.activeEvents = e; return this; }
+  /** plan-467: collider offset + explicit mass (recorded, not simulated). */
+  translation: RapierVec3 | null = null;
+  mass: number | null = null;
+  setTranslation(x: number, y: number, z: number): FakeColliderDesc { this.translation = { x, y, z }; return this; }
+  setMass(m: number): FakeColliderDesc { this.mass = m; return this; }
 }
 
 class FakeEventQueue implements RapierEventQueue {
@@ -164,6 +181,10 @@ class FakeWorld {
     this.bodies.delete(body as FakeBody);
   }
   castRay(): null { return null; }
+  /** plan-467: solver settings + contact queries. No contacts in a fake world. */
+  integrationParameters = { numSolverIterations: 4 };
+  contactPairsWith(): void {}
+  contactPair(): void {}
   free(): void { this.freed = true; }
 }
 
@@ -188,9 +209,13 @@ function makeFakeLib(): RapierLib {
       dynamic: () => new FakeDesc('dynamic'),
       fixed: () => new FakeDesc('fixed'),
       kinematicVelocityBased: () => new FakeDesc('kinematic'),
+      // plan-467: pose-driven moving parts (exercised by
+      // rv-physics-kinematic-body.test.ts, not here).
+      kinematicPositionBased: () => new FakeDesc('kinematic'),
     },
     ColliderDesc: {
       cuboid: (hx: number, hy: number, hz: number) => new FakeColliderDesc(hx, hy, hz),
+      convexHull: () => new FakeColliderDesc(0, 0, 0),
     },
     CoefficientCombineRule: { Max: 3 },
     ActiveEvents: { COLLISION_EVENTS: 1 },
@@ -272,7 +297,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
   it('dispose frees world + event queue, clears handles, allows re-init', async () => {
     const provider = new RapierPhysicsProvider();
     await provider.init();
-    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0);
+    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     provider.dispose();
     expect(provider.ready).toBe(false);
     expect(FakeWorld.instances[0].freed).toBe(true);
@@ -294,7 +319,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const provider = new RapierPhysicsProvider();
     await provider.init();
-    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0);
+    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     FakeWorld.instances[0].throwOnStep = true;
 
     provider.step(PHYSICS_FIXED_DT);
@@ -307,7 +332,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
     expect(errSpy).toHaveBeenCalledTimes(1);          // no log spam
 
     // failed also gates the other entry points.
-    provider.addDynamicMU('mu2', pose(0, 1, 0), HE, V0);
+    provider.addDynamicMU('mu2', pose(0, 1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     const synced: string[] = [];
     provider.syncPoses((muId) => synced.push(muId));
     expect(synced).toEqual([]);
@@ -317,7 +342,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
   it('removeBody is idempotent two-phase: exactly one removeRigidBody at end of step', async () => {
     const provider = new RapierPhysicsProvider();
     await provider.init();
-    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0);
+    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     const world = FakeWorld.instances[0];
 
     provider.removeBody('mu1');
@@ -343,7 +368,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
     provider.addStaticBox('floor', { x: 0, y: -0.1, z: 0 }, { x: 5, y: 0.1, z: 5 }, Q_IDENT);
     provider.step(PHYSICS_FIXED_DT);
     expect(FakeWorld.instances[0].stepCount).toBe(0);
-    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0);
+    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     provider.step(PHYSICS_FIXED_DT); // handed over THIS tick — steps immediately
     expect(FakeWorld.instances[0].stepCount).toBe(1);
   });
@@ -351,9 +376,9 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
   it('getSettledBodies: N consecutive calm ticks + upright discriminator', async () => {
     const provider = new RapierPhysicsProvider();
     await provider.init();
-    provider.addDynamicMU('calm-upright', pose(0, 0.1, 0), HE, V0);
-    provider.addDynamicMU('calm-tipped', pose(1, 0.1, 0, Q_TIPPED), HE, V0);
-    provider.addDynamicMU('moving', pose(2, 0.1, 0), HE, { x: 0.5, y: 0, z: 0 });
+    provider.addDynamicMU('calm-upright', pose(0, 0.1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
+    provider.addDynamicMU('calm-tipped', pose(1, 0.1, 0, Q_TIPPED), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
+    provider.addDynamicMU('moving', pose(2, 0.1, 0), HE, { x: 0.5, y: 0, z: 0 }, PHYSICS_DEFAULT_MU_MASS_KG);
 
     for (let t = 1; t < PHYSICS_SETTLE_FRAMES; t++) {
       expect(provider.getSettledBodies(PHYSICS_SETTLE_LIN_VEL, PHYSICS_UPRIGHT_TOLERANCE_DEG)).toEqual([]);
@@ -366,7 +391,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
     const provider = new RapierPhysicsProvider();
     await provider.init();
     provider.addSensorBox('s1', { x: 0, y: 0.3, z: 0 }, { x: 0.2, y: 0.05, z: 0.2 }, Q_IDENT); // handle 0
-    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0); // handle 1
+    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG); // handle 1
     const events: Array<[string, string, boolean]> = [];
     provider.onSensorEvent = (sensorId, muId, entered) => events.push([sensorId, muId, entered]);
 
@@ -397,7 +422,7 @@ describe('RapierPhysicsProvider lifecycle (mocked RapierLibLoader — no WASM)',
       descSpy.push(desc as FakeColliderDesc);
       return origCreate(desc, parent);
     };
-    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0);
+    provider.addDynamicMU('mu1', pose(0, 1, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
     expect(descSpy[0].friction).toBeCloseTo(0.33);
     expect(descSpy[0].restitution).toBeCloseTo(0.25);
   });
@@ -431,7 +456,7 @@ describe('RapierPhysicsProvider × real Rapier WASM (out-of-band)', () => {
     try {
       // Floor top at y=0; MU (half extent 0.1) dropped from y=0.5 with belt velocity.
       provider.addStaticBox('floor', { x: 0, y: -0.1, z: 0 }, { x: 5, y: 0.1, z: 5 }, Q_IDENT);
-      provider.addDynamicMU('mu1', pose(0, 0.5, 0), HE, { x: 0.5, y: 0, z: 0 });
+      provider.addDynamicMU('mu1', pose(0, 0.5, 0), HE, { x: 0.5, y: 0, z: 0 }, PHYSICS_DEFAULT_MU_MASS_KG);
 
       let lastY = Number.NaN;
       let settled: string[] = [];
@@ -471,7 +496,7 @@ describe('RapierPhysicsProvider × real Rapier WASM (out-of-band)', () => {
       const events: Array<[string, string, boolean]> = [];
       provider.onSensorEvent = (sensorId, muId, entered) => events.push([sensorId, muId, entered]);
 
-      provider.addDynamicMU('mu1', pose(0, 0.8, 0), HE, V0);
+      provider.addDynamicMU('mu1', pose(0, 0.8, 0), HE, V0, PHYSICS_DEFAULT_MU_MASS_KG);
       for (let t = 0; t < 240; t++) provider.step(PHYSICS_FIXED_DT);
 
       expect(events.length).toBeGreaterThanOrEqual(2);
@@ -513,6 +538,11 @@ class PluginMockProvider implements PhysicsProvider {
   step(): void { this.stepCalls++; }
   syncPoses(_out: (muId: string, pos: PubPhysicsVec3, quat: PhysicsQuat) => void): void {}
   getSettledBodies(): string[] { return []; }
+  // plan-467 moving colliders — this mock does not exercise them; the methods
+  // exist so the mock still satisfies the PhysicsProvider contract.
+  addKinematicBody(): void {}
+  setKinematicPose(): void {}
+  forEachContactLoad(): void {}
 }
 
 interface FakeViewerHandle {
@@ -819,5 +849,125 @@ describe('PhysicsZonePlugin lifecycle guards (plan-276 Phase 3)', () => {
     plugin.dispose();
     expect(mock.onSensorEvent).toBeNull(); // teardown unwires its own handler
     expect(tm.physicsManagedSensors).toBeNull();
+  });
+
+  describe('zone exit → passive load of the holding carrier (Festo logos in a box)', () => {
+    /** A non-physics MU acting as an open box: 0.1 × 0.04 × 0.1 m around `y`. */
+    function boxMU(tm: RVTransportManager, x: number, y: number): RVMovingUnit {
+      const node = new Object3D();
+      node.name = 'Box';
+      node.position.set(x, y, 0);
+      node.updateMatrixWorld(true);
+      const mu = new RVMovingUnit(node, 'box-source', new Vector3(0.05, 0.02, 0.05));
+      mu.updateAABB();
+      tm.mus.push(mu);
+      return mu;
+    }
+
+    function partMU(tm: RVTransportManager, x: number, y: number): RVMovingUnit {
+      const node = new Object3D();
+      node.name = 'logo';
+      node.position.set(x, y, 0);
+      node.updateMatrixWorld(true);
+      const mu = new RVMovingUnit(node, 'logo-source', new Vector3(0.01, 0.01, 0.01));
+      mu.updateAABB();
+      mu.physicsOwned = true;
+      mu.physicsBodyId = String(mu.id);
+      tm.mus.push(mu);
+      return mu;
+    }
+
+    async function build(tm: RVTransportManager): Promise<PhysicsZonePlugin> {
+      makeZone([0, 1, 0], [0.4, 0.4, 0.4]); // x/z ±0.2, y 0.8..1.2
+      const plugin = new PhysicsZonePlugin();
+      plugin.onModelLoaded(makeLoadResult(tm), makeFakeViewer(tm).viewer);
+      await plugin.buildPromise;
+      return plugin;
+    }
+
+    it('a part lying in a box that left the zone stops being a body and rides as a load', async () => {
+      const tm = makeTM();
+      const plugin = await build(tm);
+      const box = boxMU(tm, 1, 1);           // outside the zone
+      const logo = partMU(tm, 1, 0.995);     // inside the box volume
+      const bodyId = logo.physicsBodyId!;
+
+      plugin.onFixedUpdatePost(DT);
+
+      expect(mock.removedMUs).toContain(bodyId);
+      expect(logo.physicsOwned).toBe(false);
+      expect(logo.physicsBodyId).toBeNull();
+      expect(logo.loadedOn).toBe(box);
+      expect(box.loadedMus).toContain(logo);
+      expect(tm.mus).not.toContain(logo);
+      expect(logo.node.parent).toBe(box.node);
+      plugin.dispose();
+    });
+
+    it('a part inside the zone stays physical even when it lies in a box', async () => {
+      const tm = makeTM();
+      const plugin = await build(tm);
+      boxMU(tm, 0, 1);
+      const logo = partMU(tm, 0, 0.995);
+
+      plugin.onFixedUpdatePost(DT);
+
+      expect(logo.physicsOwned).toBe(true);
+      expect(logo.loadedOn).toBeNull();
+      expect(mock.removedMUs).toHaveLength(0);
+      plugin.dispose();
+    });
+
+    it('a tag sink takes the frozen part off the box like the body it was; authored loads pass', async () => {
+      const tm = makeTM();
+      const plugin = await build(tm);
+      const box = boxMU(tm, 1, 1);
+      const logo = partMU(tm, 1, 0.995);
+      logo.node.userData.tag = 'realvirtualLogo';
+      plugin.onFixedUpdatePost(DT); // freeze into the box
+      expect(logo.loadedOn).toBe(box);
+
+      // An authored load (never a body) with the same tag must pass untouched.
+      const authored = partMU(tm, 1, 0.995);
+      authored.physicsOwned = false;
+      authored.physicsBodyId = null;
+      authored.node.userData.tag = 'realvirtualLogo';
+      tm.mus.splice(tm.mus.indexOf(authored), 1);
+      box.node.attach(authored.node);
+      authored.loadedOn = box;
+      box.loadedMus.push(authored);
+
+      const sinkNode = new Object3D();
+      sinkNode.position.set(1, 1, 0);
+      sinkNode.updateMatrixWorld(true);
+      const sink = new RVSink(sinkNode, AABB.fromHalfSize(sinkNode, new Vector3(0.1, 0.1, 0.1)));
+      sink.DeleteOnlyTag = 'realvirtualLogo';
+      tm.sinks.push(sink);
+      const consumed: unknown[] = [];
+      sink.subscribeConsumed((mu) => consumed.push(mu));
+
+      plugin.onFixedUpdatePost(DT);
+
+      expect(consumed).toEqual([logo]);
+      expect(logo.markedForRemoval).toBe(true);
+      expect(logo.loadedOn).toBeNull();
+      expect(tm.mus).toContain(logo);            // swap-and-pop disposes it next tick
+      expect(box.loadedMus).toEqual([authored]);
+      expect(box.markedForRemoval).toBe(false);
+      plugin.dispose();
+    });
+
+    it('a part outside every zone without a carrier stays physical (RemoveBelowY catches it)', async () => {
+      const tm = makeTM();
+      const plugin = await build(tm);
+      boxMU(tm, 1, 1);
+      const logo = partMU(tm, 1, 1.2); // far above the box top
+
+      plugin.onFixedUpdatePost(DT);
+
+      expect(logo.physicsOwned).toBe(true);
+      expect(logo.loadedOn).toBeNull();
+      plugin.dispose();
+    });
   });
 });

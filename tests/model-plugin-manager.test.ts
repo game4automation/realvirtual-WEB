@@ -178,6 +178,34 @@ describe('baseline — planner suppression', () => {
     expect(mod.unregistered).toHaveLength(1);
   });
 
+  it('reports the deferral, so the bake can say "claims not checked" (plan-754 D17)', async () => {
+    // `RVViewer._collectBakeClaims()` reads this. While the module is resolved
+    // but unregistered, NO plugin can answer `bakeClaims()` — the claim set is
+    // unknown, not empty, and the removal report must not show a clean zero.
+    const mod = moduleWith();
+    const mgr = new ModelPluginManager({
+      importers: importers({ '/src/plugins/models/Toray/index.ts': mod }),
+    });
+    expect(mgr.hasDeferredModelPlugins()).toBe(false); // no module at all yet
+
+    setContext('planner', true);
+    await mgr.onModelLoading('/models/Toray.glb', fakeViewer());
+    expect(mgr.hasDeferredModelPlugins()).toBe(true);
+
+    setContext('planner', false);
+    expect(mgr.hasDeferredModelPlugins()).toBe(false);
+  });
+
+  it('a module registered right away is never reported as deferred', async () => {
+    const mod = moduleWith();
+    const mgr = new ModelPluginManager({
+      importers: importers({ '/src/plugins/models/Toray/index.ts': mod }),
+    });
+    await mgr.onModelLoading('/models/Toray.glb', fakeViewer());
+    expect(mod.registered).toHaveLength(1);
+    expect(mgr.hasDeferredModelPlugins()).toBe(false);
+  });
+
   it('does not unregister a module that was never registered', async () => {
     const mod = moduleWith();
     const mgr = new ModelPluginManager({
@@ -191,6 +219,131 @@ describe('baseline — planner suppression', () => {
     await mgr.onModelLoading('/models/Toray.glb', viewer);
     await mgr.onModelLoading('/models/Other.glb', viewer);
     expect(mod.unregistered).toHaveLength(0);
+  });
+});
+
+describe('planner suppression — the persisted-panel peek is boot-only', () => {
+  // `rv-left-panel-active` is what `LeftPanelManager` persists; a visit to the
+  // planner demo leaves `layout-planner` in it. Before 2026-09-26 the manager
+  // read it on EVERY load, so a later model switch in HMI mode — a recents
+  // click onto the demo — deferred the demo's HMI plugins, and nothing ever
+  // registered them because no context change followed. A reload "fixed" it
+  // only because boot applies the mode after the load.
+  const STALE = JSON.stringify({ left: { id: 'layout-planner' } });
+
+  it('defers the FIRST load on a persisted planner panel (boot flash guard kept)', async () => {
+    localStorage.setItem('rv-left-panel-active', STALE);
+    const mod = moduleWith();
+    const mgr = new ModelPluginManager({
+      importers: importers({ '/src/plugins/models/Toray/index.ts': mod }),
+    });
+    await mgr.onModelLoading('/models/Toray.glb', fakeViewer());
+    expect(mod.registered).toHaveLength(0);
+    expect(mgr.hasDeferredModelPlugins()).toBe(true);
+    // Boot then applies the workspace mode → a context change → registration.
+    setContext('mode:hmi', true);
+    expect(mod.registered).toHaveLength(1);
+  });
+
+  it('registers a LATER model switch right away although the stale key is still there', async () => {
+    localStorage.setItem('rv-left-panel-active', STALE);
+    const first = moduleWith();
+    const demo = moduleWith();
+    const mgr = new ModelPluginManager({
+      importers: importers({
+        '/src/plugins/models/Toray/index.ts': first,
+        '/src/plugins/models/DemoRealvirtualWeb/index.ts': demo,
+      }),
+    });
+    const viewer = fakeViewer();
+    await mgr.onModelLoading('/models/Toray.glb', viewer);
+    setContext('mode:hmi', true); // boot's mode application
+    expect(first.registered).toHaveLength(1);
+
+    // The recents click: same mode, no context change afterwards.
+    await mgr.onModelLoading('rvproject:DemoRealvirtualWeb.glb', viewer);
+    expect(first.unregistered).toHaveLength(1);
+    expect(demo.registered).toHaveLength(1);
+    expect(mgr.hasDeferredModelPlugins()).toBe(false);
+  });
+
+  it('still defers a later switch when the planner is LIVE', async () => {
+    const first = moduleWith();
+    const demo = moduleWith();
+    const mgr = new ModelPluginManager({
+      importers: importers({
+        '/src/plugins/models/Toray/index.ts': first,
+        '/src/plugins/models/DemoRealvirtualWeb/index.ts': demo,
+      }),
+    });
+    const viewer = fakeViewer();
+    await mgr.onModelLoading('/models/Toray.glb', viewer);
+    setContext('planner', true);
+    await mgr.onModelLoading('rvproject:DemoRealvirtualWeb.glb', viewer);
+    expect(demo.registered).toHaveLength(0);
+    setContext('planner', false);
+    expect(demo.registered).toHaveLength(1);
+  });
+});
+
+describe('planner suppression — runInAuthoringModes opt-in', () => {
+  // DES is an authoring mode, so entering it raises the `planner` context and
+  // used to unregister EVERY model plugin — including project simulation logic
+  // the DES run depends on (the AGVFactory work plan: vehicles circled the oval
+  // with no task). A module that lists the mode stays registered there.
+
+  /** Mirror of ModeManager.setMode + the planner's activate hook ordering. */
+  function enterMode(from: string | null, to: string, authoring: boolean): void {
+    if (from) setContext(`mode:${from}`, false);
+    setContext(`mode:${to}`, true);
+    setContext('planner', authoring);
+  }
+
+  function optedIn(modes: string[]): SpyModule {
+    const mod = moduleWith();
+    mod.runInAuthoringModes = modes;
+    return mod;
+  }
+
+  it('keeps an opted-in module registered when DES is entered — no churn', async () => {
+    const mod = optedIn(['des']);
+    const mgr = new ModelPluginManager({ importers: importers({ '/src/plugins/models/Toray/index.ts': mod }) });
+    setContext('mode:hmi', true);
+    await mgr.onModelLoading('/models/Toray.glb', fakeViewer());
+    expect(mod.registered).toHaveLength(1);
+
+    enterMode('hmi', 'des', true);
+    expect(mod.unregistered).toHaveLength(0);
+    expect(mgr.hasDeferredModelPlugins()).toBe(false);
+  });
+
+  it('registers an opted-in module loaded while DES is already active', async () => {
+    const mod = optedIn(['des']);
+    const mgr = new ModelPluginManager({ importers: importers({ '/src/plugins/models/Toray/index.ts': mod }) });
+    enterMode(null, 'des', true);
+    await mgr.onModelLoading('/models/Toray.glb', fakeViewer());
+    expect(mod.registered).toHaveLength(1);
+  });
+
+  it('still suppresses the opted-in module in the plain planner mode', async () => {
+    const mod = optedIn(['des']);
+    const mgr = new ModelPluginManager({ importers: importers({ '/src/plugins/models/Toray/index.ts': mod }) });
+    enterMode(null, 'des', true);
+    await mgr.onModelLoading('/models/Toray.glb', fakeViewer());
+
+    enterMode('des', 'planner', true); // `planner` context stays on throughout
+    expect(mod.unregistered).toHaveLength(1);
+    enterMode('planner', 'des', true);
+    expect(mod.registered).toHaveLength(2);
+  });
+
+  it('leaves a module without the opt-in suppressed in DES (unchanged default)', async () => {
+    const mod = moduleWith();
+    const mgr = new ModelPluginManager({ importers: importers({ '/src/plugins/models/Toray/index.ts': mod }) });
+    enterMode(null, 'des', true);
+    await mgr.onModelLoading('/models/Toray.glb', fakeViewer());
+    expect(mod.registered).toHaveLength(0);
+    expect(mgr.hasDeferredModelPlugins()).toBe(true);
   });
 });
 

@@ -33,6 +33,10 @@ import {
   ProjectCard, type ProjectCardMenuAction, type ProjectCardModel,
 } from './ProjectCard';
 import { PROJECTS_CARD_SIZE_KEY } from '../rv-storage-keys';
+import { DocumentInfoTooltip } from './DocumentInfoTooltip';
+import { DocumentModeChip } from './DocumentModeChip';
+import type { DocumentInfo } from '../../project/rv-document-info';
+import type { DocumentClassification } from '../../project/rv-document-classification';
 
 /** Card edge length in pixels: the grid's `minmax` floor. */
 const MIN_CARD = 72;
@@ -69,6 +73,14 @@ export interface FolderTileModel {
   onOpen: () => void;
   /** Right-click menu; omit for a folder with no verbs beyond navigation. */
   menuActions?: ProjectCardMenuAction[];
+  /**
+   * Drop target (customer feedback 2026-09-30): a card dragged onto the tile
+   * moves INTO this folder, exactly as a drop onto the folder's tree row does.
+   * `acceptsDrop` runs on every drag-over and decides whether the tile lights
+   * up; `onDrop` performs the move. Omit both for a tile nothing can land on.
+   */
+  acceptsDrop?: (e: React.DragEvent) => boolean;
+  onDrop?: (e: React.DragEvent) => void;
 }
 
 /**
@@ -87,19 +99,38 @@ function FolderTile({ tile, touchInput = false }: {
   touchInput?: boolean;
 }) {
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
+  // True while an accepted drag hovers the tile — the "drop here" wash.
+  const [dropOver, setDropOver] = useState(false);
   const hasMenu = (tile.menuActions?.length ?? 0) > 0;
   const iconSx = { width: '68%', height: '68%', color: 'rgba(255,255,255,0.5)' };
   const longPress = useLongPress({
     enabled: touchInput && hasMenu,
     onLongPress: (x, y) => setCtxPos({ x, y }),
   });
+  const canDrop = !!tile.acceptsDrop && !!tile.onDrop;
   return (
     <>
       <Box
+        data-folder-tile={tile.key}
         // The trailing click of a long-press must not navigate: the user asked
         // for the menu, not for the folder behind it.
         onClick={() => { if (!longPress.consumedLastGesture()) tile.onOpen(); }}
         onDoubleClick={tile.onOpen}
+        // The refusal happens on drag-over, before any wash is painted — the
+        // tree's rule (`ProjectTree.handleDragOver`), so a card that may not
+        // move into this folder gets no invitation from the tile either.
+        onDragOver={canDrop ? (e) => {
+          if (!tile.acceptsDrop!(e)) { setDropOver(false); return; }
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'move';
+          setDropOver(true);
+        } : undefined}
+        onDragLeave={canDrop ? () => setDropOver(false) : undefined}
+        onDrop={canDrop ? (e) => {
+          e.preventDefault();
+          setDropOver(false);
+          tile.onDrop!(e);
+        } : undefined}
         onContextMenu={hasMenu
           ? (e) => { e.preventDefault(); e.stopPropagation(); setCtxPos({ x: e.clientX, y: e.clientY }); }
           : undefined}
@@ -117,14 +148,15 @@ function FolderTile({ tile, touchInput = false }: {
           gap: 0.25,
           p: 0.5,
           borderRadius: 1,
-          border: '1px solid transparent',
+          border: dropOver ? '1px solid rgba(79,195,247,0.8)' : '1px solid transparent',
+          bgcolor: dropOver ? 'rgba(79,195,247,0.12)' : undefined,
           cursor: 'pointer',
           userSelect: 'none',
           // A hover wash on a device that cannot hover sticks after the tap and
           // reads as a selection. Touch gets a press flash instead.
           ...(touchInput
             ? { '&:active': { bgcolor: 'rgba(255,255,255,0.10)' } }
-            : { '&:hover': { bgcolor: 'rgba(255,255,255,0.06)' } }),
+            : { '&:hover': { bgcolor: dropOver ? 'rgba(79,195,247,0.12)' : 'rgba(255,255,255,0.06)' } }),
         }}
       >
         <Box
@@ -181,6 +213,18 @@ export interface FolderCardModel extends ProjectCardModel {
   draggable?: boolean;
   onDragStart?: (e: React.DragEvent) => void;
   onDragEnd?: (e: React.DragEvent) => void;
+  /**
+   * The document's description, from the manifest row (plan-506 F6) — a
+   * cache read, never a GLB read on hover. Absent: the card has no tooltip.
+   */
+  documentInfo?: DocumentInfo | null;
+  /** Level and tags, for the tooltip's footer line. */
+  classification?: DocumentClassification | null;
+  /**
+   * The mode a double-click opens this document in (plan-513 F10) — the
+   * host's `effectiveOpenMode`. Absent or unknown: no chip.
+   */
+  openMode?: string | null;
 }
 
 export interface ProjectFolderContentsProps {
@@ -224,6 +268,8 @@ export interface ProjectFolderContentsProps {
   compactLayout?: boolean;
   /** Coarse pointer: long-press stands in for right-click, no hover states. */
   touchInput?: boolean;
+  /** `viewer.modes.descriptor(id)?.label`, for the cards' mode chip (plan-513). */
+  modeLabel?(mode: string): string | undefined;
 }
 
 export function ProjectFolderContents({
@@ -235,6 +281,7 @@ export function ProjectFolderContents({
   tileGroups = [],
   compactLayout = false,
   touchInput = false,
+  modeLabel,
 }: ProjectFolderContentsProps) {
   const [cardSize, setCardSize] = useState(readCardSize);
 
@@ -337,20 +384,43 @@ export function ProjectFolderContents({
             </Box>
           ))}
           {cards.map(card => (
-            <Box
+            // The listitem itself is the tooltip anchor, so a card without a
+            // description gets no extra element at all (plan-506 F6).
+            <DocumentInfoTooltip
               key={card.key}
-              role="listitem"
-              aria-label={card.entry.name}
-              data-card-path={card.key}
-              data-card-selected={card.selected ? 'true' : undefined}
-              tabIndex={-1}
-              draggable={(!compactLayout && card.draggable) || undefined}
-              onDragStart={compactLayout ? undefined : card.onDragStart}
-              onDragEnd={compactLayout ? undefined : card.onDragEnd}
-              sx={{ minWidth: 0 }}
+              name={card.entry.name}
+              info={card.documentInfo}
+              classification={card.classification}
+              touch={touchInput}
             >
-              <ProjectCard card={card} touchInput={touchInput} />
-            </Box>
+              <Box
+                role="listitem"
+                aria-label={card.entry.name}
+                data-card-path={card.key}
+                data-card-selected={card.selected ? 'true' : undefined}
+                tabIndex={-1}
+                draggable={(!compactLayout && card.draggable) || undefined}
+                onDragStart={compactLayout ? undefined : card.onDragStart}
+                onDragEnd={compactLayout ? undefined : card.onDragEnd}
+                sx={{ minWidth: 0, position: 'relative' }}
+              >
+                <ProjectCard card={card} touchInput={touchInput} />
+                {/* Over the preview's top-right corner, where it reads as a
+                    property of the document and costs the label nothing.
+                    Inert to the pointer: the card's own clicks pass through. */}
+                {modeLabel && (
+                  <DocumentModeChip
+                    mode={card.openMode}
+                    modeLabel={modeLabel}
+                    testId={`card-mode-${card.key}`}
+                    sx={{
+                      position: 'absolute', top: 6, right: 6, pointerEvents: 'none',
+                      bgcolor: 'rgba(0,0,0,0.55)',
+                    }}
+                  />
+                )}
+              </Box>
+            </DocumentInfoTooltip>
           ))}
           {tileGroups.filter(group => group.tiles.length > 0).map(group => (
             <Fragment key={group.key}>

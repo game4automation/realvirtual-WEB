@@ -172,7 +172,7 @@ async function plantUnregisteredFile(page: Page): Promise<PlantResult> {
 
 /** Run the adopt sweep the way a rescan does, and report the rows it left. */
 async function rescanAndRead(page: Page): Promise<{
-  rows: { id: string; name: string; path: string; section: string }[];
+  rows: { id: string; name: string; path: string; section?: string }[];
 }> {
   return page.evaluate(async (paths) => {
     const [projectStore, documents] = await Promise.all([
@@ -184,7 +184,7 @@ async function rescanAndRead(page: Page): Promise<{
     return {
       rows: documents
         .documentsOf(store.getProject())
-        .map((d: { id: string; name: string; path: string; section: string }) => ({
+        .map((d: { id: string; name: string; path: string; section?: string }) => ({
           id: d.id, name: d.name, path: d.path, section: d.section,
         })),
     };
@@ -297,7 +297,13 @@ test.describe('an unregistered library file, adopted and then renamed (plan-717)
     // written into a saved GLB before the upgrade still resolve (§2.5, F8).
     expect(row!.id).toBe(expectedId);
     expect(row!.name).toBe('E2E Adopted Roller');
-    expect(row!.section).toBe('library');
+    // No `section` on an adopted row (plan-744 Phase 2). It used to read
+    // `library` — not because anything stamped it here, but because the path
+    // heuristic's FALLBACK is `library`, which is exactly the ambiguity the
+    // field was retired for: it said the same thing for a real `library/`
+    // file, a root-level one, and a browser scene. The PATH is the answer.
+    expect(row!.section).toBeUndefined();
+    expect(row!.path.startsWith('library/')).toBe(true);
 
     // Idempotent: a second rescan finds nothing to do and changes nothing.
     const again = await rescanAndRead(page);

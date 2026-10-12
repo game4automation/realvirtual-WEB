@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-09-06T15:10:26.904Z",
-  "sourceCommit": "2abcc7483b0812676dcdb56b6b03de1021da5d65",
+  "generatedAt": "2026-09-21T20:41:48.472Z",
+  "sourceCommit": "1644ed1ee061423e57858ecf0159eb092958c0c8",
   "cases": {
     "sampleStride": 4,
     "tangentBetween": [
@@ -894,6 +894,218 @@
         ]
       },
       {
+        "name": "start-wrap-left",
+        "rollers": [
+          {
+            "cx": 0,
+            "cy": 0,
+            "r": 400,
+            "side": 1,
+            "wrapRad": 4.71238898038469
+          },
+          {
+            "cx": 2000,
+            "cy": 0,
+            "r": 150,
+            "side": 1
+          }
+        ],
+        "error": null,
+        "resolvedSides": [
+          1,
+          1
+        ],
+        "lengthMm": 3869.269075452319,
+        "segments": [
+          {
+            "kind": "arc",
+            "cx": 0,
+            "cy": 0,
+            "r": 400,
+            "a0": -6.157857476011521,
+            "sweep": 4.71238898038469,
+            "lengthMm": 1884.9555921538758,
+            "wrapAngle": 4.71238898038469
+          },
+          {
+            "kind": "line",
+            "x0": 50,
+            "y0": -396.8626966596886,
+            "x1": 2018.75,
+            "y1": -148.82351124738324,
+            "lengthMm": 1984.313483298443
+          }
+        ]
+      },
+      {
+        "name": "end-wrap-right",
+        "rollers": [
+          {
+            "cx": 0,
+            "cy": 0,
+            "r": 200,
+            "side": -1
+          },
+          {
+            "cx": 2000,
+            "cy": 0,
+            "r": 90,
+            "side": -1,
+            "wrapRad": 4.71238898038469
+          }
+        ],
+        "error": null,
+        "resolvedSides": [
+          -1,
+          -1
+        ],
+        "lengthMm": 2421.0877171117363,
+        "segments": [
+          {
+            "kind": "line",
+            "x0": 11,
+            "y0": 199.69727088771143,
+            "x1": 2004.95,
+            "y1": 89.86377189947014,
+            "lengthMm": 1996.9727088771144
+          },
+          {
+            "kind": "arc",
+            "cx": 2000,
+            "cy": 0,
+            "r": 90,
+            "a0": 1.5157685598137953,
+            "sweep": -4.71238898038469,
+            "lengthMm": 424.11500823462205,
+            "wrapAngle": 4.71238898038469
+          }
+        ]
+      },
+      {
+        "name": "both-ends-wrapped",
+        "rollers": [
+          {
+            "cx": 0,
+            "cy": 0,
+            "r": 450,
+            "side": 1,
+            "wrapRad": 3.141592653589793
+          },
+          {
+            "cx": 1500,
+            "cy": 600,
+            "r": 100,
+            "side": 0
+          },
+          {
+            "cx": 3400,
+            "cy": 0,
+            "r": 190,
+            "side": 1,
+            "wrapRad": 1.5707963267948966
+          }
+        ],
+        "error": null,
+        "resolvedSides": [
+          1,
+          -1,
+          1
+        ],
+        "lengthMm": 5320.4661031736705,
+        "segments": [
+          {
+            "kind": "arc",
+            "cx": 0,
+            "cy": 0,
+            "r": 450,
+            "a0": -3.984496247146306,
+            "sweep": 3.141592653589793,
+            "lengthMm": 1413.7166941154069,
+            "wrapAngle": 3.141592653589793
+          },
+          {
+            "kind": "line",
+            "x0": 299.3840434237584,
+            "y0": -335.96010855939596,
+            "x1": 1433.4702125724982,
+            "y1": 674.657801902088,
+            "lengthMm": 1519.045753096331
+          },
+          {
+            "kind": "arc",
+            "cx": 1500,
+            "cy": 600,
+            "r": 100,
+            "a0": 2.2986890600332797,
+            "sweep": -1.1798372681876965,
+            "lengthMm": 117.98372681876965,
+            "wrapAngle": 1.1798372681876965
+          },
+          {
+            "kind": "line",
+            "x0": 1543.6715661519213,
+            "y0": 689.9599594810844,
+            "x1": 3317.0240243113494,
+            "y1": -170.92392301406045,
+            "lengthMm": 1971.2686270521328
+          },
+          {
+            "kind": "arc",
+            "cx": 3400,
+            "cy": 0,
+            "r": 190,
+            "a0": -2.022740861744211,
+            "sweep": 1.5707963267948966,
+            "lengthMm": 298.45130209103036,
+            "wrapAngle": 1.5707963267948966
+          }
+        ]
+      },
+      {
+        "name": "start-wrap-over-full-turn",
+        "rollers": [
+          {
+            "cx": 0,
+            "cy": 0,
+            "r": 300,
+            "side": -1,
+            "wrapRad": 7.853981633974483
+          },
+          {
+            "cx": 2500,
+            "cy": 400,
+            "r": 120,
+            "side": -1
+          }
+        ],
+        "error": null,
+        "resolvedSides": [
+          -1,
+          -1
+        ],
+        "lengthMm": 4881.5855490186805,
+        "segments": [
+          {
+            "kind": "arc",
+            "cx": 0,
+            "cy": 0,
+            "r": 300,
+            "a0": 9.512277467379718,
+            "sweep": -7.853981633974483,
+            "lengthMm": 2356.194490192345,
+            "wrapAngle": 7.853981633974483
+          },
+          {
+            "kind": "line",
+            "x0": -26.216369276000044,
+            "y0": 298.85230797500026,
+            "x1": 2489.5134522896,
+            "y1": 519.5409231900001,
+            "lengthMm": 2525.3910588263357
+          }
+        ]
+      },
+      {
         "name": "too-few-rollers",
         "rollers": [
           {
@@ -1653,6 +1865,1487 @@
             "lAccMm": 0,
             "atMin": false,
             "atMax": false
+          }
+        }
+      ]
+    },
+    "tension": {
+      "nPerMPerPli": 175.1,
+      "minZoneLengthMm": 1,
+      "strainSteadyState": [
+        {
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 784,
+          "eps": -0.01020408163265306
+        },
+        {
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 816,
+          "eps": 0.029411764705882353
+        },
+        {
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 800,
+          "eps": 0.01
+        },
+        {
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 900,
+          "eps": 0.12
+        },
+        {
+          "epsIn": 0,
+          "vA": 800,
+          "vB": 800,
+          "eps": 0
+        },
+        {
+          "epsIn": 0.02,
+          "vA": 0,
+          "vB": 500,
+          "eps": 1
+        },
+        {
+          "epsIn": -0.005,
+          "vA": 600,
+          "vB": 620,
+          "eps": 0.027419354838709678
+        },
+        {
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 0,
+          "eps": null
+        },
+        {
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": -400,
+          "eps": null
+        },
+        {
+          "epsIn": null,
+          "vA": 800,
+          "vB": 784,
+          "eps": null
+        }
+      ],
+      "strainStepImplicit": [
+        {
+          "name": "converging-slack",
+          "eps0": 0.01,
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 784,
+          "lengthMm": 800,
+          "dt": 0.02,
+          "steps": 20,
+          "results": [
+            0.009611612397018438,
+            0.009230690856236207,
+            0.008857091855861324,
+            0.008490674633053474,
+            0.008131301130888067,
+            0.007778835946339806,
+            0.007433146279266188,
+            0.007094101882371703,
+            0.006761575012133879,
+            0.006435440380672694,
+            0.006115575108545207,
+            0.005801858678447634,
+            0.005494172889807409,
+            0.005192401814248145,
+            0.004896431751910695,
+            0.004606151188613863,
+            0.004321450753838626,
+            0.0040422231795200336,
+            0.0037683632596312603,
+            0.0034997678105445863
+          ]
+        },
+        {
+          "name": "converging-taut",
+          "eps0": 0.01,
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 816,
+          "lengthMm": 800,
+          "dt": 0.02,
+          "steps": 20,
+          "results": [
+            0.010388083104664837,
+            0.010768407589832258,
+            0.01114112856706415,
+            0.011506398046907241,
+            0.011864365000889103,
+            0.0122151754222747,
+            0.01255897238560829,
+            0.012895896105064964,
+            0.013226083991635598,
+            0.013549670709168559,
+            0.013866788229291022,
+            0.014177565885232283,
+            0.014482130424571034,
+            0.014780606060928101,
+            0.015073114524625736,
+            0.015359775112334122,
+            0.015640704735725326,
+            0.015916017969154574,
+            0.016185827096388255,
+            0.016450242156397742
+          ]
+        },
+        {
+          "name": "stability-short-zone",
+          "eps0": 0.01,
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 1000,
+          "lengthMm": 1,
+          "dt": 0.02,
+          "steps": 10,
+          "results": [
+            0.19857142857142857,
+            0.20755102040816326,
+            0.20797862001943637,
+            0.20799898190568747,
+            0.20799995151931844,
+            0.20799999769139613,
+            0.20799999989006648,
+            0.2079999999947651,
+            0.20799999999975075,
+            0.20799999999998814
+          ]
+        },
+        {
+          "name": "standing-web-keeps-strain",
+          "eps0": 0.013,
+          "epsIn": 0.01,
+          "vA": 0,
+          "vB": 0,
+          "lengthMm": 500,
+          "dt": 0.02,
+          "steps": 5,
+          "results": [
+            0.013,
+            0.013,
+            0.013,
+            0.013,
+            0.013
+          ]
+        },
+        {
+          "name": "backwards-freezes",
+          "eps0": 0.013,
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": -100,
+          "lengthMm": 500,
+          "dt": 0.02,
+          "steps": 3,
+          "results": [
+            0.013,
+            0.013,
+            0.013
+          ]
+        },
+        {
+          "name": "paused-frame",
+          "eps0": 0.013,
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 700,
+          "lengthMm": 500,
+          "dt": 0,
+          "steps": 3,
+          "results": [
+            0.013,
+            0.013,
+            0.013
+          ]
+        },
+        {
+          "name": "zero-length",
+          "eps0": 0.013,
+          "epsIn": 0.01,
+          "vA": 800,
+          "vB": 700,
+          "lengthMm": 0,
+          "dt": 0.02,
+          "steps": 3,
+          "results": [
+            0.013,
+            0.013,
+            0.013
+          ]
+        },
+        {
+          "name": "entering-strain-passes-through",
+          "eps0": 0,
+          "epsIn": 0.02,
+          "vA": 500,
+          "vB": 500,
+          "lengthMm": 250,
+          "dt": 0.02,
+          "steps": 15,
+          "results": [
+            0.0007692307692307692,
+            0.0015088757396449705,
+            0.0022200728265817024,
+            0.002903916179405483,
+            0.0035614578648129644,
+            0.0041937094853970805,
+            0.004801643735958732,
+            0.00538619589996032,
+            0.0059482652884233845,
+            0.006488716623484023,
+            0.007008381368734638,
+            0.00750805900839869,
+            0.007988518277306431,
+            0.008450498343563876,
+            0.008894709945734497
+          ]
+        }
+      ],
+      "tensionFromStrain": [
+        {
+          "stiffness": 10,
+          "widthMm": 500,
+          "eps": 0.01,
+          "tensionN": 50
+        },
+        {
+          "stiffness": 10,
+          "widthMm": 500,
+          "eps": 0,
+          "tensionN": 0
+        },
+        {
+          "stiffness": 10,
+          "widthMm": 500,
+          "eps": -0.02,
+          "tensionN": 0
+        },
+        {
+          "stiffness": 0,
+          "widthMm": 500,
+          "eps": 0.01,
+          "tensionN": 0
+        },
+        {
+          "stiffness": 10,
+          "widthMm": 0,
+          "eps": 0.01,
+          "tensionN": 0
+        },
+        {
+          "stiffness": 2.5,
+          "widthMm": 1200,
+          "eps": 0.035,
+          "tensionN": 105.00000000000001
+        }
+      ],
+      "strainFromTension": [
+        {
+          "tensionN": 50,
+          "stiffness": 10,
+          "widthMm": 500,
+          "eps": 0.01
+        },
+        {
+          "tensionN": 0,
+          "stiffness": 10,
+          "widthMm": 500,
+          "eps": 0
+        },
+        {
+          "tensionN": -25,
+          "stiffness": 10,
+          "widthMm": 500,
+          "eps": -0.005
+        },
+        {
+          "tensionN": 50,
+          "stiffness": 0,
+          "widthMm": 500,
+          "eps": 0
+        },
+        {
+          "tensionN": 50,
+          "stiffness": 10,
+          "widthMm": 0,
+          "eps": 0
+        },
+        {
+          "tensionN": 42,
+          "stiffness": 2.5,
+          "widthMm": 1200,
+          "eps": 0.014
+        }
+      ],
+      "tensionFromDancerLoad": [
+        {
+          "loadN": 100,
+          "strands": 2,
+          "tensionN": 50
+        },
+        {
+          "loadN": 100,
+          "strands": 1,
+          "tensionN": 100
+        },
+        {
+          "loadN": 100,
+          "strands": 3,
+          "tensionN": 33.333333333333336
+        },
+        {
+          "loadN": 0,
+          "strands": 2,
+          "tensionN": 0
+        },
+        {
+          "loadN": -50,
+          "strands": 2,
+          "tensionN": 0
+        },
+        {
+          "loadN": 100,
+          "strands": 0,
+          "tensionN": 100
+        },
+        {
+          "loadN": 100,
+          "strands": 0.5,
+          "tensionN": 100
+        }
+      ],
+      "classify": [
+        {
+          "name": "far-slack",
+          "eps": -0.02,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "slack"
+        },
+        {
+          "name": "just-slack",
+          "eps": -1e-9,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "slack"
+        },
+        {
+          "name": "at-min",
+          "eps": 0,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "below"
+        },
+        {
+          "name": "below-band",
+          "eps": 0.005,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "below"
+        },
+        {
+          "name": "at-band-low",
+          "eps": 0.009,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "below"
+        },
+        {
+          "name": "in-band-low",
+          "eps": 0.0091,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "inBand"
+        },
+        {
+          "name": "at-ref",
+          "eps": 0.01,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "inBand"
+        },
+        {
+          "name": "in-band-high",
+          "eps": 0.0109,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "inBand"
+        },
+        {
+          "name": "at-band-high",
+          "eps": 0.011,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "inBand"
+        },
+        {
+          "name": "above-band",
+          "eps": 0.015,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "above"
+        },
+        {
+          "name": "at-max",
+          "eps": 0.02,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "above"
+        },
+        {
+          "name": "just-over",
+          "eps": 0.0200001,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "over"
+        },
+        {
+          "name": "far-over",
+          "eps": 0.05,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "over"
+        },
+        {
+          "name": "at-break",
+          "eps": 0.07,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "broken"
+        },
+        {
+          "name": "past-break",
+          "eps": 0.09,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "broken"
+        },
+        {
+          "name": "break-disabled",
+          "eps": 0.5,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": null,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "over"
+        },
+        {
+          "name": "zero-tolerance-at-ref",
+          "eps": 0.01,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0
+          },
+          "state": "inBand"
+        },
+        {
+          "name": "zero-tolerance-below",
+          "eps": 0.0099,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0
+          },
+          "state": "below"
+        },
+        {
+          "name": "nan",
+          "eps": null,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "state": "inBand"
+        }
+      ],
+      "bandDeviation": [
+        {
+          "name": "in-band",
+          "eps": 0.01,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 0
+        },
+        {
+          "name": "at-band-low",
+          "eps": 0.009,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 1.9274705288631188e-16
+        },
+        {
+          "name": "halfway-down",
+          "eps": 0.0045,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 0.5000000000000001
+        },
+        {
+          "name": "at-min",
+          "eps": 0,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 1
+        },
+        {
+          "name": "past-min",
+          "eps": -0.01,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 1
+        },
+        {
+          "name": "at-band-high",
+          "eps": 0.011,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 0
+        },
+        {
+          "name": "halfway-up",
+          "eps": 0.0155,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 0.4999999999999999
+        },
+        {
+          "name": "at-max",
+          "eps": 0.02,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 1
+        },
+        {
+          "name": "past-max",
+          "eps": 0.04,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 1
+        },
+        {
+          "name": "zero-span-low",
+          "eps": 0.005,
+          "thresholds": {
+            "minStrain": 0.009,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 1
+        },
+        {
+          "name": "zero-span-high",
+          "eps": 0.05,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.011,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 1
+        },
+        {
+          "name": "nan",
+          "eps": null,
+          "thresholds": {
+            "minStrain": 0,
+            "maxStrain": 0.02,
+            "breakStrain": 0.07,
+            "refStrain": 0.01,
+            "tolerance": 0.1
+          },
+          "deviation": 0
+        }
+      ],
+      "specificTension": [
+        {
+          "tensionN": 50,
+          "widthMm": 500,
+          "nPerM": 100,
+          "pli": 0.5711022272986865
+        },
+        {
+          "tensionN": 50,
+          "widthMm": 1000,
+          "nPerM": 50,
+          "pli": 0.28555111364934327
+        },
+        {
+          "tensionN": 0,
+          "widthMm": 500,
+          "nPerM": 0,
+          "pli": 0
+        },
+        {
+          "tensionN": 50,
+          "widthMm": 0,
+          "nPerM": 0,
+          "pli": 0
+        },
+        {
+          "tensionN": 17.51,
+          "widthMm": 50,
+          "nPerM": 350.2,
+          "pli": 2
+        }
+      ],
+      "specificTenacity": [
+        {
+          "nPerM": 100,
+          "basisWeightGsm": 20,
+          "nmPerKg": 5000
+        },
+        {
+          "nPerM": 100,
+          "basisWeightGsm": 0,
+          "nmPerKg": 0
+        },
+        {
+          "nPerM": 100,
+          "basisWeightGsm": 60,
+          "nmPerKg": 1666.6666666666667
+        },
+        {
+          "nPerM": 0,
+          "basisWeightGsm": 20,
+          "nmPerKg": 0
+        }
+      ],
+      "breakStrain": [
+        {
+          "breakForceNPer50mm": 35,
+          "stiffness": 10,
+          "eps": 0.06999999999999999
+        },
+        {
+          "breakForceNPer50mm": 35,
+          "stiffness": 0,
+          "eps": null
+        },
+        {
+          "breakForceNPer50mm": 0,
+          "stiffness": 10,
+          "eps": null
+        },
+        {
+          "breakForceNPer50mm": -5,
+          "stiffness": 10,
+          "eps": null
+        },
+        {
+          "breakForceNPer50mm": 120,
+          "stiffness": 2.5,
+          "eps": 0.96
+        }
+      ]
+    },
+    "sag": {
+      "sagC1": 2.4380952380952383,
+      "sagEstimatedRatio": 0.17,
+      "profile": [
+        {
+          "s": 0,
+          "depthMm": 12,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.1,
+          "depthMm": 12,
+          "f": 1.5552000000000004,
+          "fPrime": 27.64800000000001
+        },
+        {
+          "s": 0.25,
+          "depthMm": 12,
+          "f": 6.75,
+          "fPrime": 36
+        },
+        {
+          "s": 0.5,
+          "depthMm": 12,
+          "f": 12,
+          "fPrime": 0
+        },
+        {
+          "s": 0.75,
+          "depthMm": 12,
+          "f": 6.75,
+          "fPrime": -36
+        },
+        {
+          "s": 0.9,
+          "depthMm": 12,
+          "f": 1.5551999999999995,
+          "fPrime": -27.647999999999996
+        },
+        {
+          "s": 1,
+          "depthMm": 12,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0,
+          "depthMm": 0,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.1,
+          "depthMm": 0,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.25,
+          "depthMm": 0,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.5,
+          "depthMm": 0,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.75,
+          "depthMm": 0,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.9,
+          "depthMm": 0,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 1,
+          "depthMm": 0,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0,
+          "depthMm": -8,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.1,
+          "depthMm": -8,
+          "f": -1.0368000000000002,
+          "fPrime": -18.432000000000002
+        },
+        {
+          "s": 0.25,
+          "depthMm": -8,
+          "f": -4.5,
+          "fPrime": -24
+        },
+        {
+          "s": 0.5,
+          "depthMm": -8,
+          "f": -8,
+          "fPrime": 0
+        },
+        {
+          "s": 0.75,
+          "depthMm": -8,
+          "f": -4.5,
+          "fPrime": 24
+        },
+        {
+          "s": 0.9,
+          "depthMm": -8,
+          "f": -1.0367999999999995,
+          "fPrime": 18.432
+        },
+        {
+          "s": 1,
+          "depthMm": -8,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0,
+          "depthMm": 250,
+          "f": 0,
+          "fPrime": 0
+        },
+        {
+          "s": 0.1,
+          "depthMm": 250,
+          "f": 32.400000000000006,
+          "fPrime": 576
+        },
+        {
+          "s": 0.25,
+          "depthMm": 250,
+          "f": 140.625,
+          "fPrime": 750
+        },
+        {
+          "s": 0.5,
+          "depthMm": 250,
+          "f": 250,
+          "fPrime": 0
+        },
+        {
+          "s": 0.75,
+          "depthMm": 250,
+          "f": 140.625,
+          "fPrime": -750
+        },
+        {
+          "s": 0.9,
+          "depthMm": 250,
+          "f": 32.39999999999999,
+          "fPrime": -575.9999999999999
+        },
+        {
+          "s": 1,
+          "depthMm": 250,
+          "f": 0,
+          "fPrime": 0
+        }
+      ],
+      "sagDepth": [
+        {
+          "excessMm": 2,
+          "lengthMm": 800,
+          "depthMm": 25.617376914898994
+        },
+        {
+          "excessMm": 0.2,
+          "lengthMm": 800,
+          "depthMm": 8.100925873009825
+        },
+        {
+          "excessMm": 50,
+          "lengthMm": 800,
+          "depthMm": 128.08688457449497
+        },
+        {
+          "excessMm": 0,
+          "lengthMm": 800,
+          "depthMm": 0
+        },
+        {
+          "excessMm": -5,
+          "lengthMm": 800,
+          "depthMm": 0
+        },
+        {
+          "excessMm": 2,
+          "lengthMm": 0,
+          "depthMm": 0
+        },
+        {
+          "excessMm": 4000,
+          "lengthMm": 800,
+          "depthMm": 400
+        },
+        {
+          "excessMm": 800,
+          "lengthMm": 200,
+          "depthMm": 100
+        }
+      ],
+      "sagExcess": [
+        {
+          "depthMm": 25,
+          "lengthMm": 800,
+          "excessMm": 1.9047619047619049
+        },
+        {
+          "depthMm": 0,
+          "lengthMm": 800,
+          "excessMm": 0
+        },
+        {
+          "depthMm": -25,
+          "lengthMm": 800,
+          "excessMm": 1.9047619047619049
+        },
+        {
+          "depthMm": 400,
+          "lengthMm": 800,
+          "excessMm": 487.61904761904765
+        },
+        {
+          "depthMm": 25,
+          "lengthMm": 0,
+          "excessMm": 0
+        }
+      ],
+      "isSagEstimated": [
+        {
+          "depthMm": 0,
+          "lengthMm": 800,
+          "estimated": false
+        },
+        {
+          "depthMm": 135.9,
+          "lengthMm": 800,
+          "estimated": false
+        },
+        {
+          "depthMm": 136.1,
+          "lengthMm": 800,
+          "estimated": true
+        },
+        {
+          "depthMm": -200,
+          "lengthMm": 800,
+          "estimated": true
+        },
+        {
+          "depthMm": 100,
+          "lengthMm": 0,
+          "estimated": false
+        }
+      ],
+      "perpGravity": [
+        {
+          "name": "horizontal-run",
+          "g": {
+            "x": 0,
+            "y": -9810,
+            "z": 0
+          },
+          "chord": {
+            "x": 1,
+            "y": 0,
+            "z": 0
+          },
+          "length": 9810,
+          "dir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          }
+        },
+        {
+          "name": "oblique-run",
+          "g": {
+            "x": 0,
+            "y": -9810,
+            "z": 0
+          },
+          "chord": {
+            "x": 0.6,
+            "y": 0.8,
+            "z": 0
+          },
+          "length": 5886,
+          "dir": {
+            "x": 0.8,
+            "y": -0.5999999999999999,
+            "z": 0
+          }
+        },
+        {
+          "name": "vertical-run",
+          "g": {
+            "x": 0,
+            "y": -9810,
+            "z": 0
+          },
+          "chord": {
+            "x": 0,
+            "y": 1,
+            "z": 0
+          },
+          "length": 0,
+          "dir": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          }
+        },
+        {
+          "name": "vertical-run-down",
+          "g": {
+            "x": 0,
+            "y": -9810,
+            "z": 0
+          },
+          "chord": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "length": 0,
+          "dir": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          }
+        },
+        {
+          "name": "unnormalised-chord",
+          "g": {
+            "x": 0,
+            "y": -9810,
+            "z": 0
+          },
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 250
+          },
+          "length": 9810,
+          "dir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          }
+        },
+        {
+          "name": "degenerate-chord",
+          "g": {
+            "x": 0,
+            "y": -9810,
+            "z": 0
+          },
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          "length": 0,
+          "dir": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          }
+        },
+        {
+          "name": "rotated-frame",
+          "g": {
+            "x": 6937.2,
+            "y": -6937.2,
+            "z": 0
+          },
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "length": 9810.682324894635,
+          "dir": {
+            "x": 0.7071067811865476,
+            "y": -0.7071067811865476,
+            "z": 0
+          }
+        }
+      ],
+      "distributeExcess": [
+        {
+          "name": "equal-thirds",
+          "lengthsMm": [
+            100,
+            100,
+            100
+          ],
+          "excessMm": 30,
+          "written": 3,
+          "shares": [
+            10,
+            10,
+            10
+          ]
+        },
+        {
+          "name": "proportional",
+          "lengthsMm": [
+            100,
+            300
+          ],
+          "excessMm": 40,
+          "written": 2,
+          "shares": [
+            10,
+            30
+          ]
+        },
+        {
+          "name": "with-arcs",
+          "lengthsMm": [
+            250,
+            0,
+            150,
+            0,
+            600
+          ],
+          "excessMm": 80,
+          "written": 5,
+          "shares": [
+            20,
+            0,
+            12,
+            0,
+            48
+          ]
+        },
+        {
+          "name": "single",
+          "lengthsMm": [
+            800
+          ],
+          "excessMm": 12,
+          "written": 1,
+          "shares": [
+            12
+          ]
+        },
+        {
+          "name": "zero-excess",
+          "lengthsMm": [
+            100,
+            200
+          ],
+          "excessMm": 0,
+          "written": 2,
+          "shares": [
+            0,
+            0
+          ]
+        },
+        {
+          "name": "all-empty",
+          "lengthsMm": [
+            0,
+            0
+          ],
+          "excessMm": 12,
+          "written": 2,
+          "shares": [
+            0,
+            0
+          ]
+        },
+        {
+          "name": "empty-list",
+          "lengthsMm": [],
+          "excessMm": 12,
+          "written": 0,
+          "shares": []
+        }
+      ],
+      "lineTangentAfterSag": [
+        {
+          "name": "start",
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "sagDir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "s": 0,
+          "depthMm": 40,
+          "lengthMm": 800,
+          "tangent": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          }
+        },
+        {
+          "name": "quarter",
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "sagDir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "s": 0.25,
+          "depthMm": 40,
+          "lengthMm": 800,
+          "tangent": {
+            "x": 0,
+            "y": -0.14834045293024464,
+            "z": 0.9889363528682975
+          }
+        },
+        {
+          "name": "middle",
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "sagDir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "s": 0.5,
+          "depthMm": 40,
+          "lengthMm": 800,
+          "tangent": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          }
+        },
+        {
+          "name": "three-quarter",
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "sagDir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "s": 0.75,
+          "depthMm": 40,
+          "lengthMm": 800,
+          "tangent": {
+            "x": 0,
+            "y": 0.14834045293024464,
+            "z": 0.9889363528682975
+          }
+        },
+        {
+          "name": "end",
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "sagDir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "s": 1,
+          "depthMm": 40,
+          "lengthMm": 800,
+          "tangent": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          }
+        },
+        {
+          "name": "taut",
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "sagDir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "s": 0.25,
+          "depthMm": 0,
+          "lengthMm": 800,
+          "tangent": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          }
+        },
+        {
+          "name": "diagonal-chord",
+          "chord": {
+            "x": 0.6,
+            "y": 0.8,
+            "z": 0
+          },
+          "sagDir": {
+            "x": -0.8,
+            "y": 0.6,
+            "z": 0
+          },
+          "s": 0.3,
+          "depthMm": 25,
+          "lengthMm": 500,
+          "tangent": {
+            "x": 0.4880914435935651,
+            "y": 0.872792496926245,
+            "z": 0
+          }
+        },
+        {
+          "name": "degenerate-length",
+          "chord": {
+            "x": 0,
+            "y": 0,
+            "z": 1
+          },
+          "sagDir": {
+            "x": 0,
+            "y": -1,
+            "z": 0
+          },
+          "s": 0.25,
+          "depthMm": 40,
+          "lengthMm": 0,
+          "tangent": {
+            "x": 0,
+            "y": -0.9999652795861222,
+            "z": 0.008333043996551019
           }
         }
       ]

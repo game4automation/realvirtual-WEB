@@ -34,6 +34,55 @@ function Probe(props: Parameters<typeof useAssetThumbnail>[0]) {
 }
 
 describe('useAssetThumbnail', () => {
+  it('falls back to generation when a sidecar contains HTML instead of an image', async () => {
+    const url = URL.createObjectURL(new Blob(['<!doctype html><html>App</html>'], { type: 'text/html' }));
+    const release = vi.fn(() => URL.revokeObjectURL(url));
+    const service = fakeService(null);
+    const { getByTestId, unmount } = render(
+      <Probe service={service} keyParts={KEY} resolve={async () => null}
+        sidecar={async () => ({ url, release })} />,
+    );
+    await waitFor(() => expect(service.enqueue).toHaveBeenCalledOnce());
+    expect(getByTestId('card').dataset.url).toBe('');
+    expect(release).toHaveBeenCalledOnce();
+    unmount();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('uses a valid sidecar without generating a preview and releases it on unmount', async () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const blob = await new Promise<Blob>(resolve => canvas.toBlob(blob => resolve(blob!)));
+    const url = URL.createObjectURL(blob);
+    const release = vi.fn(() => URL.revokeObjectURL(url));
+    const service = fakeService(null);
+    const { getByTestId, unmount } = render(
+      <Probe service={service} keyParts={KEY} resolve={async () => null}
+        sidecar={async () => ({ url, release })} />,
+    );
+    await waitFor(() => expect(getByTestId('card').dataset.url).toBe(url));
+    expect(service.enqueue).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    unmount();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('releases a sidecar that resolves after the card unmounts', async () => {
+    const release = vi.fn();
+    let finish!: (source: { url: string; release: () => void }) => void;
+    const pending = new Promise<{ url: string; release: () => void }>(resolve => { finish = resolve; });
+    const sidecar = vi.fn(() => pending);
+    const service = fakeService(null);
+    const { unmount } = render(
+      <Probe service={service} keyParts={KEY} resolve={async () => null} sidecar={sidecar} />,
+    );
+    await waitFor(() => expect(sidecar).toHaveBeenCalledOnce());
+    unmount();
+    finish({ url: '/unused.png', release });
+    await waitFor(() => expect(release).toHaveBeenCalledOnce());
+    expect(service.enqueue).not.toHaveBeenCalled();
+  });
+
   it('does nothing at all when the service is unavailable', async () => {
     const service = fakeService(null, false);
     render(<Probe service={service} keyParts={KEY} resolve={async () => ({ url: '/a.glb' })} />);

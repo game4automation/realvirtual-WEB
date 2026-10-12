@@ -27,17 +27,27 @@ import {
   processExtras,
   type ProcessExtrasResult,
 } from '../../core/engine/rv-scene-loader';
-import { RVLogicEngine } from '../../core/engine/rv-logic-engine';
 import { isRigRaycastExcluded } from '../../core/engine/rv-traverse-utils';
 import { applyShadowFlags } from '../../core/engine/rv-mesh-classifier';
 import { isGltfWrapperName } from '../../core/engine/rv-gltf-unwrap';
-import { scanLibraryComponent } from '../../core/library-component-loader';
-import { applyKinematicsSpec } from '../../core/behavior-runtime';
+import { siblingNames, uniqueName } from '../../core/engine/rv-node-naming';
+import { reportPlacementNameCollision } from '../../core/hmi/problems-store';
+import {
+  applyNamingScanToPlaced,
+  canIntegratePlacedContent,
+  integratePlacedContent,
+} from '../../core/engine/rv-placement-integrate';
+import { stampPlacementMarkers, type PlacementInstancer } from '../../core/engine/rv-placement-instancer';
+import { syncSignalSubtree } from '../../core/engine/rv-signal-editor-sync';
+import { releasePlacedGroups } from '../../core/engine/rv-placement-integrate';
 import { attachDriveDatasheets } from '../../behaviors/_shared/aas-link';
 import { currentAasLoadGeneration, resolveAasSubtree } from '../aas-resolution';
+import { getActiveAasSource } from '../../core/aas/rv-aas-source';
 import type { SnapPoint, SnapPointRegistry } from '../../core/engine/rv-snap-point-registry';
 
 import { alignToFloor, pivotToFloorCenter } from './model-cache';
+import type { BakeRegistry, PlacementInstance } from '../../core/engine/rv-bake-registry';
+import type { BakedAsset } from '../../core/engine/rv-bake-chunk';
 import { disposePlaceholderNode } from './placeholder-node';
 import type { FloorGizmo } from './floor-gizmo';
 import type { GaussianSplatPluginApi } from './gaussian-splat-plugin-type';
@@ -45,6 +55,121 @@ import { computeSnapAlignedWorldMatrix } from '../snap-point/snap-alignment';
 import { parseSnapName } from '../snap-point/snap-name-parser';
 import { scanAndRegisterSnaps } from '../snap-point/snap-scanner';
 import type { SnapPointPlugin } from '../snap-point';
+
+// ─── Placement profiling (plan-745 Phase 2a, F14) ────────────────────────
+
+/** One profiled placement mutation. Phases are ms, in `mark()` order. */
+export interface PlacementTiming {
+  op: 'registerPlaced' | 'registerPlacedAtSnap' | 'swapPlacedGeometry' | 'removePlacedFromScene' | 'placeComponent';
+  id: string;
+  /** Absolute performance.now() of op start / end — correlates with getLongTasks(). */
+  t0?: number;
+  t1?: number;
+  /** Registration mode, where the op has one ('full' / 'light'). */
+  mode?: PlacementRegistrationMode;
+  phases: Array<{ phase: string; ms: number }>;
+  /** Synchronous total of the op itself. */
+  totalMs: number;
+  /**
+   * Time from the end of the synchronous op to the first rendered frame.
+   *
+   * The number that actually matters to a user dragging an asset in: the
+   * synchronous total says how long the main thread was blocked, this says how
+   * long until they saw the result — which is where the deferred BVH rebuild
+   * and the shader compile land.
+   */
+  firstFrameMs?: number;
+  /** `renderer.info.render.calls` on that first frame. */
+  drawCallsAfter?: number;
+  /** Whether the op asked for a (debounced, deferred) whole-scene BVH rebuild. */
+  requestedBvhRebuild?: boolean;
+}
+
+/**
+ * Ring of the most recent placement timings.
+ *
+ * Always on, capped, and cheap: two `performance.now()` calls per phase
+ * boundary and one rAF per op — the same trade `rv-load-profiler` makes. A
+ * measurement that has to be switched on is a measurement nobody takes when
+ * the interesting drop happens.
+ */
+const PLACEMENT_TIMING_CAP = 256;
+const _placementTimings: PlacementTiming[] = [];
+
+/** Long tasks (> 50 ms main-thread blocks) observed since the ring started. */
+export interface LongTaskRecord { start: number; ms: number; name: string }
+const LONG_TASK_CAP = 512;
+const _longTasks: LongTaskRecord[] = [];
+let _longTaskObserver: PerformanceObserver | null = null;
+export function getLongTasks(): readonly LongTaskRecord[] {
+  if (!_longTaskObserver && typeof PerformanceObserver !== 'undefined') {
+    try {
+      _longTaskObserver = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          _longTasks.push({ start: e.startTime, ms: e.duration, name: e.name });
+          if (_longTasks.length > LONG_TASK_CAP) _longTasks.shift();
+        }
+      });
+      _longTaskObserver.observe({ type: 'longtask', buffered: true });
+    } catch { _longTaskObserver = null; }
+  }
+  return _longTasks;
+}
+export function clearLongTasks(): void { _longTasks.length = 0; }
+// Start observing as early as the module loads so the ring is never empty
+// on the first read.
+getLongTasks();
+
+/** The recorded placement timings, oldest first. Treat as read-only. */
+export function getPlacementTimings(): readonly PlacementTiming[] {
+  return _placementTimings;
+}
+
+/** Drop every recorded timing — a measurement run starts from a clean ring. */
+export function clearPlacementTimings(): void {
+  _placementTimings.length = 0;
+}
+
+interface PlacementProfiler {
+  mark(phase: string): void;
+  /** Close the record and schedule the first-frame sample. */
+  end(extra?: { requestedBvhRebuild?: boolean }): void;
+}
+
+export function beginPlacementTiming(
+  op: PlacementTiming['op'],
+  id: string,
+  viewer: RVViewer | null,
+  mode?: PlacementRegistrationMode,
+): PlacementProfiler {
+  const t0 = performance.now();
+  let last = t0;
+  const record: PlacementTiming = { op, id, mode, phases: [], totalMs: 0, t0 };
+
+  return {
+    mark(phase: string): void {
+      const now = performance.now();
+      record.phases.push({ phase, ms: now - last });
+      last = now;
+    },
+    end(extra): void {
+      const done = performance.now();
+      record.totalMs = done - t0;
+      record.t1 = done;
+      if (extra?.requestedBvhRebuild !== undefined) record.requestedBvhRebuild = extra.requestedBvhRebuild;
+      _placementTimings.push(record);
+      if (_placementTimings.length > PLACEMENT_TIMING_CAP) _placementTimings.shift();
+      // First frame AFTER the op — one rAF, no polling, no retained closure
+      // beyond the record itself.
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => {
+          record.firstFrameMs = performance.now() - done;
+          record.drawCallsAfter = viewer?.getRendererInfo?.().drawCalls;
+        });
+      }
+    },
+  };
+}
 
 /** Dependencies needed by the scene-mutation primitives. The planner
  *  passes a stable object whose getters/refs read its own private state,
@@ -64,26 +189,30 @@ export interface SceneMutationDeps {
   getTransformControls(): FloorGizmo | null;
   /** Returns the GLB root node to parent layout objects under, or null. */
   getModelRoot(): Object3D | null;
+  /**
+   * The bake registry GLB placements are instances of (plan-753 Phase 3).
+   * Optional so older duck-typed deps keep compiling; without it every
+   * placement takes the virtual/DES registration path (aux targets, no
+   * chunks) — which is also what a non-instance node gets with it.
+   */
+  getBakeRegistry?(): BakeRegistry | null;
+  /**
+   * The placement instancer (viewer-owned, `core/engine/rv-placement-instancer`)
+   * — the ONLY door to `BakeRegistry.instantiate`. Needed by
+   * {@link swapPlacedGeometry}; optional for duck-typed deps that never swap.
+   */
+  getPlacements?(): PlacementInstancer | null;
 }
 
-/**
- * Merge the LogicSteps carried by a placed subtree into the viewer's logic
- * engine. `loadGLB()` builds the engine for the main model only; placed
- * library assets register through `processExtras()`, which deliberately
- * handles components but not logic — without this merge a placed asset's
- * sequences (SerialContainer / DriveTo / …) never run. The engine is created
- * lazily when the main model itself carried no logic; roots added after the
- * engine started run immediately (mirrors the post-load `logicEngine.start()`).
- */
-function mergePlacedLogic(viewer: RVViewer, clone: Object3D): void {
-  if (!viewer.registry || !viewer.signalStore) return;
-  if (!RVLogicEngine.hasLogicSteps(clone)) return;
-  if (!viewer.logicEngine) {
-    viewer.logicEngine = new RVLogicEngine();
-    // Mid-session engine: mark started so the roots added below run at once.
-    viewer.logicEngine.start();
-  }
-  viewer.logicEngine.addSubtree(clone, viewer.registry, viewer.signalStore);
+/** Duck-type test: a `BakedAsset` (guards the pending swap against a stray decoded Group). */
+export function isBakedAsset(value: unknown): value is BakedAsset {
+  const v = value as Partial<BakedAsset> | null;
+  return !!v && Array.isArray(v.chunks) && !!v.template && typeof v.acquire === 'function';
+}
+
+/** The bake instance a placement root is, or null (virtual / DES / splat / placeholder). */
+export function placementInstanceOf(deps: SceneMutationDeps, root: Object3D): PlacementInstance | null {
+  return deps.getBakeRegistry?.()?.instanceOf(root) ?? null;
 }
 
 /**
@@ -100,8 +229,23 @@ function mergePlacedLogic(viewer: RVViewer, clone: Object3D): void {
  */
 export type PlacementRegistrationMode = 'light' | 'full';
 
+/**
+ * How the placement root gets its name during integration (plan-758).
+ *
+ * - `'assign'` (default): a FRESH creation — `resolveUniqueName` gives the root
+ *   the first free sibling name (`Belt`, `Belt_1`, …).
+ * - `'keep'`: a RECORD-driven creation (GLB reload, legacy autosave restore,
+ *   undo/redo replay). The record is the truth: the root already carries the
+ *   recorded name and is never renamed. A sibling collision is reported as a
+ *   `placement-name-collision` problem, not resolved — resolving it would make
+ *   the name depend on the order in which records are restored.
+ */
+export type PlacementNaming = 'assign' | 'keep';
+
 /** Options for {@link addPlacedToScene}. */
 export interface AddPlacedOptions {
+  /** See {@link PlacementNaming}. Default `'assign'`. */
+  naming?: PlacementNaming;
   /** When true, skip the VISUAL-prep half (markers / shadow flags / pivot /
    *  align / parent.add / render-mode) because the caller already ran
    *  {@link prepPlacedVisual} and the node is parented + positioned. Only the
@@ -144,39 +288,64 @@ export function resolveUniqueName(deps: SceneMutationDeps, clone: Object3D, labe
   const modelRoot = deps.getModelRoot();
   if (!modelRoot) return;
 
-  let suffix = 1;
-  let candidate = baseName;
-  while (modelRoot.children.some(c => c !== clone && c.name === candidate)) {
-    suffix++;
-    candidate = `${baseName}_${suffix}`;
-  }
-  clone.name = candidate;
+  // The ONE naming rule (plan-758): first free of `base`, `base_1`, `base_2` …
+  // among the taken names, the clone itself excluded. Never strips — a fresh
+  // placement of `Conveyor_2000` stays `Conveyor_2000`.
+  clone.name = uniqueName(placementTakenNames(deps, clone), baseName);
 }
 
 /**
- * Run the naming-convention scanner on a freshly-placed subtree, mirroring
- * what `loadGLB` does for the top-level scene. Without this, library items
- * that rely on `Drive-Lin-*` / `Drive-Rot-*` / `Transport-*` naming get
- * placed as inert meshes — `processExtras` finds nothing in their
- * `userData.realvirtual` because the scanner never ran on the cached clone.
- *
- * Idempotent: deep-merge into existing rv_extras, so a clone that already
- * carries hand-authored extras keeps them.
+ * The names a new placement must not take (plan-758): the children of the
+ * parent it lands under (the model root) PLUS every planner placement root,
+ * wherever the document put it. A reloaded document keeps its placements one
+ * level below the model root, a live drop lands directly under it — a scan of
+ * the model root's children alone did not see the reloaded ones, so a copy of
+ * a reloaded `Belt` came out as a second `Belt` (found 2026-09-30, multi-select
+ * paste after reload). `exclude` is the node being named.
  */
-function _applyNamingConventionScan(deps: SceneMutationDeps, clone: Object3D): void {
-  const spec = scanLibraryComponent(clone);
-  if ((spec.drives?.length ?? 0) > 0 || (spec.transports?.length ?? 0) > 0 || (spec.sensors?.length ?? 0) > 0) {
-    applyKinematicsSpec(clone, spec);
+export function placementTakenNames(deps: SceneMutationDeps, exclude?: Object3D): Set<string> {
+  const taken = siblingNames(deps.getModelRoot(), exclude);
+  for (const root of deps.objectMap.values()) {
+    if (root !== exclude) taken.add(root.name);
   }
-  // Drive datasheet: placed library items load via a separate GLTFLoader path
-  // (not the main scene loader), so attach the SEW gearmotor AAS to their motor
-  // geometry (DriveMesh / DriveRotate / DriveRolls) here as well.
+  return taken;
+}
+
+/**
+ * The `'keep'` half of {@link PlacementNaming}: the root keeps the name its
+ * record gave it. Only CHECKS for a sibling collision and reports it
+ * (`placement-name-collision`); never renames, so the outcome cannot depend on
+ * restore order. `taken` lets a batch caller pass one precomputed sibling set
+ * instead of rescanning the model root per placement.
+ */
+export function assertPlacementNameKept(
+  deps: SceneMutationDeps,
+  clone: Object3D,
+  id: string,
+  taken?: ReadonlySet<string>,
+): void {
+  const modelRoot = deps.getModelRoot();
+  if (!modelRoot) return;
+  const collides = (taken ?? placementTakenNames(deps, clone)).has(clone.name);
+  if (!collides) return;
+  console.warn(`[LayoutPlanner] placement name collision "${clone.name}" (${id}) — kept, not renamed`);
+  const path = deps.getViewer()?.registry?.getPathForNode(clone) ?? undefined;
+  reportPlacementNameCollision({ placementId: id, name: clone.name, ...(path ? { nodePath: path } : {}) });
+}
+
+/**
+ * The planner's `afterNamingScan` hook of the core registration
+ * (`integratePlacedContent`): placed library items load outside the main scene
+ * loader, so attach the SEW gearmotor AAS to their motor geometry (DriveMesh /
+ * DriveRotate / DriveRolls) here, and classify the fresh links straight away —
+ * AasLinkPlugin is a model plugin and is NOT loaded while the planner is open,
+ * so the placed motors would otherwise stay 'pending' (plan-373 F2b).
+ */
+function _attachPlacedDatasheets(deps: SceneMutationDeps, clone: Object3D): void {
   attachDriveDatasheets(clone);
-  // Classify the freshly attached links straight away. AasLinkPlugin is a model
-  // plugin and is NOT loaded while the planner is open, so without this the
-  // placed motors would stay 'pending' — i.e. silently datasheet-less — until
-  // the next full model load (plan-373 F2b).
-  void resolveAasSubtree(clone, deps.getViewer()?.projectAssetsPath, currentAasLoadGeneration());
+  // plan-596: the same active source as every other AAS surface (project aasx/
+  // over the deploy-wide directory), not a base path of its own.
+  void resolveAasSubtree(clone, getActiveAasSource(), currentAasLoadGeneration());
 }
 
 /**
@@ -194,7 +363,7 @@ export function addPlacedToScene(
   opts?: AddPlacedOptions,
 ): ProcessExtrasResult | null {
   if (!opts?.alreadyPrepared) prepPlacedVisual(deps, clone, id, label, catalogId, opts);
-  return registerPlaced(deps, clone, id, label, catalogId, opts?.mode ?? 'full');
+  return registerPlaced(deps, clone, id, label, catalogId, opts?.mode ?? 'full', { naming: opts?.naming });
 }
 
 /**
@@ -226,19 +395,14 @@ export function adoptPlacedNode(
   label: string,
   catalogId: string,
 ): void {
-  node.userData._layoutObject = true;
-  node.userData._layoutId = id;
-  if (node.userData.realvirtual && typeof node.userData.realvirtual === 'object') {
-    (node.userData.realvirtual as Record<string, unknown>).LayoutObject =
-      { Label: label, CatalogId: catalogId, Locked: false };
-  } else {
-    node.userData.realvirtual = { LayoutObject: { Label: label, CatalogId: catalogId, Locked: false } };
-  }
+  stampPlacementMarkers(node, id, label, catalogId);
   node.traverse((child) => { child.userData._layoutObject = true; });
   // `_originalName` is what RVSource's self-template detection compares
   // against; the placement path captures it before its rename, and an adopted
   // node is never renamed, so its current name IS the original.
   node.userData._originalName ??= node.name;
+  // Record-driven: the file's name is kept as is; a duplicate is only reported.
+  assertPlacementNameKept(deps, node, id);
 
   deps.objectMap.set(id, node);
   deps.idByObject.set(node, id);
@@ -289,23 +453,26 @@ export function prepPlacedVisual(
   catalogId: string,
   opts?: Pick<AddPlacedOptions, 'skipAutoAlign'>,
 ): void {
-  // Mark layout metadata — ADD alongside existing rv-extras, don't overwrite
-  clone.userData._layoutObject = true;
-  clone.userData._layoutId = id;
-  if (clone.userData.realvirtual && typeof clone.userData.realvirtual === 'object') {
-    (clone.userData.realvirtual as Record<string, unknown>).LayoutObject = { Label: label, CatalogId: catalogId, Locked: false };
-  } else {
-    clone.userData.realvirtual = { LayoutObject: { Label: label, CatalogId: catalogId, Locked: false } };
+  // A BAKED placement arrives MATERIALISED (`PlacementInstancer.materialize`:
+  // markers, shadow flags, pivot, overrides, render mode — the one order every
+  // entry shares). Only the planner's own half is left: floor align + parenting.
+  // Virtual / DES nodes and the pending placeholder are not instances of an
+  // asset and get their whole visual prep here.
+  const materialized = !!placementInstanceOf(deps, clone);
+  if (!materialized) {
+    // Mark layout metadata — ADD alongside existing rv-extras, don't overwrite
+    stampPlacementMarkers(clone, id, label, catalogId);
+    clone.traverse((child) => { child.userData._layoutObject = true; });
+    // Cast/receive shadows using the same opaque-vs-transparent policy as the
+    // static GLB scene (processMeshes) so placed library objects match it.
+    applyShadowFlags(clone);
   }
-  clone.traverse((child) => { child.userData._layoutObject = true; });
-  // Cast/receive shadows using the same opaque-vs-transparent policy as the
-  // static GLB scene (processMeshes) so placed library objects match it.
-  applyShadowFlags(clone);
 
   // Center pivot to floor + align — skippable for multi-part CAD imports
-  // that must keep their functional CAD origin (plan-238).
+  // that must keep their functional CAD origin (plan-238). The pivot of a
+  // materialised root is the instancer's (`spec.pivot`).
   if (!opts?.skipAutoAlign) {
-    pivotToFloorCenter(clone as Group);
+    if (!materialized) pivotToFloorCenter(clone as Group);
     alignToFloor(clone as Group);
   }
 
@@ -321,6 +488,7 @@ export function prepPlacedVisual(
   // RVSource's self-template detection compares the authored `ThisObjectAsMU`
   // against this original name — without it the 2nd placement (renamed `Foo_2`)
   // would be mis-classified and resolve its template to the first source's node.
+  if (materialized) return; // `_originalName` + render mode: set by materialize
   clone.userData._originalName = clone.name;
 
   // Match the subtree to the active render mode (toon material swap + shader
@@ -331,12 +499,79 @@ export function prepPlacedVisual(
 }
 
 /**
- * REGISTRATION half of {@link addPlacedToScene}. Wires the (already-prepped,
- * already-positioned) node into every runtime system: signals, drives,
- * components, behaviors, the node registry, raycast aux-targets and snap
- * points. The layout planner runs this at drop/commit time — by then the
- * dragged node is at its final transform, so nothing here moves it.
+ * Snap bookkeeping a caller interleaves into {@link integrateSubtree}.
  *
+ * The hook fires at ONE point — right after the placement's own pick bundle is
+ * installed — and, when present, owns the subtree's snap scan. It exists
+ * because the two registration paths differ in exactly this window and nowhere
+ * else: a floor drop only publishes its own ports, while a snap drop has to
+ * mark the mated target occupied BEFORE the scan and pair its own port with it
+ * AFTER (plan-752 R5). Handing the scan itself to the hook is what keeps that
+ * interleaving byte-for-byte what it was, instead of approximating it with two
+ * separate callbacks whose relative order the next reader has to reconstruct.
+ *
+ * The marker rebuild deliberately stays with {@link integrateSubtree}: both
+ * paths do it, both do it last, and a hook that forgot it would leave the new
+ * ports without marker slots and therefore invisible.
+ */
+export interface SnapIntegrationContext {
+  /** The subtree being integrated. */
+  readonly clone: Object3D;
+  /** Its placement id. */
+  readonly id: string;
+  /** The registry the integration is working against. */
+  readonly registry: SnapPointRegistry;
+  /**
+   * Register the subtree's own `Snap-*` ports, exactly as the default path
+   * does, and return them. Call this at the point the ordering requires — a
+   * hook that never calls it publishes no ports at all.
+   */
+  scanOwnSnaps(): SnapPoint[];
+}
+
+/** Options for {@link integrateSubtree}. */
+export interface IntegrateSubtreeOptions {
+  /** Placement id — the key under which `objectMap` / `idByObject` hold it. */
+  id: string;
+  /** Catalog label. Used as the unique-name fallback when the GLB root name
+   *  is missing or is a bare glTF scene wrapper. */
+  label?: string;
+  /** Catalog id (identity of the placed asset). When omitted it is read off
+   *  the node's own `LayoutObject.CatalogId`, which is where a snap drop keeps it. */
+  catalogId?: string;
+  /** Registration depth. Default `'full'` — see
+   *  {@link PlacementRegistrationMode}. */
+  mode?: PlacementRegistrationMode;
+  /** How the root is named — see {@link PlacementNaming}. Default `'assign'`. */
+  naming?: PlacementNaming;
+  /** For `naming: 'keep'` in a batch: the precomputed sibling-name set the
+   *  collision check reads instead of rescanning the model root per placement. */
+  takenNames?: ReadonlySet<string>;
+  /** Which op the profiler records this as. Default `'registerPlaced'`. */
+  op?: PlacementTiming['op'];
+  /** Registry to publish the subtree's ports into. Defaults to the installed
+   *  snap-point plugin's own registry; a caller that already resolved one
+   *  (the snap-drop path) passes it so both halves of the pairing act on the
+   *  same object. */
+  snapRegistry?: SnapPointRegistry;
+  /** See {@link SnapIntegrationContext}. `'full'` mode only. */
+  onAfterPickInstall?: (ctx: SnapIntegrationContext) => void;
+}
+
+/**
+ * Wire an already-prepped, already-positioned subtree into every runtime
+ * system: signals, drives, components, behaviors, the node registry, raycast
+ * aux targets (virtual / DES nodes) and snap ports.
+ *
+ * **The one registration path (plan-752 F5).** Both {@link registerPlaced} and
+ * {@link registerPlacedAtSnap} are now thin wrappers over this function. They
+ * were two 120-line near-copies that had already drifted: the snap path was
+ * missing `notifyTopologyChanged()`, so a conveyor snapped onto a neighbour
+ * never invalidated the transport manager's spatial index — exactly the class
+ * of bug a second copy produces. Everything a placement needs now happens
+ * here, once, in one order.
+ *
+ * The node must already be at its final transform; nothing here moves it.
  * Two mandatory guards run first:
  *   1. Clear `_isGhost` (and the source-preview flags + stale snap cache) on
  *      the whole subtree — `processExtras` SKIPS ghost-flagged nodes, so a
@@ -345,24 +580,36 @@ export function prepPlacedVisual(
  *      (which REPLACES the mask, dropping layer 0); a placed object must
  *      participate in SSAO. No-op for fresh combined-caller clones.
  *
- * `mode` (plan-371) selects the registration depth and **defaults to `'full'`**
- * — the pre-plan-371 behaviour. `'light'` is reserved for the planner's pending
- * placeholder; see {@link PlacementRegistrationMode} for the exact split.
- * Steps that run in BOTH modes: preview-flag guards, `resolveUniqueName`,
- * object map, node registry, raycast aux targets, `markShadowsDirty`.
+ * `mode` (plan-371) selects the registration depth and **defaults to `'full'`**.
+ * `'light'` is reserved for the planner's pending placeholder; see
+ * {@link PlacementRegistrationMode} for the exact split. Steps that run in BOTH
+ * modes: preview-flag guards, `resolveUniqueName`, object map, node registry,
+ * raycast aux targets, `markShadowsDirty`.
+ *
+ * Deliberately NOT extracted from `loadGLB`: that function's phases are
+ * scene-wide on purpose, and a drop must stay O(placement)
+ * (`doc-layout-planner.md:288`).
  */
-export function registerPlaced(
+export function integrateSubtree(
   deps: SceneMutationDeps,
   clone: Object3D,
-  id: string,
-  label: string,
-  catalogId: string,
-  mode: PlacementRegistrationMode = 'full',
+  opts: IntegrateSubtreeOptions,
 ): ProcessExtrasResult | null {
+  const { id, label, onAfterPickInstall } = opts;
+  const mode = opts.mode ?? 'full';
   const full = mode !== 'light';
+  const prof = beginPlacementTiming(opts.op ?? 'registerPlaced', id, deps.getViewer(), mode);
+  // Phase 2c: nothing in this function asks for a whole-scene rebuild any
+  // more. The field stays in the record because that IS the measurement —
+  // `getPlacementTimings().some(t => t.requestedBvhRebuild)` must be false.
+  const requestedBvhRebuild = false;
   clearPreviewFlags(clone);
+  // A baked placement (plan-753 Phase 3) picks through its chunk meshes and
+  // renders them directly: no aux targets. Only virtual / DES nodes (no
+  // `BakedAsset`) pick through aux targets.
+  const instance = placementInstanceOf(deps, clone);
 
-  // Resolve unique name (uses GLB root name, adds _2, _3 for dupes; falls back
+  // Resolve unique name (uses GLB root name, adds _1, _2 for dupes; falls back
   // to the catalog label when the GLB root is a bare glTF scene wrapper).
   //
   // Runs in LIGHT mode too (plan-371 H1): `NodeRegistry.registerNode` is a bare
@@ -371,63 +618,37 @@ export function registerPlaced(
   // silently overwrite the first — leaving every path-based consumer
   // (SelectionManager, the layout-transform listener) pointing at the wrong
   // object.
-  resolveUniqueName(deps, clone, label);
+  //
+  // `naming: 'keep'` (plan-758): a record-driven root already carries its
+  // recorded name — check for a collision, report it, rename nothing.
+  if ((opts.naming ?? 'assign') === 'keep') assertPlacementNameKept(deps, clone, id, opts.takenNames);
+  else resolveUniqueName(deps, clone, label);
+  prof.mark('resolveName');
 
-  // Naming-convention scan: inject Drive/TransportSurface rv_extras for
-  // nodes whose names follow the standard convention. Mirrors what loadGLB
-  // does for the top-level scene; library placements skipped this step
-  // before, leaving drives/transports invisible on standard-named assets.
-  if (full) _applyNamingConventionScan(deps, clone);
-
-  // Process rv-extras: register signals, create drives, instantiate components
+  // The planner-INDEPENDENT registration lives in the core
+  // (`rv-placement-integrate.integratePlacedContent`) — the same function a
+  // viewer without the planner runs for a materialised layout placement:
+  // naming-convention scan, processExtras (signals / drives / components),
+  // deferred logic, transport topology (reaches the SNAP path since plan-752
+  // F5), the drive list — NO whole-scene BVH rebuild (plan-745 Phase 2c) —
+  // placed behaviors and LogicSteps. Phase marks are unchanged.
   const viewer = deps.getViewer();
   let result: ProcessExtrasResult | null = null;
-  if (full && viewer?.registry && viewer.signalStore && viewer.transportManager) {
-    result = processExtras(
-      clone,
-      viewer.registry,
-      viewer.signalStore,
-      viewer.transportManager,
-      viewer.scene,
-      viewer.gizmoManager,
-      viewer,
-      viewer.errorStore,
-      viewer.instructionStore,
-      { logicRunState: viewer.logicRunState },
-      viewer.outlineManager,
-      viewer.lampManager,
-      viewer.energyChainManager,
-      viewer.sceneButtonManager,
-    );
-    if (result.deferredLogic) viewer.registerDeferredLogic(result.deferredLogic);
-
-    // The placement may have registered new transport surfaces/sensors —
-    // invalidate the transport manager's spatial index + dead-end adjacency
-    // cache (plan-240 F4). Defensive optional call: tolerates older/duck-typed
-    // manager instances without the method.
-    viewer.transportManager.notifyTopologyChanged?.();
-
-    // Append new drives to viewer and rebuild the grouped BVH so the new
-    // placement participates in fast hover/click (debounced to coalesce
-    // multiple synchronous adds).
-    if (result.drives.length > 0) {
-      viewer.drives.push(...result.drives);
-      viewer.rebuildGroupedBvh();
-    }
-
-    // Dispatch any behavior file matching this placed library asset, scoped to
-    // its subtree (matched by the asset's GLB root name). Runs after components
-    // are constructed + drives registered, so rv.drives.get() resolves them.
-    viewer.behaviors?.dispatchPlaced(clone);
-
-    // Instantiate the asset's LogicSteps — after drives/components exist so
-    // step ComponentReferences (e.g. DriveTo.drive) resolve via the registry.
-    mergePlacedLogic(viewer, clone);
+  if (full && viewer && canIntegratePlacedContent(viewer)) {
+    result = integratePlacedContent(viewer, clone, {
+      mark: (phase) => prof.mark(phase),
+      afterNamingScan: (root) => _attachPlacedDatasheets(deps, root),
+    });
   } else {
     // LIGHT mode (pending placeholder), or a viewer that isn't fully wired:
     // register the root node only, so the placement is addressable by path
     // (selection, hierarchy, the layout-transform listener) without any
     // signal/drive/component side effects.
+    if (full) {
+      applyNamingScanToPlaced(clone);
+      _attachPlacedDatasheets(deps, clone);
+    }
+    prof.mark('namingScan');
     if (viewer?.registry) {
       const path = NodeRegistry.computeNodePath(clone);
       viewer.registry.registerNode(path, clone);
@@ -437,13 +658,12 @@ export function registerPlaced(
   deps.objectMap.set(id, clone);
   deps.idByObject.set(clone, id);
 
-  // Register every Mesh in the placed subtree as an auxiliary raycast target,
-  // resolving back to the layout root. The standard raycast pipeline uses
-  // pre-built BVH groups for the originally loaded model — placed objects
-  // aren't in those groups, so without aux targets they would not be hittable
-  // (no hover, no click selection). Aux targets bypass BVH and are added
-  // directly to the raycast intersection list.
-  if (viewer?.raycastManager) {
+  // Register every Mesh of a NON-baked placed subtree (virtual / DES node) as
+  // an auxiliary raycast target, resolving back to the layout root: such a
+  // node has no chunk window, so without aux targets it would not be hittable
+  // (no hover, no click selection). Aux targets bypass the backends and are
+  // added directly to the raycast intersection list.
+  if (viewer?.raycastManager && !instance) {
     const rm = viewer.raycastManager;
     clone.traverse((node) => {
       if (!(node as Mesh).isMesh) return;
@@ -456,6 +676,7 @@ export function registerPlaced(
       rm.addAuxRaycastTarget(node, clone);
     });
   }
+  prof.mark('auxRaycastTargets');
 
   // Register the placed asset's Snap-<DIR>-<TYPEID> nodes with the snap-point
   // registry so they show markers and can be used as attachment targets for
@@ -467,12 +688,20 @@ export function registerPlaced(
   // would let a second drag mate against geometry that doesn't exist yet.
   if (full && viewer) {
     const snapPlugin = viewer.getPlugin<SnapPointPlugin>('snap-point');
-    const snapRegistry = snapPlugin?.getRegistry();
+    const snapRegistry = opts.snapRegistry ?? snapPlugin?.getRegistry();
     if (snapRegistry) {
-      scanAndRegisterSnaps(clone, snapRegistry, clone);
+      const scanOwnSnaps = (): SnapPoint[] => scanAndRegisterSnaps(clone, snapRegistry, clone);
+      // The hook OWNS the scan when present — see {@link SnapIntegrationContext}
+      // for why the occupancy/pairing cannot be expressed around it.
+      if (onAfterPickInstall) {
+        onAfterPickInstall({ clone, id, registry: snapRegistry, scanOwnSnaps });
+      } else {
+        scanOwnSnaps();
+      }
       snapPlugin?.getMarkerRenderer?.()?.rebuild(snapRegistry.size);
     }
   }
+  prof.mark('snapPorts');
 
   // The shadow map runs with autoUpdate=false and only rebuilds when dirtied.
   // Dirty it once so the newly placed object's shadow appears immediately.
@@ -483,6 +712,7 @@ export function registerPlaced(
     // sub-meshes (e.g. a Source's preview MU) that weren't present during prep.
     // (In light mode `prepPlacedVisual` already did the single pass it needs.)
     viewer?.applyRenderModeToSubtree?.(clone);
+    prof.mark('renderMode');
 
     // Announce the new clippable geometry so overlay tools (Section/Clip) can
     // bind to it — Planner/DES add content AFTER the initial model load.
@@ -492,10 +722,40 @@ export function registerPlaced(
     // twice. As it stands each placement announces itself exactly once — at
     // light-register time nothing is announced, at swap time the real geometry
     // is, which matches the single emit every other placement path produces.
-    viewer?.emit?.('layout-content-added', { root: clone });
+    //
+    // A baked instance additionally announces its chunk + keep meshes
+    // (plan-753 §2.6, additive) so consumers bind to them without a walk.
+    viewer?.emit?.('layout-content-added', instance
+      ? { root: clone, chunks: instance.chunks, keep: instance.keep }
+      : { root: clone });
   }
+  prof.mark('announce');
+  prof.end({ requestedBvhRebuild });
 
   return result;
+}
+
+/**
+ * REGISTRATION half of {@link addPlacedToScene} — the floor-drop entry into
+ * {@link integrateSubtree}, which is where the work and the documentation are.
+ *
+ * Kept as a named function because it is the name every caller, test and plan
+ * since plan-177 refers to, and because it pins the default mode.
+ */
+export function registerPlaced(
+  deps: SceneMutationDeps,
+  clone: Object3D,
+  id: string,
+  label: string,
+  catalogId: string,
+  mode: PlacementRegistrationMode = 'full',
+  opts?: { naming?: PlacementNaming; takenNames?: ReadonlySet<string> },
+): ProcessExtrasResult | null {
+  return integrateSubtree(deps, clone, {
+    id, label, catalogId, mode,
+    ...(opts?.naming ? { naming: opts.naming } : {}),
+    ...(opts?.takenNames ? { takenNames: opts.takenNames } : {}),
+  });
 }
 
 /**
@@ -525,7 +785,7 @@ function unregisterPlaceholderSubtree(deps: SceneMutationDeps, root: Object3D): 
 }
 
 /**
- * Swap the real, decoded geometry in underneath an existing placement root
+ * Swap the real, baked geometry in underneath an existing placement root
  * (plan-371). The ROOT OBJECT IS NEVER REPLACED — only its children are — so
  * every direct `Object3D` reference survives untouched: `objectMap`, the
  * FloorGizmo's `_target`, MultiSelectPivot members, the path-based selection,
@@ -534,17 +794,19 @@ function unregisterPlaceholderSubtree(deps: SceneMutationDeps, root: Object3D): 
  * Returns `false` when the placement no longer exists (deleted / undone while
  * the GLB was decoding); the caller must then discard `realSource`.
  *
- * `realSource` is consumed: its children are moved out. It always arrives
- * transform-neutral from `ModelCache.getOrLoad` (`ensureNeutralPlacementRoot`),
- * so moving the children preserves any intrinsic transform the asset carries.
+ * `realSource` is a `BakedAsset` (plan-753 F8): it is INSTANTIATED under the
+ * root — chunk meshes + logic nodes, no geometry transplant. Virtual / DES
+ * entries never go through the pending swap (`buildVirtualNode` needs no
+ * network).
  */
 export function swapPlacedGeometry(
   deps: SceneMutationDeps,
   id: string,
-  realSource: Group,
+  realSource: BakedAsset,
 ): boolean {
   const root = deps.objectMap.get(id);
   if (!root) return false;
+  const prof = beginPlacementTiming('swapPlacedGeometry', id, deps.getViewer(), 'full');
 
   // ── 2. Preserve the pose. `dropToSurface` routinely parks a placement on an
   // elevated surface (conveyor, rack), and losing that height would be
@@ -554,6 +816,7 @@ export function swapPlacedGeometry(
   // ── 3. Un-wire the placeholder subtree BEFORE the real children are added,
   // so their registry paths cannot collide with the placeholder's.
   unregisterPlaceholderSubtree(deps, root);
+  prof.mark('unregisterPlaceholder');
 
   // ── 4. Detach + free the placeholder's own resources. `disposePlaceholderNode`
   // is used because the placeholder owns a Sprite whose geometry is a three.js
@@ -563,24 +826,25 @@ export function swapPlacedGeometry(
     disposePlaceholderNode(root as Group);
   }
 
-  // ── 5. Adopt the real geometry.
-  for (const child of [...realSource.children]) root.add(child);
+  // ── 5. Adopt the real geometry: the `BakedAsset` is INSTANTIATED under
+  // the root — chunk meshes + logic nodes, no geometry transplant.
+  if (!isBakedAsset(realSource)) throw new Error('[LayoutPlanner] swapPlacedGeometry: expected a BakedAsset');
+  const placements = deps.getPlacements?.();
+  if (!placements) throw new Error('[LayoutPlanner] swapPlacedGeometry: BakedAsset without a placement instancer');
 
   const layoutObject = (root.userData.realvirtual as
     { LayoutObject?: { Label?: string; CatalogId?: string } } | undefined)?.LayoutObject;
   const label = layoutObject?.Label ?? root.name;
   const catalogId = layoutObject?.CatalogId ?? '';
 
-  // Visual prep for the freshly adopted children — markers, shadow flags,
-  // render mode. `skipAutoAlign` gates `pivotToFloorCenter` AND `alignToFloor`
-  // together (see AddPlacedOptions), so the pivot is re-applied by hand below
-  // while `alignToFloor` stays out: it would rewrite `position.y` to 0 and drop
-  // every elevated placement onto the floor.
-  prepPlacedVisual(deps, root, id, label, catalogId, { skipAutoAlign: true });
-  // Centre the adopted geometry in the placement frame. Safe on its own: it
-  // only shifts CHILD positions and restores the root's own position/rotation
-  // before returning (model-cache.ts).
-  pivotToFloorCenter(root as Group);
+  // THE placement primitive — the same call, the same order as a live drop and
+  // a reloaded occurrence: instantiate under the (already parented) root,
+  // markers, shadow flags, floor-centre pivot, render mode. The pivot only
+  // shifts CHILD positions; `alignToFloor` deliberately stays out — it would
+  // rewrite `position.y` to 0 and drop every elevated placement onto the floor.
+  placements.materialize(root, realSource, { id, label, catalogId });
+  prof.mark('adoptGeometry');
+  prof.mark('prepVisualAndPivot');
 
   // ── 6. Belt and braces: re-assert the height even if a future change to
   // prepPlacedVisual / pivotToFloorCenter starts touching `position.y` again.
@@ -594,6 +858,11 @@ export function swapPlacedGeometry(
   // components), behaviors, LogicSteps, snap ports, raycast, grouped-BVH
   // rebuild, and the `layout-content-added` announcement.
   registerPlaced(deps, root, id, label, catalogId, 'full');
+  // `registerPlaced` files its own, finer-grained record; this phase is the
+  // whole of it, so the two reads answer different questions rather than
+  // double-counting one.
+  prof.mark('registerPlaced');
+  prof.end();
 
   return true;
 }
@@ -697,7 +966,11 @@ export function placeAtSnapPoint(
   // the placement frame identical to the restore frame. (alignToFloor is not
   // needed — the snap matrix sets the root pose, and only the pivot child-shift
   // persists through the saved transform.)
-  pivotToFloorCenter(clone as Group);
+  //
+  // A baked placement arrives MATERIALISED (`PlacementInstancer.materialize`)
+  // and is therefore pivoted already; only a non-instance node pivots here.
+  const materialized = !!placementInstanceOf(deps, clone);
+  if (!materialized) pivotToFloorCenter(clone as Group);
 
   // Compute alignment BEFORE adding to scene so existing world matrices are
   // taken from the clone's pre-place transform. Parse the own snap's name to
@@ -724,21 +997,13 @@ export function placeAtSnapPoint(
   // snap-aligned world transform. addPlacedToScene's pivotToFloorCenter /
   // alignToFloor would override our matrix, so this is the visual-prep done
   // inline (NO pivot/align). registerPlacedAtSnap then does the registration.
-  clone.userData._layoutObject = true;
-  clone.userData._layoutId = id;
-  if (clone.userData.realvirtual && typeof clone.userData.realvirtual === 'object') {
-    (clone.userData.realvirtual as Record<string, unknown>).LayoutObject = {
-      Label: label, CatalogId: catalogId, Locked: false,
-    };
-  } else {
-    clone.userData.realvirtual = {
-      LayoutObject: { Label: label, CatalogId: catalogId, Locked: false },
-    };
+  if (!materialized) {
+    stampPlacementMarkers(clone, id, label, catalogId);
+    clone.traverse((child) => { child.userData._layoutObject = true; });
+    // Cast/receive shadows using the same policy as the static scene (see
+    // addPlacedToScene).
+    applyShadowFlags(clone);
   }
-  clone.traverse((child) => { child.userData._layoutObject = true; });
-  // Cast/receive shadows using the same policy as the static scene (see
-  // addPlacedToScene).
-  applyShadowFlags(clone);
 
   // Attach to layout/model root preserving world transform
   const modelRoot = deps.getModelRoot();
@@ -746,18 +1011,21 @@ export function placeAtSnapPoint(
   targetParent.attach(clone);
 
   // Capture original GLB root name before rename (see addPlacedToScene).
-  clone.userData._originalName = clone.name;
+  clone.userData._originalName ??= clone.name;
 
   return registerPlacedAtSnap(deps, clone, id, target, ownSnapName, snapRegistry, label);
 }
 
 /**
- * REGISTRATION half of {@link placeAtSnapPoint}. Like {@link registerPlaced}
- * but additionally marks `target` occupied, registers + pairs the asset's own
- * snap with it, and rebuilds the marker mesh (snap-chain bookkeeping). Runs the
- * same preview-flag / AO guards. Assumes the node is already visually prepped
- * AND at its final snap-aligned transform (no pivot/align, no matrix recompute),
- * so the layout planner can commit a dragged-and-snapped preview node directly.
+ * The snap-drop entry into {@link integrateSubtree}: like
+ * {@link registerPlaced} but additionally marks `target` occupied, registers +
+ * pairs the asset's own snap with it, and rebuilds the marker mesh (snap-chain
+ * bookkeeping). Assumes the node is already visually prepped AND at its final
+ * snap-aligned transform (no pivot/align, no matrix recompute), so the layout
+ * planner can commit a dragged-and-snapped preview node directly.
+ *
+ * Since plan-752 the only thing this path still owns is the occupancy/pairing
+ * interleave below; everything else is the one shared registration path.
  */
 export function registerPlacedAtSnap(
   deps: SceneMutationDeps,
@@ -768,99 +1036,31 @@ export function registerPlacedAtSnap(
   snapRegistry: SnapPointRegistry,
   label?: string,
 ): ProcessExtrasResult | null {
-  clearPreviewFlags(clone);
-
-  resolveUniqueName(deps, clone, label);
-
-  // Naming-convention scan (see _applyNamingConventionScan docstring).
-  _applyNamingConventionScan(deps, clone);
-
-  // Process rv-extras (signals, drives, components)
-  const viewer = deps.getViewer();
-  let result: ProcessExtrasResult | null = null;
-  if (viewer?.registry && viewer.signalStore && viewer.transportManager) {
-    result = processExtras(
-      clone,
-      viewer.registry,
-      viewer.signalStore,
-      viewer.transportManager,
-      viewer.scene,
-      viewer.gizmoManager,
-      viewer,
-      viewer.errorStore,
-      viewer.instructionStore,
-      { logicRunState: viewer.logicRunState },
-      viewer.outlineManager,
-      viewer.lampManager,
-      viewer.energyChainManager,
-      viewer.sceneButtonManager,
-    );
-    if (result.deferredLogic) viewer.registerDeferredLogic(result.deferredLogic);
-    if (result.drives.length > 0) {
-      viewer.drives.push(...result.drives);
-      viewer.rebuildGroupedBvh();
-    }
-    // Dispatch behaviors for this placement — mirrors registerPlaced. Without
-    // this, an asset that snaps to a neighbour during drag never binds its
-    // behaviors (only the floor-dropped first placement did), so a 2nd / 3rd
-    // conveyor in a snapped line had no Conveyor.* signals and no belt control.
-    viewer.behaviors?.dispatchPlaced(clone);
-
-    // Instantiate the asset's LogicSteps (mirrors registerPlaced).
-    mergePlacedLogic(viewer, clone);
-  } else if (viewer?.registry) {
-    const path = NodeRegistry.computeNodePath(clone);
-    viewer.registry.registerNode(path, clone);
-  }
-
-  deps.objectMap.set(id, clone);
-  deps.idByObject.set(clone, id);
-
-  // Register clone meshes as aux raycast targets (so they're hittable for selection)
-  if (viewer?.raycastManager) {
-    const rm = viewer.raycastManager;
-    clone.traverse((node) => {
-      if (!(node as Mesh).isMesh) return;
-      if (node.userData?._highlightOverlay || node.userData?._isGhostOverlay) return;
-      // Runtime deformation-rig sidecars (EnergyChain, plan-362): the
-      // SkinnedMesh would be CPU-skin-raycast on every pointer move and the
-      // deactivated original still sits frozen in the rest pose. The invisible
-      // picking proxy is deliberately NOT excluded - that hull is the target.
-      if (isRigRaycastExcluded(node)) return;
-      rm.addAuxRaycastTarget(node, clone);
-    });
-  }
-
-  // Mark target occupied; scan new asset for snaps (Kettenbau).
-  snapRegistry.markOccupied(target.id, id);
-  const placedSnaps = scanAndRegisterSnaps(clone, snapRegistry, clone);
-  // The own snap that was paired with `target` is now also occupied. Locate
-  // it by name (the picker passed `ownSnapName`) and establish the
-  // bidirectional pairing so chain-resolver walks across this edge.
-  const ownSnapReg = placedSnaps.find((sp) => sp.object3D.name === ownSnapName);
-  if (ownSnapReg) {
-    snapRegistry.markOccupied(ownSnapReg.id, target.occupiedBy ?? id);
-    snapRegistry.pair(target.id, ownSnapReg.id);
-  }
-  // Resize marker InstancedMesh so the newly registered snap points actually
-  // get a marker slot allocated.
-  if (viewer) {
-    const snapPlugin = viewer.getPlugin<SnapPointPlugin>('snap-point');
-    snapPlugin?.getMarkerRenderer?.()?.rebuild(snapRegistry.size);
-  }
-
-  // Dirty the shadow map so the snapped object's shadow appears immediately
-  // (shadowMap.autoUpdate is off — see addPlacedToScene).
-  viewer?.markShadowsDirty?.();
-
-  // Re-apply render mode for any component sub-meshes created by processExtras.
-  viewer?.applyRenderModeToSubtree?.(clone);
-
-  // Announce new clippable geometry so overlay tools (Section/Clip) can bind
-  // to it (mirrors registerPlaced).
-  viewer?.emit?.('layout-content-added', { root: clone });
-
-  return result;
+  return integrateSubtree(deps, clone, {
+    id,
+    label,
+    op: 'registerPlacedAtSnap',
+    snapRegistry,
+    // The arena-set key of a snapped placement rides on the node itself — the
+    // snap picker never saw a catalog id. `integrateSubtree` reads it from
+    // `LayoutObject.CatalogId` when none is passed, which is what this path
+    // did inline before.
+    onAfterPickInstall: ({ registry, scanOwnSnaps }) => {
+      // Mark target occupied; scan new asset for snaps (Kettenbau). The scan
+      // sits BETWEEN the two occupancy writes and cannot be hoisted out of
+      // them — that interleave is the whole reason this hook exists.
+      registry.markOccupied(target.id, id);
+      const placedSnaps = scanOwnSnaps();
+      // The own snap that was paired with `target` is now also occupied.
+      // Locate it by name (the picker passed `ownSnapName`) and establish the
+      // bidirectional pairing so chain-resolver walks across this edge.
+      const ownSnapReg = placedSnaps.find((sp) => sp.object3D.name === ownSnapName);
+      if (ownSnapReg) {
+        registry.markOccupied(ownSnapReg.id, target.occupiedBy ?? id);
+        registry.pair(target.id, ownSnapReg.id);
+      }
+    },
+  });
 }
 
 /**
@@ -898,6 +1098,9 @@ export function markSnapOccupied(
 export function removePlacedFromScene(deps: SceneMutationDeps, id: string): void {
   const obj = deps.objectMap.get(id);
   if (!obj) return;
+  const prof = beginPlacementTiming('removePlacedFromScene', id, deps.getViewer());
+  // See `registerPlaced`: always false since Phase 2c, kept as the assertion.
+  const requestedBvhRebuild = false;
 
   const gizmo = deps.getTransformControls();
   if (gizmo) gizmo.detach();
@@ -926,24 +1129,55 @@ export function removePlacedFromScene(deps: SceneMutationDeps, id: string): void
   // can find sub-path overlay entries to clean up.
   const rootPathBeforeUnregister = viewer?.registry?.getPathForNode(obj) ?? null;
 
+  // plan-757 Phase 1b: the placement's nodes leave the viewer-wide group
+  // registry (`integratePlacedContent` merged them in — a group is a NAME,
+  // global to the viewer; `syncSubtreeGroups` walks the WHOLE subtree, nested
+  // content included), and every per-placement listener is told the content
+  // is gone (WebComponent instances, clip tools).
+  //
+  // plan-757 Phase 2 (F4): a nested placement (a reference node inside the
+  // placed asset that became an instance of its own) announced itself with its
+  // OWN `layout-content-added`, so it leaves with its own
+  // `layout-content-removed` — innermost first, the outer root last — and its
+  // own behaviour binds are disposed like the outer root's. Listeners that
+  // clean per subtree (the WebComponent plugin) see the nested roots first and
+  // the outer root as a no-op.
+  const nestedRoots = deps.getBakeRegistry?.()?.instanceRootsUnder(obj).filter((r) => r !== obj) ?? [];
+  if (viewer) {
+    releasePlacedGroups(viewer, obj);
+    for (const nested of nestedRoots) {
+      viewer.behaviors?.disposeObject(nested);
+      viewer.emit?.('layout-content-removed', { root: nested, path: viewer.registry?.getPathForNode(nested) ?? null });
+    }
+    viewer.emit?.('layout-content-removed', { root: obj, path: rootPathBeforeUnregister });
+  }
+
   // Unregister subtree from NodeRegistry and collect removed paths
   if (viewer?.registry) {
     const disposedComponents = disposeComponentsInSubtree(viewer.registry, obj);
     const removedPaths = viewer.registry.unregisterSubtree(obj);
 
+    // plan-589: the placement's PLC signals leave the SignalStore. The sync
+    // derives "not live" from the registry, so it has to run AFTER
+    // `unregisterSubtree` — and it needs the node objects, which is why `obj`
+    // is still in hand here. Before this, removing a placement left every one
+    // of its signals registered on a dead path, and a later placement of the
+    // same asset collided with the corpse.
+    try {
+      syncSignalSubtree(viewer, obj);
+    } catch (e) {
+      console.warn('[layout-planner] signal release failed for the removed placement:', e);
+    }
+
     // Filter removed drives out of viewer.drives
     if (viewer.drives.length > 0 && removedPaths.size > 0) {
-      const before = viewer.drives.length;
       viewer.drives = viewer.drives.filter(d => {
         const dPath = viewer.registry!.getPathForNode(d.node);
         // If path is null, the node was already unregistered → it's a removed drive
         return dPath !== null;
       });
-      // Rebuild the grouped BVH so the removed drives no longer participate
-      // (debounced to coalesce multiple synchronous removes).
-      if (viewer.drives.length !== before) {
-        viewer.rebuildGroupedBvh();
-      }
+      // The removed drives' chunk meshes leave with the placement root's
+      // release (BakeRegistry) — nothing else to retire.
     }
 
     // Filter removed components from transport manager
@@ -1001,6 +1235,12 @@ export function removePlacedFromScene(deps: SceneMutationDeps, id: string): void
     // master. Disposing them would corrupt the cache and all other clones.
     // GPU cleanup happens in ModelCache.dispose() when the plugin unloads.
     if (obj.parent) obj.parent.remove(obj);
+    // A baked instance (plan-753 F11): highlight proxies leave first (the
+    // registry's release listeners), then the refcount drops — the asset
+    // disposes its chunks only at 0 on a retired asset, never here. The ONE
+    // release (plan-757 Phase 2, F4): the nested instances under the root go
+    // with it, innermost first.
+    deps.getBakeRegistry?.()?.releaseSubtree(obj);
   }
 
   // Unregister snap-points carried by the removed subtree and free the
@@ -1032,4 +1272,6 @@ export function removePlacedFromScene(deps: SceneMutationDeps, id: string): void
 
   deps.objectMap.delete(id);
   deps.idByObject.delete(obj);
+  prof.mark('teardown');
+  prof.end({ requestedBvhRebuild });
 }

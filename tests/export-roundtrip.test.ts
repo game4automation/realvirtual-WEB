@@ -9,6 +9,7 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 import { processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import {
   attachDriveBehaviorByCode,
   type DriveBehaviorHostViewer,
@@ -41,13 +42,9 @@ async function reload(buffer: ArrayBuffer) {
   scene.add(parsed.scene);
   const registry = new NodeRegistry();
   const store = new SignalStore();
-  processExtras(
-    parsed.scene,
-    registry,
-    store,
-    new RVTransportManager(),
-    scene,
-  );
+  processExtras(parsed.scene, buildInitContext({
+    registry, signalStore: store, transportManager: new RVTransportManager(), scene,
+  }));
   const axis = find(parsed.scene, 'Axis');
   return { root: parsed.scene, axis, registry, store };
 }
@@ -86,6 +83,7 @@ describe('signal-free behavior export round-trip', () => {
     expect(slotKinds(loaded.axis, loaded.store, loaded.registry)).toEqual([
       'Accelaration:direct-property',
       'Backward:direct-property',
+      'Enable:direct-property',
       'Forward:direct-property',
       'IsAtPosition:direct-feedback',
       'IsAtSpeed:direct-feedback',
@@ -100,7 +98,7 @@ describe('signal-free behavior export round-trip', () => {
     scene.add(root);
     const registry = new NodeRegistry();
     const store = new SignalStore();
-    processExtras(root, registry, store, new RVTransportManager(), scene);
+    processExtras(root, buildInitContext({ registry, signalStore: store, transportManager: new RVTransportManager(), scene }));
     const viewer = { registry, signalStore: store, scene } satisfies DriveBehaviorHostViewer;
     expect(attachDriveBehaviorByCode(viewer, axis, 'Drive_Simple')).not.toBeNull();
     const before = JSON.stringify(axis.userData);

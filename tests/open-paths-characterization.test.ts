@@ -93,10 +93,10 @@ vi.mock('../src/core/engine/rv-local-filesystem', async (importOriginal) => {
   return { ...actual, getFolderHandle: async () => null, putHandle: async () => {} };
 });
 
-vi.mock('../src/core/project/rv-project-workspace', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/core/project/rv-project-workspace')>();
-  return { ...actual, getWorkspaceHandle: async () => null };
-});
+// The workspace engine is gone (plan-743). The demo collision guard now reads
+// the DEMO project's OWN handle, which the rv-local-filesystem mock above
+// already answers with null — so no second mock is needed to keep this file
+// from resolving a folder project it did not set up.
 
 import { SceneStore } from '../src/core/hmi/scene/scene-store';
 import { initSceneStore, getSceneStore } from '../src/core/hmi/scene/scene-store-singleton';

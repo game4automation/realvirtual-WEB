@@ -1,5 +1,9 @@
 # From Unity to realvirtual WEB — Customization and Coding-Agent Workflow
 
+> **Applies to:** Community runtime and extension workflows; Unity Professional export and commercial browser authoring are optional, separate workflows.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 This document is written **for users coming from realvirtual on Unity**.
 
 > Authoring note: everything you reference across nodes in Unity — drive signals, sensor
@@ -7,33 +11,30 @@ This document is written **for users coming from realvirtual on Unity**.
 > [doc-node-paths.md](doc-node-paths.md) explains how those paths are built and resolved, and
 > why node names must be unique across the *whole* export rather than just among siblings.
 
-If you are used to authoring a complete digital twin in the Unity Editor —
-scene, drives, sensors, signals, HMI panels, dashboards — and you are now
-looking at realvirtual WEB, the mental model is different and it is worth
-saying out loud:
+## Choose an authoring and delivery workflow
 
-> **realvirtual WEB is not a virtual-commissioning tool.**
-> It is the **delivery and runtime platform** for finished products that
-> end users (operators, service technicians, customers, sales prospects)
-> open in a browser. Virtual commissioning, PLC sign-off, mechatronic
-> design and deep engineering all stay in **realvirtual on Unity**.
+realvirtual WEB includes a Community viewer, HMI runtime, layout planner and public
+extension APIs. A standalone Community checkout builds without Unity or a private
+repository. You can use GLB files from any compatible authoring tool.
 
-> **realvirtual WEB is an IT project, not an editor project.**
-> The right way to think about it is closer to a modern web application
-> (TypeScript, React, plugins, CI, CDN deployment) than to a Unity scene
-> file. There is no WEB Editor and there is not going to be one for most
-> features. Customization happens in code — and the intended way to
-> write that code is with a coding agent such as Claude Code.
+Commercial WEB builds can additionally include the browser **Asset & Kinematics
+Editor**, CAD import, DES and other licensed modules. These features are not enabled
+by installing the Community source. See the [edition comparison](README.md#community-edition-vs-commercial).
 
-### Two products, two phases
+realvirtual on Unity remains an optional authoring and virtual-commissioning platform.
+Use its Professional exporter when you want to bring Unity-authored components and
+metadata into WEB. Browser plugins, UI customizations and project scripts can be
+written directly in TypeScript; a coding assistant is optional.
 
-| | realvirtual on Unity | realvirtual WEB |
+| Workflow | Where you work | Result |
 |---|---|---|
-| Phase | Engineering, virtual commissioning, PLC sign-off | Delivery, runtime, end-user experience |
-| Primary user | Mechatronic / controls engineer | Operator, service tech, customer, sales |
-| Authoring model | Visual editor, components, inspectors, hand-tuned per scene | Code-first, plugins, per-model packs, coding-agent driven |
-| Iteration speed | Editor cycle (open scene, change components, save, test) | Web cycle (hot-reload, run, screenshot, ship) |
-| Distribution | Built executable / live commissioning station | URL + GLB on a CDN, opened in any browser |
+| Community runtime and layouts | Browser plus public TypeScript APIs | View, connect, arrange and extend supported GLB content |
+| Commercial browser authoring | Licensed WEB modules | Edit assets/kinematics and use the enabled analysis/import tools |
+| Unity authoring and commissioning | realvirtual on Unity | Export geometry and supported `rv_extras` for WEB delivery |
+
+The remaining sections explain Unity migration and native extension patterns. Start
+with [Getting started](doc-getting-started.md) and the public
+[project plugin example](doc-project-plugin-example.md) when you do not have Unity.
 
 ### Why the split exists
 
@@ -109,8 +110,26 @@ Drive behaviours are ported one for one and keep their Unity name in
 | `Drive_PositionSwitch` | `RVDrivePositionSwitch` | `rv-drive-position-switch.ts` |
 | `Drive_ErraticPosition` | `RVErraticDriver` | `rv-erratic.ts` |
 | `Drive_SEWMovilink` | `RVDriveSEWMovilink` | `rv-drive-sew-movilink.ts` |
+| `Drive_ContinousDestination` | `RVDriveContinousDestination` | `rv-drive-continous-destination.ts` |
+| `Drive_ProfidriveSpeed` | `RVDriveProfidriveSpeed` | `rv-drive-profidrive-speed.ts` |
+| `Drive_ProfidrivePos` | `RVDriveProfidrivePos` | `rv-drive-profidrive-pos.ts` |
+| `Drive_FestoFHPP` | `RVDriveFestoFHPP` | `rv-drive-festo-fhpp.ts` |
+| `Drive_UniDriveMotor` | `RVDriveUniDriveMotor` | `rv-drive-unidrive-motor.ts` |
+| `Drive_ProportionalValve` | `RVDriveProportionalValve` | `rv-drive-proportional-valve.ts` |
+| `DrivePulseEncoder` | `RVDrivePulseEncoder` | `rv-drive-pulse-encoder.ts` |
 
-Behaviours outside that list are not ported. `Drive_SEWMovilink` carries the
+Not ported, by decision: `Drive_Sequence`, `Drive_MeasureSpeedPosition`,
+`ForceDrive`, `StartDriveOnCondition` and `LogicStopDriveOnSensor`. Two
+things to know about the ported set: `DrivePulseEncoder` is not a `Drive_*`
+behaviour (no underscore in its Unity name), so it sits on the drive node
+NEXT TO the one active `Drive_*` behaviour instead of competing with it; and
+`Drive_ProportionalValve` replaces its Unity `FlowCurve` (an `AnimationCurve`,
+which the GLB exporter cannot carry) with a `FlowExponent` number — 1 is the
+linear default curve, above 1 progressive. All drive behaviours are
+`authorable`, i.e. they appear in the asset editor's *Add Component* list, but
+only while the selected node already carries a Drive.
+
+`Drive_SEWMovilink` carries the
 SEW MOVI-C profile — MOVILINK control word 1 / status word 1 with the priority
 cascade fault > inhibit > rapid stop > stop > enable and both speed encodings
 (`PercentNmax`, `Rpm`) — so a station modelled with SEW drives also runs in
@@ -273,143 +292,38 @@ loose coupling.
 
 Architecture, examples and slot reference: **[doc-extending-webviewer.md](doc-extending-webviewer.md)**.
 
-### 3.3 Per-Model Plugin Pack — to ship customization with a specific GLB
+### 3.3 Project plugins for a specific document
 
-A *Model Plugin Pack* is a small folder under `src/plugins/models/<YourModel>/`
-that exports `models = [...]` and `registerModelPlugins(viewer)`. realvirtual
-auto-loads it when the matching GLB is loaded and tears it down on model
-change.
+Bind a project module through `documents[].scriptRef`, rather than matching a GLB
+filename. The module exports `registerModelPlugins(viewer)` and
+`unregisterModelPlugins(viewer)`. Register plugins with `viewer.use()` and remove
+the same IDs with `viewer.removePlugin()`; dispose event listeners, timers and DOM.
 
-This is the **recommended way to customize realvirtual WEB for a specific
-machine, plant or product**. It keeps the customization tightly scoped (it
-only runs for *your* GLB), self-contained (one folder, one entry point) and
-easy to ship/share.
+The [public project example](doc-project-plugin-example.md) includes the complete
+folder layout, compilable TypeScript, manifest and cleanup. Several documents can
+reference one module. A direct `plugins/my-plugin.ts` is sufficient; a collecting
+`index.ts` is optional. Changing a document filename does not change this binding.
 
-#### 3.3.1 Folder layout
-
-```
-src/plugins/models/
-├── model-option-plugin.ts      ← shared: the generic `?option=` variant mechanism
-├── DemoRealvirtualWeb/         ← reference example
-│   ├── index.ts                 # entry point — exports models + register/unregister
-│   ├── model-options.ts         # optional: `?option=` variants of the same GLB
-│   ├── operator-hmi-controls.ts # model-specific plugin (hides engineering controls)
-│   ├── robot-follow-position.ts # model-specific plugin (follow-cam anchor)
-│   └── demo-kiosk-tour.ts       # optional: model-specific content
-├── DemoProcessIndustry/
-│   └── index.ts
-└── YourMachine/                 ← your customization
-    ├── index.ts
-    ├── YourKpiPlugin.ts
-    ├── YourMaintenancePanel.tsx
-    └── content/                 # PDFs, JSON, images that belong to this model
-```
-
-`model-options.ts` is picked up by a separate eager glob in `main.ts` and is
-what makes `?option=<id>` variants of one GLB possible — see
-[doc-document-linking.md](doc-document-linking.md) for the worked example
-(the Demo's Festo / SEW / Bosch supplier swap).
-
-The folder name is the convention; the actual **matching is done by the
-`models` array inside `index.ts`** (see below). One pack can claim several
-GLB filenames (e.g. casing variants, legacy names) — the manager will
-deduplicate.
-
-#### 3.3.2 The `index.ts` contract
-
-A model plugin pack must export three symbols. This is the contract enforced
-by `core/rv-model-plugin-manager.ts`:
-
-```ts
-// src/plugins/models/YourMachine/index.ts
-import type { RVViewer } from '../../../core/rv-viewer';
-
-// Optional: built-in plugins you want active only for this model.
-import { YourKpiPlugin } from './YourKpiPlugin';
-import { OrderManagerPlugin } from '../../order-manager-plugin';
-import { AasLinkPlugin } from '../../aas-link-plugin';
-
-// (1) GLB filenames (without .glb) this pack handles.
-export const models = ['YourMachine', 'yourmachine', 'YourMachineRev2'];
-
-// (2) Optional defaults — applied on every load of this model.
-//     The user can still override these via Settings.
-//     Valid names: 'Bright' | 'Dark' | 'White' | 'Concrete' | 'Outdoor'
-//     (ENVIRONMENT_PRESETS in src/core/hmi/environment-presets.ts).
-export const defaultEnvironmentPreset = 'Bright' as const;
-
-const registeredIds: string[] = [];
-
-// (3) Called by the model-plugin-manager after the GLB has loaded.
-export function registerModelPlugins(viewer: RVViewer): void {
-  const instances = [
-    new YourKpiPlugin(),
-    new AasLinkPlugin(),
-    new OrderManagerPlugin(),
-  ];
-  for (const p of instances) {
-    viewer.use(p);
-    registeredIds.push(p.id);
-  }
-}
-
-// (4) Called automatically when the user switches to another GLB or closes
-//     the model. Must remove everything you added in registerModelPlugins.
-export function unregisterModelPlugins(viewer: RVViewer): void {
-  for (const id of registeredIds) {
-    viewer.removePlugin(id);
-  }
-  registeredIds.length = 0;
-}
-```
-
-Key points:
-
-- **Auto-discovery.** `rv-model-plugin-manager.ts` uses a Vite glob to find
-  every `src/plugins/models/*/index.ts(x)`. You do **not** import or register
-  your pack anywhere — dropping the folder is enough.
-- **Filename matching, not folder matching.** The manager loads the GLB,
-  reads the filename, then walks all known model packs and picks the one
-  whose `models` array contains a matching string. Folder name and `models`
-  entries may differ.
-- **Strict pairing.** `registerModelPlugins` and `unregisterModelPlugins`
-  must be symmetrical. The manager calls `unregister` on every model switch,
-  so leaking plugins, event listeners or DOM nodes will break the next load.
-- **Order matters.** Plugins are activated in the order you put them into
-  the array. If `PluginB` looks up `PluginA` via `viewer.getPlugin('a')` in
-  its own `onModelLoaded`, register `PluginA` first. The Demo pack depends
-  on this: `ModelOptionPlugin` must run before `AasLinkPlugin` pre-parses
-  the AASX files.
-- **Optional content alongside `index.ts`.** Anything you put next to
-  `index.ts` (tour JSON, PDFs, custom React components) is part of
-  the same package and travels with it. The `DemoRealvirtualWeb` pack keeps
-  a `demo-kiosk-tour.ts` this way — note that its kiosk registration is
-  currently commented out in `index.ts` ("disabled for now"), so the Demo
-  does *not* run a kiosk tour today.
+Built-in `src/plugins/models/*/index.ts` packs are source-tree integrations shipped
+with the viewer. Their filename matching and bundled imports are not the contract
+for a portable runtime project module. See [Scripting](doc-scripting.md) for the
+three extension paths and [Extending WEB](doc-extending-webviewer.md) for APIs.
 
 #### 3.3.3 Workflow — adding customization for a new machine
 
-1. **Export your GLB from Unity.** Make sure `rv_extras` carries the
-   metadata you want to drive UI from: AAS links, signal definitions,
-   camera presets, maintenance procedures, `Web*` markers.
-2. **Drop the GLB into `public/models/`.** It appears in the model
-   selector automatically.
-3. **Create `src/plugins/models/<YourMachine>/index.ts`** following the
-   contract above.
-4. **Pick which built-in plugins you want** (KPI bar, cart, docs, AAS,
-   WebXR, multiuser, ...). Most of the heavy lifting is already in
-   `src/plugins/`.
-5. **Write any custom plugins next to `index.ts`** — KPI sources that
-   talk to your specific PLC tags, machine-specific status panels, etc.
-6. **Restart the dev server** (`npm run dev`) — the auto-discovery glob
-   will pick up the new folder.
+1. Export a GLB from Unity, or use a compatible GLB from another authoring tool.
+2. Import it into a writable project. The project manifest lists its document path;
+   folders are not scanned into a model selector automatically.
+3. Put your TypeScript module under the project's `plugins/` folder and export
+   `registerModelPlugins` and `unregisterModelPlugins`.
+4. Bind the document's **PLUGIN** slot to that module (`documents[].scriptRef`).
+5. Compile with `npm run build:project-scripts -- <projectDir>`, reopen the document,
+   and allow that project's native code when prompted.
+6. Test model switching and cleanup as well as the visible customization.
 
-That is the whole loop. There is no separate registration step, no central
-manifest to edit, no build configuration to change.
-
-The `DemoRealvirtualWeb/index.ts` and `DemoProcessIndustry/index.ts` packs
-in the repo are the two canonical examples — copy whichever is closer to
-your use case and adapt it.
+Follow the complete [public project example](doc-project-plugin-example.md).
+The source-tree model packs described above are build-time integration examples;
+project code should use an explicit manifest binding instead of a model filename.
 
 ---
 
@@ -532,9 +446,7 @@ exactly in that environment:
   surface for browser HMI is now natural language + code**, not editor
   inspectors. The repo is shaped to take advantage of that.
 
-So if you are coming from Unity and looking for a "WEB HMI inspector" —
-there is none, and there will not be one for most features. The
-equivalent productivity comes from a coding agent driving this codebase.
+Use the built-in Inspector and, when licensed, the browser Asset & Kinematics Editor for supported authoring tasks. Custom React dashboards and integration logic use the public TypeScript extension APIs. Coding assistants can help write those extensions but are not required.
 
 realvirtual WEB is designed as an **AI-first product**. The codebase is
 structured, documented and instrumented so that a coding agent (Claude Code,

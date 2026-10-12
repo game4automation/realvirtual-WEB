@@ -46,9 +46,11 @@ import { MAX_OP_HISTORY } from './rv-op-utils';
 import {
   canCoalesceRvOps,
   describeRvOp,
+  journalIdOf,
   makeComposite,
   mergeRvOps,
   type RvOp,
+  type RvOpMeta,
   type RvPrimitiveOp,
 } from './rv-unified-ops';
 import type { RvDocumentMode, RvExecutor } from './rv-unified-executors';
@@ -138,6 +140,63 @@ export interface RvDocumentOptions {
 /** Opaque handle returned by {@link RvDocument.beginTransaction}. */
 export interface RvTransactionToken { readonly _depth: number }
 
+/** Options of {@link RvDocument.beginTransaction} / {@link RvDocument.withTransaction} (plan-590). */
+export interface RvTransactionOptions {
+  /**
+   * Metadata stamped on the committed composite — at the TOP level, also when
+   * this transaction is nested in an outer one (the first meta wins).
+   */
+  meta?: RvOpMeta;
+  /**
+   * Runs immediately BEFORE a failed or aborted transaction rolls back what it
+   * applied. The signal-rename coordinator switches the SignalStore into its
+   * reverse phase here, so the automatic rollback of the model step migrates
+   * the signal back instead of releasing and re-registering it.
+   */
+  beforeRollback?: () => void;
+}
+
+/** Direction of a history move. */
+export type RvHistoryDirection = 'undo' | 'redo';
+
+/**
+ * Verdict of a {@link RvHistoryInterceptor}:
+ *  - `handled`  — the interceptor moved the history itself (through
+ *                 {@link RvDocument.replayHistory}); the document does nothing more;
+ *  - `refused`  — the move is not possible right now; the stacks stay as they are;
+ *  - `default`  — not mine; the document undoes / redoes the entry normally.
+ */
+export type RvHistoryVerdict = 'handled' | 'refused' | 'default';
+
+/**
+ * Asked before an entry carrying `meta.journalId` is undone or redone
+ * (plan-590 History-Interceptor). Runs INSIDE the document's queue slot of that
+ * undo/redo: it must not await the queue of the same document (use
+ * {@link RvDocument.replayHistory}, which does not queue).
+ */
+export type RvHistoryInterceptor = (
+  entry: RvOp,
+  direction: RvHistoryDirection,
+  doc: RvDocument,
+) => Promise<RvHistoryVerdict>;
+
+/** Position of the history stacks — what a journal compares before it moves them. */
+export interface RvHistoryHead {
+  undoLen: number;
+  redoLen: number;
+  /** Id of the newest undoable entry. */
+  topId?: string;
+  /** Id of the newest redoable entry. */
+  redoTopId?: string;
+}
+
+/** The last interception — the UI reads it to explain a refused undo (toast). */
+export interface RvHistoryInterception {
+  journalId: string;
+  direction: RvHistoryDirection;
+  verdict: RvHistoryVerdict;
+}
+
 /** A frozen photograph of a document's history — see {@link RvDocument.captureHistory}. */
 export interface RvDocumentHistory {
   ops: RvOp[];
@@ -197,6 +256,16 @@ export class RvDocument {
   private _txnBusy = false;
   /** True while a rollback drives the executor — no React wake-up per step. */
   private _notifyPaused = false;
+  /** Meta of the open transaction (first one wins, plan-590). */
+  private _txnMeta: RvOpMeta | null = null;
+  /** Hooks to run before the open transaction rolls back (plan-590). */
+  private _txnBeforeRollback: Array<() => void> = [];
+
+  /** History interceptor (plan-590) — see {@link setHistoryInterceptor}. */
+  private _historyInterceptor: RvHistoryInterceptor | null = null;
+  /** True while the interceptor runs — an undo/redo from inside it is re-entrant. */
+  private _intercepting = false;
+  private _lastInterception: RvHistoryInterception | null = null;
 
   /** Metadata dirty (document rename) — OR'd into {@link dirty}. */
   private _metaDirty = false;
@@ -383,10 +452,12 @@ export class RvDocument {
 
   /** Undo the newest op, down to the baseline floor. */
   async undo(): Promise<void> {
+    this._assertNotIntercepting('undo');
     await this._enqueue(async () => {
       if (this._canApply && !this._canApply()) return;
       if (!this.canUndo()) return;
       const op = this._ops[this._ops.length - 1];
+      if (await this._intercept(op, 'undo')) return;
       // The stacks move only AFTER the inverse applied — popping first would
       // discard the entry on a failed undo, leaving the change with no way back.
       await this.executor.applyInverse(op);
@@ -398,15 +469,126 @@ export class RvDocument {
 
   /** Redo the newest undone op. Same stack discipline as {@link undo}. */
   async redo(): Promise<void> {
+    this._assertNotIntercepting('redo');
     await this._enqueue(async () => {
       if (this._canApply && !this._canApply()) return;
       const op = this._redo[this._redo.length - 1];
       if (!op) return;
+      if (await this._intercept(op, 'redo')) return;
       await this.executor.applyForward(op);
       this._redo.pop();
       this._ops.push(op);
     });
     this._changed();
+  }
+
+  // ─── History interceptor (plan-590) ─────────────────────────────────
+
+  /**
+   * Install (or clear, with `null`) the history interceptor. Only entries that
+   * carry `meta.journalId` are offered to it; every other undo/redo is
+   * untouched. One interceptor per document — the signal-rename coordinator.
+   */
+  setHistoryInterceptor(interceptor: RvHistoryInterceptor | null): void {
+    this._historyInterceptor = interceptor;
+  }
+
+  get historyInterceptor(): RvHistoryInterceptor | null { return this._historyInterceptor; }
+
+  /** The verdict of the last intercepted undo/redo, or null. */
+  get lastHistoryInterception(): RvHistoryInterception | null { return this._lastInterception; }
+
+  /** Where the history stacks stand right now. */
+  historyHead(): RvHistoryHead {
+    const top = this._ops[this._ops.length - 1];
+    const redoTop = this._redo[this._redo.length - 1];
+    return {
+      undoLen: this._ops.length,
+      redoLen: this._redo.length,
+      ...(top ? { topId: top.id } : {}),
+      ...(redoTop ? { redoTopId: redoTop.id } : {}),
+    };
+  }
+
+  /** A copy of the redo branch (oldest first) — what a journal keeps to restore it. */
+  redoBranch(): RvOp[] { return [...this._redo]; }
+
+  /**
+   * Put a redo branch back verbatim (plan-590). The rename's rollback first
+   * takes its own entry back — which leaves the entry on the redo stack — and
+   * then restores the branch the user had BEFORE the rename, so a failed rename
+   * costs nothing Redo could still have given back.
+   */
+  restoreRedoBranch(ops: readonly RvOp[]): void {
+    this._redo = [...ops];
+    this._notify();
+  }
+
+  /**
+   * Execute the history entry of `journalId` in `direction` — the replay path
+   * of the history interceptor (plan-590 Replay-Vertrag):
+   *
+   *  - WITHOUT asking the interceptor again (no re-entrance),
+   *  - WITHOUT recording new history (no `_record`, the redo branch is kept),
+   *  - WITHOUT waiting for this document's queue — it runs inside the queue
+   *    slot of the undo/redo that called the interceptor, or inside a
+   *    {@link runExclusive} of the caller.
+   *
+   * The entry must be the newest undoable (undo) resp. redoable (redo) one —
+   * a journal never replays past another edit. Throws otherwise, or when the
+   * executor fails; the stacks move only after the executor succeeded.
+   */
+  async replayHistory(journalId: string, direction: RvHistoryDirection): Promise<void> {
+    if (direction === 'undo') {
+      const op = this._ops[this._ops.length - 1];
+      if (!op || journalIdOf(op) !== journalId || !this.canUndo()) {
+        throw new Error(`[rv-document] replayHistory: the newest undoable entry of "${this._name}" is not journal ${journalId}`);
+      }
+      await this.executor.applyInverse(op);
+      this._ops.pop();
+      this._redo.push(op);
+    } else {
+      const op = this._redo[this._redo.length - 1];
+      if (!op || journalIdOf(op) !== journalId) {
+        throw new Error(`[rv-document] replayHistory: the newest redoable entry of "${this._name}" is not journal ${journalId}`);
+      }
+      await this.executor.applyForward(op);
+      this._redo.pop();
+      this._ops.push(op);
+    }
+    this._changed();
+  }
+
+  /** True when the newest undoable (undo) / redoable (redo) entry belongs to `journalId`. */
+  isHistoryTop(journalId: string, direction: RvHistoryDirection): boolean {
+    const op = direction === 'undo'
+      ? (this.canUndo() ? this._ops[this._ops.length - 1] : undefined)
+      : this._redo[this._redo.length - 1];
+    return journalIdOf(op) === journalId;
+  }
+
+  private _assertNotIntercepting(what: RvHistoryDirection): void {
+    if (this._intercepting) {
+      // Awaiting our own queue from inside the slot that runs the interceptor
+      // would deadlock — the interceptor must use replayHistory instead.
+      throw new Error(`[rv-document] re-entrant ${what} of "${this._name}" from inside the history interceptor`);
+    }
+  }
+
+  /** Offer an entry to the interceptor. True when the document must not move the stacks itself. */
+  private async _intercept(op: RvOp, direction: RvHistoryDirection): Promise<boolean> {
+    const journalId = journalIdOf(op);
+    const interceptor = this._historyInterceptor;
+    if (!journalId || !interceptor) return false;
+    this._intercepting = true;
+    let verdict: RvHistoryVerdict;
+    try {
+      verdict = await interceptor(op, direction, this);
+    } finally {
+      this._intercepting = false;
+    }
+    this._lastInterception = { journalId, direction, verdict };
+    return verdict !== 'default';
   }
 
   // ─── Transactions ───────────────────────────────────────────────────
@@ -415,10 +597,12 @@ export class RvDocument {
    * Open a transaction: subsequent ops accumulate into ONE composite undo unit.
    * Reference-counted — only the outermost {@link endTransaction} commits.
    */
-  beginTransaction(label: string): RvTransactionToken {
+  beginTransaction(label: string, opts?: RvTransactionOptions): RvTransactionToken {
     if (this._txnDepth === 0) {
       this._txnLabel = label;
       this._txnError = null;
+      this._txnMeta = null;
+      this._txnBeforeRollback = [];
       // Publish "busy" BEFORE suppression starts — the only notification the UI
       // gets while the transaction runs (F6). ORDER IS LOAD-BEARING: `_notify`
       // returns early once `_txnOps` is set, so assigning the buffer first
@@ -428,6 +612,10 @@ export class RvDocument {
       this._notify();
       this._txnOps = [];
     }
+    // plan-590: a nested transaction keeps its meta at the TOP level — the
+    // outermost transaction is the one that commits, so it carries it.
+    if (opts?.meta?.journalId && !this._txnMeta?.journalId) this._txnMeta = { ...opts.meta };
+    if (opts?.beforeRollback) this._txnBeforeRollback.push(opts.beforeRollback);
     this._txnDepth++;
     return Object.freeze({ _depth: this._txnDepth });
   }
@@ -447,17 +635,25 @@ export class RvDocument {
       const collected = this._txnOps ?? [];
       const failure = this._txnError;
       const label = this._txnLabel;
+      const meta = this._txnMeta;
+      const beforeRollback = this._txnBeforeRollback;
       this._closeTransaction();
       if (failure !== null) {
+        runBeforeRollback(beforeRollback);
         await this._rollback(collected);
         throw failure;
       }
       if (collected.length === 0) return;
       // Composites never nest — flatten one level, exactly like both templates.
-      const flattened = collected.flatMap(
-        (o) => (o.kind === 'composite' ? o.ops : [o as RvPrimitiveOp]),
-      );
-      this._record(this._composite(label, flattened));
+      // A child composite's journal id survives the flattening at the TOP
+      // level (plan-590): it is what routes the undo of the whole entry.
+      let journalId = meta?.journalId;
+      const flattened = collected.flatMap((o) => {
+        if (o.kind !== 'composite') return [o as RvPrimitiveOp];
+        journalId ??= journalIdOf(o);
+        return o.ops;
+      });
+      this._record(this._composite(label, flattened, journalId ? { ...meta, journalId } : undefined));
     }).finally(() => { this._closeTransaction(); });
   }
 
@@ -475,7 +671,9 @@ export class RvDocument {
     if (this._txnDepth > 0) return Promise.resolve();
     return this._enqueue(async () => {
       const collected = this._txnOps ?? [];
+      const beforeRollback = this._txnBeforeRollback;
       this._closeTransaction();
+      runBeforeRollback(beforeRollback);
       await this._rollback(collected);
     }).finally(() => { this._closeTransaction(); });
   }
@@ -484,8 +682,8 @@ export class RvDocument {
    * RAII form. Re-entrant: a nested call folds into the OUTER transaction, so
    * compound tools can reuse actions that open their own.
    */
-  async withTransaction<T>(label: string, fn: () => T | Promise<T>): Promise<T> {
-    const token = this.beginTransaction(label);
+  async withTransaction<T>(label: string, fn: () => T | Promise<T>, opts?: RvTransactionOptions): Promise<T> {
+    const token = this.beginTransaction(label, opts);
     let result: T;
     try {
       result = await fn();
@@ -506,6 +704,8 @@ export class RvDocument {
     this._txnLabel = '';
     this._txnError = null;
     this._txnBusy = false;
+    this._txnMeta = null;
+    this._txnBeforeRollback = [];
   }
 
   /**
@@ -538,8 +738,8 @@ export class RvDocument {
    * origin-typed helper an explicit mutator would use, rather than assembling
    * the record inline and bypassing the one place that guarantee lives.
    */
-  private _composite(label: string, ops: RvPrimitiveOp[]): RvOp {
-    return makeComposite(this.mode, label, ops);
+  private _composite(label: string, ops: RvPrimitiveOp[], meta?: RvOpMeta): RvOp {
+    return makeComposite(this.mode, label, ops, meta);
   }
 
   // ─── Replay / lifecycle ─────────────────────────────────────────────
@@ -809,5 +1009,12 @@ export class RvDocument {
     if (this._txnOps || this._notifyPaused) return;
     this._snapshot = null;
     for (const fn of this._listeners) fn();
+  }
+}
+
+/** Run the before-rollback hooks of a transaction; a failing hook never stops the rollback. */
+function runBeforeRollback(hooks: ReadonlyArray<() => void>): void {
+  for (const hook of hooks) {
+    try { hook(); } catch (e) { console.error('[rv-document] beforeRollback hook failed:', e); }
   }
 }

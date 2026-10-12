@@ -16,7 +16,8 @@
 
 import { useSyncExternalStore } from 'react';
 import { Box, Typography, CircularProgress, Modal } from '@mui/material';
-import { extractFileBlob } from '../../plugins/aas-link-parser';
+import { extractAasEntryBlob } from '../../plugins/aas-link-parser';
+import { asAasSource, getAasSourceByKey, getActiveAasSource, type AasSource } from '../aas/rv-aas-source';
 import { tooltipRegistry } from './tooltip/tooltip-registry';
 import { DocViewerOverlay } from './DocViewerOverlay';
 
@@ -25,7 +26,18 @@ import { DocViewerOverlay } from './DocViewerOverlay';
 /** Source descriptor for a PDF document. */
 export type PdfSource =
   | { type: 'url'; url: string }
-  | { type: 'blob'; aasId: string; zipPath: string; basePath?: string };
+  | {
+    type: 'blob';
+    aasId: string;
+    zipPath: string;
+    /** Legacy: an assets root whose `aasx/` holds the file. */
+    basePath?: string;
+    /**
+     * Key of the AAS source that listed the id (plan-596) — the PDF is read
+     * from exactly that source's archive. Falls back to the active source.
+     */
+    sourceKey?: string;
+  };
 
 /** A single PDF link attached to a node. */
 export interface PdfLink {
@@ -64,7 +76,7 @@ function notifyPdf(): void {
 export function openPdfViewer(
   title: string,
   source: PdfSource,
-  options?: { initialPage?: number },
+  options?: { initialPage?: number; /** `source.url` is an object URL the viewer now OWNS — revoked on close / switch. */ ownsUrl?: boolean },
 ): void {
   // Revoke previous blob URL if switching PDFs
   if (_pdfState.url && _activeBlobUrls.has(_pdfState.url)) {
@@ -75,14 +87,18 @@ export function openPdfViewer(
   const initialPage = options?.initialPage;
 
   if (source.type === 'url') {
+    if (options?.ownsUrl) _activeBlobUrls.add(source.url);
     _pdfState = { open: true, url: source.url, title, initialPage, loading: false, error: '' };
     notifyPdf();
   } else {
     _pdfState = { open: true, url: '', title, initialPage, loading: true, error: '' };
     notifyPdf();
 
-    extractFileBlob(source.aasId, source.zipPath, source.basePath)
-      .then((blobUrl) => {
+    extractAasEntryBlob(source.aasId, source.zipPath, aasSourceOf(source))
+      .then(({ blob }) => {
+        // The viewer owns this URL (revoked on close / switch), independent of
+        // the package cache, so an evicted archive never pulls a PDF away.
+        const blobUrl = URL.createObjectURL(blob);
         _activeBlobUrls.add(blobUrl);
         _pdfState = { ..._pdfState, url: blobUrl, loading: false, error: '' };
         notifyPdf();
@@ -92,6 +108,16 @@ export function openPdfViewer(
         notifyPdf();
       });
   }
+}
+
+/** The AAS source a blob link names: its source key, a legacy base path, or the active source. */
+function aasSourceOf(source: { basePath?: string; sourceKey?: string }): AasSource {
+  if (source.sourceKey) {
+    const byKey = getAasSourceByKey(source.sourceKey);
+    if (byKey) return byKey;
+  }
+  if (source.basePath) return asAasSource(source.basePath);
+  return getActiveAasSource();
 }
 
 /** Close the PDF viewer overlay and revoke the current blob URL. */

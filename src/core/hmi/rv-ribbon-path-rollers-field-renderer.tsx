@@ -31,6 +31,9 @@ import { ReorderableList, type ReorderableListItem } from './ReorderableList';
 import { fieldRendererRegistry, type FieldRendererProps } from './rv-field-renderer-registry';
 import { persistFieldOp } from './scene/scene-field-ops';
 import type { ComponentRef } from '../engine/rv-node-registry';
+import { assetRelativePath } from '../engine/rv-reference-resolver';
+import { EMPTY_SNAPSHOT } from '../engine/rv-selection-manager';
+import { FS } from './shared-sx';
 
 /** The wire `componentType` the exporter writes for a plain node reference. */
 const TRANSFORM_TYPE = 'UnityEngine.Transform';
@@ -48,11 +51,7 @@ function isRef(v: unknown): v is ComponentRef {
 
 // Stable no-op store fns for when the viewer is absent (keeps hook order stable).
 const noopSubscribe = () => () => {};
-const EMPTY = Object.freeze({
-  selectedPaths: Object.freeze([]) as ReadonlyArray<string>,
-  primaryPath: null,
-});
-const emptySnapshot = () => EMPTY;
+const emptySnapshot = () => EMPTY_SNAPSHOT;
 
 export function RibbonPathRollersRenderer({ value, fieldName, nodePath, viewer }: FieldRendererProps) {
   const initial = Array.isArray(value) ? (value as unknown[]).filter(isRef) : [];
@@ -72,8 +71,10 @@ export function RibbonPathRollersRenderer({ value, fieldName, nodePath, viewer }
 
   // Resolve each ref to its CURRENT node path, so the selection highlight and
   // the click-to-select survive the loader's dedup renames (doc-node-paths.md).
+  // Through the ONE resolver, relative to the RibbonPath's own asset (plan-757 F7).
+  const ownerNode = registry?.getNode(nodePath) ?? null;
   const resolved = order.map((ref) => {
-    const node = registry?.getNode(ref.path) ?? null;
+    const node = registry ? (registry.resolvePath(ref.path, ownerNode) ?? registry.getNode(ref.path)) : null;
     const curPath = node ? (registry?.getPathForNode(node) ?? ref.path) : ref.path;
     return { ref, curPath, missing: !node };
   });
@@ -115,8 +116,14 @@ export function RibbonPathRollersRenderer({ value, fieldName, nodePath, viewer }
 
   const handleAdd = (): void => {
     if (!primaryPath) return;
-    if (order.some((ref) => ref.path === primaryPath)) return;
-    commit([...order, { type: 'ComponentReference', path: primaryPath, componentType: TRANSFORM_TYPE } as ComponentRef]);
+    // plan-757 D12: a reference is WRITTEN asset-relative — relative to the
+    // asset the RibbonPath node belongs to (the enclosing reference scope) —
+    // and read tolerantly, so the same file works as a document and as a
+    // placement. A target outside that asset keeps its full path.
+    const owner = registry?.getNode(nodePath) ?? null;
+    const written = owner && registry ? assetRelativePath(primaryPath, registry.enclosingScope(owner)) : primaryPath;
+    if (order.some((ref) => ref.path === written || ref.path === primaryPath)) return;
+    commit([...order, { type: 'ComponentReference', path: written, componentType: TRANSFORM_TYPE } as ComponentRef]);
   };
 
   return (
@@ -139,7 +146,7 @@ export function RibbonPathRollersRenderer({ value, fieldName, nodePath, viewer }
           disabled={!primaryPath}
           onClick={handleAdd}
           data-testid="web-rollers-add"
-          sx={{ fontSize: 11, textTransform: 'none' }}
+          sx={{ fontSize: FS.label, textTransform: 'none' }}
         >
           Add selected node
         </Button>

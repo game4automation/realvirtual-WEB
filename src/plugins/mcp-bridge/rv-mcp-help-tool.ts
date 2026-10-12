@@ -23,11 +23,11 @@
 import { McpTool, McpParam } from '../../core/engine/rv-mcp-tools';
 
 // Vite ?raw imports — embedded as strings at build time.
-import HELP_EDITOR from './help/editor.md?raw';
 import HELP_LAYOUT from './help/layout.md?raw';
 import HELP_SIMULATION from './help/simulation.md?raw';
 import HELP_PLC from './help/plc.md?raw';
 import HELP_DES from './help/des.md?raw';
+import HELP_OPERATOR_PANEL from './help/operator-panel.md?raw';
 // The kinematize topic serves the customer-facing recipe verbatim — single source,
 // no copy in help/. It is the full workflow (perceive → knowledge folder → axes →
 // verify → materials) that editor.md only summarizes.
@@ -35,8 +35,8 @@ import HELP_KINEMATIZE from '../../../recipes/kinematize-cad-import.md?raw';
 
 const TOPICS: Record<string, { summary: string; content: string }> = {
   editor: {
-    summary: 'Asset Editor: kinematize & materialize CAD (open → perceive → act → verify → save)',
-    content: HELP_EDITOR,
+    summary: 'Asset Editor: preparing a model from raw CAD (same guide as kinematize)',
+    content: HELP_KINEMATIZE,
   },
   kinematize: {
     summary: 'The full CAD-to-kinematic-model recipe: perception, knowledge folder, axes with visual verification, materials — read before kinematizing a raw import',
@@ -58,12 +58,16 @@ const TOPICS: Record<string, { summary: string; content: string }> = {
     summary: 'Discrete-event simulation: status, bottlenecks, stepping, modes',
     content: HELP_DES,
   },
+  'operator-panel': {
+    summary: 'Operator panel windows as JSON (WebOperatorPanel): schema, device types, IEC colour rules, status rules, examples, MCP steps',
+    content: HELP_OPERATOR_PANEL,
+  },
 };
 
 export class McpHelpTool {
-  @McpTool('Get the deep how-to guide for a workflow domain. Topics: editor (kinematize/materialize CAD tool reference), kinematize (the full CAD-to-kinematic-model recipe incl. perception and verification), layout (build conveyor lines, heights), simulation (debugging drives/signals/flow), plc, des. Call without topic to list them. Read the matching guide BEFORE starting a multi-step workflow.', { readOnly: true })
+  @McpTool('Get the deep how-to guide for a workflow domain. Topics: editor (kinematize/materialize CAD tool reference), kinematize (the full CAD-to-kinematic-model recipe incl. perception and verification), layout (build conveyor lines, heights), simulation (debugging drives/signals/flow), plc, des, operator-panel (build an operator panel window as JSON — WebOperatorPanel). Call without topic to list them. Read the matching guide BEFORE starting a multi-step workflow.', { readOnly: true })
   async webHelp(
-    @McpParam('topic', 'editor | kinematize | layout | simulation | plc | des (omit to list topics).', 'string', false) topic: string,
+    @McpParam('topic', 'editor | kinematize | layout | simulation | plc | des | operator-panel (omit to list topics).', 'string', false) topic: string,
   ): Promise<string> {
     const key = (topic || '').trim().toLowerCase();
     const entry = TOPICS[key];

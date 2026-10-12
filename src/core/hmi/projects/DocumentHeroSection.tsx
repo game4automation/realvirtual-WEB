@@ -23,7 +23,18 @@
  */
 
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
-import { Box, Button, LinearProgress, Typography } from '@mui/material';
+import {
+  Box,
+  Button,
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  LinearProgress,
+  List,
+  ListItemButton,
+  ListItemText,
+  Typography,
+} from '@mui/material';
 import {
   getModelLoadProgressSnapshot,
   subscribeModelLoadProgress,
@@ -42,9 +53,17 @@ import {
 import { getOpenDocumentBase } from '../../editor/active-asset-store';
 import { getProjectStore } from '../../project/project-store';
 import {
+  getPluginBindingState,
+  subscribePluginBindingState,
+} from '../../rv-plugin-binding-state';
+import { scanPluginExports } from '../../rv-model-plugin-manager';
+import {
   isConnectConfigPath,
   isKnowledgeFilePath,
+  isProjectScriptPath,
+  PROJECT_SCRIPT_FOLDER,
   readDocumentRef,
+  type DocumentRefField,
   stripConnectConfigSuffix,
   stripKnowledgeFileSuffix,
 } from '../../project/rv-project-refs';
@@ -53,8 +72,54 @@ import {
   setProjectsSelection,
   subscribeProjectsDashboard,
 } from './projects-dashboard-store';
-import { CONNECT_CONFIG_DRAG_TYPE, KNOWLEDGE_FILE_DRAG_TYPE } from './connect-config-dnd';
-import { DocumentCard, type DocumentCardRefSlot } from '../scene/DocumentCard';
+import {
+  CONNECT_CONFIG_DRAG_TYPE,
+  KNOWLEDGE_FILE_DRAG_TYPE,
+  SCRIPT_FILE_DRAG_TYPE,
+} from './connect-config-dnd';
+import {
+  DocumentCard,
+  type DocumentCardBindAction,
+  type DocumentCardRefSlot,
+} from '../scene/DocumentCard';
+
+/**
+ * The three fields as the keyboard route names them (plan-479 F7, Phase 5).
+ *
+ * One table rather than three call sites: the menu label, the picker's title
+ * and the word for "nothing bound" all have to agree per field, and the
+ * candidate list is looked up by the same key. A fourth reference field is a
+ * row here plus a listing — which is the whole point of `DocumentRefField`
+ * having replaced the hand-counted union in Phase 0.
+ */
+const BIND_FIELDS: ReadonlyArray<{
+  field: DocumentRefField;
+  /** Menu entry — the verb, because a menu is a list of things one can do. */
+  menuLabel: string;
+  /** Picker heading — the noun, because a dialog names what it is showing. */
+  title: string;
+  /** How a candidate is shown; the classifying ending is noise in a list. */
+  display: (path: string) => string;
+}> = [
+  {
+    field: 'connectRef',
+    menuLabel: 'Bind CONNECT configuration…',
+    title: 'Bind a CONNECT configuration',
+    display: stripConnectConfigSuffix,
+  },
+  {
+    field: 'scriptRef',
+    menuLabel: 'Bind plugin…',
+    title: 'Bind a project plugin',
+    display: ref => ref.replace(new RegExp(`^${PROJECT_SCRIPT_FOLDER}/`, 'i'), ''),
+  },
+  {
+    field: 'knowledgeRef',
+    menuLabel: 'Bind knowledge file…',
+    title: 'Bind a knowledge file',
+    display: stripKnowledgeFileSuffix,
+  },
+];
 
 /**
  * The hero while an open-in-place load runs (plan: cool + animated open).
@@ -175,6 +240,7 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
       documentId: doc.id,
       bundled: doc.tier === 'bundled',
       ref: readDocumentRef(doc, 'connectRef'),
+      scriptRef: readDocumentRef(doc, 'scriptRef'),
       knowledgeRef: readDocumentRef(doc, 'knowledgeRef'),
     };
     // `viewVersion` is the re-read trigger: the seam republishes whenever what
@@ -189,9 +255,13 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
    */
   const [configs, setConfigs] = useState<string[]>([]);
   const [knowledgeFiles, setKnowledgeFiles] = useState<string[]>([]);
+  const [scripts, setScripts] = useState<string[]>([]);
   useEffect(() => {
     const backend = store.getBackend();
-    if (!dashboard.open || !backend) { setConfigs([]); setKnowledgeFiles([]); return; }
+    if (!dashboard.open || !backend) {
+      setConfigs([]); setKnowledgeFiles([]); setScripts([]);
+      return;
+    }
     let alive = true;
     void (backend.listConnectConfigs?.() ?? Promise.resolve([]))
       .then(paths => { if (alive) setConfigs(paths); })
@@ -199,17 +269,22 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
     void (backend.listKnowledgeFiles?.() ?? Promise.resolve([]))
       .then(paths => { if (alive) setKnowledgeFiles(paths); })
       .catch(() => { if (alive) setKnowledgeFiles([]); });
+    void (backend.listProjectScripts?.() ?? Promise.resolve([]))
+      .then(paths => { if (alive) setScripts(paths); })
+      .catch(() => { if (alive) setScripts([]); });
     return () => { alive = false; };
   }, [dashboard.open, store, project.project?.id, project.documents]);
 
   const writable = project.writable && binding !== null && !binding.bundled;
 
   /** The one write per field. In-memory first, so the chip flips at once. */
-  const assign = useCallback((field: 'connectRef' | 'knowledgeRef', ref: string | null) => {
+  const assign = useCallback((field: DocumentRefField, ref: string | null) => {
     if (!binding) return;
     const write = field === 'connectRef'
       ? store.setDocumentConnectRef(binding.documentId, ref)
-      : store.setDocumentKnowledgeRef(binding.documentId, ref);
+      : field === 'scriptRef'
+        ? store.setDocumentScriptRef(binding.documentId, ref)
+        : store.setDocumentKnowledgeRef(binding.documentId, ref);
     void write.catch((e) => {
       console.warn(`[document-hero] ${field} not written:`, e);
     });
@@ -224,7 +299,7 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
 
   /** One slot per reference field — same shape, different strip + listing. */
   const slotFor = (
-    field: 'connectRef' | 'knowledgeRef',
+    field: DocumentRefField,
     ref: string | null,
     existing: readonly string[],
     strip: (path: string) => string,
@@ -248,17 +323,105 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
   const connect = slotFor('connectRef', binding?.ref ?? null, configs, stripConnectConfigSuffix);
   const knowledge = slotFor(
     'knowledgeRef', binding?.knowledgeRef ?? null, knowledgeFiles, stripKnowledgeFileSuffix);
+  // No strip for the plugin: `.ts` is part of the file's own name, not a
+  // classifying ending the user never chose. `plugins/` is dropped though —
+  // every candidate is under it, so repeating it says nothing.
+  const pluginBase = slotFor(
+    'scriptRef',
+    binding?.scriptRef ?? null,
+    scripts,
+    ref => ref.replace(new RegExp(`^${PROJECT_SCRIPT_FOLDER}/`, 'i'), ''),
+  );
+
+  /**
+   * What the last load had to say about this binding (plan-479 F6) — the one
+   * thing the CONNECT and knowledge slots have no equivalent of.
+   *
+   * Published by the plugin manager in `core/`, consumed here through a hook:
+   * `core` states, `hmi` renders, and no cycle is created.
+   */
+  const runtime = useSyncExternalStore(subscribePluginBindingState, getPluginBindingState);
+
+  /**
+   * The source-scan verdict (F4) — "this file exports no plugin pair", found by
+   * reading the text, never by importing it.
+   *
+   * Only asked for a binding whose file IS in the project: a missing file has
+   * nothing to scan, and a scan of an absent file would answer "no exports" and
+   * bury the more useful "it is not there".
+   */
+  const scriptRef = binding?.scriptRef ?? null;
+  const scriptPresent = scriptRef !== null && scripts.includes(scriptRef);
+  const [noExports, setNoExports] = useState(false);
+  useEffect(() => {
+    if (scriptRef === null || !scriptPresent) { setNoExports(false); return; }
+    let alive = true;
+    void scanPluginExports(scriptRef, project.project?.canonicalName ?? null)
+      // `unreadable` is NOT a verdict: a project whose code is not in this
+      // build resolves at runtime, and warning about it would be a lie.
+      .then(scan => { if (alive) setNoExports(!scan.unreadable && !scan.isPluginModule); })
+      .catch(() => { if (alive) setNoExports(false); });
+    return () => { alive = false; };
+  }, [scriptRef, scriptPresent, project.project?.canonicalName]);
+
+  /**
+   * The chip, with the runtime verdict folded in.
+   *
+   * The runtime answer outranks the source scan — it is the same question
+   * answered by actually running the thing (R5) — and both are ignored when
+   * they speak about a DIFFERENT reference than the one now bound, which is the
+   * state between a re-binding and the next model load.
+   */
+  const plugin = useMemo((): DocumentCardRefSlot | null => {
+    if (!pluginBase || pluginBase.kind !== 'bound' || scriptRef === null) return pluginBase;
+    const current = runtime.kind !== 'none' && runtime.scriptRef === scriptRef ? runtime : null;
+    if (current?.kind === 'failed') {
+      return current.reason === 'no-exports'
+        ? { ...pluginBase, status: 'no-exports', statusDetail: current.detail }
+        : { ...pluginBase, status: 'failed', statusDetail: current.detail };
+    }
+    if (current?.kind === 'loaded') {
+      return {
+        ...pluginBase,
+        status: 'loaded',
+        statusDetail: current.from === 'runtime'
+          ? 'Loaded from the project at run time'
+          : 'Loaded from this build',
+      };
+    }
+    if (noExports) {
+      return {
+        ...pluginBase,
+        status: 'no-exports',
+        statusDetail: 'This file exports no registerModelPlugins/unregisterModelPlugins '
+          + 'pair — binding it loads nothing.',
+      };
+    }
+    return pluginBase;
+  }, [pluginBase, runtime, scriptRef, noExports]);
 
   /**
    * The hero as a drop target (Unity-style reference assignment): a config or
    * knowledge card dragged from the grid binds on drop. Gated on the payload
    * TYPE, so the tree's move drag and random text drops sail past untouched.
    */
-  const [dragOver, setDragOver] = useState<'connect' | 'knowledge' | null>(null);
-  const dragKindOf = (e: React.DragEvent): 'connect' | 'knowledge' | null =>
+  const [dragOver, setDragOver] = useState<'connect' | 'knowledge' | 'plugin' | null>(null);
+  /**
+   * Why the last drop did nothing (plan-479 F8).
+   *
+   * There is no application-wide snackbar this could dock onto — the only
+   * message surface in this section is the gateway `noticeBox` below, which is
+   * fed by `connect-store` and speaks for CONNECT. So the hero states the
+   * refusal ITSELF, in the same box, rather than inventing a second global
+   * channel for one sentence. A refusal the user cannot see is the bug being
+   * fixed here; where the sentence is rendered is the smaller question.
+   */
+  const [rejection, setRejection] = useState<string | null>(null);
+  const dragKindOf = (e: React.DragEvent): 'connect' | 'knowledge' | 'plugin' | null =>
     e.dataTransfer.types.includes(CONNECT_CONFIG_DRAG_TYPE) ? 'connect'
       : e.dataTransfer.types.includes(KNOWLEDGE_FILE_DRAG_TYPE) ? 'knowledge'
-        : null;
+        : e.dataTransfer.types.includes(SCRIPT_FILE_DRAG_TYPE) ? 'plugin'
+          : null;
   const onDragOver = (e: React.DragEvent) => {
     const kind = writable ? dragKindOf(e) : null;
     if (!kind) return;
@@ -270,13 +433,143 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
     setDragOver(null);
     if (!writable || !dragKindOf(e)) return;
     e.preventDefault();
+    setRejection(null);
     const configRef = e.dataTransfer.getData(CONNECT_CONFIG_DRAG_TYPE);
     if (isConnectConfigPath(configRef)) { assign('connectRef', configRef); return; }
     const knowledgeRef = e.dataTransfer.getData(KNOWLEDGE_FILE_DRAG_TYPE);
-    if (isKnowledgeFilePath(knowledgeRef)) assign('knowledgeRef', knowledgeRef);
+    if (isKnowledgeFilePath(knowledgeRef)) { assign('knowledgeRef', knowledgeRef); return; }
+    const scriptRef = e.dataTransfer.getData(SCRIPT_FILE_DRAG_TYPE);
+    if (scriptRef === '') return;
+    if (isProjectScriptPath(scriptRef)) { assign('scriptRef', scriptRef); return; }
+    // F8: the drag carried a script payload the rule refuses. Saying WHY is the
+    // point — a drop that silently does nothing is indistinguishable from a
+    // broken screen, and that ambiguity is what sends people back to the JSON.
+    setRejection(
+      `"${scriptRef}" cannot be bound as a plugin — only .ts and .tsx files `
+      + `under ${PROJECT_SCRIPT_FOLDER}/ are loaded for a document.`,
+    );
   };
   // The ring announces WHICH slot the drop will fill — the slot's own color.
-  const ringRgb = dragOver === 'knowledge' ? '233, 64, 120' : '102, 187, 106';
+  const ringRgb = dragOver === 'knowledge' ? '233, 64, 120'
+    : dragOver === 'plugin' ? '79, 195, 247'
+      : '102, 187, 106';
+
+  /**
+   * The keyboard route (plan-479 F7): which field's picker is open, if any.
+   *
+   * A menu entry per field opens this; the picker writes through the very same
+   * `assign` the drop uses. There is deliberately no second store call here —
+   * two write paths is how a read-only project or a containment rule ends up
+   * being enforced on one route and not the other.
+   */
+  const [picking, setPicking] = useState<DocumentRefField | null>(null);
+
+  /**
+   * The candidates per field.
+   *
+   * The script list is filtered by `isProjectScriptPath` even though the
+   * backend already walks `plugins/` — the picker is the F8 counterpart on the
+   * keyboard route, and the honest way to refuse a file the rule would reject
+   * is to never offer it. A refusal one cannot trigger needs no sentence.
+   */
+  const candidates = useMemo((): Record<DocumentRefField, readonly string[]> => ({
+    connectRef: configs,
+    scriptRef: scripts.filter(isProjectScriptPath),
+    knowledgeRef: knowledgeFiles,
+  }), [configs, scripts, knowledgeFiles]);
+
+  const bindActions = useMemo((): DocumentCardBindAction[] => (
+    writable
+      ? BIND_FIELDS.map(({ field, menuLabel }) => ({
+        id: field,
+        label: menuLabel,
+        onSelect: () => { setRejection(null); setPicking(field); },
+      }))
+      : []
+  ), [writable]);
+
+  const pickingSpec = picking === null
+    ? null
+    : BIND_FIELDS.find(f => f.field === picking) ?? null;
+  const pickerBound = picking === null || !binding
+    ? null
+    : picking === 'connectRef' ? binding.ref
+      : picking === 'scriptRef' ? binding.scriptRef
+        : binding.knowledgeRef;
+
+  /**
+   * The candidate picker — the whole of F7's second half.
+   *
+   * A plain list of buttons in a dialog, because that is what is operable
+   * without a pointer: MUI moves focus into the dialog on open, Tab and the
+   * arrow keys walk the buttons, Enter activates one and Escape leaves without
+   * writing. Nothing here is reachable by mouse only.
+   */
+  const picker = pickingSpec && (
+    <Dialog
+      open
+      onClose={() => setPicking(null)}
+      maxWidth="xs"
+      fullWidth
+      data-testid="document-hero-bind-dialog"
+    >
+      <DialogTitle sx={{ fontSize: 14, fontWeight: 600 }}>{pickingSpec.title}</DialogTitle>
+      <DialogContent sx={{ px: 1, pb: 1 }}>
+        <List dense disablePadding>
+          {/* Clearing is a binding decision too, and the × on the chip is a
+              mouse target — without this row the keyboard could bind but
+              never unbind. */}
+          <ListItemButton
+            autoFocus
+            data-testid="document-hero-bind-none"
+            onClick={() => {
+              // Enabled even when nothing is bound — it is the first stop of
+              // the focus trap, and a disabled first stop would send the
+              // keyboard somewhere different depending on the state it found.
+              // It simply writes nothing in that case.
+              if (pickerBound !== null) assign(pickingSpec.field, null);
+              setPicking(null);
+            }}
+          >
+            <ListItemText
+              primary="None"
+              secondary={pickerBound === null ? 'Nothing is bound' : 'Clear this binding'}
+              primaryTypographyProps={{ fontSize: 13 }}
+              secondaryTypographyProps={{ fontSize: 10 }}
+            />
+          </ListItemButton>
+          {candidates[pickingSpec.field].map((path) => (
+            <ListItemButton
+              key={path}
+              data-testid={`document-hero-bind-option-${path}`}
+              selected={path === pickerBound}
+              onClick={() => { assign(pickingSpec.field, path); setPicking(null); }}
+            >
+              <ListItemText
+                primary={pickingSpec.display(path)}
+                secondary={path}
+                primaryTypographyProps={{ fontSize: 13 }}
+                secondaryTypographyProps={{ fontSize: 10 }}
+              />
+            </ListItemButton>
+          ))}
+          {candidates[pickingSpec.field].length === 0 && (
+            <Typography
+              data-testid="document-hero-bind-empty"
+              sx={{ fontSize: 11, color: 'text.disabled', px: 2, py: 1 }}
+            >
+              {/* Saying WHERE the candidates would come from is the difference
+                  between an empty list and a broken screen. */}
+              {pickingSpec.field === 'scriptRef'
+                ? `This project has no .ts or .tsx file under ${PROJECT_SCRIPT_FOLDER}/ to bind.`
+                : 'This project has no file of that kind to bind.'}
+            </Typography>
+          )}
+        </List>
+      </DialogContent>
+    </Dialog>
+  );
+
 
   /**
    * What the running gateway had to say about the last binding change
@@ -288,7 +581,11 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
    * the user just did, and none of them may be silence.
    */
   const gateway = useSyncExternalStore(subscribeActiveDocumentState, getActiveDocumentState);
-  const notice = gateway.pending
+  const notice = rejection
+    // The user's own last gesture outranks a standing gateway remark: the
+    // refusal is an answer to what they just did, one tick ago.
+    ? { tone: '255, 167, 38', text: rejection }
+    : gateway.pending
     ? {
       tone: '255, 179, 0',
       text: `Activate "${gateway.pending.profile}"? `
@@ -340,7 +637,7 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
       <Button
         size="small"
         data-testid="document-hero-connect-dismiss"
-        onClick={clearActiveDocumentState}
+        onClick={() => { setRejection(null); clearActiveDocumentState(); }}
         sx={{ fontSize: 11, minWidth: 0, px: 1, py: 0, color: 'text.disabled' }}
       >
         Dismiss
@@ -391,7 +688,9 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
                 onReveal={onReveal}
                 previewVisible={dashboard.open}
                 connect={connect}
+                plugin={plugin}
                 knowledge={knowledge}
+                bindActions={bindActions}
               />
             </Box>
             {noticeBox}
@@ -422,7 +721,9 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
               onReveal={onReveal}
               previewVisible={dashboard.open}
               connect={connect}
+              plugin={plugin}
               knowledge={knowledge}
+              bindActions={bindActions}
             />
             {noticeBox}
           </Box>
@@ -438,6 +739,7 @@ export function DocumentHeroSection({ onReveal, compactLayout = false }: Documen
         )}
       </Box>
       {dashboard.opening !== null && <OpeningHero label={dashboard.opening} />}
+      {picker}
     </Box>
   );
 }

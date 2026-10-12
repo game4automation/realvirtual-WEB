@@ -1,5 +1,9 @@
 # Document Linking System
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 realvirtual WEB supports linking PDF documents and AASX (Asset Administration Shell) packages to 3D scene nodes. Linked documents appear in the tooltip and can be opened in a built-in PDF viewer overlay.
 
 ## Architecture
@@ -10,6 +14,14 @@ Document linking consists of two phases:
 2. **Runtime**: A plugin loads the index on model load, matches nodes by metadata, and attaches `_rvPdfLinks` entries to `node.userData`.
 
 The tooltip system automatically renders PDF links for any node that has `_rvPdfLinks` in its userData.
+
+> **Not a document link: a GLB `AssetReference`.** A node that references another GLB asset is a
+> *placement* of that asset, not a link to a document — at runtime the viewer materialises it
+> through the placement instancer, recursively (plan-757 Phase 2: nothing is grafted at runtime;
+> the asset editor is the one authoring load that still composes). Document links attached to nodes
+> INSIDE a placed asset resolve on `layout-content-added` like any other placed content; a nested
+> placement (a reference inside a placed asset) is content of its record's placement, and an edit
+> under it is refused by name ("Open the referenced asset"). See `doc-node-paths.md` §9.
 
 ## Document Sources
 
@@ -331,14 +343,24 @@ export class DocsLinkPlugin implements RVViewerPlugin {
 }
 ```
 
-Register it in the project's `plugins/index.ts`:
-```typescript
-import { DocsLinkPlugin } from './docs-link-plugin';
+Bind the document to a project module through `documents[].scriptRef`. A direct
+`plugins/docs-link-plugin.ts` can export both registration functions:
 
+```typescript
+// Add to the module that defines DocsLinkPlugin; RVViewer is a type-only import.
 export function registerModelPlugins(viewer: RVViewer): void {
-  viewer.use(new DocsLinkPlugin('/private-assets/myproject/'));
+  viewer.use(new DocsLinkPlugin('/my-project-assets/'));
+}
+export function unregisterModelPlugins(viewer: RVViewer): void {
+  viewer.removePlugin('docs-link'); // Must match DocsLinkPlugin.id.
 }
 ```
+
+Host `docs-index.json` and PDFs under the base URL you pass; a folder-project Blob
+module has no HTTP directory of its own. `/private-assets/` is a maintainer dev-server
+route, not available to a standalone Community project. The
+[public project example](doc-project-plugin-example.md) covers compilation and binding.
+For production, use a same-origin static directory or a CORS-enabled host you control.
 
 ## PDF Viewer
 
@@ -351,11 +373,31 @@ The built-in PDF viewer overlay (`DocViewerOverlay`) automatically renders when 
 
 No additional configuration needed — any node with `_rvPdfLinks` in its userData will show PDF buttons in the tooltip.
 
+## Manuals next to the model: `<link url>` into the project (2026-10-12)
+
+A `docs/` tree with `docs-index.json` links documents by part number. The simpler case of a
+3D-HMI — "this station, this operating manual" — needs no index and no plugin: the
+`RuntimeMetadata` of the station carries a `<link url="…">` whose URL is a **path relative to
+the project root**, e.g.
+
+```xml
+<link url="Kroenert Files/Final Documentation CD/01-Operation/260_MK_38780_FSU_BAL_ENU.pdf">Open operating manual</link>
+```
+
+The tooltip resolves the link once when it renders (`metadata-link-resolver.ts`): if the OPEN
+project holds that file, the project backend hands out an object URL for it and a PDF opens
+in the built-in viewer (a non-PDF in a new tab) — a folder project reads it straight from
+the linked folder, a hosted deploy from the published project. Absolute `http(s)` URLs stay
+web links, and a relative URL the project does not hold keeps its legacy meaning as a link
+into `https://doc.realvirtual.io/` (Unity demo content). The click is synchronous, so popup
+blockers never interfere. Nothing is uploaded anywhere: the manual stays where the project
+keeps it.
+
 ## Production Deployment
 
-For production builds, private project assets need to be deployed separately:
+For production builds, host the document index and files at the configured base URL:
 
-1. **Bunny CDN**: Upload the `docs/` folder and `docs-index.json` to the CDN
+1. **Static host**: Copy the `docs/` folder and `docs-index.json` to your HTTP(S) host
 2. **Update basePath**: Point to the CDN URL instead of `/private-assets/`
 3. The `docs-index.json` is small (< 100KB typically) and can be bundled
 4. PDFs are fetched on demand — only opened documents are downloaded

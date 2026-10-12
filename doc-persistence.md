@@ -1,5 +1,11 @@
 # Persistence Architecture — realvirtual WEB
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
+For Save, autosave, recovery and moving a project, start with [Projects and saving](doc-projects.md). This document is the storage reference; retired layouts are summarized in [Migration](doc-migration.md).
+
 This document describes how realvirtual persists state across page reloads,
 tab closes, and user sessions: which storage backend each piece of state lives
 in, the wire format, and the lifecycle (when it's written, when it's read, how
@@ -27,14 +33,16 @@ them.
 
 | Backend | Used for | Survives reload? | Survives tab close? | Cleared by |
 |---|---|---|---|---|
-| **localStorage** | Almost everything: scenes, drafts, settings, overlays, presets, panel state | ✅ | ✅ | `clearAllRVStorage()` / Settings → "Reset all" |
+| **localStorage** | Small metadata and preferences: active pointers, settings, overlays, presets and panel state; not current GLB draft bodies | ✅ | ✅ | `clearAllRVStorage()` / Settings → "Reset all" |
 | **sessionStorage** | Tab-scoped ephemeral state: sensor history panel layout, order cart, login gate auth | ✅ | ❌ | Tab close (browser-managed) |
-| **IndexedDB** (`rv-filesystem`) | `FileSystemDirectoryHandle` for a project / workspace folder (plus the retired working-folder slot, §7.6) | ✅ | ✅ | Project close / `removeWorkFolder()` |
-| **Cache API** (`rv-planner-glbs`) | Network cache for planner library GLBs | ✅ | ✅ | `ModelCache.clearPersistentCache()` |
+| **IndexedDB** (`rv-filesystem`) | `FileSystemDirectoryHandle` for a project folder (plus the retired workspace-root and working-folder slots, §7.6) | ✅ | ✅ | Project close / `removeWorkFolder()` |
+| **IndexedDB** (`rv-model-index`, store `snapshots`) | Cross-project **model index** (plan-509): one snapshot per project, key `<backend>:<projectId>`, holding each document's id, name, path, tags and declared mode — what the Projects screen's "Search documents…" field searches without opening (or prompting for) a folder | ✅ | ✅ | Remove / Delete / Replace of a linked project (`forgetProjectTraces`) / browser eviction / site-data clear |
+| **IndexedDB** (`rv-document-modes`, store `modes`) | Per-document **last mode** (plan-513): key `<backend>:<projectId>:<documentId>`, value `{ mode, usedAt }` — the workspace mode each document was last used in, shown as a chip on every document row and restored by every deliberate open | ✅ | ✅ | Remove / Delete / Replace of a linked project (`forgetProjectTraces`) / opening a project as a demo / browser eviction / site-data clear |
+| **Cache API** (`rv-assets-glb-v2`, splats `rv-assets-splat-v2`) | Network cache for placeable library GLBs / splats, keyed by URL + catalog hash | ✅ | ✅ | `ModelCache.clearPersistentCache()` |
 | **OPFS** (`core/storage/rv-opfs-blobs`) + **Cache API** (`rv-cad-glbs`) | Converted-CAD GLB bytes, keyed by `(sha256, quality)` — how an `importCad` op replays without re-tessellating (§7.8) | ✅ | ✅ | `clearCadGlbCache()` |
 | **OPFS / IndexedDB / localStorage** (`rv-project/*`) | Project subsystem — which project is open, its backend, its blobs (§3.6) | ✅ | ✅ | Project delete / browser site-data clear |
 | **URL query string** | Active scene id / built-in filename / model URL — round-trip across bookmarks and reloads | ✅ (re-read on boot) | ❌ | New URL |
-| **In-memory** (`SceneStore`, op buffer, redo stack, transaction buffer) | Live workspace state; flushed to localStorage on debounce | ❌ | ❌ | Lost on reload unless autosaved |
+| **In-memory** (`SceneStore`, op buffer, redo stack, transaction buffer) | Live workspace state; GLB autosave bodies are written through the project backend/OPFS on debounce | ❌ | ❌ | Lost on reload unless autosaved |
 
 [`src/core/hmi/rv-storage-keys.ts`](src/core/hmi/rv-storage-keys.ts) holds
 `ALL_RV_STORAGE_KEYS` and `clearAllRVStorage()` (used by Settings → "Reset
@@ -66,10 +74,9 @@ customer:
 | `public/library/` | **The component library — app-level**, one copy per installation, beside the demo rather than inside it (the delivered standard library: `PalletHandling` + `catalog.json`). Reached through a manifest `libraries[]` subscription, never through the demo backend base path | `/library/...` | yes |
 | `../realvirtual-WebViewer-Private~/projects/<name>/` | Customer and internal projects. `projects/Development/` is the **internal** one: `fixtures/`, `models/`, `library/Custom/`, `scratch/` | `/private-assets/<project>/<path...>` | only on a private deploy of that project |
 
-The third root is why `public/models/` can be small. Before plan-395 it held
-45 MB of test fixtures, experiments and NDA-covered geometry — not out of
-carelessness, but because no other place existed. `projects/Development/` is
-that place, and `scratch/` inside it is the one for experiments.
+Community users keep their own models in a project folder or browser project.
+The private root in this table is a maintainer facility, not a prerequisite.
+Older layouts used `public/models/`; see [Migration notes](doc-migration.md).
 
 The `/private-assets/` route is recursive and serves any project subfolder, so
 it is also the one place where a path from a URL becomes a path on disk. Its
@@ -92,12 +99,11 @@ thing actually get written?**".
 | What | Where | **Write trigger** | Read trigger |
 |---|---|---|---|
 | **Working-scene body** (autosave snapshot) | **GLB body slot** `draft/<baseKey>` or `draft/<sceneId>` (OPFS / project backend, §3.1b) | Every op application, **debounced 2000 ms** (`DRAFT_AUTOSAVE_DEBOUNCE_MS`, `scene-store.ts:1537-1580` → `_autosaveBody()`) | `openScene(id)` / `openBuiltin(url)` / `openEmpty()` at boot, via `_resolveLoad()` |
-| ~~Working-scene op log~~ | ~~`localStorage rv-scenes/draft/<base>`, `rv-scenes/scene-draft/<id>`~~ | **DEAD since plan-397 phase 7 / plan-413 phase 6** — no writer, no reader (§3.1c, §3.1 table). Only the clear helpers still touch these keys. | — |
 | **GLB-node signal bindings** (`kind: 'node'`) | Working-scene `setField` op: `SignalLinks.Mappings` | Every bind, unbind, or confirmed mapping edit | Scene replay / model load via `SignalBindPlugin` |
 | **Placement signal bindings** (`kind: 'placed'`) | `PlacedComponent.signalMappings` inside the placement record | Every bind/unbind — written straight through `LayoutStore.updateSignalMappings()`, **no** `setField` op | With the placement, on `addPlacement` replay |
-| **Saved document** (a row in the project) | project file `scenes/<name>.glb` + a `documents[]` row | **Explicit user action**: Save / Save as… / Duplicate / Import / Rename | `openDocument(id)` |
-| **Active-scene pointer** | `localStorage rv-scenes/active` | `save()` / `openScene()`; cleared when opening an unsaved built-in | Boot fallback when `?scene=` is missing |
-| **URL `?scene=…`** | History API (no storage) | Every workspace switch via `history.replaceState` | Boot, on every reload |
+| **Saved document** (a row in the project) | project-relative GLB file + a `documents[]` row; folders do not determine document type | **Explicit user action**: Save / Save as… / Duplicate / Import / Rename | `openDocument(id)` |
+| **Active-scene pointer** | `localStorage rv-scenes/active` | `save()` / `openScene()`; cleared when opening an unsaved built-in | Boot fallback when no explicit document link is supplied |
+| **URL `?doc=…`** (`?scene=` remains a legacy alias) | History API (no storage) | Every workspace switch via `history.replaceState` | Boot, on every reload |
 | **Visual / interface / search / multiuser settings** | `localStorage rv-<area>-settings` | **Every setter call** in the respective store (no debounce — synchronous) | Lazy on first access |
 | **Per-group visibility** | `localStorage rv-group-visibility` | On every visibility toggle | Scene/model load + UI mount |
 | **Per-model camera preset** | `localStorage rv-camera-start:<modelKey>` | `saveStartPos()` / `clearStartPos()` (also via `setCamera` op) | `scene-loaded` event |
@@ -106,9 +112,11 @@ thing actually get written?**".
 | **Planner active library** | `localStorage rv-planner-active-library` | Every library pick in the Library window's dropdown | Planner panel mount, **before** the store's own `activeTabUrl` |
 | **Hierarchy / Inspector / panel UI state** | `localStorage rv-hierarchy-… / rv-inspector-… / rv-extras-editor-…` | On every UI change (expand, resize, select) | Panel mount |
 | **User plugin overrides** (which plugins are switched off) | `localStorage rv-plugin-overrides/<scope>` — scope = project id, else model key (plan-435) | Every feature-matrix toggle, via the `plugins-changed` event with `kind: 'user-disabled' \| 'user-enabled'` | Boot, after the last `viewer.use()` and **before** the model load |
-| **Project / workspace folder handle** | `IndexedDB rv-filesystem` | On user folder selection | Project open / resume |
+| **Project folder handle** | `IndexedDB rv-filesystem` | On user folder selection | Project open / resume |
+| **Model index snapshot** (plan-509) | `IndexedDB rv-model-index` → store `snapshots`, key `<backend>:<projectId>` | After a `ProjectStore` publish with a project open whose document signature (project name + `id\|name\|path\|tags\|mode` per document) changed, **debounced 500 ms per project** (`rv-model-index-writer.ts`); the bundled demo from its HTTP manifest when the Projects screen mounts. A folder snapshot is only committed while the project is still linked. One entry is removed when an opened hit's document is gone; the whole snapshot only by `forgetProjectTraces` — never automatically | Projects screen mount, and on every change broadcast over `BroadcastChannel('rv-model-index')` |
+| **Document last mode** (plan-513) | `IndexedDB rv-document-modes` → store `modes`, key `<backend>:<projectId>:<documentId>` | Every `SceneStore.openDocument`, Save-as and first save of a draft (beside the recents ring, same mode rule: the running open's intent, else the live mode), and every `mode-changed` outside an open-intent scope. Never under a kiosk lock, never for a demo project — opening a project as a demo deletes its entries. Once, on the first load, the recents ring's modes are copied in (demo project excluded, marker `~seededFromRecents`). Removed per project by `forgetProjectTraces` (folder backend only) | Dashboard mount (one map for all chips) and on every change broadcast over `BroadcastChannel('rv-document-modes')`; one key read per deliberate open (cards, model search, recents, boot resume). An IndexedDB failure is "no last mode", never a failed open |
 | **Folder display name** | `localStorage rv-local-folders` | Same call that writes the IDB handle | Settings UI render |
-| **Planner GLB tarballs** | `Cache API rv-planner-glbs` | First fetch of a catalog GLB | Every subsequent fetch (cache-first) |
+| **Planner GLB tarballs** | `Cache API rv-assets-glb-v2` | First fetch of a catalog GLB (verified against the catalog `sha256` when it has one) | Every subsequent fetch under the same URL + hash (cache-first) |
 | **Sensor history panel layout** | `sessionStorage rv-sensor-history` | On panel drag / resize | Panel mount in same tab |
 | **Order Manager cart** | `sessionStorage rv-order-cart` | On cart add / remove | Panel mount in same tab |
 | **Login Gate auth** | `sessionStorage rv-login-auth` (default) | On successful login | Page load |
@@ -390,18 +398,69 @@ through `isValidProjectV1` and `mergeManifest`'s read-modify-write untouched
 (`tests/section-passthrough.test.ts`). Reading one is the business of the legacy
 layer at the top of `rv-project-documents.ts` and of nothing else.
 
-**One transitional exception.** `documentOfSceneEntry` (and its Node twin in
-`scripts/_rv-manifest.mjs`) still stamps `section: 'scenes'` on a browser scene
-row. An OLD client meeting a section-less bare-id scene would run it through the
-pre-plan-736 path heuristic, get `'library'`, and route it down the blob branch —
-a storage failure, not a badge. Removing the stamp is a separate step, gated on
-the slow delivery channels (ctrlX snap, CONNECT-embedded appliances) shipping a
-client that no longer reads the field. The first section-less row written into a
-user's browser storage is the point of no return.
+**The transitional exception is gone (plan-744 Phase 2).** Until then,
+`documentOfSceneEntry` and its Node twin stamped `section: 'scenes'` on a
+browser scene row, because an OLD client meeting a section-less bare-id scene
+would run it through the pre-plan-736 path heuristic, get `'library'`, and
+route it down the blob branch — a storage failure, not a badge. The gate on
+removing it was the slow delivery channels (ctrlX snap, CONNECT-embedded
+appliances) shipping a client that no longer reads the field; that gate was
+declared open, and the residual risk is **accepted and not mitigated**: a
+browser scene saved from this build on is section-less, and a client older than
+plan-736 that meets it will misroute it. Rolling the stamp back is three lines
+and does **not** heal rows already written.
+
+With the stamp gone there is one lift for all three legacy arrays,
+`documentOfEntry` — the section argument decided nothing else.
 
 **For MCP callers.** The file/document tools report `folder` — the first path
-segment, `''` at the project root. `section` survives as a deprecated alias
-carrying the identical value for one release.
+segment, `''` at the project root. The deprecated `section` alias beside it was
+removed in plan-744 F9; it had carried the identical value, and `rg` found no
+consumer outside this repo (not in CONNECT's C#, not in `unity_mcp_server.py`).
+
+### 2.0-0a The last folder-typed paths, retired (plan-744)
+
+plan-736 removed the stored `section`. What it left behind was code that still
+*derived* one, and plan-744 removed that too. Four things changed, and each was
+a place where the folder a file sat in decided what happened to it:
+
+**One listing.** `ProjectBackend.listModels()` and `.listLibrary()` are gone.
+They asked "which documents live in this FOLDER", which any caller can answer
+off the row it already has, and they disagreed about depth — models walked one
+level, library walked the tree — so a GLB in `models/sub/` existed on disk,
+existed in the manifest, and appeared in neither list. `listDocuments()` is the
+one list and it walks the whole tree. A caller that genuinely means one folder
+filters on the path, at the read site.
+
+Two folders are skipped: any **dot-segment** (`.thumbnails/`, `.trash/`) is our
+own bookkeeping, and root-level **`imports/`** is a staging area for bytes on
+their way in — a converted CAD file or an Onshape pull, which a re-sync has to
+be able to overwrite at a known path. Staged bytes become a document when
+someone decides what they are, not when they land. The rule lives once, in
+`rv-asset-identity.ts` (`isPrivateSegment`, `isStagingPath`, `isAdoptablePath`).
+
+**Thumbnails hang on the id.** `<project>/.thumbnails/<encodeThumbnailId(id)>.png`,
+for every document. The old convention mirrored the asset's PATH under
+`library/.thumbnails/`, which lost the picture on every move or rename and only
+ever existed for `library/**` — so a model, a scene, or anything in a delivered
+project had no persisted preview and fell back to a render cache that is
+per-browser. The read chain is `doc.thumbnail` (what the manifest states) →
+the id sidecar → a lazy, `'create'`-preconditioned copy of an old
+path-mirrored file → null, and null means the card renders from the GLB.
+`applyTreeMove` runs the same copy *before* a move, or a document dragged out
+of `library/` before anything rendered its card would lose the picture for
+good. Nothing sweeps the old files; they stay for a release.
+
+**Save-as lands at the project root** when the document has no folder of its
+own, instead of `library/Custom`. The dialog's folder picker is where the user
+says otherwise.
+
+**`demos` replaces a section lookup.** `RvProject.demos = { hmi?, planner? }`
+holds document IDS. The WelcomeModal used to pick "the first document under
+`models/`" and "the first under `scenes/`", which made a folder name part of
+the product's behaviour and answered nothing for a project that files its
+documents at the root — which the demo project does. Absent, the modal falls
+back to the start document and the first document.
 
 ### 2.0-0 One content type: the document
 
@@ -659,7 +718,7 @@ document saved under `models/` was placed from stale bytes afterwards.
 
 ### 2.0a-2 Authored manifests: the demo project (plan-726)
 
-Almost every manifest in this system is *written by the app*. `public/project.json`
+Almost every manifest in this system is *written by the app*. `public/demo-realvirtual/project.json`
 is the exception: it is authored by hand, checked in, and shipped to the deploy
 root, where `BundledBackend.readManifest()` reads it. It defines the
 DemoRealvirtual project (`id: prj_sample`) for every channel at once — the hosted
@@ -1010,7 +1069,7 @@ into the project.
 ### Examples are documents (plan-731)
 
 There is **one catalogue**. An "Example" — a curated demo scene shipped with the
-build — is an ordinary `documents[]` row of `public/project.json`, and it is
+build — is an ordinary `documents[]` row of `public/demo-realvirtual/project.json`, and it is
 opened by `openDocument()` like every other document. Its preferred workspace
 mode (e.g. `planner`) is a property of the row (`mode`), applied on open unless
 `?mode=` overrides it.
@@ -1562,7 +1621,7 @@ Three interchangeable backends behind one `ProjectBackend` interface
 |---|---|---|
 | **folder** | A user-picked directory via the File System Access API (`selectFolderForKey`, readwrite) | Durable, user-owned, shareable. The successor to the old "working folder". |
 | **browser** | OPFS blobs + `localStorage rv-project/browser/<id>` | Zero-setup default; evictable like all browser storage. |
-| **bundled** | Read-only, shipped with the build (`library/catalog.json` etc.) | The DemoRealvirtual project — authored in `public/project.json`, see below. `writeDocument` is refused with a reason. |
+| **bundled** | Read-only, shipped with the build (`library/catalog.json` etc.) | The DemoRealvirtual project — authored in `public/demo-realvirtual/project.json`, see below. `writeDocument` is refused with a reason. |
 
 The `rv-project/*` localStorage keyspace:
 
@@ -1570,11 +1629,52 @@ The `rv-project/*` localStorage keyspace:
 |---|---|---|
 | `rv-project/last` | Id of the last opened project — restored on boot | `project-store.ts` |
 | `rv-project/resume/<projectId>` | The `(asset, mode)` pair last open in this project — boot's second line of defence behind `?doc=` (plan-702/703) | `rv-project-resume-store.ts` |
-| `rv-project/recent` | Recent-project list for the picker | `rv-project-recent.ts` |
-| `rv-project/workspace` | The workspace root that contains project folders | `rv-project-workspace.ts` |
+| `rv-project/linked` | The LINKED PROJECTS list — every project folder this browser knows, uncapped, sorted by `lastOpenedAt` then `linkedAt`. Since plan-743 this is the dashboard's only project source rather than a cache beside a workspace root: losing a row loses the project from the list | `rv-project-linked.ts` |
 | `rv-project/migration` | One-shot migration state (legacy loose keys → project) | `rv-project-migration.ts` |
 | `rv-project/workfolder-offer` | "Adopt your old working folder as a project?" was offered | `rv-project-migration.ts` |
 | `rv-project/browser/<id>` | Metadata for a browser-backend project | `browser-backend.ts` |
+| `rv-project/recent-documents` | The cross-project **recents ring** — up to ten documents, newest first, each with its project, backend, mode and (since schema 2) its project-relative path. Versioned envelope, see below. Since plan-513 the ring's `mode` is history only: the chip and the open read a document's mode from `IndexedDB rv-document-modes` | `rv-project-recents-store.ts` |
+
+**Schema 2 of the recents ring, and the one-time loss it costs (plan-482).**
+`RECENTS_SCHEMA_VERSION` went from 1 to 2 when `documentPath` became a
+**mandatory** field of `RecentDocumentEntry`. There is deliberately **no
+migration code**: `parseRecents()` already gates on `env.version !==
+RECENTS_SCHEMA_VERSION` and answers `[]` for anything else, so a v1 ring is
+discarded the first time a v2 build reads it — the same treatment
+`NEWS_CONTRACT_VERSION` and the editor's last-asset key give an unknown version.
+The key itself is unchanged and is **not** a `runLegacyCleanup()` entry: that
+sweep retires whole keys, not versions inside one.
+
+The cost is one empty "Recently opened" list per user, once, and it is
+deliberate: an *optional* path would have saved the old ring but forced every
+reading side to reckon with "maybe no path" forever, and a list that refills
+itself the next time you open something needs no announcement. There is
+therefore no toast and no banner. The same gate has a second, less obvious
+consequence worth knowing during a deploy: while a v1 tab and a v2 tab are open
+side by side, each one discards what the other writes — the `storage` listener
+re-reads the key rather than trusting the event payload. Accepted for a comfort
+list; a downgrade guard would cost more than the damage.
+
+Two more properties of the path, both of which follow from it being **recorded
+rather than resolved**: it is written at the three moments a document takes on
+an identity (an open, a save into the project, a save-as), because the ring is
+cross-project and rendering it must not read a closed project's manifest and
+provoke a permission prompt; and it is re-pointed after a rename or a move
+inside the OPEN project, by both `applyTreeMove()` and `SceneStore.rename()`,
+which change a file's place entirely independently of one another. Only the path
+is rewritten — order, `mode` and `openedAt` stay, because a rename is not an
+open. A file moved **outside** the app stays wrong in the list until it is next
+opened: the app cannot watch a folder it does not have open.
+
+**Retired by plan-743, deleted on the first boot after the update** by
+`runLegacyCleanup()` (`rv-project-legacy-cleanup.ts`, called from `main.ts`
+before `resolveActiveProject`): the localStorage keys `rv-project/workspace`
+and `rv-project/recent`, and the IndexedDB handle slot `workspace`. There is no
+migration — the old engine stored one handle for the workspace ROOT and never
+one per child project, so there was nothing to migrate a child project from.
+The replacement is the user pointing **Add** at the old root once, which links
+every child in a single step. `rv-project/last` and every `projectfolder:<id>`
+handle are deliberately untouched, so boot resume survives the update.
 
 Two couplings back into this document: the project id scopes the per-base draft
 key (§3.1), and `saveSettingsIntoModel()` writes through
@@ -2323,8 +2423,12 @@ save path.
   / discard draft / open requested — the last one shelves first).
 - **Save**: `GLTFExporter` bakes the live tree (geometry +
   `userData.realvirtual` incl. `CADLink`) into a binary GLB written to
-  `<project>/library/Custom/<name>.glb` of the **active project** (+ thumbnail under
-  `library/.thumbnails/Custom/`). There is exactly ONE save destination and
+  the document's OWN folder in the **active project** — the project ROOT when
+  it has none (plan-744 F7; `library/Custom` was the last folder-as-a-type in
+  the save path and is no longer a fallback) — plus a preview under
+  `<project>/.thumbnails/<documentId>.png` (F5: keyed by IDENTITY, so a move or
+  a rename keeps it, and written for every document rather than for
+  `library/**` alone). There is exactly ONE save destination and
   one path to it (`saveDocument()`, plan-709 §2.2): the editor's second target
   — `<workfolder>/library/Custom/` — and its browser-download fallback are both
   gone. `downloadAssetGlb` survives as an explicit menu verb, not as what
@@ -2583,8 +2687,8 @@ stores `FileSystemDirectoryHandle`s in the `handles` object store. It is a
 
 | Handle key | Constant | What it points at |
 |---|---|---|
-| `workspace` | `HANDLE_KEY_WORKSPACE` | The workspace root that contains project folders |
-| `projectfolder:<projectId>` | `handleKeyForProject(id)` | One project folder picked outside a workspace |
+| `projectfolder:<projectId>` | `projectHandleKey(id)` | ONE project folder. Since plan-743 every listed project has one of these — the shared workspace-root grant is gone, so a project the user has not opened this session carries a lock icon until they click it |
+| `newprojectparent` | `HANDLE_KEY_NEW_PROJECT_PARENT` | The folder the New-project dialog last created a project *inside*. Nothing is ever read from it; the only write is the new project's own subfolder |
 | `workfolder` | `HANDLE_KEY_WORKFOLDER` — **`@deprecated`, read-only** | The legacy single working folder. **Nothing writes to it any more** (plan-709 §2.6): the Custom-library save, MCP captures, MCP imports, planner thumbnails and the local-folder catalog all went to the project. The slot survives so an existing install can still be READ — by the boot model scan and by Settings → Backup → *Old Working Folder*, which copies the whole tree into the open project and never deletes the source |
 
 Handles survive reloads but the browser may prompt the user to re-grant
@@ -2611,21 +2715,27 @@ the migration in Settings → Backup → *Old Working Folder*. The Layout Planne
 local-folder catalog — the other reader — went with the write paths (§2.6 of
 plan-709): a library on this machine is a **project** now, opened from Projects.
 
-### 7.7 Cache API — `rv-planner-glbs`
+### 7.7 Cache API — `rv-assets-glb-v2`
 
 `ModelCache` ([`plugins/layout-planner/model-cache.ts`](src/plugins/layout-planner/model-cache.ts))
-uses the browser **Cache API** (named bucket `rv-planner-glbs`) as a
-persistent network cache for catalog GLBs:
+uses the browser **Cache API** (named bucket `rv-assets-glb-v2`; splats use
+`rv-assets-splat-v2`) as a persistent network cache for catalog GLBs. Since
+plan-508 the key is the URL **plus the catalog's `sha256`** (`cacheKeyFor(url, sha256)`
+→ `…?__rvsha=<hash>`, fragment dropped), and downloaded bytes are verified against it:
 
 ```
 getOrLoad(url):
-  if in-memory cache  → clone and return
-  if Cache API hit    → load from blob, populate in-memory
-  else                → fetch, cache.put(url, response), load from blob
+  if in-memory cache            → clone and return
+  if Cache API hit (url + hash) → load from blob, populate in-memory
+  else                          → fetch, verify sha256, cache.put(key, response),
+                                  drop older versions of the url, load from blob
 ```
 
+A catalog without `sha256` keeps the URL-only key (with a same-origin conditional GET
+on a hit). The pre-plan-508 bucket `rv-planner-glbs` (and `rv-planner-splats`) is
+deleted the first time the new bucket is opened in a session — nothing is migrated.
 This survives reload (unlike the in-memory `Map`) and means a heavy planner
-catalog only downloads once per browser. `ModelCache.clearPersistentCache()`
+catalog only downloads once per browser and version. `ModelCache.clearPersistentCache()`
 deletes the bucket; otherwise it persists until the user clears site data.
 
 ### 7.8 Converted-CAD cache — OPFS + `rv-cad-glbs`
@@ -2657,8 +2767,9 @@ Two tiers, tried in this order:
 
 > **The cache must never live under `library/`.** `listFiles` (rv-local-filesystem)
 > recurses every subdirectory and filters only by extension, so cached GLBs there
-> would surface as planner catalog entries. (`library/.thumbnails/` escapes this
-> only because it holds `.png`.) Guarded by `tests/rv-cad-glb-cache.test.ts`.
+> would surface as planner catalog entries. (A dot-folder such as `.thumbnails/` escapes this
+> because the walk skips dot segments; since plan-744 the preview sidecar lives
+> at `<project>/.thumbnails/` anyway.) Guarded by `tests/rv-cad-glb-cache.test.ts`.
 
 Because the lookup lives in the **public core**, a public build — which has no
 `CadGeometryProvider` at all — can reopen a draft containing STEP imports. The
@@ -3060,7 +3171,7 @@ the op log. Closing the shared view restores the local working scene.
 
 ### 13.5 Offline mode and Service Workers
 
-The Cache API bucket `rv-planner-glbs` (§7.7) is the only network cache.
+The Cache API bucket `rv-assets-glb-v2` (§7.7; splats `rv-assets-splat-v2`) is the only network cache.
 There is no Service Worker, no offline-first behaviour, and model GLBs
 are not cached unless they came through `ModelCache`. A reload without
 network connectivity will show an empty Models panel except for whatever

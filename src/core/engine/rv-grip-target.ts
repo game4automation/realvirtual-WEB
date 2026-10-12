@@ -24,6 +24,11 @@ export class RVGripTarget implements RVComponent {
   // Properties — exact C# Inspector field names
   AlignPosition = true;
   AlignRotation = true;
+  /** Grip auto-place (plan-577 F5/F6): align the part at this pose, then make it
+   *  a passive load of the MU below it instead of parenting it to this target;
+   *  the target stays free. A blocked or ambiguous seat refuses the place, no
+   *  MU below falls back to the classic target placement. Zones ignore it. */
+  LoadOnCarrier = false;
 
   constructor(node: Object3D) {
     this.node = node;
@@ -32,7 +37,7 @@ export class RVGripTarget implements RVComponent {
   init(context: ComponentContext): void {
     // Register in transport manager
     context.transportManager.gripTargets.push(this);
-    debug('loader', `  GripTarget: ${this.node.name} alignPos=${this.AlignPosition} alignRot=${this.AlignRotation}`);
+    debug('loader', `  GripTarget: ${this.node.name} alignPos=${this.AlignPosition} alignRot=${this.AlignRotation} loadOnCarrier=${this.LoadOnCarrier}`);
   }
 
   get isFree(): boolean {
@@ -52,6 +57,6 @@ export class RVGripTarget implements RVComponent {
 registerComponent({
   type: 'GripTarget',
   schema: RVGripTarget.schema,
-  capabilities: { authorable: true },   // addable in the asset editor (schema-complete)
+  capabilities: { authorable: true, bake: 'chunk' },   // addable in the asset editor (schema-complete); moves with its gripper
   create: (node) => new RVGripTarget(node),
 });

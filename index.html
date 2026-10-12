@@ -8,29 +8,16 @@
   <meta name="theme-color" content="#e94078" />
   <link rel="icon" type="image/png" href="/favicon.png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-  <link rel="manifest" href="/manifest.json" />
-  <!-- The boot manifest, fetched before anything else can be decided (plan-731 5a).
-
-       `readManifest()` is awaited before the SceneStore exists and before the
-       start document is even known (`main.ts`), so this request sits at the
-       head of a strictly serial chain: manifest → start document → GLB. Warming
-       it costs nothing and saves one round trip off the critical path.
-
-       The options must MATCH `BundledBackend._fetchJson()`, which issues
-       `fetch(url, { cache: 'no-cache' })`, or the browser treats the preload as
-       a different request and downloads the file twice — worse than not
-       preloading at all:
-
-         - `as="fetch"` because a `fetch()` is what consumes it. Without `as`
-           Chrome discards the entry with "preload not used".
-         - `crossorigin` because a `fetch()` without an explicit `credentials`
-           option is `same-origin`, which in preload terms is the anonymous
-           mode. Omitting it mismatches on a CDN sub-domain — which is exactly
-           where our public demo is served from.
-
-       Deliberately NOT `no-store`-shaped: the whole point of plan-726 §8 was
-       that an unchanged manifest costs a conditional request, not a download. -->
-  <link rel="preload" href="/project.json" as="fetch" type="application/json" crossorigin />
+  <link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />
+  <!-- The boot-manifest preload is NOT static any more (plan-598 Phase 2).
+       Which manifest the runtime reads first depends on the delivery channel —
+       `demo-realvirtual/project.json` on the public demo, `project.json` on a
+       root/customer deploy, `p/project.json` on a hosted one, and NOTHING on a
+       password deploy (no project request may leave before the password gate).
+       The static `%BASE_URL%project.json` was right on none of the first three
+       ("preloaded but not used" on the demo). The deploy writes the one correct
+       tag: scripts/_bunny-lib.mjs `manifestPreloadFor` / `injectManifestPreload`,
+       options matching `BundledBackend._fetchJson()` (`as="fetch"`, `crossorigin`). -->
   <title>realvirtual WEB — Browser-based 3D HMI & Digital Twin Viewer</title>
   <meta name="description" content="realvirtual WEB is the open, browser-based 3D HMI and digital twin viewer for industrial automation. Explore live demos of conveyor simulation, robotics and PLC-connected 3D visualization — no installation, right in the browser." />
   <!-- URL-bound SEO tags (canonical, og:url, og:image, twitter:card) are injected
@@ -214,16 +201,21 @@
       border-radius: 3px;
       overflow: hidden;
     }
+    /* Full-width bar scaled from the left edge: progress and the sweep are
+       transform-only (compositor), never width/margin (layout). main.ts sets
+       `style.transform = scaleX(fraction)` for determinate progress. */
     .loader-progress-bar {
       height: 100%;
-      width: 0%;
+      width: 100%;
       background: linear-gradient(90deg, #e94078, #ff6b9d);
       border-radius: 3px;
-      transition: width 0.3s ease-out;
+      transform-origin: left center;
+      transform: scaleX(0);
+      transition: transform 0.3s ease-out;
     }
     /* Indeterminate sweep when no real progress */
     .loader-progress-bar.indeterminate {
-      width: 30%;
+      transition: none;
       animation: progress-sweep 1.8s ease-in-out infinite;
     }
     .loader-progress-pct {
@@ -309,10 +301,13 @@
       to { transform: rotate(360deg); }
     }
 
+    /* Same shape as the old width/margin-left sweep (0→60%→0 wide, sliding
+       0→20%→100%), expressed as translate + scale so it never touches layout.
+       translateX(%) is relative to the bar's own width, which is the track. */
     @keyframes progress-sweep {
-      0% { width: 0%; margin-left: 0%; }
-      50% { width: 60%; margin-left: 20%; }
-      100% { width: 0%; margin-left: 100%; }
+      0% { transform: translateX(0%) scaleX(0); }
+      50% { transform: translateX(20%) scaleX(0.6); }
+      100% { transform: translateX(100%) scaleX(0); }
     }
   </style>
 </head>

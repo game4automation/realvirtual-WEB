@@ -258,6 +258,12 @@ describe('the demo model is defined once (plan-726 F10)', () => {
       // ── Dev tooling input ──
       // A vignette render script naming its source GLB.
       'scripts/vignettes/conveyor-sensor.json',
+      // The G3 perf-gate harness (plan-754): one of its four fixed gate models
+      // is the demo, addressed by its `?model=` URL like the others.
+      'scripts/perf-bake-gates.mjs',
+      // The robot-asset extraction script: its default `--source` is the demo
+      // GLB it cuts the robot out of, named by path like every CLI default.
+      'scripts/perf-extract-robot-asset.mjs',
     ].sort());
   });
 
@@ -388,9 +394,15 @@ describe('no source declares a second scene list (plan-731 F3)', () => {
     expect(main).not.toContain("import.meta.glob('/public/models/");
     expect(main).not.toContain('import.meta.glob("/public/models/');
     // The channels that DO feed the catalogue are still there — this is a
-    // removal, not an amputation of model discovery.
-    expect(main).toContain('models.json');
-    expect(main).toContain('/__api/private-models');
+    // removal, not an amputation of model discovery. Since plan-598 the
+    // requests live in the boot-discovery module (started early, merged in the
+    // old order), which main.ts drives; the glob ban covers that module too.
+    const discovery = codeOf('src', 'core', 'project', 'rv-boot-discovery.ts');
+    expect(discovery).not.toContain('import.meta.glob(');
+    expect(main).toContain('startBootDiscovery');
+    expect(main).toContain('mergeDiscoveredEntries');
+    expect(discovery).toContain('models.json');
+    expect(discovery).toContain('/__api/private-models');
   });
 
   // ── plan-735 F6 (3b): the synthetic manifest and its feeders are gone ────

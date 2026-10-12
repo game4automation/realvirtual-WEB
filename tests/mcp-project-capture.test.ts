@@ -59,7 +59,7 @@ function canvasStub(): HTMLCanvasElement {
   } as unknown as HTMLCanvasElement;
 }
 
-describe('web_render / web_screenshot_annotated savePath', () => {
+describe('savePath resolution for the capture tools', () => {
   afterEach(() => setBackend(null));
 
   it('writes a bare name into the project captures folder', async () => {

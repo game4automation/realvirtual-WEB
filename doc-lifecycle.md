@@ -1,5 +1,9 @@
 # Lifecycle — RVViewer
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 This document describes the **runtime lifecycle** of realvirtual WEB:
 from construction to model load, the per-frame simulation/render loop, pause and
 reset semantics, connection-state transitions, and teardown.
@@ -107,32 +111,84 @@ loaded GLB. `viewer.loadScene(scene)` wraps it for the Scene/Op-Log workflow.
 | 3 | **External plugins** (opt-in via `appConfig.externalPlugins`) | Probes `./project-plugin.js` + `./models/<name>/model-plugin.js`; runs default export with `this` | — |
 | 4 | **ModelPluginManager** | Loads Vite-bundled per-model plugins (`plugins/models/*`) | `onModelLoading(url, viewer)` |
 | 5 | **Load gate** | `await this.loadGate` (set by e.g. login flow) | — |
-| 6 | **GLB parse** | `loadGLB(url, scene, { overlay, … })` — parses GLB, applies `rv_extras`, runs two-phase component construction | — |
-| 7 | **Shader pre-compile** | `renderer.compileAsync()` (when available) | — |
+| 6 | **GLB parse + bake** | `loadGLB(url, scene, { overlay, … })` — the six-step pipeline below | — |
+| 7 | **Shader pre-compile** | `renderer.compileAsync()` against the render target the frame draws into (the composer's offscreen target when post-processing is on — a program variant is keyed on it). No frame renders until the programs are linked. | — |
 | 8 | **State assignment** | `currentModel`, `drives`, `transportManager`, `signalStore`, `playback`, `replayRecordings`, `logicEngine`, `registry`, `groups` are set | — |
 | 9 | **Wire subsystems** | Source-markers binding, `ComponentEventDispatcher`, `AutoFilterRegistry`, `SelectionManager.init()`, `RaycastManager`, isolation gate, core context-menu items | — |
-| 9b | **Async BVH kickoff** | The BVH build for all raycast geometry starts in the background (one reused worker across loads; time-sliced inline fallback when no `Worker` is available). The load does NOT wait for it | — |
+| 9b | **Async BVH kickoff** | The three-mesh-bvh build for the remaining raycast geometry (collision, transport, instance pick — NOT baked chunks, which got their pick structure inside the bake) starts in the background (one reused worker across loads; time-sliced inline fallback when no `Worker` is available). The load does NOT wait for it | — |
 | 10 | **Plugin notification** | Every enabled plugin gets `onModelLoaded(result, viewer)` | `onModelLoaded` |
 | 11 | **Re-evaluate physics** | `_physicsPluginActive` updated (plugins may have flipped `handlesTransport` in step 10) | — |
 | 12 | **Emit event** | `'model-loaded'` event fires | `'model-loaded'` |
+| 12b | **Shader pre-compile, second pass** | Same as step 7 for the variants plugins and listeners introduced (e.g. toon materials); already-linked programs are reused. Per-material clipping cannot be pre-compiled by three, so the Section tool binds its planes on first use, not at load. | — |
 | 13 | **Drain async** | `await whenLoadingIdle()` — env-map IBL, deferred prefetch, etc. | — |
 | 14 | **Resolve** | `loadModel` promise resolves with `LoadResult` | — |
+
+#### Step 6 in detail — `load → prepare → bake → drop → place → init` (plan-754)
+
+| # | Step | What happens |
+|---|------|--------------|
+| 1 | **load** | GLB → a throwaway `tmp` graph. `GLTFLoader` only: no registry, no components. |
+| 2 | **prepare** | Structural work on `tmp`, driven by extras alone and with no instance in existence: naming scan, reference tags + plugin `bakeClaims()` → `computeSurvival`, `capabilities.onPreBake` per component TYPE (Kinematic re-parenting, Drive home pose, Sensor beam, …), material dedup + uber. |
+| 3 | **bake** | `tmp` → a fresh **template**: survivors as plain nodes, chunk meshes per boundary × material, keep meshes MOVED over. Everything nobody claimed is simply not built — the prune. Each chunk's **pick structure** is built in a worker pool inside this step and awaited before `bake()` resolves (phase `pick`, plan-756). |
+| 4 | **drop** | `tmp` is released: every geometry/material/texture it holds that the template does not reference is disposed, `ImageBitmap`s closed, `gltf.parser` dropped. `bakeDropStats` records it. |
+| 5 | **place** | Template → scene. For the main model the template IS the instance (`BakeRegistry.instantiateTemplate`, no clone); a library asset is cloned per placement with shared geometry and the template kept detached in `ModelCache`. Aliases + path recompute run here. |
+| 6 | **init** | Registry built from the FINAL graph, components constructed and initialised, late init, drive position restore, `freezeStaticMatrices`, bounds, and the async BVH kickoff for the non-baked pick surfaces (collision, transport, instance pick). |
+
+The consequence worth internalising: **the scene graph is complete.** What is in
+`children` is what is drawn, what the registry addresses and what the hierarchy
+panel shows — nothing is masked out of rendering and nothing is spliced out of
+`children`. The hierarchy panel IS `viewer.scene`; a row the registry does not
+know is simply flagged `runtime` (or `chunk` for baked geometry).
+
+Steps 2–4 are a **pure function** of the GLB, the component capability table and
+the plugin claims — no viewer state — which is what lets `ModelCache` run them
+once per asset and share the result across every placement.
+
+**Who does not bake:** the asset editor (it authors the tree, so the authored
+hierarchy must survive verbatim — `assertBakeAllowed` / `preserveHierarchy`) and
+a document that draws nothing. Those run steps 1 → 5 → 6 on the authored tree —
+step 6 never re-parents and never drives an axis to home (the runtime re-parent
+pass and the `'bracket'` / `'defer'` home-pose modes went with plan-757 Phase 3
+commit B; the `Kinematic` and `Drive` hooks of step 2 are the only place that
+happens). There is no runtime override any more: the localStorage
+`rv-webviewer-static-merge` value is ignored since commit B (2026-09-22), the
+only rollback of the bake is a deploy revert. A bake that FAILS is a load error:
+`loadGLB` rejects with `BakeFailedError` and the Problems panel carries a
+`bake-failed` entry — no unbaked tree. Everything else bakes,
+**including the embed facade** (`src/embed/rv-embed-viewer.ts`, the website's
+`<rv-embed>`, `npm run build:embed`), which owns its own `BakeRegistry` and chunk
+pick backend and goes through `ModelCache` like the main viewer.
 
 > **Two-phase component construction** in step 6 mirrors Unity's
 > `Awake()`/`Start()` lifecycle: all node registry entries are created first
 > (Awake), then typed component instances are built and can resolve
 > cross-references (Start). See [doc-signal-architecture.md](doc-signal-architecture.md) §2.
 
-> **`model-loaded` timing and `raycast-ready`:** `loadModel()` does not wait
-> for BVH construction. The GLB parse builds the merged raycast geometries
-> without their BVH trees; the trees are then built asynchronously — merged
-> groups first (indirect mode, preserving the face-range tables), then
-> per-mesh geometries — through one sequential background worker. Until the
-> build completes, hover and click raycasts run through the native three.js
-> fallback: fully functional, just slower on large models. Once every
-> eligible geometry carries its tree, the viewer emits `'raycast-ready'` and
-> flags a re-render. A new `loadModel()` or a `clearModel()` during a running
-> build aborts the whole remaining sequence and discards in-flight results;
+> **`model-loaded` timing and `raycast-ready`:** a **baked** load DOES wait for
+> its pick acceleration. `bake()` resolves only once every chunk carries its own
+> pick structure (plan-756): the staged buffers go to a worker pool inside the
+> bake and the `BufferGeometry` is built from what comes back, so there is no
+> later readiness flag and no window in which a ray is brute-forced over a whole
+> chunk. `model-loaded` therefore fires later than it used to, by the duration of
+> the new bake phase `pick` (`web_layout_timings`); `whenSceneReady()` needs no
+> change, because it already joins on loads and placements. Failure path: a worker
+> that dies, errors or misses its watchdog is retired, that one chunk is re-staged
+> and built inline; if the inline build throws too, the chunk is published
+> **segment-only** with a warning and picked by `PickBackend`'s linear segment
+> walk (plan-757 Phase 3 commit B; `web_status.bake.segmentOnlyChunks`) — the
+> load still succeeds and nothing is published half-ready. The same walk is the
+> pick structure's rollback (`rv-webviewer-pick-structure` = `0`).
+>
+> The **unbaked** path is unchanged and does NOT wait: authoring loads
+> (`preserveHierarchy`, the editor) pick
+> real meshes through `InstancePickIndex` with per-mesh three-mesh-bvh trees, and
+> so do collision and transport geometries on every load. Those trees are built
+> asynchronously by one sequential background worker (time-sliced inline fallback
+> without `Worker`); until a tree lands, `acceleratedRaycast` falls back to the
+> native three.js raycast — fully functional, just slower on large models. Once
+> every eligible geometry carries its tree, the viewer emits `'raycast-ready'` and
+> flags a re-render. A new `loadModel()` or a `clearModel()` during a running build
+> aborts the whole remaining sequence and discards in-flight results;
 > `'raycast-ready'` is not emitted for an aborted load.
 
 ### 3.2 `loadScene()` extension
@@ -577,7 +633,9 @@ surfaced as an event so components react:
 2. **`'simulation-resetstat'`** — statistics accumulators are cleared
    (registrations persist). Also fired standalone for DES stat-only resets.
 3. **`'simulation-start'`** — components (re)start from the clean state (e.g. a
-   conveyor re-asserts `Run = true`).
+   conveyor re-asserts `Run = true`). Then the LogicSteps restart
+   (`logicEngine.start()` — every root from its first step, as after a load;
+   only for an engine that already ran, so a signature-gated model stays held).
 4. **Signal level re-apply** — `viewer.signalReapply.reapplyAll()` drives every
    wired component INPUT slot once with the value currently in the SignalStore.
 
@@ -808,14 +866,14 @@ to emit will silently no-op.
 Snapshot of the lifecycle-relevant events from `ViewerEvents` in
 [src/core/rv-viewer-events.ts](src/core/rv-viewer-events.ts).
 For the complete list (hover, selection, charts, XR, FPV, layout, etc.) see
-[doc-extending-webviewer.md](doc-extending-webviewer.md) §4.
+the generated [ViewerEvents catalog](doc-events-and-hooks.md#event-catalog).
 
 | Event | Payload | Fires when | Typical subscriber |
 |-------|---------|-----------|--------------------|
 | `'model-loaded'` | `{ result: LoadResult }` | After `loadModel()` step 12 | HMI tiles, KPI cards, MCP bridge, chart subscribers |
 | `'model-logic-activated'` | `{ result: LoadResult }` | Executable model logic is bound — immediately for `none`/`valid` signatures, or after an explicit late activation for `invalid`/unverifiable ones. Geometry/HMI lifecycle stays on `'model-loaded'` | Anything that must not run untrusted model logic before it is cleared |
 | `'signature-state-changed'` | `{ signatureState, logicRunState }` | Model-signature verification result or the `active`/`gated`/`activating` run gate changes | Signature banner, logic activation UX |
-| `'raycast-ready'` | `void` | Background BVH build completed for every eligible geometry (not emitted for aborted loads) | Plugins wanting BVH-accelerated raycasts from the first query |
+| `'raycast-ready'` | `void` | Background three-mesh-bvh build completed for every eligible NON-baked geometry — collision, transport, instance pick (not emitted for aborted loads); a baked model's own pick structure already exists when `model-loaded` fires | Plugins wanting accelerated raycasts on those geometries from the first query |
 | `'model-cleared'` | `void` | First step of `clearModel()` | HMI reset, listener cleanup |
 | `'scene-loaded'` | `{ scene: RvScene }` | After `loadScene()` Phase 5 | camera-startpos plugin, scene-aware overlays |
 | `'simulation-pause-changed'` | `{ paused, reasons, reason }` | On `idle ↔ paused` transition only | External PLC I/O, animations, recorders |

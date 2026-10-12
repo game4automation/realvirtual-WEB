@@ -18,9 +18,9 @@
  *
  * Worker setup follows the official Vite ESM integration: the generic editor
  * worker plus the TypeScript language worker are bundled via `?worker`
- * imports — no vite.config change needed. `MonacoEnvironment.getWorker`
- * dispatches by label; a previously installed getWorker (e.g. the private ST
- * loader in internal builds) is preserved as fallback for foreign labels.
+ * imports — no vite.config change needed. The workers are registered in the
+ * shared label registry `../monaco/rv-monaco-workers` (plan-555), which owns
+ * the single `MonacoEnvironment.getWorker` of the page.
  *
  * TypeScript language mode (§4.2):
  *  - `rv-sdk.d.ts` (generated, §6 S5) + the minimal `noLib` ambient lib are
@@ -39,6 +39,7 @@
 // never touch the eager bundle.
 import type * as MonacoApi from 'monaco-editor';
 import { generateSdkDts, SDK_MINIMAL_LIB_DTS } from '../../sdk/rv-sdk-dts';
+import { MONACO_FALLBACK_WORKER_LABEL, registerMonacoWorker } from '../monaco/rv-monaco-workers';
 
 export type Monaco = typeof MonacoApi;
 
@@ -64,21 +65,12 @@ async function doLoad(): Promise<Monaco> {
     import('monaco-editor/esm/vs/language/typescript/ts.worker?worker'),
   ]);
 
-  // Compose with an already-installed environment (internal builds may have
-  // loaded the private ST editor first): we own 'typescript'/'javascript',
-  // everything else falls through to the previous getWorker (or the generic
-  // editor worker).
-  const g = self as unknown as {
-    MonacoEnvironment?: { getWorker?: (workerId: string, label: string) => Worker };
-  };
-  const previousGetWorker = g.MonacoEnvironment?.getWorker;
-  g.MonacoEnvironment = {
-    getWorker: (workerId: string, label: string): Worker => {
-      if (label === 'typescript' || label === 'javascript') return new TsWorker();
-      if (previousGetWorker) return previousGetWorker(workerId, label);
-      return new EditorWorker();
-    },
-  };
+  // One shared worker registry (plan-555): we claim 'typescript'/'javascript'
+  // and offer the generic editor worker as the '*' fallback. First wins per
+  // label, so the private ST loader or the JSON loader may load before or
+  // after this one without taking our workers away.
+  registerMonacoWorker(['typescript', 'javascript'], () => new TsWorker());
+  registerMonacoWorker([MONACO_FALLBACK_WORKER_LABEL], () => new EditorWorker());
 
   configureTypescript(monaco);
   await warmUpTypescript(monaco);

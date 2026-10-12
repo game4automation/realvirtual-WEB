@@ -8,7 +8,12 @@ import react from '@vitejs/plugin-react';
 import { playwright } from '@vitest/browser-playwright';
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, createReadStream, statSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
+import { hostname } from 'node:os';
 import { parsePrivateAssetUrl, resolvePrivateAsset } from './scripts/_rv-private-assets.mjs';
+import { cinematicAssetsPlugin } from './scripts/_rv-cinematic-assets.mjs';
+// @ts-expect-error — plain JS Node module, no type declarations by design (scripts/lib).
+import { assetNotFoundGuard } from './scripts/lib/rv-fs.mjs';
+import { createThirdPartyNotices, defaultPolicySpecs, noticesTierFromEnv } from './scripts/vite-plugin-third-party-notices.mjs';
 
 // ─── Private content detection ──────────────────────────────────────────
 const PRIVATE_ROOT_CANDIDATES = [
@@ -58,8 +63,17 @@ const RV_HMR_CLIENT_PORT = (() => {
 // webBuild: web-specific build number = commit count of THIS repo
 //           (realvirtual-WEB-DEV), independent of the Unity framework.
 // commit/buildDate: short hash and date of the built commit.
+// buildTime: when THIS build ran, local time "YYYY-MM-DD HH:MM".
 // All git calls are guarded so a git-less build (tarball, CI without .git)
 // still produces a valid bundle.
+//
+// ENV WINS OVER GIT. A deploy does not build in the repository: it builds in a
+// filtered staging tree that carries no `.git`, so every git call below fell
+// back and delivered builds showed "web build 0", no commit and today's date
+// instead of the commit's. The deploy therefore reads the values in the SOURCE
+// repository and hands them over as RV_WEB_BUILD / RV_COMMIT / RV_BUILD_DATE /
+// RV_BUILD_TIME (see runBuild() in scripts/_workspace-lib.mjs). Set and
+// non-empty, they win; otherwise git is asked, exactly as before.
 function rvGit(cmd: string, fallback: string): string {
   try {
     return execSync(cmd, { cwd: __dirname, stdio: ['ignore', 'pipe', 'ignore'] })
@@ -68,18 +82,37 @@ function rvGit(cmd: string, fallback: string): string {
     return fallback;
   }
 }
+//! Environment override first, then git, then the fallback.
+function rvBuildMeta(envKey: string, cmd: string, fallback: string): string {
+  const fromEnv = process.env[envKey];
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+  return rvGit(cmd, fallback);
+}
+//! Local wall-clock time as "YYYY-MM-DD HH:MM" — deliberately not toISOString(),
+//! which would report UTC and read as an hour or two off for the operator.
+function rvLocalTimestamp(now: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    ` ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
 const RV_VERSION = JSON.parse(
   readFileSync(resolve(__dirname, 'package.json'), 'utf-8'),
 ).version as string;
-const RV_WEB_BUILD = rvGit('git rev-list --count HEAD', '0');
-const RV_COMMIT = rvGit('git rev-parse --short HEAD', '');
-const RV_BUILD_DATE = rvGit(
+const RV_WEB_BUILD = rvBuildMeta('RV_WEB_BUILD', 'git rev-list --count HEAD', '0');
+const RV_COMMIT = rvBuildMeta('RV_COMMIT', 'git rev-parse --short HEAD', '');
+const RV_BUILD_DATE = rvBuildMeta(
+  'RV_BUILD_DATE',
   'git log -1 --format=%cd --date=short',
   new Date().toISOString().slice(0, 10),
 );
+const RV_BUILD_TIME = (() => {
+  const fromEnv = process.env.RV_BUILD_TIME;
+  if (fromEnv && fromEnv.trim()) return fromEnv.trim();
+  return rvLocalTimestamp(new Date());
+})();
 console.log(
   `[rv-build] realvirtual WEB v${RV_VERSION} · web build ${RV_WEB_BUILD}` +
-  `${RV_COMMIT ? ` (${RV_COMMIT})` : ''} · ${RV_BUILD_DATE}`,
+  `${RV_COMMIT ? ` (${RV_COMMIT})` : ''} · ${RV_BUILD_DATE} · built ${RV_BUILD_TIME}`,
 );
 
 // ─── Dev-server session info (serve only, never built) ──────────────────
@@ -114,6 +147,12 @@ function rvServeInfoLiteral(command: string): string {
   if (command !== 'serve') return 'null';
   const session = rvSessionManifest();
   return JSON.stringify({
+    // The MACHINE, ahead of the directory: with a port forward in play
+    // (`ssh -L 5100:127.0.0.1:5100`, `tailscale serve`) a remote dev server is
+    // served under the reader's OWN localhost, so the page origin proves nothing
+    // about which computer answered. Only the serving side knows this — the
+    // browser has no way to learn its own machine name.
+    host: hostname(),
     root: __dirname,
     branch: rvGit('git rev-parse --abbrev-ref HEAD', ''),
     plans: session?.plans ?? null,
@@ -510,6 +549,28 @@ function sendBody(res: any, _path: string, method?: string): boolean {
   return false;
 }
 
+// ─── Asset 404 guard (plan-508 F1) ────────────────────────────────────────
+//
+// A missing asset path must answer 404 text/plain, never Vite's SPA
+// `index.html` with status 200 — one such answer, cached by the planner's blob
+// cache, WAS `ChainConveyor-1m.glb` for a browser profile (2026-09-26). The
+// middleware itself (`assetNotFoundGuard`, rules and exemptions) lives in
+// `scripts/lib/rv-fs.mjs` so its node test does not type-check this file; it is
+// re-exported here and registered as a PRE-hook below.
+export { assetNotFoundGuard };
+
+/** Pre-hook plugin: registered straight in `configureServer`, so it runs BEFORE Vite's SPA fallback. */
+function assetNotFoundGuardPlugin() {
+  return {
+    name: 'rv-asset-404-guard',
+    apply: 'serve' as const,
+    configureServer(server: { middlewares: { use: Function }; config: { base: string; publicDir: string | false; root: string } }) {
+      const roots = [server.config.publicDir, server.config.root].filter((d): d is string => typeof d === 'string' && d !== '');
+      server.middlewares.use(assetNotFoundGuard({ base: server.config.base, roots }));
+    },
+  };
+}
+
 function privateModelsPlugin() {
   if (process.env.RV_NO_PRIVATE === '1') return null;
   if (!HAS_PRIVATE || !existsSync(PRIVATE_PROJECTS_DIR)) return null;
@@ -757,6 +818,82 @@ function dracoDecoderPlugin() {
 }
 
 /**
+ * Vite plugin: ship occt-import-js as two LOOSE files (plan-544, Thomas 2026-10-03).
+ *
+ * occt-import-js is LGPL-2.1-only. It must stay a separate, replaceable library, so its glue
+ * (`occt-import-js.js`) and module (`occt-import-js.wasm`) are NOT bundled into a Rollup chunk:
+ * they are copied verbatim — i.e. exactly as they sit in node_modules after the
+ * `patch-occt-memory.mjs` pre-/postinstall step (heap ceiling 2 GB -> 4 GB, declared as
+ * "modified (memory limit patch)" in third-party/manual-components.json) — to `<dist>/occt/`,
+ * and the STEP-import worker loads them at runtime from `<deploy base>/occt/`. In dev the same
+ * URLs are served from node_modules.
+ *
+ * The files are emitted only when a worker pass bundled the STEP-import worker (private tree),
+ * so public and customer builds without the importer do not carry 7.6 MB of WASM. Worker passes
+ * run before the main `generateBundle`, which is where the flag is read.
+ */
+function occtLooseFilePlugin() {
+  const SRC = resolve(__dirname, 'node_modules/occt-import-js/dist');
+  const FILES = ['occt-import-js.js', 'occt-import-js.wasm'];
+  let stepWorkerBundled = false;
+  return {
+    /** Main-build plugin: dev middleware + emit. */
+    plugin() {
+      return {
+        name: 'rv-occt-loose-files',
+        configureServer(server: { config: { base?: string }; middlewares: { use: Function } }) {
+          server.middlewares.use((req: { url?: string }, res: any, next: Function) => {
+            const u = (req.url || '').split('?')[0];
+            const base = server.config.base || '/';
+            const prefix = u.startsWith(`${base}occt/`) ? `${base}occt/` : (u.startsWith('/occt/') ? '/occt/' : null);
+            if (!prefix) return next();
+            const name = u.slice(prefix.length);
+            const file = join(SRC, name);
+            if (!FILES.includes(name) || !existsSync(file)) return next();
+            res.setHeader('Content-Type', name.endsWith('.wasm') ? 'application/wasm' : 'text/javascript');
+            createReadStream(file).pipe(res);
+          });
+        },
+        generateBundle(this: { emitFile: Function; error: Function }) {
+          if (!stepWorkerBundled) return;
+          for (const name of FILES) {
+            const file = join(SRC, name);
+            if (!existsSync(file)) {
+              this.error(`[rv-occt-loose-files] missing ${file} — the STEP-import worker would fail to load its CAD engine`);
+            }
+            this.emitFile({ type: 'asset', fileName: `occt/${name}`, source: readFileSync(file) });
+          }
+        },
+      };
+    },
+    /** Worker-pass plugin: notes whether the STEP-import worker is part of this build. */
+    workerPlugin() {
+      return {
+        name: 'rv-occt-loose-files-worker',
+        generateBundle(_options: unknown, bundle: Record<string, { type: string; modules?: Record<string, unknown> }>) {
+          for (const item of Object.values(bundle)) {
+            if (item.type !== 'chunk') continue;
+            if (Object.keys(item.modules ?? {}).some((id) => /[\/]step-import-worker\.ts(\?|$)/.test(id))) {
+              stepWorkerBundled = true;
+            }
+          }
+        },
+      };
+    },
+  };
+}
+const occtLooseFiles = occtLooseFilePlugin();
+
+/**
+ * Vite plugin: serve / ship the cinematic render's private loose assets — OIDN weights and the
+ * look HDRIs (plan-550 F12, plan-553 F8). Implementation + file list: scripts/_rv-cinematic-assets.mjs.
+ */
+function cinematicAssets() {
+  if (!HAS_PRIVATE) return null;
+  return cinematicAssetsPlugin(PRIVATE_ROOT);
+}
+
+/**
  * Vite plugin: Strip the impeccable-live dev script from PRODUCTION builds.
  *
  * The impeccable live tool injects `<script src="http://localhost:8400/live.js">`
@@ -777,12 +914,45 @@ function stripImpeccableLivePlugin() {
   };
 }
 
+/**
+ * Vite plugin: Strip the web app manifest link from NON-COMMERCIAL builds.
+ *
+ * The `<link rel="manifest">` (display: standalone) is what makes Chrome/Edge offer
+ * "Install app". The public demo must not be installable; commercial/customer builds
+ * (RV_COMMERCIAL=1) keep it so an HMI can run in its own app window. Dev serve is
+ * untouched. There is no service worker either way, so an installed app is only a
+ * window onto the online URL.
+ */
+function stripInstallManifestPlugin() {
+  if (process.env.RV_COMMERCIAL) return null;
+  return {
+    name: 'rv-strip-install-manifest',
+    apply: 'build' as const,
+    transformIndexHtml(html: string) {
+      return html.replace(/^.*<link rel="manifest"[^>]*>.*\r?\n?/gm, '');
+    },
+  };
+}
+
+// ─── Third-party licence notices (plan-544) ─────────────────────────────
+// ONE collector shared by the main plugin and the worker-pass plugin: worker builds are separate
+// Rollup passes (see `worker` below) and would otherwise leave worker-only packages (occt-import-js
+// in the STEP-import worker, three-mesh-bvh's worker, …) out of the notices. The policy set follows
+// the tier (F12): the Private policy only when the private tree is part of this build.
+const thirdPartyNotices = createThirdPartyNotices({
+  rootDir: __dirname,
+  policies: defaultPolicySpecs(__dirname, HAS_PRIVATE ? PRIVATE_ROOT : null),
+  manualComponents: resolve(__dirname, 'third-party/manual-components.json'),
+  tier: noticesTierFromEnv(HAS_PRIVATE),
+});
+
 export default defineConfig(({ command }) => ({
   base: process.env.VITE_BASE || './',
   plugins: [
     privateResolverPlugin(),
     missingStubResolverPlugin(),
     privateModelsPlugin(),
+    assetNotFoundGuardPlugin(),
     react(),
     // VitePWA disabled – no service worker, always fresh content
     devServerIdentityPlugin(),
@@ -792,6 +962,12 @@ export default defineConfig(({ command }) => ({
     presetSavePlugin(),
     dracoDecoderPlugin(),
     stripImpeccableLivePlugin(),
+    stripInstallManifestPlugin(),
+    // Before the notices plugin: its generateBundle must already see the emitted occt/ files.
+    occtLooseFiles.plugin(),
+    // Same rule for the cinematic denoiser weights (oidn/*.tza, plan-550).
+    cinematicAssets(),
+    thirdPartyNotices.plugin(),
   ].filter(Boolean),
   // Worker builds are a SEPARATE Rollup pass that does NOT inherit the main `plugins`.
   // The STEP-import worker (`step-import-worker.ts`) lives in the private sibling folder and
@@ -799,10 +975,11 @@ export default defineConfig(({ command }) => ({
   // up from the worker file (which has no node_modules) and fails to resolve them. Register the
   // same resolver for the worker pass so private-folder bare imports hit the main node_modules.
   worker: {
-    // ES format is required because the STEP-import worker code-splits (it dynamically loads the
-    // occt-import-js WASM chunk); Vite's default 'iife' worker format rejects code-splitting builds.
+    // ES format: the STEP-import worker is a module worker (it loads the loose occt-import-js glue
+    // with a runtime `import()`, see occtLooseFilePlugin), and other workers code-split; Vite's
+    // default 'iife' worker format rejects code-splitting builds.
     format: 'es',
-    plugins: () => [privateResolverPlugin()].filter(Boolean),
+    plugins: () => [privateResolverPlugin(), occtLooseFiles.workerPlugin(), thirdPartyNotices.workerPlugin()].filter(Boolean),
   },
   resolve: {
     dedupe: ['three'],
@@ -834,6 +1011,22 @@ export default defineConfig(({ command }) => ({
   },
   define: {
     __RV_HAS_PRIVATE__: JSON.stringify(HAS_PRIVATE),
+    // plan-467 F15 test gate: with RV_PHYSICS_REQUIRE_WASM=1 the real-WASM
+    // physics suites must NOT skip when @dimforge/rapier3d-compat (out-of-band)
+    // is missing — a skip there would hide exactly the cases the plan cares
+    // about. A `define` rather than an env var because the suites run in
+    // browser mode, where only VITE_-prefixed env vars would be visible.
+    // Statically `false` in every build, so nothing survives into a bundle.
+    __RV_PHYSICS_REQUIRE_WASM__: JSON.stringify(process.env.RV_PHYSICS_REQUIRE_WASM === '1'),
+    // plan-501 SOL R2 #3 — same gate for the kinematic mechanism solver: with
+    // RV_SOLVER_REQUIRE_WASM=1 a missing rv_kinematic_solver.wasm is a FAILURE in
+    // the solver suites (tests/helpers/require-solver.ts), not a quiet skip. A
+    // define for the same reason as above: the suites run in browser mode.
+    __RV_SOLVER_REQUIRE_WASM__: JSON.stringify(process.env.RV_SOLVER_REQUIRE_WASM === '1'),
+    // plan-501 §9.7 acceptance gate: the SiMoRob torque bands and the Phase-3 runtime/main-thread
+    // measurement run only with RV_PLAN501_ACCEPTANCE=1 — red until Simon's numeric reference
+    // arrives (plan-501 open:), load-dependent for the measurement. Statically false in every build.
+    __RV_PLAN501_ACCEPTANCE__: JSON.stringify(process.env.RV_PLAN501_ACCEPTANCE === '1'),
     __RV_EMBED__: 'false',
     __RV_COMMERCIAL__: JSON.stringify(!!process.env.RV_COMMERCIAL),
     // Internal/dev-only features (DES, IK solver, STEP import, layout cloud, …).
@@ -846,6 +1039,7 @@ export default defineConfig(({ command }) => ({
     __RV_WEB_BUILD__: JSON.stringify(RV_WEB_BUILD),
     __RV_COMMIT__: JSON.stringify(RV_COMMIT),
     __RV_BUILD_DATE__: JSON.stringify(RV_BUILD_DATE),
+    __RV_BUILD_TIME__: JSON.stringify(RV_BUILD_TIME),
     // Dev server only. Every built bundle substitutes the literal `null`, so
     // Rollup eliminates the badge subtree and no machine path is ever shipped.
     // Stricter than __RV_INTERNAL__, which is also true for internal *builds*.
@@ -865,15 +1059,11 @@ export default defineConfig(({ command }) => ({
     // FBXLoader is lazy-imported by the FBX import provider (@rv-private) —
     // same reason again; without it every fbx-to-three test times out on the
     // reload rather than failing with an assertion.
-    // occt-import-js is lazy-imported by the STEP import WORKER (@rv-private,
-    // step-import-worker.ts). A worker's dynamic import is not part of the
-    // startup scan, so on a cold dep cache the FIRST browser-route STEP import
-    // discovered it mid-session — Vite answered with "new dependencies
-    // optimized: occt-import-js" / "optimized dependencies changed. reloading"
-    // and full-reloaded the page while the import was still running. What the
-    // user sees: press Import, the page reloads, nothing was imported.
-    // The CONNECT route never loads this module, which is why converting via
-    // CONNECT always worked and only the in-browser route failed.
+    // occt-import-js is NOT listed: since plan-544 the STEP-import worker no
+    // longer imports it as a module — it loads the loose glue file from
+    // `<base>occt/` at runtime (occtLooseFilePlugin), so the optimizer never
+    // discovers it and no mid-session "optimized dependencies changed.
+    // reloading" can hit an in-browser STEP import.
     // echarts sub-entries (core/charts/components/renderers, all via
     // echarts-setup.ts) MUST be pre-bundled together: without pinning, a
     // mid-session dep re-optimization can split echarts into two optimized
@@ -883,15 +1073,29 @@ export default defineConfig(({ command }) => ({
     include: [
       'read-excel-file',
       'monaco-editor/esm/vs/editor/editor.api',
+      // The PUBLIC Monaco loaders (script editor, JSON field editor — plan-555)
+      // import the package ROOT (it carries the TS / JSON language services);
+      // unlisted, its first lazy import re-optimized and reloaded the page
+      // ("new dependencies optimized: monaco-editor"). Pre-bundled together
+      // with editor.api above, both share ONE editor core instance.
+      'monaco-editor',
+      // JSON path ↔ text range of the JSON field editor (plan-555), lazy as well.
+      'jsonc-parser',
       'three/examples/jsm/loaders/GLTFLoader.js',
       'three/examples/jsm/loaders/USDZLoader.js',
       'three/examples/jsm/loaders/FBXLoader.js',
       'three/examples/jsm/libs/fflate.module.js',
-      'occt-import-js',
       'echarts/core',
       'echarts/charts',
       'echarts/components',
       'echarts/renderers',
+      // The cinematic renderer's path tracer (plan-550, private, lazy, itself excluded below)
+      // imports these; discovering one mid-session re-optimizes and RELOADS the page — in the
+      // middle of a recording (seen with Pass.js in the first CLI smoke).
+      'three-mesh-bvh/webgpu',
+      'three/webgpu',
+      'three/tsl',
+      'three/examples/jsm/postprocessing/Pass.js',
     ],
     // three-mesh-bvh/worker (lazily imported by rv-bvh-build-port.ts) MUST be
     // excluded, not included: pre-bundling relocates the module to
@@ -909,7 +1113,13 @@ export default defineConfig(({ command }) => ({
     // would otherwise discover and re-bundle on every physics test run
     // (esbuild "build was canceled" churn). In dev/vitest the loader uses the
     // /node_modules URL import, so the package must never be optimized.
-    exclude: ['three-mesh-bvh/worker', '@dimforge/rapier3d-compat'],
+    // three-gpu-pathtracer / oidn-web (plan-550) live in the PRIVATE package's node_modules and
+    // are imported lazily by the cinematic renderer: discovering them mid-session would re-optimize
+    // and RELOAD the page — in the middle of a cinematic recording. Excluded, they are served as
+    // the plain ESM they ship as; their own `three` / `three-mesh-bvh` imports resolve to the
+    // main project's copies (privateResolverPlugin).
+    // @petamoriken/float16 is oidn-web's only dependency and lives next to it (private node_modules).
+    exclude: ['three-mesh-bvh/worker', '@dimforge/rapier3d-compat', 'three-gpu-pathtracer', 'oidn-web', '@petamoriken/float16'],
   },
   server: {
     host: true,
@@ -1063,7 +1273,7 @@ export default defineConfig(({ command }) => ({
           }
           const allowed = new Set([
             'webviewer.mcp.md',
-            'src/plugins/mcp-bridge/help/editor.md',
+            'recipes/kinematize-cad-import.md',
             'src/plugins/mcp-bridge/help/layout.md',
             'src/plugins/mcp-bridge/help/simulation.md',
             'src/plugins/mcp-bridge/help/plc.md',
@@ -1108,6 +1318,31 @@ export default defineConfig(({ command }) => ({
          * make a red test green — a legitimate tool change updates it in the
          * same commit that changes the tools.
          */
+        /**
+         * plan-498 Phase 3 — the live FMU smoke (`tests/fmu-live-smoke.e2e.test.ts`)
+         * runs only against a REAL CONNECT named by `RV_CONNECT_URL`. Browser
+         * tests cannot read the environment, so this read-only command hands
+         * the one variable over; unset → the smoke skips.
+         */
+        connectSmokeUrl(): string | null {
+          const url = process.env.RV_CONNECT_URL?.trim();
+          return url ? url : null;
+        },
+        /**
+         * plan-498 Phase 4 — writes THE shipped FMU demo model. The model is
+         * built in the browser by the asset writer (`tests/fmu-demo-model.build.test.ts`),
+         * the file lives on disk. Same narrow shape as the writers above: it
+         * refuses unless `RV_BUILD_FMU_DEMO=1` is set and writes exactly one file.
+         */
+        writeFmuDemoGlb(_ctx: unknown, base64: string): { written: boolean; bytes?: number; reason?: string } {
+          if (process.env.RV_BUILD_FMU_DEMO !== '1') {
+            return { written: false, reason: 'RV_BUILD_FMU_DEMO is not set' };
+          }
+          const abs = resolve(__dirname, 'public/demo-realvirtual/fmu-demo.glb');
+          const bytes = Buffer.from(base64, 'base64');
+          writeFileSync(abs, bytes);
+          return { written: true, bytes: bytes.byteLength };
+        },
         writeMcpBaseline(_ctx: unknown, contents: string): { written: boolean; reason?: string } {
           if (process.env.RV_UPDATE_MCP_BASELINE !== '1') {
             return { written: false, reason: 'RV_UPDATE_MCP_BASELINE is not set' };

@@ -43,6 +43,14 @@ describe('PluginContextImpl (plan-182 Phase 4a)', () => {
     expect(ctx.simLoop).toBeInstanceOf(SimLoopFacadeImpl);
   });
 
+  it('shares the viewer sim loop, also for per-plugin contexts (ticks must reach fixedUpdate)', () => {
+    const viewer = makeMockViewer() as unknown as { _simLoop: SimLoopFacadeImpl };
+    viewer._simLoop = new SimLoopFacadeImpl(viewer as never);
+    const ctx = new PluginContextImpl(viewer as never);
+    expect(ctx.simLoop).toBe(viewer._simLoop);
+    expect(ctx.forPlugin('plc').simLoop).toBe(viewer._simLoop);
+  });
+
   it('transport is null when transportManager is null', () => {
     const ctx = new PluginContextImpl(makeMockViewer());
     expect(ctx.transport).toBeNull();

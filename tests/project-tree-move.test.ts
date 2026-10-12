@@ -23,7 +23,7 @@
  * tests all run here.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   findDocumentById,
   findDocumentByPath,
@@ -46,6 +46,15 @@ import {
   planTreeMove,
 } from '../src/core/project/rv-project-tree';
 import { applyTreeMove, treeMoveSteps } from '../src/core/project/rv-project-tree-move';
+import {
+  LS_KEY_RECENT_DOCUMENTS,
+  readRecents,
+  __resetRecentsSnapshot,
+} from '../src/core/project/rv-project-recents-store';
+import {
+  serialiseRecents,
+  type RecentDocumentEntry,
+} from '../src/core/project/rv-project-recents';
 
 function project(documents: RvDocumentEntry[]): RvProject {
   return {
@@ -576,5 +585,132 @@ describe('an EMPTY folder renames without a byte move', () => {
       'docs/Module_A/4112630_E_BOM.pdf',
       'docs/Module_A/4112630_E_HTC.pdf',
     ]);
+  });
+});
+
+
+// ─── T4, way 1 of 2 — the tree move (plan-482 §2.7) ──────────────────────
+
+/**
+ * The path in the recents ring is a RECORDED copy of where a document lived,
+ * and a move makes that copy wrong. The row still OPENS — the click goes by
+ * `documentId`, never by the path — but it lies about the one thing the path
+ * was added for: telling two same-named documents apart.
+ *
+ * This is the first of the two independent ways a document changes place. The
+ * other, `SceneStore.rename`, is covered in
+ * `recent-documents-recording.test.ts`; handling only one of them would have
+ * fixed the more frequent half and left the ring lying in the other.
+ */
+describe('plan-482 §2.7 — a tree move re-points the recents ring', () => {
+  function ring(items: RecentDocumentEntry[]) {
+    localStorage.setItem(LS_KEY_RECENT_DOCUMENTS, serialiseRecents(items));
+    __resetRecentsSnapshot();
+  }
+
+  function entry(over: Partial<RecentDocumentEntry> = {}): RecentDocumentEntry {
+    return {
+      projectId: 'proj_test',
+      backend: 'folder',
+      documentId: ROLL_ID,
+      documentName: 'Roll2m',
+      documentPath: ROLL_PATH,
+      projectName: 'Test project',
+      mode: 'hmi',
+      openedAt: '2026-09-12T10:00:00.000Z',
+      ...over,
+    };
+  }
+
+  function movePlan() {
+    const roots = TREE();
+    const from = 'proj/library/parts/Roll2m.glb';
+    return planTreeMove(roots, from, canMoveInTree(roots, from, 'proj/archive'));
+  }
+
+  function movingIO() {
+    return fakeIO(
+      { 'library/parts/Roll2m.glb': 'GLB' },
+      { manifest: plantWithPart() },
+    ).io;
+  }
+
+  beforeEach(() => {
+    localStorage.removeItem(LS_KEY_RECENT_DOCUMENTS);
+    __resetRecentsSnapshot();
+  });
+
+  afterEach(() => {
+    localStorage.removeItem(LS_KEY_RECENT_DOCUMENTS);
+    __resetRecentsSnapshot();
+  });
+
+  it('re-points the moved row even when it is NOT at the head of the ring', async () => {
+    ring([
+      entry({ documentId: 'doc_plant', documentPath: 'scenes/Plant.scene.glb' }),
+      entry(),
+    ]);
+
+    await applyTreeMove(movingIO(), movePlan());
+
+    expect(readRecents().map(e => [e.documentId, e.documentPath])).toEqual([
+      ['doc_plant', 'scenes/Plant.scene.glb'],
+      [ROLL_ID, 'archive/Roll2m.glb'],
+    ]);
+  });
+
+  it('changes ONLY the path — not the order, the mode or the timestamp', async () => {
+    ring([entry({ documentId: 'doc_plant', documentPath: 'scenes/Plant.scene.glb' }), entry()]);
+    const before = readRecents();
+
+    await applyTreeMove(movingIO(), movePlan());
+
+    const after = readRecents();
+    expect(after.map(e => e.documentId)).toEqual(before.map(e => e.documentId));
+    expect(after.map(e => e.mode)).toEqual(before.map(e => e.mode));
+    expect(after.map(e => e.openedAt)).toEqual(before.map(e => e.openedAt));
+  });
+
+  it('leaves the same documentId in ANOTHER project alone', async () => {
+    ring([entry({ projectId: 'other_project' })]);
+
+    await applyTreeMove(movingIO(), movePlan());
+
+    expect(readRecents()[0].documentPath).toBe(ROLL_PATH);
+  });
+
+  it('a FOLDER move carries every ring row below it, opened or not', async () => {
+    const A_PATH = 'library/parts/A.glb';
+    const B_PATH = 'library/parts/B.glb';
+    const A = previewAssetId(A_PATH);
+    const B = previewAssetId(B_PATH);
+    ring([
+      entry({ documentId: A, documentName: 'A', documentPath: A_PATH }),
+      entry({ documentId: B, documentName: 'B', documentPath: B_PATH }),
+    ]);
+    const manifest = project([
+      { id: A, path: A_PATH, name: 'A', section: 'library' },
+      { id: B, path: B_PATH, name: 'B', section: 'library' },
+    ]);
+    const { io } = fakeIO({ [A_PATH]: 'GLB', [B_PATH]: 'GLB' }, { manifest });
+    const roots = buildProjectTree([{
+      id: 'proj',
+      name: 'MyPlant',
+      kind: 'project',
+      writable: true,
+      files: [
+        { path: A_PATH, documentId: A },
+        { path: B_PATH, documentId: B },
+        { path: 'archive/.keep' },
+      ],
+    }] as unknown as Parameters<typeof buildProjectTree>[0]);
+    const from = 'proj/library/parts';
+    const verdict = canMoveInTree(roots, from, 'proj/archive');
+    expect(verdict.ok).toBe(true);
+
+    await applyTreeMove(io, planTreeMove(roots, from, verdict));
+
+    expect(readRecents().map(e => e.documentPath).sort())
+      .toEqual(['archive/parts/A.glb', 'archive/parts/B.glb']);
   });
 });

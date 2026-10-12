@@ -213,7 +213,11 @@ describe('resolveActiveProject', () => {
     // The DEPLOY's id — the synthetic `prj_sample` is gone (plan-735 F6).
     expect(resolved.project?.id).toBe('prj_deploy');
     expect(resolved.models.map(m => m.label)).toEqual(['Demo']);
-    expect(resolved.scenes.map(s => s.name)).toEqual(['Demo A']);
+    // `scenes` is EVERY document now (plan-744 F3), not the scene-section
+    // subset. The subset was a projection over a path heuristic, and the
+    // heuristic answers nothing for a browser project — whose documents are
+    // the ones this field was most needed for. Nothing in production reads it.
+    expect(resolved.scenes.map(s => s.name)).toEqual(['Demo A', 'Demo']);
   });
 
   it('opens My Workspace with neither ?project= nor a last-opened project', async () => {

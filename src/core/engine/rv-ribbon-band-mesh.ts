@@ -51,6 +51,7 @@
 import {
   BufferAttribute,
   BufferGeometry,
+  Color,
   DataTexture,
   DoubleSide,
   DynamicDrawUsage,
@@ -186,6 +187,21 @@ export class RVRibbonBandMesh {
   private readonly _sectionTextures: Texture[][] = [];
   /** First SAMPLE of each section; `[0]` is always 0. */
   private _sectionStarts: number[] = [0];
+  /**
+   * Group -> SECTION, since plan-471. A render group is the intersection
+   * `(section, zone)`: the scroll lives at the section and the tint at the zone,
+   * and neither partition refines the other. Without tension this is the
+   * identity and every method below behaves exactly as it did before.
+   */
+  private _groupToSection: number[] = [0];
+  /** The colour, emission and emissive intensity each group material was born with. */
+  private readonly _baseColors: Color[] = [];
+  private readonly _baseEmissive: Color[] = [];
+  private readonly _baseEmissiveIntensity: number[] = [];
+  /** Whether group `g` currently carries a tint (so a clear can be a no-op). */
+  private readonly _tinted: boolean[] = [];
+  /** Reused tint colour — `applyTint` runs once per group per tick. */
+  private readonly _tint = new Color();
   private _widthMm: number;
   private _sampleCount = 0;
 
@@ -193,8 +209,12 @@ export class RVRibbonBandMesh {
    * @param maxSamples  capacity of the sample buffer (>= 2).
    * @param widthMm     web width; extruded symmetrically along the up vector.
    * @param source      optional node whose FIRST mapped material the band copies.
+   * @param libraryMaterial optional material resolved from `RibbonPath.MaterialName`
+   *        (plan-496). It takes PRECEDENCE over `source`, exactly as in Unity.
+   *        It is COPIED like a borrowed one — the document material is never touched.
    */
-  constructor(maxSamples: number, widthMm: number, source?: Object3D | null) {
+  constructor(maxSamples: number, widthMm: number, source?: Object3D | null,
+              libraryMaterial?: Material | null) {
     this.maxSamples = Math.max(2, Math.floor(maxSamples));
     this._widthMm = widthMm;
 
@@ -235,7 +255,8 @@ export class RVRibbonBandMesh {
     this._geometry.setIndex(new BufferAttribute(indices, 1));
     this._geometry.setDrawRange(0, 0);
 
-    const borrowed = source ? firstMappedMaterial(source) : null;
+    const borrowed = (libraryMaterial as MeshStandardMaterial | null | undefined)
+      ?? (source ? firstMappedMaterial(source) : null);
     let material: MeshStandardMaterial;
     let textures: Texture[];
     if (borrowed) {
@@ -296,6 +317,31 @@ export class RVRibbonBandMesh {
   /** Number of sections the band is currently split into (>= 1). */
   get sectionCount(): number {
     return this._sectionMaterials.length;
+  }
+
+  /** Number of RENDER GROUPS the band currently draws (>= 1). */
+  get groupCount(): number {
+    return this._sectionStarts.length;
+  }
+
+  /** First SAMPLE of each render group, in running order (diagnostics + tests). */
+  get groupStarts(): readonly number[] {
+    return this._sectionStarts;
+  }
+
+  /** The group -> section map (diagnostics + tests). */
+  get groupToSection(): readonly number[] {
+    return this._groupToSection;
+  }
+
+  /** True while group `g` carries a tension tint (diagnostics + tests). */
+  isTinted(group: number): boolean {
+    return this._tinted[group] === true;
+  }
+
+  /** The material of one render group (diagnostics + tests). */
+  groupMaterial(group: number): MeshStandardMaterial | null {
+    return this._sectionMaterials[group] ?? null;
   }
 
   /** First sample of each section, in running order; `[0]` is always 0. */
@@ -365,6 +411,23 @@ export class RVRibbonBandMesh {
       this._positions[at + 3] = _p.x + _u.x * hw;
       this._positions[at + 4] = _p.y + _u.y * hw;
       this._positions[at + 5] = _p.z + _u.z * hw;
+    }
+
+    // The undrawn tail [n, maxSamples) follows the LAST sample on every write.
+    // Left alone it keeps whatever an earlier, longer write put there — e.g. a
+    // former path end now inside a rewinder that has since grown past it — and
+    // the buffer IS read beyond the draw range: by `computeBoundingSphere`, by
+    // raycasts over the attribute and by checks that walk every vertex. It must
+    // be rewritten each time, not once: a collapsed tail goes stale as soon as
+    // the last sample moves.
+    if (n > 0) {
+      const last = (n - 1) * 6;
+      for (let at = n * 6; at < this.maxSamples * 6; at += 6) {
+        for (let k = 0; k < 6; k++) {
+          this._positions[at + k] = this._positions[last + k];
+          this._normals[at + k] = this._normals[last + k];
+        }
+      }
     }
 
     this._sampleCount = n;
@@ -450,7 +513,18 @@ export class RVRibbonBandMesh {
       return;
     }
     if (du === 0) return;
-    for (const tex of this._sectionTextures[sectionOrDu] ?? []) scrollMap(tex, du);
+    // Since plan-471 a section may own SEVERAL groups (a tension zone boundary
+    // inside it splits the draw range but not the speed), so the scroll walks
+    // every group that belongs to this section rather than a single index.
+    let found = false;
+    for (let g = 0; g < this._groupToSection.length; g++) {
+      if (this._groupToSection[g] !== sectionOrDu) continue;
+      found = true;
+      for (const tex of this._sectionTextures[g] ?? []) scrollMap(tex, du);
+    }
+    // A band that was never grouped (a direct `write` without `setSections`)
+    // still has to scroll its one material, which is what the tests do.
+    if (!found) for (const tex of this._sectionTextures[sectionOrDu] ?? []) scrollMap(tex, du);
   }
 
   /** Reset every section's scroll offset to the authored state. */
@@ -478,6 +552,8 @@ export class RVRibbonBandMesh {
       if (s > clean[clean.length - 1]) clean.push(s);
     }
     this._sectionStarts = clean;
+    // No tension: one group per section, in order.
+    this._groupToSection = clean.map((_, k) => k);
     this._ensureSectionMaterials(clean.length);
 
     this._geometry.clearGroups();
@@ -495,9 +571,121 @@ export class RVRibbonBandMesh {
     this.mesh.material = this._sectionMaterials.slice(0, clean.length);
   }
 
+  /**
+   * Split the drawn band into RENDER GROUPS (plan-471): `starts` are the first
+   * samples, `toSection[g]` says which section's speed group `g` scrolls with.
+   *
+   * This is the allocating path — it clones a material per group and rebuilds
+   * the geometry group list — and Auflage A5 therefore restricts it to a change
+   * of the group COUNT. A moving dancer, which changes the group BOUNDARIES on
+   * every tick, goes through {@link updateGroupStarts} instead.
+   */
+  setGroups(starts: readonly number[], toSection: readonly number[]): void {
+    const n = this._sampleCount;
+    const limit = Math.max(0, n - 1);
+    const clean: number[] = [];
+    const sections: number[] = [];
+    // Clamped and made monotone, but never DROPPED: a repeated start is a
+    // zero-width group, and the caller counts on the 1:1 mapping.
+    let previous = 0;
+    for (let i = 0; i < starts.length; i++) {
+      const s = i === 0 ? 0 : Math.min(limit, Math.max(previous, Math.floor(starts[i])));
+      previous = s;
+      clean.push(s);
+      sections.push(toSection[i] ?? 0);
+    }
+    if (clean.length === 0) { clean.push(0); sections.push(0); }
+    this._sectionStarts = clean;
+    this._groupToSection = sections;
+    this._ensureSectionMaterials(clean.length);
+
+    this._geometry.clearGroups();
+    if (clean.length <= 1) {
+      this.mesh.material = this._sectionMaterials[0];
+      return;
+    }
+    for (let k = 0; k < clean.length; k++) {
+      const from = clean[k];
+      const to = k + 1 < clean.length ? clean[k + 1] : Math.max(0, n - 1);
+      // A zero-width group is KEPT (see `RVRibbonPath._buildGroupPartition`):
+      // the group list must stay 1:1 with the partition so the allocation-free
+      // `updateGroupStarts` can address it by index.
+      this._geometry.addGroup(from * 6, Math.max(0, to - from) * 6, k);
+    }
+    this.mesh.material = this._sectionMaterials.slice(0, clean.length);
+  }
+
+  /**
+   * Move the group boundaries WITHOUT touching materials or the group list's
+   * identity — the allocation-free half of the contract above (Auflage A5).
+   *
+   * The caller guarantees the same group COUNT; anything else falls back to
+   * {@link setGroups} rather than writing a half-updated list.
+   */
+  updateGroupStarts(starts: readonly number[]): void {
+    if (starts.length !== this._sectionStarts.length) {
+      this.setGroups(starts, this._groupToSection);
+      return;
+    }
+    const n = this._sampleCount;
+    const limit = Math.max(0, n - 1);
+    for (let k = 0; k < starts.length; k++) {
+      this._sectionStarts[k] = Math.max(0, Math.min(limit, Math.floor(starts[k])));
+    }
+    const groups = this._geometry.groups;
+    if (groups.length !== this._sectionStarts.length) return;
+    for (let k = 0; k < this._sectionStarts.length; k++) {
+      const from = this._sectionStarts[k];
+      const to = k + 1 < this._sectionStarts.length ? this._sectionStarts[k + 1] : limit;
+      // In place: `groups` entries are plain objects the renderer reads every
+      // frame, so mutating them costs nothing and allocates nothing.
+      groups[k].start = from * 6;
+      groups[k].count = Math.max(0, to - from) * 6;
+      groups[k].materialIndex = k;
+    }
+  }
+
+  /**
+   * Tint one render group, or restore it EXACTLY (`color === null`).
+   *
+   * Two channels, because one is not enough (Auflage A6): `.color` MULTIPLIES
+   * the colour map, so on a black texel it does nothing at all — a printed dark
+   * film would show no alarm whatever. The emissive term is ADDITIVE and is
+   * therefore what makes the two alarm states readable on any material, in a
+   * still image.
+   *
+   * The restore is bit-exact: the colour, the emission and the emissive
+   * intensity each group was born with are captured when its material is
+   * created and copied back verbatim, never recomputed.
+   */
+  applyTint(group: number, color: number | null, strength: number, emissiveStrength: number): void {
+    const material = this._sectionMaterials[group];
+    if (!material) return;
+    if (color === null || !(strength > 0)) {
+      if (this._tinted[group] !== true) return;
+      material.color.copy(this._baseColors[group]);
+      material.emissive.copy(this._baseEmissive[group]);
+      material.emissiveIntensity = this._baseEmissiveIntensity[group];
+      this._tinted[group] = false;
+      return;
+    }
+    const amount = Math.min(1, strength);
+    this._tint.setHex(color);
+    material.color.copy(this._baseColors[group]).lerp(this._tint, amount);
+    if (emissiveStrength > 0) {
+      material.emissive.copy(this._tint).multiplyScalar(Math.min(1, emissiveStrength));
+      material.emissiveIntensity = 1;
+    } else {
+      material.emissive.copy(this._baseEmissive[group]);
+      material.emissiveIntensity = this._baseEmissiveIntensity[group];
+    }
+    this._tinted[group] = true;
+  }
+
   /** Grow the per-section material/map arrays to `count` entries. */
   private _ensureSectionMaterials(count: number): void {
     const base = this._sectionMaterials[0];
+    this._captureBase(0);
     while (this._sectionMaterials.length < count) {
       const clone = base.clone();
       // `Texture.clone()` shares the `image` (the GPU upload) and copies only
@@ -509,7 +697,19 @@ export class RVRibbonBandMesh {
       if (clone.map) this._maps.push(clone.map);
       clone.side = DoubleSide;
       this._sectionMaterials.push(clone);
+      this._captureBase(this._sectionMaterials.length - 1);
     }
+  }
+
+  /** Remember the untinted appearance of group `g`, once. */
+  private _captureBase(g: number): void {
+    if (this._baseColors[g]) return;
+    const material = this._sectionMaterials[g];
+    if (!material) return;
+    this._baseColors[g] = material.color.clone();
+    this._baseEmissive[g] = material.emissive.clone();
+    this._baseEmissiveIntensity[g] = material.emissiveIntensity;
+    this._tinted[g] = false;
   }
 
   /** Free geometry, generated/cloned textures and the band's own materials. */
@@ -522,6 +722,10 @@ export class RVRibbonBandMesh {
     this._sectionTextures.length = 0;
     if (this._ownsMaterial) for (const mat of this._sectionMaterials) mat.dispose();
     this._sectionMaterials.length = 0;
+    this._baseColors.length = 0;
+    this._baseEmissive.length = 0;
+    this._baseEmissiveIntensity.length = 0;
+    this._tinted.length = 0;
   }
 }
 

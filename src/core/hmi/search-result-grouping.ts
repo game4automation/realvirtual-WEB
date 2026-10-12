@@ -14,6 +14,8 @@
  * first item into that flat order.
  */
 
+import { CATEGORY_LABEL, CATEGORY_ORDER, categoryOf } from '../engine/rv-component-category';
+
 /** Structural subset of NodeSearchResult the grouping reads. */
 export interface GroupableResult {
   /** Registered component types at this path. Empty for plain nodes. */
@@ -32,31 +34,29 @@ export interface SearchResultGroup<T extends GroupableResult> {
 /** Group label for the untyped rest — always sorted last. */
 export const OBJECTS_GROUP = 'Objects';
 
-/** Fixed group order for the common categories; others follow alphabetically. */
-const GROUP_PRIORITY = ['Drives', 'Sensors', 'Conveyors', 'Signals', 'Logic'];
-
-/** Category label for one search result. */
+/**
+ * Category label for one search result (plan-597): the SAME coarse category the
+ * hierarchy filter chips use (`categoryOf`, rv-component-category.ts), so a type
+ * is "Transport" in both places. Untyped results are {@link OBJECTS_GROUP}.
+ */
 export function searchGroupLabel(result: GroupableResult): string {
   const t = result.matchedBy ?? result.types[0] ?? '';
   if (!t || t === 'Node') return OBJECTS_GROUP;
-  if (t === 'Drive' || t.startsWith('Drive_') || t === 'DrivesRecorder') return 'Drives';
-  if (t === 'Sensor') return 'Sensors';
-  if (t === 'TransportSurface') return 'Conveyors';
-  if (t.startsWith('PLCInput') || t.startsWith('PLCOutput') || t === 'ConnectSignal') return 'Signals';
-  if (t.startsWith('LogicStep')) return 'Logic';
-  // Other component types group under their own type key (e.g. "AASLink").
-  return t;
+  return CATEGORY_LABEL[categoryOf(t).category];
 }
 
+const LABEL_RANK: ReadonlyMap<string, number> = new Map(
+  CATEGORY_ORDER.map((id, i) => [CATEGORY_LABEL[id], i] as const),
+);
+
 function groupRank(label: string): number {
-  const p = GROUP_PRIORITY.indexOf(label);
-  if (p !== -1) return p;
-  return label === OBJECTS_GROUP ? GROUP_PRIORITY.length + 1 : GROUP_PRIORITY.length;
+  if (label === OBJECTS_GROUP) return CATEGORY_ORDER.length + 1;
+  return LABEL_RANK.get(label) ?? CATEGORY_ORDER.length;
 }
 
 /**
- * Group results by category. Group order: Drives, Sensors, Conveyors,
- * Signals, Logic, other types (alphabetical), Objects last. Item order
+ * Group results by category. Group order: `CATEGORY_ORDER` (Other last of
+ * the categories), Objects at the very end. Item order
  * inside a group preserves the input (relevance) order.
  */
 export function groupSearchResults<T extends GroupableResult>(

@@ -342,14 +342,17 @@ describe('CAD re-import after an editor reload (plan-727)', () => {
     expect(report.unmatched).toEqual([]);
   });
 
-  it('runtime load still re-parents (unchanged) — which is exactly why the editor must not', async () => {
+  it('a non-baking load WITHOUT the authoring flag keeps the tree authored too (plan-757 Phase 3 commit B)', async () => {
+    // History: until commit B a runtime init re-parented the member under
+    // `Kine`, and this case spelled out the silent loss (matched 0, unmatched
+    // []) an editor save used to bake into the GLB. The init re-parents in NO
+    // mode any more — only the `Kinematic` hook inside the bake does — so an
+    // editor load is safe with or without the flag, and re-import carries the
+    // member either way.
     const { report, part, cadRoot } = await loadAndReimport(false);
-    expect(part.parent?.name).toBe('Kine');
-    expect(isDescendantOf(part, cadRoot)).toBe(false);
-    // The silent loss, spelled out: NOT carried over, and NOT reported as
-    // unmatched either — the node is simply outside what relativePathMap walks.
-    // This is the state an editor save used to bake into the GLB permanently.
-    expect(report.matched).toBe(0);
+    expect(part.parent?.name).toBe('Gearbox');
+    expect(isDescendantOf(part, cadRoot)).toBe(true);
+    expect(report.matched).toBe(1);
     expect(report.unmatched).toEqual([]);
   });
 });

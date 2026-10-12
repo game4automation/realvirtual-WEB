@@ -28,7 +28,7 @@
  * the same assignment is a silent no-op (sources render at `layers.mask = 0`).
  */
 
-import { Object3D, Mesh, Material, MeshStandardMaterial, Color, DoubleSide } from 'three';
+import { Object3D, Mesh, Material, MeshStandardMaterial, Color, DoubleSide, TextureLoader, RepeatWrapping, SRGBColorSpace, Texture } from 'three';
 import type { MaterialValue } from './rv-asset-ops';
 import { NodeRegistry } from '../engine/rv-node-registry';
 
@@ -101,11 +101,11 @@ export function captureMaterialPrev(
   }));
 }
 
-/** True when the material is a plain, untextured MeshStandardMaterial. */
+/** True when a standard material can be represented by an editor preset. */
 function isPlainStandard(mat: Material): mat is MeshStandardMaterial {
   const m = mat as MeshStandardMaterial;
   if (!(m as { isMeshStandardMaterial?: boolean }).isMeshStandardMaterial) return false;
-  return !m.map && !m.normalMap && !m.roughnessMap && !m.metalnessMap
+  return (!m.map || typeof m.map.userData?.rvPresetTexture === 'string') && !m.normalMap && !m.roughnessMap && !m.metalnessMap
     && !m.aoMap && !m.emissiveMap && !m.alphaMap && !m.lightMap;
 }
 
@@ -123,6 +123,7 @@ export function materialToValue(mat: Material | null | undefined): MaterialValue
     roughness: mat.roughness,
     opacity: mat.opacity,
     transparent: mat.transparent,
+    ...(mat.map ? { texture: mat.map.userData.rvPresetTexture as string } : {}),
     ...(emissive !== '#000000'
       ? { emissive, emissiveIntensity: mat.emissiveIntensity }
       : {}),
@@ -135,6 +136,7 @@ export function materialValueKey(v: MaterialValue): string {
   return [
     v.color, q(v.metalness), q(v.roughness), q(v.opacity),
     v.transparent ? '1' : '0', v.emissive ?? '-', q(v.emissiveIntensity ?? 1),
+    v.texture ?? '',
   ].join('|');
 }
 
@@ -146,6 +148,23 @@ export function materialValueKey(v: MaterialValue): string {
  * instances must outlive an undo/redo cycle (a redo re-attaches the same value).
  * `disposeMaterialCache` clears it on viewer teardown.
  */
+const TEXTURE_READY = new WeakMap<Texture, Promise<void>>();
+
+/** Wait for assigned library maps before serializing an asset. */
+export async function waitForMaterialTextures(root: Object3D): Promise<void> {
+  const pending = new Set<Promise<void>>();
+  root.traverse((node) => {
+    const mesh = node as Mesh;
+    if (!mesh.isMesh) return;
+    for (const mat of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+      const map = (mat as MeshStandardMaterial).map;
+      const ready = map && TEXTURE_READY.get(map);
+      if (ready) pending.add(ready);
+    }
+  });
+  await Promise.all(pending);
+}
+
 const CACHE = new Map<string, MeshStandardMaterial>();
 
 /**
@@ -172,6 +191,19 @@ export function materialForValue(v: MaterialValue): MeshStandardMaterial {
   if (v.emissive) {
     mat.emissive = new Color(v.emissive);
     mat.emissiveIntensity = v.emissiveIntensity ?? 1;
+  }
+  if (v.texture) {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const ready = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
+    // Rendering may precede export; retain failures without an unhandled rejection.
+    void ready.catch(() => {});
+    mat.map = new TextureLoader().load(v.texture, () => resolve(), undefined, reject);
+    TEXTURE_READY.set(mat.map, ready);
+    mat.map.flipY = false;
+    mat.map.colorSpace = SRGBColorSpace;
+    mat.map.wrapS = mat.map.wrapT = RepeatWrapping;
+    mat.map.userData.rvPresetTexture = v.texture;
   }
   // Painted parts are usually CAD solids seen from outside, but transparent
   // presets (glass, guards) read as paper-thin without back faces.
@@ -218,6 +250,9 @@ function collectPaintableMeshesWithPaths(root: Object3D): Array<{ mesh: Mesh; pa
 
 /** Release every cached material. Call on viewer teardown. */
 export function disposeMaterialCache(): void {
-  for (const mat of CACHE.values()) mat.dispose();
+  for (const mat of CACHE.values()) {
+    mat.map?.dispose();
+    mat.dispose();
+  }
   CACHE.clear();
 }

@@ -135,8 +135,7 @@ function sharedCustomer(slug: string, overrides: Record<string, unknown> = {}) {
     customer: slug,
     displayName: `${slug} GmbH`,
     kind: 'standard',
-    licensing: { connect: { issuer: 'portal', keyRef: 'connectLicenseKey' } },
-    secretsRef: `customers/${slug}.secrets.json`,
+    licensing: { connect: { issuer: 'portal', key: syntheticLicenceKey() } },
     forgejo: { org: SHARED_ORG, repo: SHARED_REPO, team: slug, permission: 'read' },
     delivery: { ...MAUSER.delivery, projects: [] as string[] },
     ...overrides,
@@ -351,45 +350,47 @@ describe('customer register — no secret values', () => {
 
   it('refuses an API-key-shaped value anywhere in the file', () => {
     const root = fixture({ mauser: { ...MAUSER, displayName: syntheticApiKey() } });
-    expect(() => loadCustomer(root, 'mauser')).toThrow(/mauser\.secrets\.json/);
+    expect(() => loadCustomer(root, 'mauser')).toThrow('holds a credential-shaped value');
   });
 
-  it('refuses a keyRef that is a value rather than a field name', () => {
+  it('refuses a licence key that is not in the CONNECT shape', () => {
     const root = fixture({
-      mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal', keyRef: syntheticLicenceKey() } } },
+      mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal', key: 'connectLicenseKey' } } },
     });
-    expect(() => loadCustomer(root, 'mauser')).toThrow(/keyRef must be one of/);
+    expect(() => loadCustomer(root, 'mauser')).toThrow(/licensing.connect.key must look like/);
+  });
+
+  it('refuses a placeholder licence key, which would look licensed and activate nothing', () => {
+    const root = fixture({
+      mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal', key: 'LIC-XXXX-XXXX-XXXX' } } },
+    });
+    expect(() => loadCustomer(root, 'mauser')).toThrow(/looks like a placeholder/);
   });
 });
 
 describe('customer register — secret resolution', () => {
   const licensed = {
     ...MAUSER,
-    licensing: { connect: { issuer: 'portal', keyRef: 'connectLicenseKey' } },
-    secretsRef: 'customers/mauser.secrets.json',
+    licensing: { connect: { issuer: 'portal', key: syntheticLicenceKey() } },
   };
 
-  it('reads the values from the gitignored secrets file', () => {
-    const root = fixture({ mauser: licensed }, {
-      secrets: {
-        mauser: {
-          connectLicenseKey: syntheticLicenceKey(),
-          requestyApiKey: syntheticApiKey(),
-          requestyBaseUrl: 'https://api.example.invalid/v1',
-        },
+  it('takes both the licence and the Requesty pair out of the register entry', () => {
+    const root = fixture({
+      mauser: {
+        ...licensed,
+        inference: { requestyApiKey: syntheticApiKey(), requestyBaseUrl: 'https://api.example.invalid/v1' },
       },
     });
     const secrets = resolveCustomerSecrets(root, loadCustomer(root, 'mauser'), { env: {} });
     expect(secrets.connectLicenseKey).toBe(syntheticLicenceKey());
+    expect(secrets.requestyApiKey).toBe(syntheticApiKey());
     expect(secrets.requestyBaseUrl).toBe('https://api.example.invalid/v1');
   });
 
-  it('lets the environment win over the file for the Requesty pair', () => {
+  it('lets the environment win over the entry for the Requesty pair', () => {
     // The one-off run against another gateway that worked before the register
     // existed has to keep working.
-    const root = fixture({ mauser: licensed }, {
-      secrets: { mauser: { connectLicenseKey: syntheticLicenceKey(), requestyApiKey: syntheticApiKey() } },
-    });
+    const root = fixture({ mauser: { ...licensed, inference: { requestyApiKey: syntheticApiKey() } } });
     const secrets = resolveCustomerSecrets(root, loadCustomer(root, 'mauser'), {
       env: { REQUESTY_API_KEY: 'from-environment', REQUESTY_BASE_URL: 'https://other.example.invalid/v1' },
     });
@@ -399,18 +400,18 @@ describe('customer register — secret resolution', () => {
     expect(secrets.connectLicenseKey).toBe(syntheticLicenceKey());
   });
 
-  it('names the expected path and the SOPS counterpart when nothing resolves', () => {
-    const root = fixture({ mauser: licensed });
-    expect(() => resolveCustomerSecrets(root, loadCustomer(root, 'mauser'), { env: {} }))
-      .toThrow(/mauser\.secrets\.json[\s\S]*secrets store \(secrets\/delivery\/<slug>\.secrets\.json, SOPS-encrypted\)/);
+  it('names the register entry when a declared licence carries no key', () => {
+    // The state between onboarding and the portal issuing the licence. The
+    // message has to name the file to edit — there is no sidecar to look in.
+    const root = fixture({ mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal' } } } });
+    const call = () => resolveCustomerSecrets(root, loadCustomer(root, 'mauser'), { env: {} });
+    expect(call).toThrow('licensing.connect.key');
+    expect(call).toThrow('mauser.json');
   });
 
-  it('rejects an unknown field in the secrets file', () => {
-    const root = fixture({ mauser: licensed }, {
-      secrets: { mauser: { connectLicenseKey: syntheticLicenceKey(), portalPassword: 'nope' } },
-    });
-    expect(() => resolveCustomerSecrets(root, loadCustomer(root, 'mauser'), { env: {} }))
-      .toThrow(/unknown field "portalPassword"/);
+  it('rejects an unknown field in the inference block', () => {
+    const root = fixture({ mauser: { ...licensed, inference: { portalPassword: 'nope' } } });
+    expect(() => loadCustomer(root, 'mauser')).toThrow('inference contains unknown field "portalPassword"');
   });
 
   it('resolves to nothing, without throwing, for a customer that holds no licence', () => {
@@ -454,31 +455,21 @@ describe('customer register — delivery translation', () => {
   // is not deliverable has neither, and must not be asked for them.
   const LICENSED = {
     ...MAUSER,
-    licensing: { connect: { issuer: 'portal', keyRef: 'connectLicenseKey' } },
-    secretsRef: 'customers/mauser.secrets.json',
+    licensing: { connect: { issuer: 'portal', key: syntheticLicenceKey() } },
   };
   const STANDARD = {
     ...MAUSER,
     customer: 'acme',
     displayName: 'Acme AG',
     kind: 'standard',
-    licensing: { connect: { issuer: 'portal', keyRef: 'connectLicenseKey' } },
-    secretsRef: 'customers/acme.secrets.json',
+    licensing: { connect: { issuer: 'portal', key: syntheticLicenceKey() } },
     forgejo: { org: 'rv-acme', repo: 'rv-project-acme', team: 'members', permission: 'read' },
     // The register itself enforces this emptiness for kind "standard".
     delivery: { ...MAUSER.delivery, projects: [] as string[] },
   };
-  const registerWithBoth = () => fixture(
-    { mauser: LICENSED, acme: STANDARD },
-    {
-      secrets: {
-        mauser: { connectLicenseKey: syntheticLicenceKey() },
-        // A standard customer runs CONNECT like anyone else, so they carry a
-        // licence key too — what they do NOT carry is a project (plan-434 Phase 4).
-        acme: { connectLicenseKey: syntheticLicenceKey() },
-      },
-    },
-  );
+  // A standard customer runs CONNECT like anyone else, so they carry a licence
+  // key too — what they do NOT carry is a project (plan-434 Phase 4).
+  const registerWithBoth = () => fixture({ mauser: LICENSED, acme: STANDARD });
 
   it('enumerates both customers, the standard one with an empty project list', () => {
     const root = registerWithBoth();
@@ -522,13 +513,15 @@ describe('customer register — delivery translation', () => {
  * longer stop a delivery that never ships one.
  */
 describe('customer register — shared delivery translation', () => {
-  const sharedRegister = (secrets: Record<string, Record<string, string>> = {}) => fixture(
-    { acme: sharedCustomer('acme'), beta: sharedCustomer('beta') },
-    { secrets },
-  );
+  // Overrides per slug rather than secrets files: the licence is part of the
+  // entry now, so "this customer has no key yet" is expressed in the entry.
+  const sharedRegister = (overrides: Record<string, Record<string, unknown>> = {}) => fixture({
+    acme: sharedCustomer('acme', overrides.acme ?? {}),
+    beta: sharedCustomer('beta', overrides.beta ?? {}),
+  });
 
   it('points a shared customer at the one shared remote and says so in the config', () => {
-    const root = sharedRegister({ acme: { connectLicenseKey: syntheticLicenceKey() } });
+    const root = sharedRegister();
     const config = withHubBaseUrl(() => loadDeliveryConfigByCustomer(root, 'acme'));
     expect(config.remote).toBe(`https://git.example.invalid/${SHARED_ORG}/${SHARED_REPO}.git`);
     expect(config.sharedRepo).toBe(true);
@@ -539,8 +532,7 @@ describe('customer register — shared delivery translation', () => {
   });
 
   it('marks an own-repo delivery as not shared', () => {
-    const root = fixture({ mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal', keyRef: 'connectLicenseKey' } }, secretsRef: 'customers/mauser.secrets.json' } },
-      { secrets: { mauser: { connectLicenseKey: syntheticLicenceKey() } } });
+    const root = fixture({ mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal', key: syntheticLicenceKey() } } } });
     const config = withHubBaseUrl(() => loadDeliveryConfigByCustomer(root, 'mauser'));
     expect(config.sharedRepo).toBe(false);
     expect(config.remote).toBe('https://git.example.invalid/rv-mauser/rv-project-mauser.git');
@@ -550,24 +542,21 @@ describe('customer register — shared delivery translation', () => {
     // The key is not delivered in the shared channel, so its absence cannot be
     // what stops the delivery. The register still DECLARES the licence, and the
     // doctor still reports it as owed — that is the management view, not this one.
-    const root = sharedRegister();
+    const root = sharedRegister({ acme: { licensing: { connect: { issuer: 'portal' } } } });
     expect(() => withHubBaseUrl(() => loadDeliveryConfigByCustomer(root, 'acme'))).not.toThrow();
     const config = withHubBaseUrl(() => loadDeliveryConfigByCustomer(root, 'acme'));
     expect(config.connectLicenseKey).toBeUndefined();
     // The same gap in an own repo still stops the delivery: there the key IS
     // shipped, so a workspace without one is a broken delivery.
     const own = fixture(
-      { mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal', keyRef: 'connectLicenseKey' } } } },
+      { mauser: { ...MAUSER, licensing: { connect: { issuer: 'portal' } } } },
     );
     expect(() => withHubBaseUrl(() => loadDeliveryConfigByCustomer(own, 'mauser')))
-      .toThrow(/no value resolves/);
+      .toThrow(/licensing.connect.key/);
   });
 
   it('does not read two customers on one remote as a conflict', () => {
-    const root = sharedRegister({
-      acme: { connectLicenseKey: syntheticLicenceKey() },
-      beta: { connectLicenseKey: syntheticLicenceKey() },
-    });
+    const root = sharedRegister();
     const configs = withHubBaseUrl(() => listDeliveryConfigs(root));
     expect(configs.map(config => config.configName)).toEqual(['acme', 'beta']);
     expect(new Set(configs.map(config => config.remote)).size).toBe(1);

@@ -61,6 +61,8 @@ import {
 } from './slot-row-models';
 import { createSignalBindingPersistence } from './signal-binding-persistence';
 import { emitSignalBindingApplied } from './binding-applied-pulse';
+import { mergeAppliedMappings } from './binding-inventory';
+import { bindWithUnitScale, getBindPendingVersion, isBindPending, subscribeBindPending } from './unit-scale';
 import {
   findSignalBindTarget,
   signalBindEligibility,
@@ -69,8 +71,7 @@ import {
 } from './signal-bind-target';
 import { SLOT_DESCRIPTORS } from './slot-descriptors';
 import { slotLabelOverride } from './slot-display-label';
-
-const INK_LOW = 'rgba(255,255,255,0.5)';
+import { FS, INK_LOW } from '../../core/hmi/shared-sx';
 
 function signalPrimitiveOf(signal: string): 'bool' | 'float' | 'int' {
   if (signal.includes('Bool')) return 'bool';
@@ -134,6 +135,9 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
   const mappingSnapshot = useCallback(() => JSON.stringify(persistence.read()), [persistence]);
   useSyncExternalStore(subscribeMappings, mappingSnapshot);
   const connectSnap = useSyncExternalStore(subscribeConnectStore, getConnectSnapshot);
+  // plan-512: while a unit-aware bind of this target is queued or running, its
+  // rows are busy — a second action would only wait behind it.
+  useSyncExternalStore(subscribeBindPending, getBindPendingVersion);
 
   const rows = buildRows(persistence.read());
   // Rebuilt with `rows` on every render (both are cheap, ≤ a few dozen rows).
@@ -162,7 +166,9 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
       topic: s.topic,
       conflict: s.conflict,
       origin: s.origin,
-    })), [signals, pickerRow]);
+      // plan-512 F9: the source's unit, shown in the picker before binding.
+      unit: viewer.signalStore?.getSignalMeta(s.name)?.unit,
+    })), [signals, pickerRow, viewer.signalStore]);
 
   // Same rule for click, Enter and drag (plan-341 §2.8 a) — see SignalBindPopover.
   const pickerRejectReason = (item: SignalSearchItem): DropRejectReason | null => {
@@ -183,23 +189,30 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
 
   const persist = (next: import('../layout-planner/rv-layout-store').SignalMapping[]): void => {
     const applied = mgr.applyMappings(targetId, target.node, next);
-    persistence.write(applied);
+    // Broken links of the same target survive an unrelated change (plan-425).
+    persistence.write(mergeAppliedMappings(next, applied));
   };
 
   const bindRow = (row: SlotRow, source: PickerSignal): void => {
-    const next = upsertMappingForRow(persistence.read(), row, source);
-    if (!next) return;
-    persist(next);
-    // THE user-initiated boundary (plan-425 F8). Deliberately not inside
-    // `persist`, which the unbind path also calls, nor inside applyMappings,
-    // which every model load runs.
-    emitSignalBindingApplied(viewer, targetId, {
-      componentPath: row.componentPath,
-      slot: row.slot,
-      signal: source.name,
-      sourceKind: source.origin === 'internal' ? 'internal' : 'connect',
+    if (!upsertMappingForRow(persistence.read(), row, source)) return;
+    // plan-512: the unit-aware bind — mapping and unit factor in ONE undo step.
+    void bindWithUnitScale(viewer, target, persistence, row, source).then((result) => {
+      if (!result?.persisted) {
+        if (result?.error) console.warn(`[signal-bind] binding ${row.slot} did not stick: ${result.error}`);
+        return;
+      }
+      // THE user-initiated boundary (plan-425 F8). Deliberately not inside
+      // `persist`, which the unbind path also calls, nor inside applyMappings,
+      // which every model load runs.
+      emitSignalBindingApplied(viewer, targetId, {
+        componentPath: row.componentPath,
+        slot: row.slot,
+        signal: source.name,
+        sourceKind: source.origin === 'internal' ? 'internal' : 'connect',
+      });
     });
   };
+  const busyReason = isBindPending(targetId) ? 'Binding in progress…' : undefined;
 
   return (
     <>
@@ -211,7 +224,7 @@ function BindableSlotRows({ viewer, target, buildRows, disabledReason }: {
           qualifier={qualifiers.get(slotRowKey(row))}
           viewer={viewer}
           signals={signals}
-          disabledReason={disabledReason}
+          disabledReason={disabledReason ?? busyReason}
           onOpenPicker={(r, anchor) => setPicker({ key: slotRowKey(r), anchor })}
           onUnbind={(r) => persist(removeMappingForRow(persistence.read(), r))}
           onDropSignal={(r, source) => bindRow(r, source)}
@@ -338,7 +351,7 @@ export function ComponentSignalSlots({ viewer, signalStore, nodePath, componentT
     <>
       {eligibility && !eligibility.eligible && (
         <Box sx={{ px: 1, py: 0.25 }}>
-          <Typography sx={{ fontSize: 11, color: INK_LOW }}>
+          <Typography sx={{ fontSize: FS.label, color: INK_LOW }}>
             Signal linking unavailable — {eligibility.reason}
           </Typography>
         </Box>
@@ -433,7 +446,7 @@ export function PLCSignalSlot({ viewer, nodePath, componentType }: PLCSignalSlot
     <>
       {eligibility && !eligibility.eligible && (
         <Box sx={{ px: 1, py: 0.25 }}>
-          <Typography sx={{ fontSize: 11, color: INK_LOW }}>
+          <Typography sx={{ fontSize: FS.label, color: INK_LOW }}>
             Signal linking unavailable — {eligibility.reason}
           </Typography>
         </Box>

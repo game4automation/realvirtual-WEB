@@ -55,6 +55,18 @@ export class InterfaceManager implements RVViewerPlugin {
   }
 
   /**
+   * The endpoint of the active interface's CURRENT connection, normalised to
+   * the HTTP origin it shares with a REST gateway (plan-498 "Transport-
+   * Erkennung"): `ws:` → `http:`, `wss:` → `https:`, default ports explicit-
+   * free (`ws://h:80` ≡ `http://h`), path/query dropped. `null` when no
+   * interface is active or it is not connected.
+   */
+  getActiveEndpoint(): URL | null {
+    const endpoint = this.getActive()?.connectedEndpoint ?? null;
+    return endpoint ? normalizeEndpointOrigin(endpoint) : null;
+  }
+
+  /**
    * Activate an interface by its ID.
    * Disconnects any previously active interface first (mutex).
    */
@@ -163,4 +175,23 @@ export class InterfaceManager implements RVViewerPlugin {
     this.registry.clear();
     this.viewer = null;
   }
+}
+
+/**
+ * `ws`/`wss` → `http`/`https`, default port dropped, path/query/hash cleared —
+ * so two spellings of one server compare equal via `.origin` / `.href`.
+ */
+export function normalizeEndpointOrigin(endpoint: URL): URL {
+  const url = new URL(endpoint.href);
+  if (url.protocol === 'ws:') url.protocol = 'http:';
+  else if (url.protocol === 'wss:') url.protocol = 'https:';
+  // The URL parser already drops a port equal to the scheme default; after a
+  // protocol change it must be re-checked against the NEW scheme.
+  if ((url.protocol === 'http:' && url.port === '80') || (url.protocol === 'https:' && url.port === '443')) url.port = '';
+  url.pathname = '/';
+  url.search = '';
+  url.hash = '';
+  url.username = '';
+  url.password = '';
+  return url;
 }

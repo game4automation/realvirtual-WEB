@@ -1,5 +1,9 @@
 # Node Paths — How References Are Written and Resolved
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 Almost everything realvirtual WEB knows about a scene beyond its geometry is addressed by a
 **node path**: a slash-separated string naming a node in the scene hierarchy. Component
 references, instruction targets, kinematic bodies, signal addresses and persisted selections
@@ -192,7 +196,7 @@ spellings (plan-734).
 ## 3. How the exporter builds paths
 
 `SerializationContext.GetRelativePath()`
-([GLBComponentSerializer.cs:164](../../Packages/io.realvirtual.professional/Runtime/AssetManager/private/Serialization/GLBComponentSerializer.cs#L164))
+(GLBComponentSerializer.cs:164 (optional Unity Professional source; not included in Community))
 walks from the target up to its export root, joining Unity names with `/`.
 
 The export root name is **always** the first path segment, independent of how many roots are
@@ -502,3 +506,186 @@ change in section 3 and still reads GLBs exported before it.
   ([KhronosGroup/glTF#2337](https://github.com/KhronosGroup/glTF/issues/2337) is still open);
   Three.js offers `gltf.parser.associations` as an official route back to the original node
   index, which is the direction a future ID-based reference scheme would take.
+
+## 9. Baked models: root + logic nodes only (plan-753 / plan-754)
+
+Since plan-753 Phase 3 a **layout-planner placement is an instance of a baked library asset**:
+the placement root (`LayoutObject`) carries a handful of *chunk meshes* (one merged geometry per
+mover × material bucket, shared by every placement of the same asset) plus the asset's **logic
+nodes** — the nodes that carry a component (`Drive`, `TransportSurface`, `Sensor`, `Lamp`, …),
+a `Snap-*` port or a mover role. The CAD hierarchy of the library file is **not** rebuilt under
+the placement; its triangles live inside the chunks.
+
+**Since plan-754 the same is true of the MAIN model.** The bake is destructive: the GLB is parsed
+into a temporary graph, and the model that reaches the scene is a fresh *template* holding the
+survivors only — component nodes (a `Group` or an export marker alone does not count, see below),
+reference targets, `Snap-*` ports, their ancestors, keep meshes, the chunk meshes and the
+partition objects the bake creates for groups. Everything else is not hidden, not masked and not ghosted: it does not
+exist, and it is never registered. So this section is no longer about placements; it is the
+runtime rule for every baked model.
+
+> **Registered = document.** The `NodeRegistry` is the document's address book, and after the
+> bake it holds exactly the template's nodes. A path resolves iff the registry knows it. Anything
+> else in the scene — a chunk mesh, a light, a gizmo, a hover overlay, a pooled MU — is visible
+> in the hierarchy and in the MCP node tools, flagged `chunk` or `runtime`, and has only a
+> *computed* name path: readable and measurable, never a reference target and never selectable.
+
+Consequences for node paths:
+
+- **Addressable paths inside a baked model are the root and its logic nodes**, e.g.
+  `Conveyor_2/Transport-Z` or `Conveyor_2/Drive-Rot-Y`. A CAD sub-path such as
+  `Conveyor_2/Frame/Leg_3` **does not exist any more** and yields no hit in `web_node_find`,
+  `web_node_tree`, `web_node_bounds` or `web_select`. Skills that used to address CAD parts
+  (`weblayout`, `webmcp`, `debugweb`) address the model root, a placement root or a logic node.
+- A bare CAD node that a plugin or an integration must still reach at runtime has to be
+  **claimed** before the bake — see `RVPlugin.bakeClaims` in `doc-extending-webviewer.md`, or
+  author a component / an `rv.BakeRole` on the node in the GLB. An unclaimed node is removed.
+- **A `Group` alone claims nothing (plan-755).** Component types that declare the capability
+  `claimsNode: false` — `Group` (incl. `Group_1`, …) and the Unity export markers `rigidbody`,
+  `renderer`, `colliders`, `BoxCollider`, `MeshCollider`, `RuntimeUIWindow`,
+  `RuntimeInteractable` — do not keep their node alive. A node that carries nothing else survives
+  only as reference target, plugin claim, `Snap-*` port, keep mesh or ancestor of a survivor. On a
+  CAD model grouped down to single solids this is a large, deliberate break: about **12,600 node
+  paths of the Mauser that resolved before no longer resolve** (group-only nodes plus the plain
+  ancestors only they kept alive). Saved paths and MCP scripts that named such a node must switch
+  to one of: the group's **partition object** (next item), a `bakeClaims()` claim, a real
+  component on the node, or the editor (which never bakes).
+- **Partition objects: `<boundary>/<key>`.** Inside a chunk boundary the bake splits the geometry
+  by the set of group names between a mesh and that boundary and creates ONE node per
+  combination, which is the parent of those chunk meshes and a registered member of each of its
+  groups (hide / isolate in the Groups panel act on it). Its path is `<boundary path>/<key>`;
+  **static group geometry hangs directly under the model root: `<root>/<key>`**, not under the
+  nearest surviving ancestor. `<key>` is the sorted group names joined with `|`, used as the node
+  name as-is (`MC01.13`, `CNCCase|CNCDoor`); only `/` is removed, and a sibling name collision
+  gets the usual `_N` suffix with the readable spelling in `userData._rvOrigName`. Members that
+  a `Kinematic` integrates are re-parented before the bake, so their object sits under the
+  kinematic: `<Kinematic>/<GroupName>`. A group that sits ON the boundary node creates no object
+  — the boundary node itself is the member.
+  A partition object is **synthetic** (`userData._rvSynthetic`): it is registered, resolvable by
+  its real path and selectable in the hierarchy, but it exists in no document — read-only in the
+  inspector, never an override or reference target you persist, and **excluded from the
+  sanitized-path fallback** (stage 4 of the resolver): it was never an authored path, and its
+  free-text name must not make an authored path ambiguous.
+  Since plan-757 a planner placement gets the same partition objects as the main model: the
+  `ModelCache` bakes through the one recipe (`prepareAndBake`, `src/core/engine/rv-prepare-and-bake.ts`),
+  hooks included, and `instantiate()` clones the whole template — so a placement has the same
+  nodes, aliases and partition objects as the document that opens the same file, at another root
+  (plugin `bakeClaims()` stay main-model only, see `doc-extending-webviewer.md`). Its groups are
+  merged by NAME into the viewer's `GroupRegistry` (Unity semantics: ten placements with a group
+  `Platen` are one group with ten member sets) and leave it again when the placement is removed.
+- **Component references are asset-relative (plan-757 D12 / F7).** The editor writes a
+  `ComponentReference.path` RELATIVE TO THE ASSET ROOT (`Mount/Kine`, no root segment). Files
+  exported by Unity spell the root (`Machine/Mount/Kine`); both are read by ONE resolver
+  (`src/core/engine/rv-reference-resolver.ts`, used by `prepare` before the bake and by
+  `NodeRegistry.resolve()` at runtime) in exactly this order:
+  1. the path as written, inside the asset scope (`<asset root path>/<path>`, with the registry's
+     alias and sanitized stages);
+  2. else, if the first segment equals the asset root's authored or current name, strip it and
+     resolve the rest inside the scope;
+  3. else unresolved — reported (`override-orphaned`, the removal report, a console warning),
+     never guessed and never resolved into ANOTHER placement.
+  The order makes a real child named like the root unambiguous: `Conveyor/Conveyor/Belt` resolves in
+  step 1 through the renamed-node alias of the `Conveyor_1` child before step 2 could strip the
+  segment and land on the root's own `Belt`. The scope is the enclosing asset root — the main
+  model root, or the placement's reference node, whose registered names include the asset's own
+  root name (`Arburg_1` places `Arburg` — the placement's `_N` name is the planner's
+  sibling-unique name, see the placement-naming rule in the reference paragraph below, and
+  `_originalName` on the root still holds the asset's own name), so `Arburg/Kine` binds inside
+  each of ten Arburgs.
+  `AssetOverrides.byPath` keys are read the same way, relative to the reference node. No file is
+  migrated: the old spelling keeps resolving.
+- Chunk meshes appear as plain meshes named after their chunk key (`static`,
+  `mover:<path>`, `tex:<material>`, with a `grp:<key>` segment when partitioned, e.g.
+  `mover:<path>|grp:<key>|tex:<material>`); they carry no `rv_extras` and are never a reference
+  target. The key is an identity — never parse it by splitting on `|`, a group key contains `|`.
+  The hierarchy panel LABELS them "kind + size" (`Merged · 84.2k tris`, `<material> · 12k tris`,
+  prefixed `<partition> · `; plan-505) — a display label only, the name is the key.
+- **The hierarchy's fold row is presentation, not a node (plan-505).** The panel lists a
+  boundary's direct chunk meshes behind one row `Geometry · N chunks · M tris`. That row has no
+  `Object3D`, no path and no registry entry; it is not an MCP target (`web_node_tree` and the
+  scene snapshot list the chunk meshes themselves, unchanged) and nothing may address it. Its only
+  identity is the panel-local expand key `<boundary uuid>::baked`.
+- **The asset editor is unaffected.** It never bakes: it opens the document through
+  `ModelCache.decodeFresh`, where the full CAD hierarchy and every path of section 4 still exist.
+  Per-part addressability of bare CAD nodes is an editor-mode property now.
+  `AssetOverrides.byNodeId` on a node that is not a logic node is dropped with a warning at
+  instantiate time (Decision 1); `trsByNodeId` forces the addressed node into its own chunk so
+  the saved transform stays visible (plan-753 I7).
+- **No runtime rollback of the bake (plan-757 Phase 3, 2026-09-22).** The Visual-tab switch went
+  with commit A, the localStorage `rv-webviewer-static-merge` override with commit B (a stored value
+  is ignored); the only rollback is a deploy revert. A bake that FAILS is a load error
+  (`BakeFailedError`, `bake-failed` problem), never an unbaked tree. Per-part addressability of bare
+  CAD nodes is therefore an editor-mode property, full stop. The pick structure keeps a rollback of
+  its own (`rv-webviewer-pick-structure` = `0`, the linear segment walk of `PickBackend`) — it
+  changes how a chunk is picked, never which nodes exist.
+- Persistence is unchanged: a placement is still saved as reference + transform
+  (`AssetReference`), never as a copy of the hierarchy (Decision 11).
+- **Every reference is a placement, recursively (plan-757 Phase 2, 2026-09-22).** A runtime load
+  (`viewer.loadModel`, the embed facade) grafts nothing: EVERY non-`embedded` `AssetReference`
+  node of the document — a planner placement (`PlacementMeta`) or a hand-authored reference —
+  stays an empty node, survives the bake (`AssetReference` claims its node) and is materialised
+  by the viewer's `PlacementInstancer` through the same `ModelCache` recipe as any placement; a
+  reference INSIDE a placed asset is queued by the instancer itself, before the outer placement
+  settles (the scene-ready contract holds). The main model is the placement at the origin that is
+  not cloned, so a document with geometry of its own AND references bakes like one without.
+  Only an AUTHORING load (the asset editor, recompose, descend) still grafts: the editor edits and
+  saves the composed tree.
+  - **Paths of nested content** are plain hierarchy paths through the reference nodes:
+    `Layout/Machine_1/Cell_1/Slide` for a Cell placed inside a Machine placed in the layout,
+    `Machine/Mount/Cell_1/Slide` when the reference sits under a static intermediate node. The
+    reference node keeps the name the file gave it; a hand-authored reference is not pivoted
+    (its content keeps the child transforms, as the graft did), a planner reference is
+    floor-centre pivoted.
+  - **A placement has ONE name (plan-758).** The record's `label`, the scene node's name and the
+    reference node the save writes are the same string, and the hierarchy path's last segment
+    is that string before the save and after the reload. The name comes from ONE helper,
+    `src/core/engine/rv-node-naming.ts`, with the WebViewer's `_N` convention counting from 1
+    and filling gaps: the first placement of an asset whose GLB root is `Belt` is `Belt`, the
+    next `Belt_1`, then `Belt_2`. The taken names are the children of the node the placement
+    lands under (the model root) PLUS every planner placement root wherever the document keeps
+    it — a reloaded document's placements sit one level below the model root while a live drop
+    lands directly under it, and a copy of a reloaded `Belt` must still not be a second `Belt`
+    (`placementTakenNames` in `scene-mutations.ts`). The GLB root name wins over the catalog
+    label, as before. A copy (`Ctrl+D`,
+    `Ctrl+V`) is named by `copyName`: the source's own trailing `_<digits>` block is stripped
+    first, then the first free name in that family is taken — ten copies of `Belt_2` read
+    `Belt_3` … , never `Belt_2_1` and never the former `Belt (copy) (copy)`. Nothing else
+    strips: a fresh placement of a catalog entry called `Conveyor_2000` stays `Conveyor_2000`
+    (its copy is `Conveyor`, then `Conveyor_1` — accepted). Every RECORD-driven creation — GLB
+    reload, the legacy autosave restore, the undo of a delete and the redo of an add
+    (`placeFromRecord`) — applies the recorded name verbatim (`naming: 'keep'`) and never
+    re-uniquifies, so a name can never depend on the order in which records are restored.
+    A sibling that already carries the recorded name is reported as the Problems entry
+    `placement-name-collision` and left alone (the registry then resolves that path to the
+    last node registered); a record that reaches the save with an empty name is written under
+    the fallback and reported as `placement-name-empty`. Legacy names such as `Belt (copy)`
+    are opaque to the strip rule and are never rewritten; a copy of one is `Belt (copy)_1`.
+    Two reference nodes with the IDENTICAL name in one file are a pre-existing case the
+    loader resolves before any planner code runs (three.js renames the second at parse time,
+    §2.1) — the planner cannot keep such a name and does not try.
+  - **A nested root is CONTENT of its record's placement, not a record.** It carries
+    `userData._layoutObject` + `_layoutNestedOf` (the parent placement's id) +
+    `_layoutNestedId` (its stable occurrence chain `<parent id>/<reference NodeId>`, what placed
+    behaviors key it by) and never `_layoutId`. Planner tools that need "the record" climb with
+    `recordRootOf(node)` (`src/core/engine/rv-placement-instancer.ts`); runtime rules that ask
+    "which placement owns this content" use the innermost root (`isPlacementRoot`). The hierarchy
+    panel shows it under its placement; it is not selectable or movable as a record of its own.
+  - **NodeId addresses:** placed content is indexed under its placement's occurrence — the
+    reference node's `NodeId` for a document-level placement, the chain `<outer occurrence>/<reference
+    NodeId>` for nested content — so `NodeRegistry.getNodeByAddress(nodeId, occurrence)` answers
+    for placed content as it did for a grafted frame. Authored ids only; a node without one is
+    addressed by path.
+  - **Save routing — the level rule.** An edit inside a TOP-LEVEL placement (depth 1) routes to
+    `AssetOverrides.byNodeId` / `trsByNodeId` on that reference node in the file being written
+    (`locate()` climbs to the nearest placement root with a record). An edit under a NESTED
+    reference (depth ≥ 2) is refused by name — `ReferencedFileWriteError` /
+    `UnwritableTransformError` with the path and the way out ("Open the referenced asset") — because
+    the nested reference node lives in the foreign file; there is no `byPath` routing below the
+    first level. A `byPath` override that leads into a nested reference orphans with the reason
+    `nested-reference` in the Problems panel, never silently.
+  - **Refusals are visible:** a reference cycle (A → B → A, or back to the document) and a depth
+    beyond `MAX_REFERENCE_DEPTH` (16) leave the node empty with a labelled placeholder and a
+    `reference-cycle` / `reference-depth` problem; the per-load cap (`maxPlacementsPerLoad`,
+    5000 by default) stops NESTED queueing with ONE aggregated `placement-cap` entry.
+  - **Sidecars:** an unsigned placed asset gets its own `<glb>.kin.json`, exactly as a composed
+    frame did (`ModelCache` applies it before the recipe); a signed asset is self-contained.

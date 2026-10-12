@@ -73,10 +73,9 @@ describe('RVMetadata factory component', () => {
   it('registers hoverable tooltip capabilities under both RuntimeMetadata and Metadata', () => {
     for (const key of ['RuntimeMetadata', 'Metadata']) {
       const caps = getCapabilities(key);
-      expect(caps.hoverable, key).toBe(true);
-      expect(caps.selectable, key).toBe(true);
-      expect(caps.tooltipType, key).toBe('metadata');
-      expect(caps.filterLabel, key).toBe('Metadata');
+      expect(caps.pick, key).toBe('select');
+      expect(caps.ui.tooltip, key).toBe('metadata');
+      expect(caps.ui.filter, key).toBe('Metadata');
     }
   });
 });

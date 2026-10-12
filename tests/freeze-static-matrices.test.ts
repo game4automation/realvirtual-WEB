@@ -6,7 +6,7 @@
  *
  * Verifies the static/dynamic classification that gates the per-frame
  * updateMatrixWorld pruning: a node stays dynamic iff it, an ancestor, or a
- * descendant carries a mover component (Drive, Kinematic, Grip,
+ * descendant carries a component whose bake role is chunk or keep (Drive, Kinematic, Grip,
  * TransportSurface, Source, Sink, MU, Cam, SceneButtonMoveable); everything else
  * is frozen. The scenarios mirror the live cases — including a deep static mesh
  * under a Drive (the "Cylinder001" shape, where the moving mesh has
@@ -16,6 +16,10 @@
  */
 import { describe, it, expect } from 'vitest';
 import { Object3D, Mesh } from 'three';
+// The mover set now comes from each component's `capabilities.bake` (plan-753):
+// pull in the registrations the scenarios below rely on (Drive, Source, Sink,
+// TransportSurface, Grip, MU, SceneButtonMoveable, Kinematic, PlacementMeta).
+import '../src/core/engine/rv-scene-loader';
 import { freezeStaticMatrices } from '../src/core/engine/rv-freeze-static';
 
 /** Tag a node with an rv_extras component (truthy value = present). */
@@ -86,8 +90,8 @@ describe('freezeStaticMatrices', () => {
     expect(part.matrixWorldAutoUpdate).toBe(true);
   });
 
-  it('keeps Source/Sink/Transport/Grip/MU subtrees dynamic (runtime MU carriers)', () => {
-    for (const key of ['Source', 'Sink', 'TransportSurface', 'Grip', 'Kinematic', 'MU']) {
+  it('keeps Source/Transport/Grip/MU subtrees dynamic (runtime MU carriers); a Sink is static (merge)', () => {
+    for (const key of ['Source', 'TransportSurface', 'Grip', 'Kinematic', 'MU']) {
       const root = named('root');
       const carrier = withComponent(named(key), key);
       const child = named('child', true);
@@ -98,6 +102,20 @@ describe('freezeStaticMatrices', () => {
       expect(carrier.matrixWorldAutoUpdate, `${key} carrier`).toBe(true);
       expect(child.matrixWorldAutoUpdate, `${key} child`).toBe(true);
     }
+  });
+
+  it('freezes a Sink subtree — plan-753 F6: Sink = merge, nothing in it moves at runtime', () => {
+    // The Phase-1 LEGACY_KEEP_OVERRIDE kept Sink dynamic for the old arena
+    // batcher only; with that batcher gone (Phase 4b) the registry role rules.
+    const root = named('root');
+    const sink = withComponent(named('Sink'), 'Sink');
+    const child = named('child', true);
+    root.add(sink); sink.add(child);
+
+    freezeStaticMatrices(root);
+
+    expect(sink.matrixWorldAutoUpdate).toBe(false);
+    expect(child.matrixWorldAutoUpdate).toBe(false);
   });
 
   it('keeps a SceneButtonMoveable cap dynamic (plan-417 order bug)', () => {
@@ -193,5 +211,40 @@ describe('freezeStaticMatrices', () => {
     expect(child.matrixWorld.elements[12]).toBeCloseTo(1);
     expect(child.matrixWorld.elements[13]).toBeCloseTo(2);
     expect(child.matrixWorld.elements[14]).toBeCloseTo(3);
+  });
+});
+
+describe('freezeStaticMatrices — live-dropped placement root', () => {
+  it('keeps the whole subtree of a LIVE placement root dynamic (LayoutObject stamp only)', async () => {
+    // A live drop (`PlacementInstancer.materialize` → `stampPlacementMarkers`)
+    // stamps `LayoutObject` on a fresh root — never `PlacementMeta`, which only
+    // a reloaded reference node carries from the GLB. The placement's static
+    // freeze (`integratePlacedContent`, F13) must still treat that root as a
+    // mover: frozen frame chunks never follow a later move of the root
+    // (`matrixWorldAutoUpdate=false` blocks even a forced update), so a
+    // dragged conveyor lost its frame and kept only its rolls (2026-09-24).
+    const { stampPlacementMarkers } = await import('../src/core/engine/rv-placement-instancer');
+    const root = named('root');
+    const placement = named('RollConveyor');
+    stampPlacementMarkers(placement, 'p1', 'Roll Conveyor', 'cat:roll');
+    const drive = withComponent(named('drive'), 'Drive');
+    const roll = named('roll', true);
+    const frameMesh = named('frameChunk', true);
+    frameMesh.matrixAutoUpdate = false;
+    root.add(placement);
+    placement.add(drive); drive.add(roll);
+    placement.add(frameMesh);
+
+    freezeStaticMatrices(root);
+
+    expect(placement.matrixWorldAutoUpdate).toBe(true);
+    expect(frameMesh.matrixWorldAutoUpdate).toBe(true);
+
+    // And the proof of the symptom: move the root the way the planner does
+    // (position + updateMatrixWorld) — the frame must travel with the rolls.
+    placement.position.set(5, 0, 0);
+    placement.updateMatrixWorld(true);
+    expect(roll.matrixWorld.elements[12]).toBeCloseTo(5);
+    expect(frameMesh.matrixWorld.elements[12]).toBeCloseTo(5);
   });
 });

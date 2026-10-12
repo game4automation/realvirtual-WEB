@@ -39,6 +39,7 @@ import { Box3, Matrix4 } from 'three';
 import type { BufferGeometry, Mesh, Object3D } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
 import type { ExtendedTriangle } from 'three-mesh-bvh';
+import { chunkMetaOf } from './rv-bake-chunk';
 import { NodeRegistry } from './rv-node-registry';
 import type { CollisionRoleName, CollisionRoleRegistrar, StockBoundsSource } from './rv-collision-role';
 import { toCollisionRole } from './rv-collision-role';
@@ -264,9 +265,13 @@ function isDeformedMesh(mesh: Mesh): boolean {
 
 /**
  * Pipeline helper meshes are not machine geometry and never join a body:
- * merged raycast/pick meshes (`_rvRaycastBVH`, invisible by contract, span a
- * whole batch range) and pooled highlight-proxy overlays
- * (`_highlightOverlay`, BVH-less wrappers). The proxies are the treacherous
+ * pooled highlight overlays (`_highlightOverlay`, BVH-less wrappers).
+ *
+ * Chunk meshes are NOT helpers — since plan-754 they are the only carrier of
+ * the geometry they absorbed, for the main model exactly as for a planner
+ * placement. (Until Phase 1c the in-place bake duplicated masked source
+ * meshes, and its chunks were excluded here via `_rvBakeInPlace`.)
+ * The proxies are the treacherous
  * case: the collision highlight itself parents them into the hit body's
  * subtree, so the next rebuild would collect them and their missing
  * boundsTree drags the body to `aabbOnly` — a box-test feedback loop born
@@ -284,7 +289,7 @@ function isPipelineHelperMesh(mesh: Mesh): boolean {
   if (!ud) return false;
   // NOT `=== true`: the flag carries the chunk INDEX, and index 0 is falsy.
   if (ud._rvMachiningChunk !== undefined) return true;
-  return ud._rvRaycastBVH === true || ud._highlightOverlay === true;
+  return ud._highlightOverlay === true;
 }
 
 /** Normalized role-pair key for the ignore set (order-independent). */
@@ -648,7 +653,7 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
    * left none. Returns whether the mesh now has one.
    *
    * Batched loads stopped producing per-mesh trees (the pick path raycasts
-   * merged `__raycastBVH_*` arenas instead), so every role-carrying body fell
+   * merged pick meshes instead), so every role-carrying body fell
    * to the AABB fallback — and a Workpiece INSIDE a Machine is a permanent
    * box overlap: /demo showed a standing "Machine ↔ Workpiece" card the moment
    * the robot loaded the CNC (2026-09-02). Bodies are few and hand-authored,
@@ -672,7 +677,14 @@ export class RVCollisionManager implements CollisionRoleRegistrar, IMULifecycleH
       return false;
     }
     try {
-      geo.boundsTree = new MeshBVH(geo) as BufferGeometry['boundsTree'];
+      // plan-756 §2.4a.10 / R13: the DEFAULT MeshBVH build REORDERS the index in
+      // place. On a baked chunk that would scatter the pick structure's segments
+      // — the one thing nothing may do after the bake. An
+      // `indirect` tree keeps its own triangle order in a side array and leaves
+      // `geometry.index` untouched; the narrowphase only ever sees resolved
+      // `ExtendedTriangle`s (`bvhcast` + `intersectsTriangles`), so it cannot
+      // tell the difference.
+      geo.boundsTree = new MeshBVH(geo, chunkMetaOf.has(geo) ? { indirect: true } : undefined) as BufferGeometry['boundsTree'];
       return true;
     } catch {
       this._bvhBuildFailed.add(geo);

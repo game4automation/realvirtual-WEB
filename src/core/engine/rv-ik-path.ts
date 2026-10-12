@@ -663,6 +663,26 @@ export class RVIKPath implements RVComponent {
     this._linDecel = false;
   }
 
+  /**
+   * plan-538 F1g — stop the path NOW: back to idle like {@link reset}, every
+   * axis it was moving stopped and held (a LIN segment's position overwrite
+   * included), and the start edge disarmed against the CURRENT trigger level —
+   * a held `StartPath` / `SignalStart` must not restart the path on the next
+   * tick. A later genuine rising edge starts it again.
+   */
+  cancel(): void {
+    const wasActive = this.PathIsActive || this._linActive || this._activeMoving;
+    this.reset();
+    if (wasActive) {
+      for (const drive of this._axisDrives) {
+        drive.positionOverwrite = false;
+        drive.stop();
+        drive.targetPosition = drive.currentPosition;
+      }
+    }
+    this._startBefore = this.StartPath || this._startSignalValue;
+  }
+
   /** Resolved, ordered target list (read-only) — used by the path visualizer. */
   get targets(): readonly RVIKTarget[] { return this._path; }
 
@@ -770,6 +790,6 @@ export function resolveAxisDrivesFromNode(registry: NodeRegistry, node: Object3D
 registerComponent({
   type: 'IKPath',
   schema: RVIKPath.schema,
-  capabilities: { selectable: true, badgeColor: '#ba68c8', filterLabel: 'IK Paths' },
+  capabilities: { pick: 'select', ui: { badge: '#ba68c8', filter: 'IK Paths', category: 'robotics' } },
   create: (node: Object3D) => new RVIKPath(node),
 });

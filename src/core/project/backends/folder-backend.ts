@@ -33,7 +33,11 @@ import {
   splitRelPath,
 } from '../rv-project-storage';
 import { assertReadableScenePath } from '../rv-legacy-format';
-import { CONNECT_CONFIG_SUFFIX, KNOWLEDGE_FILE_SUFFIX } from '../rv-project-refs';
+import {
+  CONNECT_CONFIG_SUFFIX,
+  MARKDOWN_FILE_SUFFIX,
+  isProjectScriptPath,
+} from '../rv-project-refs';
 import {
   assertRevisionPrecondition,
   revisionOfBytes,
@@ -46,15 +50,13 @@ import {
   type FolderWriterStatusListener,
 } from '../rv-project-folder-writer';
 import {
-  assetDocumentsOf,
-  documentsFromLists,
+  documentOfEntry,
   readDocuments,
-  sectionOfDocument,
   type DocumentStat,
 } from '../rv-project-documents';
+import { isPrivateSegment, isStagingPath } from '../rv-asset-identity';
 import {
   type RvDocumentEntry,
-  type RvProjectAssetEntry,
   type RvProjectSceneEntry,
   type RvProject,
 } from '../rv-project-types';
@@ -199,56 +201,6 @@ export class FolderBackend implements ProjectBackend {
 
   // ─── Listing ──────────────────────────────────────────────────────────
 
-  /**
-   * Models are **folder-driven**: every GLB in `models/` belongs to the project.
-   *
-   * This is the opposite of the manifest-driven scene half, and deliberately
-   * so — a scene has an id, a display name and a `modifiedAt` that conflict
-   * resolution keys off, none of which can be recovered from a filename. A model has
-   * no identity beyond its file — dropping `Machine.glb` into a project's
-   * `models/` folder *is* the act of adding it, and requiring a second edit to
-   * `project.json` before it appears only produced projects that silently
-   * showed nothing. The manifest is kept as an optional **metadata overlay**:
-   * an entry matching a file on disk contributes its `label`, `thumbnail` and
-   * anything else it carries, while an entry naming a file that is gone is
-   * dropped rather than listed as a phantom.
-   */
-  async listModels(): Promise<RvProjectAssetEntry[]> {
-    const declared = new Map(
-      assetDocumentsOf(await this.readManifest(), 'models').map(e => [e.path, e] as const),
-    );
-    const files = await this._listFolderGlbs('models');
-    if (files.length === 0) return [];
-    return files.map(path => declared.get(path) ?? { path });
-  }
-
-  /**
-   * Top-level `.glb` filenames of one project subfolder, as manifest paths.
-   *
-   * Sorted for a stable list order, and non-recursive: a base model is a file
-   * in `models/`, not a tree. A missing folder is the normal case for a project
-   * that has none
-   * (§1.1 R1) and yields an empty list, never a throw.
-   */
-  private async _listFolderGlbs(folder: string): Promise<string[]> {
-    const dir = await this._resolveDir(folder);
-    if (!dir) return [];
-    const out: string[] = [];
-    try {
-      // `entries()` rather than `values()`: both are standard, but the name is
-      // what this needs and it is the one every handle shim here implements.
-      for await (const [name, handle] of dir.entries()) {
-        if (handle.kind !== 'file') continue;
-        if (!name.toLowerCase().endsWith('.glb')) continue;
-        out.push(`${folder}/${name}`);
-      }
-    } catch {
-      // A revoked grant mid-iteration must not take the whole open down.
-      return out.sort();
-    }
-    return out.sort();
-  }
-
   /** File extensions the library layer understands. */
   private static readonly ASSET_EXTENSIONS = ['.glb', '.gltf', '.splat', '.ksplat', '.ply'];
 
@@ -278,8 +230,9 @@ export class FolderBackend implements ProjectBackend {
     try {
       for await (const [name, handle] of dir.entries()) {
         if (handle.kind === 'directory') {
-          // `.thumbnails` and friends are sidecars, not assets.
-          if (!name.startsWith('.')) subdirs.push(`${prefix}${name}`);
+          // `.thumbnails` and friends are sidecars, not assets — the one
+          // dot-segment rule, imported rather than restated (plan-744).
+          if (!isPrivateSegment(name)) subdirs.push(`${prefix}${name}`);
           continue;
         }
         if (matches(name.toLowerCase())) {
@@ -317,63 +270,47 @@ export class FolderBackend implements ProjectBackend {
   }
 
   /**
-   * Library assets are **folder-driven** too, for the same reason models are:
-   * what is in the project belongs to the project.
+   * The one list (plan-413 §2.4) — ONE walk of the whole project tree, ONE row
+   * shape (plan-744 F2).
    *
-   * `library/` is a sibling of `models/`, not a folder inside it: a component
-   * catalog and a set of base models are different kinds of thing. Scanning is
-   * recursive because a library is a tree — its folders become the collection
-   * chips the provider derives.
+   * This used to be composed from three section listings, which made the folder
+   * layout a type system through the back door: scenes were manifest-driven,
+   * `models/` and `library/` were each walked separately, and a GLB anywhere
+   * else — the project root included — existed on disk and in the manifest yet
+   * fell out of the list on every rescan. plan-716/717 replaced the three walks
+   * with this one; plan-744 removed the last of the old shape, the
+   * **re-bucketing** that still ran the scan's paths back through
+   * `sectionOfDocument` only to hand three arrays to `documentsFromLists`
+   * and get one list back. Nothing downstream could tell the difference, which
+   * is the whole point: the bucket never survived the trip.
    *
-   * The manifest `library[]` is the same optional metadata overlay it is for
-   * models — labels and thumbnails for files that exist, nothing for files that
-   * do not.
-   */
-  async listLibrary(): Promise<RvProjectAssetEntry[]> {
-    const declared = new Map(
-      assetDocumentsOf(await this.readManifest(), 'library').map(e => [e.path, e] as const),
-    );
-    const found = await this._walkAssets('library');
-    if (found.length === 0) return [];
-    return found.map(path => declared.get(path) ?? { path });
-  }
-
-  /**
-   * The one list (plan-413 §2.4) — ONE walk of the whole project tree.
-   *
-   * This used to be composed from the three section listings above, which made
-   * the folder layout a type system through the back door: scenes were
-   * manifest-driven, `models/` and `library/` were each walked separately, and
-   * a GLB anywhere else — the project root included — existed on disk and in
-   * the manifest yet fell out of the list on every rescan. Since plan-716/717 a
-   * section is a *place*, so the scan is now placeless: every asset file
-   * anywhere under the project root (dot-folders excepted) is a document, and
-   * its section is derived from its path exactly as `sectionOfDocument` would
-   * derive it anywhere else.
+   * So a row is built where it is found, from the file and the manifest row
+   * that claims its path, and `imports/` is the one folder the walk enters and
+   * the listing skips — it is a staging area for bytes on their way in, not a
+   * place documents live.
    *
    * The manifest's `documents[]` stays the metadata overlay — it is where the
    * classification cache lives — but it never adds an entry the folder does
    * not have, because a document with no bytes is a phantom. That phantom rule
-   * now covers scenes too: a scene row whose body is gone is a card that opens
+   * covers scenes too: a scene row whose body is gone is a card that opens
    * to nothing, and listing it was the old split's bug, not its feature.
    */
   async listDocuments(): Promise<RvDocumentEntry[]> {
     const manifest = await this.readManifest();
     const declared = readDocuments(manifest) ?? [];
     const declaredByPath = new Map(declared.map(d => [d.path, d] as const));
-    const scenes: RvProjectSceneEntry[] = [];
-    const models: RvProjectAssetEntry[] = [];
-    const library: RvProjectAssetEntry[] = [];
+    const out: RvDocumentEntry[] = [];
     for (const path of await this._walkAssets('')) {
+      if (isStagingPath(path)) continue;
       const row = declaredByPath.get(path);
-      const section = sectionOfDocument(row ?? ({ path } as RvDocumentEntry));
-      // The empty id/name are the "mint one for me" markers `documentOfSceneEntry`
-      // has always honoured — a bare file off the scan has no row to speak with.
-      if (section === 'scenes') scenes.push(row ?? { path, id: '', name: '' });
-      else if (section === 'models') models.push(row ?? { path });
-      else library.push(row ?? { path });
+      // The merge `documentsFromLists` used to do, inline and without the
+      // detour: the manifest row wins on everything it carries, the lift
+      // supplies the id and name it may be missing, and `classification` is
+      // pinned to the row because the lift does not compute one.
+      const base = documentOfEntry(row ?? { path });
+      out.push(row ? { ...row, ...base, classification: row.classification } : base);
     }
-    return documentsFromLists({ scenes, models, library }, declared);
+    return out;
   }
 
   /**
@@ -385,9 +322,23 @@ export class FolderBackend implements ProjectBackend {
     return this._walkMatching('', lower => lower.endsWith(CONNECT_CONFIG_SUFFIX));
   }
 
-  /** Every `*.knowledge.md` under the project root — see the interface. */
+  /** Every Markdown file under the project root — see the interface. */
   async listKnowledgeFiles(): Promise<string[]> {
-    return this._walkMatching('', lower => lower.endsWith(KNOWLEDGE_FILE_SUFFIX));
+    return this._walkMatching('', lower => lower.endsWith(MARKDOWN_FILE_SUFFIX));
+  }
+
+  /**
+   * Every bindable project script (plan-479 Phase 1) — see the interface.
+   *
+   * Filtered off the FULL walk rather than off `_walkMatching`, because the
+   * classification is folder AND ending and `_walkMatching`'s predicate only
+   * ever sees the file NAME. One traversal either way; the dashboard does not
+   * call this at all (it classifies `listAllFiles` once, in
+   * `classifyProjectFiles`), so this exists for the backends and callers that
+   * ask per ending.
+   */
+  async listProjectScripts(): Promise<string[]> {
+    return (await this.listAllFiles()).filter(isProjectScriptPath);
   }
 
   /**
@@ -407,6 +358,40 @@ export class FolderBackend implements ProjectBackend {
   async listAllFiles(): Promise<string[]> {
     const all = await this._walkMatching('', () => true);
     return all.filter(path => !isInternalProjectPath(path));
+  }
+
+  async listFolders(): Promise<string[]> {
+    const folders: string[] = [];
+    const walk = async (dir: FileSystemDirectoryHandle, prefix: string): Promise<void> => {
+      for await (const [name, handle] of dir.entries()) {
+        const path = prefix ? `${prefix}/${name}` : name;
+        if (handle.kind !== 'directory' || isInternalProjectPath(path)) continue;
+        folders.push(path);
+        await walk(handle as FileSystemDirectoryHandle, path);
+      }
+    };
+    await walk(this._dir, '');
+    return folders.sort();
+  }
+
+  async deleteEmptyFolder(relPath: string): Promise<void> {
+    assertWritable(this);
+    const parts = relPath.split('/');
+    if (parts.some(p => !p || p === '.' || p === '..' || /[\\:]/.test(p))
+      || isInternalProjectPath(relPath)) throw new Error('Invalid project folder.');
+    const name = parts.pop()!;
+    let parent = this._dir;
+    try {
+      for (const part of parts) parent = await parent.getDirectoryHandle(part);
+      // Verify the entry is a directory before attempting removal.
+      const dir = await parent.getDirectoryHandle(name);
+      for await (const _entry of dir.entries()) {
+        throw new Error('This folder is not empty. Delete its contents first.');
+      }
+      await parent.removeEntry(name, { recursive: false });
+    } catch (error) {
+      if ((error as { name?: string }).name !== 'NotFoundError') throw error;
+    }
   }
 
   /** Real `(size, mtime)` for every stored document. See the interface. */
@@ -606,6 +591,30 @@ export class FolderBackend implements ProjectBackend {
     }
     const url = URL.createObjectURL(file);
     return { url, release: () => URL.revokeObjectURL(url) };
+  }
+
+  /**
+   * The lazy half of {@link readDocumentUrl} (plan-751).
+   *
+   * Returns the `File` itself rather than an object URL. A `File` IS a `Blob`,
+   * and — unlike a blob URL put through `fetch().blob()` — it is still a handle
+   * to the file on disk: `slice(a, b)` reads that range and nothing else. A
+   * header scan over a folder of GLBs therefore costs its headers instead of
+   * its bytes, which is what makes a project on a network share openable.
+   *
+   * No `release()` to mirror: nothing was allocated, so there is nothing to
+   * revoke. That asymmetry is deliberate and is why this is a second method
+   * instead of a flag on the first one.
+   */
+  async readDocumentBlob(ref: DocRef): Promise<Blob | null> {
+    const { folder, filename } = splitRelPath(docPathOf(ref));
+    const dir = folder ? await this._resolveDir(folder) : this._dir;
+    if (!dir) return null;
+    try {
+      return await (await dir.getFileHandle(filename)).getFile();
+    } catch {
+      return null;
+    }
   }
 
   async flush(): Promise<void> {

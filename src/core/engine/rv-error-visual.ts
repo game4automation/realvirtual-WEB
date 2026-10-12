@@ -15,7 +15,7 @@
  * ErrorStore wiring, no lifecycle. The owning component drives those.
  */
 
-import { CanvasTexture, type Object3D, type Texture } from 'three';
+import { CanvasTexture, type Object3D } from 'three';
 import type { GizmoHandle, GizmoOverlayManager } from './rv-gizmo-manager';
 import { computeSubtreeAABB } from './rv-traverse-utils';
 
@@ -224,33 +224,7 @@ export function createStatusHighlightGizmos(
   ];
 }
 
-/** Create the backed error-text badge sprite above the part (initially hidden).
- *  Returns the gizmo handle plus the owned texture (caller disposes it). */
-export function createErrorBadgeGizmo(
-  gizmoManager: GizmoOverlayManager,
-  node: Object3D,
-  text: string,
-  borderColor = ERROR_COLOR,
-): { gizmo: GizmoHandle; texture: Texture } {
-  const { texture, aspect } = buildBadgeTexture(text, borderColor);
-  const { size } = computeSubtreeAABB(node);
-  // World height of the badge ≈ a fraction of the part height (min 0.08 m).
-  const badgeHeight = Math.max(0.08, size.y * 0.4);
-  const gizmo = gizmoManager.create(node, {
-    shape: 'sprite',
-    color: 0xffffff,
-    opacity: 1.0,
-    spriteTexture: texture,
-    worldSize: badgeHeight,
-    depthTest: false,
-    renderOrder: 12,
-    excludeFromRaycast: true,
-    visible: false,
-    category: 'status',
-  });
-  // Sprite worldSize is the badge HEIGHT; width = height × aspect.
-  gizmo.root.scale.set(badgeHeight * aspect, badgeHeight, 1);
-  // Lift the badge above the part (sprite default sits at the AABB center).
-  gizmo.root.position.y += size.y * 0.5 + badgeHeight;
-  return { gizmo, texture };
-}
+// The world-space error-text badge sprite (`createErrorBadgeGizmo`) was removed
+// on 2026-10-12: it scaled with the part height and dwarfed a whole station. The
+// error text lives in the message-panel card only; `buildBadgeTexture` stays for
+// the planner placeholder.

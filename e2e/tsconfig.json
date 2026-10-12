@@ -1,0 +1,20 @@
+{
+  "//": [
+    "plan-503: type-checks the Playwright specs, which no other tsconfig includes.",
+    "Gate: npx tsc -p e2e/tsconfig.json --noEmit",
+    "src/*.d.ts carries the ambient Vite/build declarations that the src modules imported by some specs rely on.",
+    "The six excluded specs predate this config and do not type-check today: in-browser imports of",
+    "'/src/...' / '/node_modules/...' URLs that only the Vite dev server resolves, plus two real type",
+    "errors (inline-signal-linking.spec.ts:89, signal-link-mode.spec.ts:353). Fixing them is outside plan-503."
+  ],
+  "extends": "../tsconfig.json",
+  "include": ["./**/*.ts", "../src/*.d.ts"],
+  "exclude": [
+    "./control-window.spec.ts",
+    "./hmi-highlight-parity.spec.ts",
+    "./inline-signal-linking.spec.ts",
+    "./scene-link-migration.spec.ts",
+    "./signal-link-mode.spec.ts",
+    "./slot-authority.spec.ts"
+  ]
+}

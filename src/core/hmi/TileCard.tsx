@@ -92,7 +92,7 @@ export function TileCard({ title, subtitle, severity, icon, timestamp, component
             {timestamp}
           </Typography>
           <Box sx={{ display: 'flex', gap: 0.25 }}>
-            <IconButton size="small" sx={{ p: 0.25 }} onClick={(e) => { e.stopPropagation(); if (componentPath) pulseSeverityOutline(viewer, componentPath, severity); }}>
+            <IconButton aria-label="Focus related object" disabled={!componentPath} size="small" sx={{ p: 0.25 }} onClick={(e) => { e.stopPropagation(); if (componentPath) pulseSeverityOutline(viewer, componentPath, severity); }}>
               <OpenInNew sx={{ fontSize: 14 }} />
             </IconButton>
           </Box>

@@ -29,7 +29,7 @@
  *    chunks would turn a single `dispose()` into a dangling-GPU-buffer hazard
  *    for its neighbours.
  * 3. **The whole subtree is excluded from arena batching** via
- *    `EXCLUDED_SUBTREE_KEYS` in `rv-batched-render.ts` — the batcher bakes the
+ *    the component's `bake: 'keep'` role — the bake stages the
  *    HOME pose once, which would freeze the workpiece at its uncut state.
  *
  * Coordinate spaces: the kernel works in GRID space millimeters
@@ -948,10 +948,10 @@ registerComponent({
   schema: RVMachiningVolume.schema,
   capabilities: {
     authorable: true,
-    hoverable: true,
-    selectable: true,
-    badgeColor: '#26a69a',
-    filterLabel: 'Machining Volumes',
+    pick: 'select',
+    bake: 'keep',    // the CSG kernel rewrites the workpiece geometry — never baked
+    dynamicGeometry: true,  // plan-756 F9: picked by brute force in its current box
+    ui: { badge: '#26a69a', filter: 'Machining Volumes', category: 'process' },
   },
   create: (node) => new RVMachiningVolume(node),
   afterCreate: (inst, node) => setComponentInstance(node, inst),

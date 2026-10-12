@@ -1,5 +1,9 @@
 # Behavior Modelling — Continuous & DES (a beginner's guide)
 
+> **Applies to:** Continuous behaviors are in Community. DES execution requires the commercial beta DES feature.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 This guide explains how the material-flow components in `src/behaviors/` work — conveyors,
 turntables, sources, sinks — so you can **read** them and **write** your own. No prior knowledge
 of the engine is assumed; read it top to bottom once and the code will make sense.

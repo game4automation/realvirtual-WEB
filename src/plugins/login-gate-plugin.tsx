@@ -86,10 +86,14 @@ function isAuthed(key: string): boolean {
   return localStorage.getItem(key) === '1';
 }
 
+/** Gate on the config before any hook runs, so the form keeps one hook order. */
 function LoginGateOverlay({ viewer }: UISlotProps) {
   const cfg = _config;
   if (!cfg) return null;
+  return <LoginGateForm viewer={viewer} cfg={cfg} />;
+}
 
+function LoginGateForm({ viewer, cfg }: UISlotProps & { cfg: LoginGateConfig }) {
   const key = cfg.sessionKey ?? 'rv-login-auth';
   const accent = cfg.accentColor ?? '#4fc3f7';
 

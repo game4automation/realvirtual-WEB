@@ -39,7 +39,7 @@ import { allSchemas } from './helpers/mcp-schemas';
 
 // The checked-in files, read exactly the way the help tool reads them.
 import INSTRUCTIONS from '../webviewer.mcp.md?raw';
-import HELP_EDITOR from '../src/plugins/mcp-bridge/help/editor.md?raw';
+import HELP_KINEMATIZE from '../recipes/kinematize-cad-import.md?raw';
 import HELP_LAYOUT from '../src/plugins/mcp-bridge/help/layout.md?raw';
 import HELP_SIMULATION from '../src/plugins/mcp-bridge/help/simulation.md?raw';
 import HELP_PLC from '../src/plugins/mcp-bridge/help/plc.md?raw';
@@ -47,7 +47,7 @@ import HELP_DES from '../src/plugins/mcp-bridge/help/des.md?raw';
 
 const SOURCES: Record<string, string> = {
   'webviewer.mcp.md': INSTRUCTIONS,
-  'src/plugins/mcp-bridge/help/editor.md': HELP_EDITOR,
+  'recipes/kinematize-cad-import.md': HELP_KINEMATIZE,
   'src/plugins/mcp-bridge/help/layout.md': HELP_LAYOUT,
   'src/plugins/mcp-bridge/help/simulation.md': HELP_SIMULATION,
   'src/plugins/mcp-bridge/help/plc.md': HELP_PLC,
@@ -191,13 +191,13 @@ describe('the gate catches drift in BOTH directions', () => {
   it('a new tool with no doc run makes the block differ', () => {
     const withFake = renderDocBlocks([...schemas, fake])
       .find((b) => b.marker === 'tool-reference editor')!.body.trim();
-    const checkedIn = extractBlock(HELP_EDITOR, 'tool-reference editor');
+    const checkedIn = extractBlock(HELP_KINEMATIZE, 'tool-reference editor');
     expect(withFake).not.toBe(checkedIn);
     expect(withFake).toContain('web_editor_invented');
   });
 
   it('a hand-edited block makes the block differ', () => {
-    const checkedIn = extractBlock(HELP_EDITOR, 'tool-reference editor')!;
+    const checkedIn = extractBlock(HELP_KINEMATIZE, 'tool-reference editor')!;
     const tampered = checkedIn.replace('| `web_editor_open` |', '| `web_editor_opne` |');
     expect(tampered).not.toBe(checkedIn);
     // …and the comparison the gate performs would reject it.

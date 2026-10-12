@@ -30,11 +30,24 @@ import {
   getDisplayName,
   getSchemaDefaults,
 } from '../engine/rv-component-registry';
+// `isDriveExtension` lives in the schema-info data layer (plan-517): the same
+// function gates this list AND sets `requiresDriveOnSameNode` in
+// `web_component_schema`, so the inspector and what agents are told agree.
+import { isDriveExtension } from '../engine/rv-component-schema-info';
 import { getActiveEditTarget } from './rv-edit-target';
 
 export interface AddComponentSectionProps {
   viewer: RVViewer;
   nodePath: string;
+}
+
+/** Types offered at the top of the list, in this order (plan-521: `Zone` is the
+ *  preferred way to author stoppers, sensor boxes, clamps and lifts). */
+const PREFERRED_TYPES: readonly string[] = ['Zone'];
+
+function preferredRank(type: string): number {
+  const i = PREFERRED_TYPES.indexOf(type);
+  return i < 0 ? PREFERRED_TYPES.length : i;
 }
 
 export function AddComponentSection({ viewer, nodePath }: AddComponentSectionProps) {
@@ -46,12 +59,23 @@ export function AddComponentSection({ viewer, nodePath }: AddComponentSectionPro
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const [search, setSearch] = useState('');
 
+  // Drive behaviours (`Drive_*`) and drive add-ons extend a Drive on the SAME
+  // node — without one they would sit inert (their init() finds no Drive and
+  // bails). They are offered only while the node carries a Drive, either as a
+  // registered instance or as an authored rv_extras record.
+  const nodeHasDrive = useMemo(() => {
+    if (viewer.registry?.getByPath('Drive', nodePath)) return true;
+    const rv = viewer.registry?.getNode(nodePath)?.userData?.realvirtual as Record<string, unknown> | undefined;
+    return !!rv && Object.keys(rv).some((key) => key.replace(/_\d+$/, '') === 'Drive');
+  }, [viewer, nodePath]);
+
   const candidates = useMemo(() => {
     const types = getTypesWithCapability('authorable');
     return types
+      .filter((type) => nodeHasDrive || !isDriveExtension(type))
       .map((type) => ({ type, label: getDisplayName(type) }))
-      .sort((a, b) => a.label.localeCompare(b.label));
-  }, []);
+      .sort((a, b) => preferredRank(a.type) - preferredRank(b.type) || a.label.localeCompare(b.label));
+  }, [nodeHasDrive]);
 
   if (!target.addComponent) return null;
 

@@ -514,10 +514,8 @@ registerComponent({
   displayName: 'Instruction',
   schema: RVCustomRuntimeInstruction.schema,
   capabilities: {
-    hoverable: false,
-    selectable: false,
-    filterLabel: 'Instructions',
-    badgeColor: '#ab47bc',
+    pick: 'none',
+    ui: { filter: 'Instructions', category: 'logic', badge: '#ab47bc' },
   },
   create: (node) => new RVCustomRuntimeInstruction(node),
   afterCreate: (inst, node) => {

@@ -186,3 +186,61 @@ describe('RVHighlightManager - flash channel', () => {
     mgr.clearFlash();
   });
 });
+
+describe('RVHighlightManager - aux emphasis with an own color (WebError red X-ray)', () => {
+  it('overlay mode: a colored set draws with its own red fill, the plain set keeps the selection color', () => {
+    const scene = new Scene();
+    const mgr = new RVHighlightManager(scene);
+    const outline = makeMockOutline();
+    mgr.setOutlineManager(outline as never);
+    const plain = renderedRoot(scene);
+    const faulty = renderedRoot(scene);
+    mgr.setAuxEmphasis('planner-ghost', [plain]);
+    mgr.setAuxEmphasis('web-error:faulty', [faulty], { color: 0xff2020 });
+
+    const fills: Mesh[] = [];
+    scene.traverse(o => { if (o.userData?._highlightOverlay && (o as Mesh).isMesh && (o as Mesh).material) fills.push(o as Mesh); });
+    const colors = fills.map(m => ((m.material as MeshBasicMaterial).color?.getHex?.() ?? -1));
+    expect(colors).toContain(0xff2020);
+    expect(colors.filter(c => c === 0xff2020)).toHaveLength(1);
+    expect(colors.some(c => c !== 0xff2020 && c !== -1)).toBe(true);
+    // Outline side stays the shared selection channel: nothing outlined in overlay mode.
+    expect(outline.selectionOutlined).toEqual([]);
+
+    // Removing the colored set disposes its materials and leaves the plain one.
+    mgr.setAuxEmphasis('web-error:faulty', null);
+    const after: number[] = [];
+    scene.traverse(o => { const m = (o as Mesh).material as MeshBasicMaterial | undefined; if (o.userData?._highlightOverlay && m?.color) after.push(m.color.getHex()); });
+    expect(after).not.toContain(0xff2020);
+    expect(mgr.isAuxActive).toBe(true);
+    mgr.dispose();
+  });
+
+  it('removing an id that was never shown is a no-op (no rebuild)', () => {
+    const scene = new Scene();
+    const mgr = new RVHighlightManager(scene);
+    const ghost = renderedRoot(scene);
+    mgr.setAuxEmphasis('planner-ghost', [ghost]);
+    const before = overlayCount(scene);
+    mgr.setAuxEmphasis('never-shown', null);
+    expect(overlayCount(scene)).toBe(before);
+    mgr.dispose();
+  });
+});
+
+describe('RVHighlightManager - colored aux set in an OUTLINE profile', () => {
+  it('still draws the red fill (overlay family), never joins the shared outline channel', () => {
+    const scene = new Scene();
+    const mgr = new RVHighlightManager(scene);
+    const outline = makeMockOutline();
+    mgr.setOutlineManager(outline as never);
+    mgr.setProfile(MODE_HIGHLIGHT_PROFILES.planner);
+    const faulty = renderedRoot(scene);
+    mgr.setAuxEmphasis('web-error:faulty', [faulty], { color: 0xff2020 });
+    expect(outline.selectionOutlined).toEqual([]);
+    const colors: number[] = [];
+    scene.traverse(o => { const m = (o as Mesh).material as MeshBasicMaterial | undefined; if (o.userData?._highlightOverlay && m?.color) colors.push(m.color.getHex()); });
+    expect(colors).toContain(0xff2020);
+    mgr.dispose();
+  });
+});

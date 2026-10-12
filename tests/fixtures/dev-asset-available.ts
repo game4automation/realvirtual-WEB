@@ -38,6 +38,20 @@
 const GLB_CONTENT_TYPE = /gltf-binary|octet-stream/i;
 
 /**
+ * Content types for a `.json` entry. Not every `DEV_GLB` row is a GLB: the Unity
+ * parity fixture `ribbon-unity-state.json` is the recorded state the roundtrip
+ * suite replays, and it is served as JSON. Checking it against the GLB types
+ * would call a file that IS there unavailable — the silent-skip direction this
+ * probe exists to prevent. The SPA fallback (`text/html`) still fails both.
+ */
+const JSON_CONTENT_TYPE = /json/i;
+
+/** The content type `url` must answer with to count as really served. */
+function expectedContentType(url: string): RegExp {
+  return /\.json(\?|#|$)/i.test(url) ? JSON_CONTENT_TYPE : GLB_CONTENT_TYPE;
+}
+
+/**
  * True when `url` really serves a GLB — not the dev server's HTML fallback.
  *
  * A `HEAD` request: the body is up to 36 MB and nothing here needs it. Network
@@ -49,7 +63,7 @@ export async function devAssetAvailable(url: string): Promise<boolean> {
   try {
     const probe = await fetch(url, { method: 'HEAD' });
     if (!probe.ok) return false;
-    return GLB_CONTENT_TYPE.test(probe.headers.get('content-type') ?? '');
+    return expectedContentType(url).test(probe.headers.get('content-type') ?? '');
   } catch {
     return false;
   }

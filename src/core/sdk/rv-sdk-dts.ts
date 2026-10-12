@@ -166,16 +166,17 @@ interface TransportHandle {
   readonly direction: Vec3; readonly speed: number; readonly radial: boolean;
   readonly node: NodeHandle;
 }
-interface SourceHandle { spawn(): MU; automatic: boolean; interval: number }
+interface SourceHandle { spawn(): MU | null; automatic: boolean; interval: number }
 interface SinkHandle { on(cb: (mu: MU) => void): () => void }
 interface GripHandle {
   pick(): void; place(): void;
   readonly gripped: ReadonlyArray<MU>; readonly range: number;
 }
 interface LogicStepHandle {
+  readonly runId: number;
   readonly state: 'Idle' | 'Active' | 'Waiting' | 'Finished';
   readonly progress: number;
-  start(): void; reset(): void;
+  start(): void; reset(): void; complete(): void;
 }
 interface SignalHandle {
   readonly bool: boolean; readonly num: number; readonly int: number;
@@ -299,6 +300,11 @@ interface Self {
   belt(p: string): BeltHandle | null; transport(p: string): TransportHandle | null;
   source(p: string): SourceHandle | null; sink(p: string): SinkHandle | null;
   grip(p: string): GripHandle | null; logicStep(p: string): LogicStepHandle | null;
+  readonly scene: {
+    list(type?: string): { path: string; type: string }[];
+    read(path: string, type: string): { [field: string]: unknown } | null;
+    set(path: string, type: string, field: string, value: unknown): void;
+  };
 
   signal(name: string): SignalHandle; signalAt(path: string): SignalHandle;
   setSignals(updates: { [name: string]: boolean | number }): void;

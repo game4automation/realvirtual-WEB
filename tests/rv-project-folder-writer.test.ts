@@ -24,7 +24,7 @@ import { FakeDir, FailureInjector, asDirHandle, namedError } from './helpers/fak
 import { RVProjectFolderWriter } from '../src/core/project/rv-project-folder-writer';
 import { clearSceneMutationListeners, emitSceneMutation } from '../src/core/hmi/scene/rv-scene-mutations';
 import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import { writeSceneDocument } from './helpers/document-io';
 

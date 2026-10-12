@@ -13,7 +13,7 @@
  * is untouched. That is what makes the change safe for external agent sessions
  * holding paths from an earlier call.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import { Group, Object3D, Scene } from 'three';
 // plan-713 Phase 1 — web_node_tree moved off the plugin into McpSceneTools.
 import { McpSceneTools } from '../src/plugins/mcp-bridge/rv-mcp-scene-tools';
@@ -143,15 +143,27 @@ describe('web_node_tree default root', () => {
  */
 async function editorTools(modelRoot: Object3D, registry: NodeRegistry, doc: object) {
   const { McpEditorTools } = await import('../src/plugins/mcp-bridge/rv-mcp-editor-tools');
-  const viewer = { registry, currentModelRoot: modelRoot } as never;
+  const { setActiveAssetContext } = await import('../src/core/editor/active-asset-store');
+  const viewer = {
+    registry, currentModelRoot: modelRoot,
+    modes: { activeMode: 'editor' },
+    selectionManager: { getSnapshot: () => ({ selectedPaths: [] }) },
+  } as never;
   const tools = new McpEditorTools(() => viewer);
-  // `_ctx()` resolves the active asset context; the guard under test runs before
-  // anything it provides is used.
+  // `_ctx()` resolves the active asset context for the unbound tools; the
+  // command-bound ones (rename, set_visible — plan-499) resolve it through the
+  // registry guard, so the context is published for real as well.
   (tools as unknown as { _ctx: () => object })._ctx = () => ({ viewer, doc });
+  setActiveAssetContext({ viewer, doc: { id: 'root-lock-doc', ...doc } } as never);
   return tools;
 }
 
 describe('MCP editor tools refuse the model root', () => {
+  afterEach(async () => {
+    const { setActiveAssetContext } = await import('../src/core/editor/active-asset-store');
+    setActiveAssetContext(null);
+  });
+
   it('web_editor_rename / _transform / _set_visible answer with an error', async () => {
     const { modelRoot, registry } = buildScene();
     const calls: string[] = [];
@@ -172,9 +184,12 @@ describe('MCP editor tools refuse the model root', () => {
       webEditorSetVisible(p: string, v: boolean): Promise<string>;
     }).webEditorSetVisible('Robot', false));
 
-    for (const res of [rename, transform, visible]) {
+    // Community edition (plan-499 F20): the command-bound verbs answer
+    // "not available" before any rule; the unbound transform still locks.
+    const bound = __RV_HAS_PRIVATE__ ? 'model root is locked' : 'not available in this edition';
+    for (const [res, text] of [[rename, bound], [transform, 'model root is locked'], [visible, bound]] as const) {
       expect(res.ok).toBeUndefined();
-      expect(String(res.error)).toContain('model root is locked');
+      expect(String(res.error)).toContain(text);
     }
     // Nothing reached the document at all.
     expect(calls).toEqual([]);
@@ -196,6 +211,6 @@ describe('MCP editor tools refuse the model root', () => {
     await (tools as never as { webEditorSetVisible(p: string, v: boolean): Promise<string> })
       .webEditorSetVisible('Robot/Base', false);
 
-    expect(calls).toEqual(['rename', 'visible']);
+    expect(calls).toEqual(__RV_HAS_PRIVATE__ ? ['rename', 'visible'] : []);
   });
 });

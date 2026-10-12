@@ -93,9 +93,14 @@ export function isSecretPath(relPath) {
  * Skipped at depth 1 only — a `docs/scripts/` folder is documentation content
  * and must still travel, which is why this is a separate, shallower rule than
  * {@link isDeniedProjectArtifactPath} rather than one merged predicate.
+ *
+ * `cad` holds the customer's original CAD sources (STEP/JT) that the editor
+ * converted into the project's GLBs. A delivered viewer never reads them, and a
+ * private deploy uploads assets unencrypted next to an encrypted model — so the
+ * sources would be the one unprotected copy of the geometry behind the password.
  */
 export const PROJECT_ASSET_SKIP_DIRS = Object.freeze([
-  'models', 'plugins', 'scripts', 'node_modules', '.git',
+  'models', 'plugins', 'scripts', 'node_modules', '.git', 'cad',
 ]);
 
 /**
@@ -576,4 +581,112 @@ export function isOversizedDeliveryFile(absolutePath) {
 //! Bare filename of a path, normalised across separators. Convenience re-export shape.
 export function fileNameOf(path) {
   return basename(path.replace(/\\/g, '/'));
+}
+
+// ─── Hosted deploy: the project folder verbatim (plan-759 F1) ────────────
+
+/**
+ * What a hosted deploy REMOVES from an otherwise byte-for-byte copy of the
+ * project folder. Deliberately NOT {@link isDeniedProjectArtifactPath}: that
+ * rule strips `project.json`, and the served project IS its manifest.
+ *
+ * Directory names, matched on every path segment.
+ */
+export const HOSTED_DEPLOY_DENIED_DIRS = Object.freeze([
+  '.git', '.trash', '.cad-cache', 'node_modules',
+]);
+
+/**
+ * File names, matched on the bare filename. Sources of the project plugin
+ * (`*.ts`/`*.tsx`, D13) never travel: the compiled bundle is the delivery form
+ * and the source is realvirtual's. Editor leftovers (`*.bak`, `*.tmp`) and OS
+ * noise are the D10 additions.
+ */
+export const HOSTED_DEPLOY_DENIED_FILES = Object.freeze([
+  /\.bak$/i,
+  /\.tmp$/i,
+  /\.tsx?$/i,
+  /^tsconfig.*\.json$/i,
+  /^\.git(ignore|attributes|modules)$/i,
+  /^\.DS_Store$/i,
+  /^Thumbs\.db$/i,
+]);
+
+//! Files above this size are published with a warning (a hosted deploy carries
+//! the 148 MB Toray model on purpose; the 90 MB LFS ceiling is the git channel's).
+export const HOSTED_DEPLOY_WARN_FILE_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Parses a `.rvprojectignore` (gitignore-lite) into rules. Supported: comments,
+ * blank lines, a trailing `/` meaning "directory", `*` as a segment glob. No
+ * negation, no `**` — the template never used them and a reader that silently
+ * ignored a `!rule` would ship the file the author tried to keep.
+ */
+export function parseProjectIgnoreRules(text) {
+  const rules = [];
+  for (const raw of String(text ?? '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    if (line.startsWith('!')) throw new Error(`.rvprojectignore: negation is not supported ("${line}")`);
+    const dirOnly = line.endsWith('/');
+    const body = (dirOnly ? line.slice(0, -1) : line).replace(/^\/+/, '');
+    if (!body) continue;
+    const anchored = body.includes('/');
+    const re = new RegExp(`^${body.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')}$`, 'i');
+    rules.push({ source: line, re, dirOnly, anchored });
+  }
+  return rules;
+}
+
+//! Reads and parses `<projectDir>/.rvprojectignore`; `[]` when absent.
+export function readProjectIgnoreRules(projectDir) {
+  const path = join(projectDir, '.rvprojectignore');
+  if (!existsSync(path)) return [];
+  return parseProjectIgnoreRules(readFileSync(path, 'utf8'));
+}
+
+/**
+ * The verdict for one path of a hosted deploy: `null` when it travels, else a
+ * short reason. `isDir` says whether the path is a directory (directory-only
+ * ignore rules then apply). Secrets first — that rule is never overridden.
+ */
+//! CAD source formats a hosted deploy keeps out of a project's top-level CAD/ folder.
+const CAD_SOURCE_EXTENSIONS = /\.(step|stp|jt|iges|igs|x_t|x_b|sldprt|sldasm|prt|asm|catpart|catproduct|ipt|iam|3dxml|plmxml)$/i;
+
+export function hostedDeployDenyReason(relPath, { isDir = false, ignoreRules = [] } = {}) {
+  const posix = String(relPath).replace(/\\/g, '/').replace(/^\/+/, '');
+  if (isSecretPath(posix)) return 'secret';
+  const segments = posix.split('/');
+  const name = segments[segments.length - 1];
+  const dirSegments = isDir ? segments : segments.slice(0, -1);
+  if (dirSegments.some((s) => HOSTED_DEPLOY_DENIED_DIRS.includes(s))) return 'denied-dir';
+  if (!isDir && HOSTED_DEPLOY_DENIED_FILES.some((re) => re.test(name))) return 'denied-file';
+  // The top-level CAD/ folder holds the original STEP/JT sources the editor
+  // converted into the project's GLBs; the served viewer never reads them, and
+  // they would be the one unencrypted copy next to a password-protected model.
+  // GLB documents kept in that folder still travel — only the source formats stay.
+  if (!isDir && dirSegments.length > 0 && dirSegments[0].toLowerCase() === 'cad'
+      && CAD_SOURCE_EXTENSIONS.test(name)) return 'cad-source';
+  // The publish/embed artefact rule (RAG working data, CONNECT gateway config
+  // with API keys, `*.key`, derived JSON) applies unchanged — EXCEPT for the
+  // manifest, which that rule strips and a served project cannot live without.
+  if (name.toLowerCase() !== 'project.json' && isDeniedProjectArtifactPath(posix)) return 'artifact';
+  for (const rule of ignoreRules) {
+    if (rule.anchored) {
+      if (rule.re.test(posix) || (rule.dirOnly ? false : rule.re.test(posix))) return `ignore:${rule.source}`;
+      if (dirSegments.length > 0 && rule.re.test(dirSegments.join('/'))) return `ignore:${rule.source}`;
+      continue;
+    }
+    if (rule.dirOnly) {
+      if (dirSegments.some((s) => rule.re.test(s))) return `ignore:${rule.source}`;
+    } else if (segments.some((s) => rule.re.test(s))) {
+      return `ignore:${rule.source}`;
+    }
+  }
+  return null;
+}
+
+//! True when a hosted deploy must not publish `relPath`.
+export function isHostedDeployDenied(relPath, opts = {}) {
+  return hostedDeployDenyReason(relPath, opts) !== null;
 }

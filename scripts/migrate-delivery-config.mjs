@@ -17,10 +17,10 @@
  *
  * ## Secret values
  *
- * `connectLicenseKey`, `requestyApiKey` and `requestyBaseUrl` move to the
- * gitignored secrets file; the register entry keeps only `secretsRef` and a
- * `licensing.connect.keyRef` pointing at the field name. The values are not
- * printed, not in `--dry-run` either.
+ * Every value lands in the entry (2026-09-13): the licence as
+ * `licensing.connect.key`, the Requesty pair as `inference`. No sidecar file is
+ * written any more — one customer is one file. No secret value is printed, not
+ * in `--dry-run` either.
  *
  * ## Usage
  *
@@ -47,10 +47,11 @@ import {
 
 const DEFAULT_PRIVATE_ROOT = fileURLToPath(new URL('../../realvirtual-WebViewer-Private~/', import.meta.url));
 
-//! The .gitignore that makes the secrets file — and any future customer certificate — untrackable.
+//! The .gitignore backstop against a stray secrets file or customer certificate.
 export const CUSTOMERS_GITIGNORE = [
-  '# Secret VALUES never enter git (plan-434 §2.3). The encrypted counterparts live in the',
-  '# private knowledge-base secrets store (secrets/delivery/<slug>.secrets.json, SOPS-encrypted).',
+  '# Nothing secret lives beside the register any more: the CONNECT licence is',
+  '# `licensing.connect.key` and the Requesty pair is `inference` in the entry itself',
+  '# (2026-09-13). This rule stays as a backstop against an old habit or an old script.',
   '*.secrets.json',
   '# Reserved: signing is not modelled yet, but a customer certificate must never',
   '# reach a commit by accident either.',
@@ -87,7 +88,7 @@ function supportLevel(privateRoot, projects, presetsRoot) {
 }
 
 /**
- * Builds the register entry and the secrets payload for one legacy config.
+ * Builds the register entry for one legacy config.
  * Pure — no filesystem writes, so the CLI can show a dry run of the same object.
  */
 export function customerFromDeliveryConfig(config, options) {
@@ -128,16 +129,15 @@ export function customerFromDeliveryConfig(config, options) {
   };
   if (billomatCustomer) entry.billing = { billomatCustomer };
 
-  const secrets = {};
   if (config.connectLicenseKey) {
-    secrets.connectLicenseKey = config.connectLicenseKey;
-    entry.licensing.connect = { issuer: 'portal', keyRef: 'connectLicenseKey' };
+    entry.licensing.connect = { issuer: 'portal', key: config.connectLicenseKey };
   }
-  if (config.requestyApiKey) secrets.requestyApiKey = config.requestyApiKey;
-  if (config.requestyBaseUrl) secrets.requestyBaseUrl = config.requestyBaseUrl;
-  if (Object.keys(secrets).length > 0) entry.secretsRef = `customers/${slug}.secrets.json`;
+  const inference = {};
+  if (config.requestyApiKey) inference.requestyApiKey = config.requestyApiKey;
+  if (config.requestyBaseUrl) inference.requestyBaseUrl = config.requestyBaseUrl;
+  if (Object.keys(inference).length > 0) entry.inference = inference;
 
-  return { entry, secrets };
+  return { entry };
 }
 
 const serialise = (value) => JSON.stringify(value, null, 2) + '\n';
@@ -168,7 +168,7 @@ export function migrateDeliveryConfig(privateRoot, configName, options = {}) {
     ? [...config.projects]
     : [configName];
   const support = options.support ?? supportLevel(privateRoot, projects, options.presetsRoot);
-  const { entry, secrets } = customerFromDeliveryConfig(config, {
+  const { entry } = customerFromDeliveryConfig(config, {
     slug,
     projects,
     support,
@@ -177,11 +177,10 @@ export function migrateDeliveryConfig(privateRoot, configName, options = {}) {
   });
 
   const registryPath = customerRegistryPath(privateRoot, slug);
-  const secretsPath = join(privateRoot, 'customers', `${slug}.secrets.json`);
   const apply = options.apply === true;
   const actions = [];
-  // The ignore rule goes down FIRST: the secrets file must never exist for even
-  // one moment in a folder that does not already exclude it.
+  // Still written first, and still written at all: the folder keeps its backstop
+  // rule even though this tool no longer puts a secrets file there.
   actions.push({
     file: 'customers/.gitignore',
     status: writeIfChanged(join(privateRoot, 'customers', '.gitignore'), CUSTOMERS_GITIGNORE, apply),
@@ -190,13 +189,6 @@ export function migrateDeliveryConfig(privateRoot, configName, options = {}) {
     file: `customers/${slug}.json`,
     status: writeIfChanged(registryPath, serialise(entry), apply),
   });
-  if (Object.keys(secrets).length > 0) {
-    actions.push({
-      file: `customers/${slug}.secrets.json`,
-      status: writeIfChanged(secretsPath, serialise(secrets), apply),
-      secretFields: Object.keys(secrets).sort(),
-    });
-  }
   return { configName, slug, support, entry, actions };
 }
 

@@ -64,6 +64,13 @@ export class RVSceneButtonBase implements RVComponent {
   /** Raised by the signal-binding manager while a live source owns this slot. */
   liveControlled = false;
 
+  /**
+   * plan-538 F4 — normally-closed signal: the store value is the INVERSE of the
+   * pressed state (true = released). Set by a wrapper (EmergencyButton3D
+   * `NormallyClosed`) before `setStateSignal()`. Default false.
+   */
+  invertSignal = false;
+
   private _ctx?: ComponentContext;
   private _manager?: SceneButtonManager;
   private _writer?: SignalWriter;
@@ -122,6 +129,14 @@ export class RVSceneButtonBase implements RVComponent {
     this._unsubState = undefined;
     this._stateSignal = address;
     if (!address || !this._ctx) return;
+
+    // plan-538 F4: an NC button writes its released value (true) at start, so
+    // the PLC sees "OK" without a first click — before the read-back below,
+    // which would otherwise take the GLB's `false` for "pressed". Not while a
+    // live source owns the slot: its value stands.
+    if (this.invertSignal && !this.liveControlled && this._writer) {
+      this._writer.setByPath(address, !this._active);
+    }
 
     // plan-427: BIDIRECTIONAL slot — the button writes this address on click and
     // reads it back here. `_syncFromSignal` returns early when the value already
@@ -231,11 +246,13 @@ export class RVSceneButtonBase implements RVComponent {
     // live-controlled, but the release flank of a pulse started BEFORE the gate
     // was raised still passes through here.
     if (source === 'auto' && this.liveControlled) return;
-    this._writer.setByPath(this._stateSignal, value);
+    // plan-538 F4: a normally-closed button writes the inverse of "pressed".
+    this._writer.setByPath(this._stateSignal, this.invertSignal ? !value : value);
   }
 
   /** Confirmed state from the store (own write echo, force, remote, PLC). */
-  private _syncFromSignal(value: boolean): void {
+  private _syncFromSignal(signalValue: boolean): void {
+    const value = this.invertSignal ? !signalValue : signalValue;
     if (this._active === value) return;
     this._active = value;
     this.cap?.setPressed(value);
@@ -265,11 +282,8 @@ registerComponent({
   type: 'SceneButtonBase',
   schema: RVSceneButtonBase.schema,
   capabilities: {
-    hoverable: true,
-    hoverEnabledByDefault: true,
-    selectable: true,
-    filterLabel: 'Buttons',
-    badgeColor: '#7e57c2',
+    pick: 'select',
+    ui: { filter: 'Buttons', category: 'hmi', badge: '#7e57c2' },
   },
   create: (node) => new RVSceneButtonBase(node),
   afterCreate: (inst, node) => {

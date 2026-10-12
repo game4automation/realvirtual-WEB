@@ -48,6 +48,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { BunnyClient, mimeType, normalizeRegion } from './_bunny-lib.mjs';
+import { NOTICES_JSON, NOTICES_TXT, noticesWarnBanner, readNoticesMode } from './lib/rv-third-party-notices.mjs';
 
 export const RV_EMBED_PULL_ZONE_ID = '5668163';
 export const RV_EMBED_REMOTE_ROOT = 'embed';
@@ -163,6 +164,9 @@ export function collectEmbedArtifacts(distDir = DIST_DIR) {
     'vignettes/conveyor-sensor.glb',
     'test/index.html',
     'test/poster.svg',
+    // Third-party licence notices (plan-544 F6): an embed release without them must not ship.
+    NOTICES_TXT,
+    NOTICES_JSON,
   ];
   for (const rel of required) {
     if (!existsSync(join(root, rel))) throw new Error(`Required embed artifact missing: ${rel}`);
@@ -355,6 +359,10 @@ export async function main() {
   console.log(`  latest:  https://realvirtual.io/${prefixes.latest}/`);
   console.log(`  files:   ${artifacts.length} artifacts x 2 prefixes`);
   console.log('  cleanup: no DELETE; exact-URL purge for non-hashed manifest artifacts only');
+  const noticesJson = join(DIST_DIR, NOTICES_JSON);
+  console.log(`  notices: ${NOTICES_TXT} (${readNoticesMode(noticesJson) ?? 'unknown'} mode)`);
+  const banner = noticesWarnBanner(noticesJson, { product: 'rv-embed release' });
+  if (banner) console.log(banner);
 
   const client = dryRun
     ? null

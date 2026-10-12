@@ -51,6 +51,7 @@
 import { describe, expect, it, vi, beforeAll, beforeEach, afterAll, afterEach } from 'vitest';
 import { Object3D, Vector3 } from 'three';
 import { processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import type { RVChain } from '../src/core/engine/rv-chain';
 import type { RVDrive } from '../src/core/engine/rv-drive';
 import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
@@ -80,11 +81,10 @@ describe('Chain rv_extras through the loader placement path', () => {
       },
     };
 
-    const result = processExtras(
-      h.root, h.registry, h.signalStore, h.transportManager, h.scene,
-      undefined, undefined, undefined, undefined,
-      { chainManager: h.chainManager },
-    );
+    const result = processExtras(h.root, buildInitContext({
+      registry: h.registry, signalStore: h.signalStore, transportManager: h.transportManager, scene: h.scene,
+      chainManager: h.chainManager,
+    }));
     expect(result).toBeTruthy();
 
     const chain = h.registry.getByPath<RVChain>('Chain', 'Root/Chain')!;
@@ -113,11 +113,10 @@ describe('Chain rv_extras through the loader placement path', () => {
         NumberOfElements: 4,
       },
     };
-    expect(() => processExtras(
-      h.root, h.registry, h.signalStore, h.transportManager, h.scene,
-      undefined, undefined, undefined, undefined,
-      { chainManager: h.chainManager },
-    )).not.toThrow();
+    expect(() => processExtras(h.root, buildInitContext({
+      registry: h.registry, signalStore: h.signalStore, transportManager: h.transportManager, scene: h.scene,
+      chainManager: h.chainManager,
+    }))).not.toThrow();
     const chain = h.registry.getByPath<RVChain>('Chain', 'Root/Chain')!;
     expect(chain.isActive).toBe(false);
     expect(chain.elements).toHaveLength(0);

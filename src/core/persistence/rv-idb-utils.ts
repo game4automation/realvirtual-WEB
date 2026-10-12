@@ -13,6 +13,9 @@
  *  - `idbRequest(req)` — one IDBRequest as a Promise.
  *  - `idbTxDone(tx)` — transaction completion as a Promise.
  *  - get/put/delete/keys helpers for the common single-op cases.
+ *  - `idbUpdate(db, store, key, fn)` — read-modify-write inside ONE
+ *    `readwrite` transaction (plan-509), so two overlapping updates of the
+ *    same record — in this tab or another — cannot lose each other's change.
  *
  * GENERIC by design (plan-261): lives in the PUBLIC repo so the private DES
  * plugin can import it (private→public only, plan 194). It must never import
@@ -92,6 +95,57 @@ export async function idbGetAllKeys(
 ): Promise<IDBValidKey[]> {
   const tx = db.transaction(store, 'readonly');
   return idbRequest(tx.objectStore(store).getAllKeys(range ?? null));
+}
+
+/** All values of a store (single read transaction). */
+export async function idbGetAll<T>(db: IDBDatabase, store: string): Promise<T[]> {
+  const tx = db.transaction(store, 'readonly');
+  return idbRequest(tx.objectStore(store).getAll() as IDBRequest<T[]>);
+}
+
+/**
+ * Read-modify-write one record in ONE `readwrite` transaction (plan-509).
+ *
+ * `idbGet` + `idbPut` are two transactions, and another writer (a second tab,
+ * or a second call in this one) can commit between them — the later put then
+ * silently drops the earlier change. IndexedDB serialises overlapping
+ * `readwrite` transactions on the same store, so doing both inside one closes
+ * that window.
+ *
+ * `fn` receives the current value (undefined when absent) and returns the new
+ * one; `undefined` deletes the record. It must be SYNCHRONOUS: awaiting
+ * anything inside it lets the transaction auto-commit before the put.
+ * Resolves with what was written.
+ */
+export async function idbUpdate<T>(
+  db: IDBDatabase,
+  store: string,
+  key: IDBValidKey,
+  fn: (current: T | undefined) => T | undefined,
+): Promise<T | undefined> {
+  const tx = db.transaction(store, 'readwrite');
+  const os = tx.objectStore(store);
+  let next: T | undefined;
+  let failure: unknown = null;
+  const req = os.get(key) as IDBRequest<T | undefined>;
+  req.onsuccess = () => {
+    try {
+      next = fn(req.result);
+      if (next === undefined) os.delete(key);
+      else os.put(next, key);
+    } catch (e) {
+      // Rethrown below, as the caller's rejection — a throw out of an IDB
+      // event handler would only reach `window.onerror`.
+      failure = e;
+      tx.abort();
+    }
+  };
+  try {
+    await idbTxDone(tx);
+  } catch (e) {
+    throw failure ?? e;
+  }
+  return next;
 }
 
 /** Delete every record whose key falls in `range` (single transaction). */

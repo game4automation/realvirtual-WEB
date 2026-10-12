@@ -10,7 +10,7 @@
  * component field involved:
  *   • node.userData.realvirtual.AASLink = { AASId, Description }
  *       → GenericTooltipController iterates realvirtual keys and matches
- *         getCapabilities('AASLink').tooltipType === 'aas'.
+ *         getCapabilities('AASLink').ui.tooltip === 'aas'.
  *   • node.userData._rvAasLink = { aasId, description, serverUrl, gated }
  *       → the 'aas' data resolver reads this and the AAS panel / tooltip /
  *         sidebar / search / PDF-document UI all consume it unchanged.
@@ -29,7 +29,7 @@
  */
 
 import type { Object3D } from 'three';
-import { markAasPending } from '../../plugins/aas-resolution';
+import { markAasPending } from '../../plugins/aas-resolution-mark';
 
 /**
  * The standard gearmotor used by the transport library (conveyor / turntable /

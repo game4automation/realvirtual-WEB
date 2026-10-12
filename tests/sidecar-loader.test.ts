@@ -75,3 +75,45 @@ describe('tryFetchSidecarSpec', () => {
     expect(seenUrl).toBe('/models/Foo.kin.json?v=42');
   });
 });
+
+describe('tryFetchSidecarSpec — an absent sidecar is silent, whatever the server makes of it', () => {
+  it('200 + text/html (a dev server\'s SPA fallback) is absent: null, no warn', async () => {
+    mockFetch(async () => new Response('<!DOCTYPE html>\n<html><body></body></html>', {
+      status: 200, headers: { 'content-type': 'text/html; charset=utf-8' },
+    }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const spec = await tryFetchSidecarSpec('/models/Spa.glb');
+    expect(spec).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('an HTML body without an honest content-type is absent too', async () => {
+    mockFetch(async () => new Response('  <html><body>not here</body></html>', { status: 200 }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const spec = await tryFetchSidecarSpec('/models/Static.glb');
+    expect(spec).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('a blob: / data: url has no adjacent file — nothing is fetched', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+    globalThis.fetch = fetchMock;
+    expect(await tryFetchSidecarSpec('blob:http://localhost/0000-1111.glb')).toBeNull();
+    expect(await tryFetchSidecarSpec('data:model/gltf-binary;base64,AAAA.glb')).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('a genuine JSON syntax error warns ONCE per url, then the sidecar counts as absent', async () => {
+    const fetchMock = vi.fn(async () => new Response('{"drives": [', { status: 200 }));
+    globalThis.fetch = fetchMock;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(await tryFetchSidecarSpec('/models/Broken.glb')).toBeNull();
+    expect(await tryFetchSidecarSpec('/models/Broken.glb')).toBeNull();
+    expect(await tryFetchSidecarSpec('/models/Broken.glb')).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+});

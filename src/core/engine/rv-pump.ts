@@ -143,10 +143,6 @@ export class RVPump {
 }
 
 registerTooltipComponent(RVPump, {
-  hoverable: true,
-  badgeColor: '#7e57c2',
-  filterLabel: 'Pumps',
-  hoverEnabledByDefault: true,
-  hoverPriority: 10,
-  pinPriority: 5,
+  pick: 'select',
+  ui: { badge: '#7e57c2', filter: 'Pumps', category: 'process', priority: 10 },
 });

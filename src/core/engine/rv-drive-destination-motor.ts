@@ -202,5 +202,7 @@ export class RVDriveDestinationMotor implements RVComponent {
 
 // Register schema for auto-derivation of CONSUMED fields + hierarchy badge color.
 registerComponentSchema('Drive_DestinationMotor', RVDriveDestinationMotor.schema, {
-  badgeColor: '#29b6f6',
+  bake: 'chunk', // sits on the Drive node it extends — moves with it (plan-753 §2.3)
+  authorable: true, // addable in the asset editor on a node that carries a Drive
+  ui: { badge: '#29b6f6' },
 });

@@ -163,6 +163,23 @@ export const EDITOR_KINEMATIC_SELECTION_STYLE: HighlightStyle = {
   showEdges: true,
 };
 
+/**
+ * plan-760 — the editor's PLAIN GROUP accent (`GROUP_ACCENT` `#80deea`, cyan):
+ * the selection ghost of a Groups-section row (all members) and of an Auto
+ * Assign target that is a plain group. Mirrors
+ * {@link EDITOR_KINEMATIC_SELECTION_STYLE} in every value but the color.
+ */
+export const EDITOR_GROUP_SELECTION_STYLE: HighlightStyle = {
+  overlayColor: 0x80deea,
+  overlayOpacity: 0.08,
+  overlayWireframe: false,
+  edgeColor: 0x80deea,
+  edgeOpacity: 0.45,
+  edgeLinewidth: 1,
+  showOverlay: true,
+  showEdges: true,
+};
+
 // ─── Profiles ───────────────────────────────────────────────────────────
 
 const HMI_PROFILE: HighlightProfile = Object.freeze({

@@ -2,11 +2,15 @@
 // Copyright (C) 2026 realvirtual GmbH <https://realvirtual.io>
 
 import { describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 // @ts-expect-error — plain JavaScript deploy module has no declaration file.
 import * as embedDeploy from '../scripts/embed-deploy.mjs';
 
 const {
+  collectEmbedArtifacts,
   EmbedDeliveryClient,
   assertEmbedPublicUrl,
   assertEmbedRemotePath,
@@ -295,5 +299,42 @@ describe('rv-embed Bunny publish', () => {
       RV_EMBED_BUNNY_STORAGE_KEY: 'storage-secret',
     }, { dryRun: false })).toThrow(/WARNING.*RV_EMBED_BUNNY_API_KEY.*30 days/);
     expect(() => loadEmbedDeployConfig({}, { dryRun: true })).not.toThrow();
+  });
+});
+
+// plan-544 F6: an embed release without its third-party notices must fail before any upload.
+describe('collectEmbedArtifacts — third-party notices are required (plan-544)', () => {
+  function makeEmbedDist(withNotices: boolean): string {
+    const root = mkdtempSync(join(tmpdir(), 'rv-embed-dist-'));
+    const files = [
+      'rv-embed.js', 'draco/draco_decoder.js', 'draco/draco_decoder.wasm', 'draco/draco_wasm_wrapper.js',
+      'vignettes/conveyor-sensor.glb', 'test/index.html', 'test/poster.svg',
+      ...(withNotices ? ['THIRD-PARTY-NOTICES.txt', 'third-party-notices.json'] : []),
+    ];
+    for (const rel of files) {
+      mkdirSync(dirname(join(root, rel)), { recursive: true });
+      writeFileSync(join(root, rel), rel.endsWith('.json') ? '{"mode":"warn"}' : 'x');
+    }
+    return root;
+  }
+
+  it('fails with a required-artefact error when the notices are missing', () => {
+    const root = makeEmbedDist(false);
+    try {
+      expect(() => collectEmbedArtifacts(root)).toThrow(/Required embed artifact missing: THIRD-PARTY-NOTICES\.txt/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('collects the notices with every other artefact when present', () => {
+    const root = makeEmbedDist(true);
+    try {
+      const rels = collectEmbedArtifacts(root).map((a: { rel: string }) => a.rel);
+      expect(rels).toContain('THIRD-PARTY-NOTICES.txt');
+      expect(rels).toContain('third-party-notices.json');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

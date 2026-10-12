@@ -42,6 +42,41 @@ export interface PhysicsAABB { min: PhysicsVec3; max: PhysicsVec3 }
  *  (`null` when the hit collider belongs to no registered body). */
 export interface PhysicsRayHit { distance: number; bodyId: string | null }
 
+/**
+ * Collision shape of a MOVING machine part (plan-467 F2). Authored from the
+ * node's Unity collider extras — there is deliberately NO mesh-AABB fallback:
+ * a part without collider extras stays invisible to physics, exactly as today.
+ *
+ * `cuboid` carries the Unity BoxCollider `center` as `localOffset` (already
+ * scaled and X-converted): Rapier places the collider at that offset RELATIVE
+ * to the body, so an off-centre box no longer collides at the node origin
+ * (SOL R1 #6).
+ *
+ * `convexHull` points are in the NODE frame with the node's world scale baked
+ * in, decimated to at most {@link PHYSICS_HULL_MAX_POINTS} vertices, laid out
+ * as flat xyz triples — the exact input `ColliderDesc.convexHull()` takes.
+ */
+export type PhysicsShape =
+  | { kind: 'cuboid'; halfExtents: PhysicsVec3; localOffset: PhysicsVec3 }
+  | { kind: 'convexHull'; points: Float32Array };
+
+/**
+ * Contact load on ONE kinematic body for the last `step()` (plan-467 F6/F7):
+ * the force the contact partners exert ON the body (N) and the moment about
+ * the WORLD ORIGIN (N·m).
+ *
+ * The reference point is the world origin — NOT the body — because the inverse
+ * dynamics accumulates every wrench about the world origin as well
+ * (`inward_pass`, SOL R1 #3). A per-body reference would need a transport
+ * theorem shift at every consumer and would be silently wrong wherever one is
+ * missing.
+ */
+export interface PhysicsContactLoad {
+  bodyId: string;
+  fx: number; fy: number; fz: number;
+  mx: number; my: number; mz: number;
+}
+
 /** Per-zone simulation config (from `WebPhysicsZone` rv_extras, §2.3). */
 export interface PhysicsZoneConfig {
   /** World gravity (m/s²). ONE world for all zones — the first registered
@@ -53,6 +88,15 @@ export interface PhysicsZoneConfig {
   restitution: number;
   /** MUs falling below this world Y (meters) are removed (F9). */
   removeBelowY: number;
+  /** plan-467 F1 authoring hook: `false` keeps MOVING parts (drive/mechanism
+   *  subtrees with collider extras) out of the physics world in this zone.
+   *  Omitted → true (moving colliders are on wherever physics is on). */
+  movingColliders?: boolean;
+  /** plan-467 F16: default mass (kg) of an MU handed over inside this zone,
+   *  used when the MU carries no `PhysicsMassKg` of its own. Omitted →
+   *  {@link PHYSICS_DEFAULT_MU_MASS_KG}. Rapier's own default is DENSITY-based
+   *  and gives a 0.2 m cube 8 g, which makes every payload meaningless. */
+  muMassKg?: number;
 }
 
 // ─── Provider contract (implemented by the private Rapier provider) ────────
@@ -92,8 +136,36 @@ export interface PhysicsProvider {
   /** Update a conveyor's surface velocity (called per tick from drive speed). */
   setConveyorVelocity(id: string, vel: PhysicsVec3): void;
   /** Handover kinematic → dynamic (F4): create a dynamic MU body with an
-   *  EXPLICIT initial velocity (belt direction × speed; v = 0 allowed). */
-  addDynamicMU(muId: string, pose: PhysicsPose, halfExtents: PhysicsVec3, initialVel: PhysicsVec3): void;
+   *  EXPLICIT initial velocity (belt direction × speed; v = 0 allowed) and an
+   *  EXPLICIT mass in kg (plan-467 F16 — never Rapier's density default; CCD is
+   *  enabled on the MU because Rapier runs no CCD between kinematic and dynamic
+   *  bodies, rapier#303). */
+  addDynamicMU(
+    muId: string,
+    pose: PhysicsPose,
+    halfExtents: PhysicsVec3,
+    initialVel: PhysicsVec3,
+    massKg: number,
+    shapes?: Extract<PhysicsShape, { kind: 'cuboid' }>[],
+  ): void;
+  /**
+   * Register a MOVING machine part as a `KinematicPositionBased` body
+   * (plan-467 F1/F2). Its pose is pushed every tick via
+   * {@link setKinematicPose} BEFORE `step()`, from which Rapier derives the
+   * contact velocity — that is what pushes, lifts and carries MUs.
+   *
+   * `reportContactForces` marks the body for the per-tick contact query behind
+   * {@link forEachContactLoad}. Only bodies owned by a mechanism LINK need it
+   * (drive-only parts collide but feed nothing back), and querying is not free.
+   */
+  addKinematicBody(id: string, shape: PhysicsShape, pose: PhysicsPose, reportContactForces: boolean): void;
+  /**
+   * Push a kinematic body's next world pose. MUST run BEFORE `step()` — a pose
+   * written after the step is one tick late and pushes nothing (Rapier derives
+   * the contact velocity from `next − current`). The provider copies the values
+   * synchronously, so callers may reuse their scratch objects.
+   */
+  setKinematicPose(id: string, pose: PhysicsPose): void;
   /** Mark a body for removal (two-phase internally, idempotent — F9). */
   removeBody(muId: string): void;
   /** Sensor volume as a fixed sensor collider emitting enter/leave events (F6). */
@@ -115,6 +187,16 @@ export interface PhysicsProvider {
    *  (F7 return handover). Call exactly once per fixed tick — the internal
    *  settle counters advance per call. */
   getSettledBodies(maxLinVel: number, uprightToleranceDeg: number): string[];
+
+  /**
+   * Contact loads of the last `step()`, one callback per kinematic body that
+   * was created with `reportContactForces` and is actually loaded (plan-467
+   * F7). Call AFTER `step()` and at most once per tick.
+   *
+   * Zero-GC like {@link syncPoses}: `cb` receives a REUSED object — read the
+   * numbers, never retain the reference.
+   */
+  forEachContactLoad(cb: (load: PhysicsContactLoad) => void): void;
 }
 
 /**
@@ -223,6 +305,9 @@ export interface PhysicsDiagnostics {
   zones: number;
   /** Dynamic MU bodies currently owned by the provider. */
   bodies: number;
+  /** Kinematic bodies of moving machine parts (plan-467 F13). Counted in
+   *  ADDITION to `bodies`; the Settings line renders it as "N (M kinematic)". */
+  kinematicBodies: number;
   /** Last measured step+sync duration in ms (one fixed tick). */
   stepMs: number;
 }
@@ -232,6 +317,7 @@ export const physicsDiagnostics: PhysicsDiagnostics = {
   active: false,
   zones: 0,
   bodies: 0,
+  kinematicBodies: 0,
   stepMs: 0,
 };
 
@@ -248,3 +334,84 @@ export const physicsDiagnostics: PhysicsDiagnostics = {
  * still check `enabled && full` defensively. Load-time-only like `enabled`.
  */
 export const physicsSettings = { enabled: false, full: false };
+
+// ─── Effective physics state (plan-525 §2.6 — "the model switches it on") ──
+
+/**
+ * The inputs of the effective physics gate (plan-525 §2.6), kept apart so the
+ * Browser preference is never confused with the effective state:
+ *
+ *  - `deployAllowed` — settings.json `simulation.physicsEnabled !== false`
+ *    (the deployment KILL-SWITCH, set once at boot);
+ *  - `userPref` / `userFullPref` — the Settings toggles (`rv.physics`,
+ *    `rv.physics.full`), written by the settings store;
+ *  - `modelZone` — the loaded model carries an authored, enabled
+ *    `WebPhysicsZone` (set by the physics plugin on model load, reset on clear;
+ *    the plugin's synthetic WholeScene zone never counts);
+ *  - `sceneFlag` — the model's authored `SceneSettings.physicsEnabled`, or
+ *    undefined when it carries none.
+ */
+export interface PhysicsInputs {
+  deployAllowed: boolean;
+  userPref: boolean;
+  userFullPref: boolean;
+  modelZone: boolean;
+  sceneFlag?: boolean;
+}
+
+/**
+ * The truth table of plan-525 §2.6 (user decision "the zone always wins"):
+ * kill-switch → off; an active authored zone in the model → on; an authored
+ * `SceneSettings` flag → that flag; else the Browser preference. Pure.
+ */
+export function computeEffectivePhysics(i: PhysicsInputs): boolean {
+  if (!i.deployAllowed) return false;
+  if (i.modelZone) return true;
+  if (typeof i.sceneFlag === 'boolean') return i.sceneFlag;
+  return i.userPref;
+}
+
+/**
+ * Effective FULL physics (F17, Beta): only ever a USER choice — the Browser's
+ * `rv.physics` AND `rv.physics.full` toggles under an open kill-switch. A zone
+ * model switches plain physics on for itself, never full physics; an authored
+ * `SceneSettings` flag always turns full physics off (the model decided). Pure.
+ */
+export function computeEffectiveFullPhysics(i: PhysicsInputs): boolean {
+  if (!i.deployAllowed || typeof i.sceneFlag === 'boolean') return false;
+  return i.userPref && i.userFullPref;
+}
+
+/** The live inputs (module singleton; boot + settings store + physics plugin write them). */
+export const physicsInputs: PhysicsInputs = {
+  deployAllowed: true,
+  userPref: false,
+  userFullPref: false,
+  modelZone: false,
+  sceneFlag: undefined,
+};
+
+const _physicsStateListeners = new Set<() => void>();
+
+/** Subscribe to recomputations of the effective state (Settings panel hint, F8). */
+export function subscribePhysicsState(fn: () => void): () => void {
+  _physicsStateListeners.add(fn);
+  return () => { _physicsStateListeners.delete(fn); };
+}
+
+/**
+ * Recompute `physicsSettings` from {@link physicsInputs} — the ONE writer of the
+ * effective gate (no snapshot/restore). Load-time semantics unchanged: the
+ * physics plugin reads the gate when it builds the world, so a change takes
+ * effect on the next model load unless the plugin recomputes on that load.
+ */
+export function recomputePhysics(): void {
+  physicsSettings.enabled = computeEffectivePhysics(physicsInputs);
+  physicsSettings.full = physicsSettings.enabled && computeEffectiveFullPhysics(physicsInputs);
+  for (const fn of _physicsStateListeners) fn();
+}
+
+/** True when the loaded model switched physics on although the Browser preference is off (F8). */
+export function isPhysicsEnabledByModel(): boolean {
+  return physicsInputs.deployAllowed && physicsInputs.modelZone && !physicsInputs.userPref;
+}

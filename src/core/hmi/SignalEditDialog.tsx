@@ -14,6 +14,19 @@
  * Saving writes through the store's addSignal/updateSignal → PUT full interface (collision check,
  * atomic save and worker hot-reload included). For MQTT this creates a Single-mode signal exactly
  * like the Unity MQTTInterface: one topic per signal, the payload is one scalar value.
+ *
+ * **plan-589: the dialog edits a PLACE, not a name.** `topic` + `mode` say which container of the
+ * interface the signal lives in (the flat `signals` list, or one MQTT topic's own list), and the
+ * place decides two things the dialog used to get wrong:
+ *
+ *  - whether the ADDRESS is mandatory. It used to be mandatory always. It is mandatory only where
+ *    the gateway says `addressRule === 'required'` — an MQTT `Single` topic carries the address on
+ *    the container, a `Json` topic keys its object by the signal name, and PLCSIM / SHM / ABB /
+ *    WebSocket Realtime / WINMOD / PVI fall back to the name. A gateway that states no rule imposes
+ *    none (and warns about none).
+ *  - how the address is VALIDATED. `POST /signals/validate` checks an MQTT address as a topic, which
+ *    is the wrong parser for a ProcessImage signal — that one carries a Siemens byte offset
+ *    (`%IW13`) and is checked locally against the gateway's own address syntax.
  */
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
@@ -40,23 +53,33 @@ import {
   addSignal,
   updateSignal,
   validateSignalAddress,
+  isTextDataType,
   type ConnectInterface,
   type ConnectInterfaceSignal,
   type ConnectSignalSchema,
+  type MqttTopicMode,
   type SignalValidationResult,
 } from './connect-store';
+import { addressRuleFor, isProcessImageAddress } from '../import/rv-iface-signal-slots';
+
+/** plan-590 — why the name is read-only in this dialog, and where the rename lives instead. */
+export const SIGNAL_NAME_HERE_READONLY =
+  'Rename the signal from its Name row in the inspector — that updates every reference';
 
 /** Debounce for the live address validation round-trip. */
 const VALIDATE_DEBOUNCE_MS = 300;
 
 type SignalDirection = 'input' | 'output';
 
-/** Value kind fallback when no server validation result is available (mirrors the gateway's KindFromDataType). */
+/**
+ * Value kind fallback when no server validation result is available (mirrors the gateway's
+ * KindFromDataType, plus the text types `Text` / `WSTRING` / `STRING[n]`, which must never read as Int).
+ */
 function kindFromDataType(dataType: string): 'Bool' | 'Int' | 'Float' | 'Text' {
   const d = dataType.trim().toUpperCase();
   if (d === 'BOOL' || d === 'BIT') return 'Bool';
   if (d === 'REAL' || d === 'LREAL' || d === 'FLOAT') return 'Float';
-  if (d === 'STRING') return 'Text';
+  if (isTextDataType(d)) return 'Text';
   return 'Int';
 }
 
@@ -130,6 +153,10 @@ export function SignalEditDialog({
   schema,
   editSignal,
   isBound,
+  topic,
+  mode,
+  nameReadOnly,
+  seed,
 }: {
   open: boolean;
   onClose: () => void;
@@ -140,8 +167,31 @@ export function SignalEditDialog({
   editSignal?: ConnectInterfaceSignal | null;
   /** True when the edited signal is bound to the loaded model (rename warning). */
   isBound?: boolean;
+  /** plan-589: MQTT topic container the signal lives in; omit for the interface-level `signals` list. */
+  topic?: string;
+  /** plan-589: payload mode of `topic` — decides the address rule and the validator. */
+  mode?: MqttTopicMode;
+  /**
+   * plan-589 F5: opened from a MODEL signal, whose name is the key the binding couples by. Renaming
+   * it here would silently unbind the model, so the field is read-only — the rename is the
+   * inspector's name row (plan-590 `SignalRenameDialog`).
+   */
+  nameReadOnly?: boolean;
+  /**
+   * plan-589: prefill for ADD mode — the inspector opens the dialog from a model signal that has no
+   * CONNECT entry yet and already knows the name, wire type and origin data type. Ignored while
+   * editing, where the stored signal is authoritative.
+   */
+  seed?: { name?: string; type?: string; dataType?: string };
 }) {
   const isEdit = !!editSignal;
+  // The address rule of THIS place. null = the gateway states none (older gateway): no requirement
+  // and no warning, which is the plan's explicit compatibility promise (§5.4).
+  const addressRule = addressRuleFor({ topic, mode }, schema);
+  const addressRequired = addressRule === 'required';
+  // A ProcessImage address is a Siemens byte offset, not an MQTT topic — the server-side validator
+  // would apply the topic parser to it, so this one place validates locally instead.
+  const localAddressCheck = mode === 'ProcessImage';
 
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
@@ -160,11 +210,15 @@ export function SignalEditDialog({
   // (Re)seed the form whenever the dialog opens for a different signal / mode.
   useEffect(() => {
     if (!open) return;
-    setName(editSignal?.name ?? '');
+    setName(editSignal?.name ?? seed?.name ?? '');
     setAddress(editSignal?.protocolAddress ?? '');
-    setDataType(seedSignalDataType(editSignal, schema));
-    setDirection(directionOfType(editSignal?.type) ?? 'output');
-    setDirectionTouched(!!editSignal); // an existing signal's direction is authoritative
+    // In ADD mode the seed stands in for the stored signal, so the model's own wire type and origin
+    // data type drive the same derivation the edit path uses.
+    setDataType(seedSignalDataType(editSignal ?? (seed ? { ...seed, name: seed.name ?? '', protocolAddress: '', type: seed.type ?? '', record: false } : null), schema));
+    setDirection(directionOfType(editSignal?.type ?? seed?.type) ?? 'output');
+    // An existing signal's direction is authoritative — and so is a seeded one, which comes from the
+    // model signal's own type and must not be overwritten by an address-derived guess.
+    setDirectionTouched(!!editSignal || !!seed?.type);
     setComment(editSignal?.comment ?? '');
     setRecord(editSignal?.record ?? false);
     setValidation(null);
@@ -178,6 +232,20 @@ export function SignalEditDialog({
   useEffect(() => {
     if (!open || !address.trim()) {
       setValidation(null);
+      return;
+    }
+    // ProcessImage (plan-589): checked here, with the gateway's own symbolic-address syntax. The
+    // DataType cross-check (`%IW13` declared Bool) stays on the gateway, which runs it over the
+    // whole tag table when the worker compiles.
+    if (localAddressCheck) {
+      const valid = isProcessImageAddress(address);
+      setValidating(false);
+      setValidation({
+        checked: true,
+        valid,
+        error: valid ? null : `Invalid process-image address '${address.trim()}' — expected e.g. %IW13, %I3.1 or 96.0`,
+        normalizedAddress: valid ? address.trim() : null,
+      });
       return;
     }
     setValidating(true);
@@ -198,10 +266,14 @@ export function SignalEditDialog({
     }, VALIDATE_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, address, dataType, direction, directionTouched, iface.type]);
+  }, [open, address, dataType, direction, directionTouched, iface.type, localAddressCheck]);
 
   const addressBlocked = !!validation && validation.checked && !validation.valid;
-  const canSave = !saving && name.trim().length > 0 && address.trim().length > 0 && !addressBlocked;
+  // plan-589 F12: an address is only MANDATORY where the gateway says so. Everywhere else an empty
+  // address is a legitimate configuration (container topic, Json key by name, name fallback), and
+  // an unstated rule must not invent a requirement either.
+  const addressMissing = addressRequired && address.trim().length === 0;
+  const canSave = !saving && name.trim().length > 0 && !addressMissing && !addressBlocked;
   const renamed = isEdit && name.trim() !== editSignal!.name;
 
   const wireType = useMemo(() => {
@@ -223,39 +295,72 @@ export function SignalEditDialog({
       record,
     };
     try {
-      if (isEdit) await updateSignal(iface.id, editSignal!.name, signal);
-      else await addSignal(iface.id, signal);
+      // plan-589: into the SLOT's container — a topic's own `signals` list when the dialog was
+      // opened on one, the interface-level list otherwise.
+      if (isEdit) await updateSignal(iface.id, editSignal!.name, signal, topic);
+      else await addSignal(iface.id, signal, topic);
       onClose();
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));
     }
     setSaving(false);
-  }, [iface.id, isEdit, editSignal, name, address, dataType, comment, record, wireType, validation, onClose]);
+  }, [iface.id, isEdit, editSignal, name, address, dataType, comment, record, wireType, validation, topic, onClose]);
 
-  const addressLabel = schema?.addressLabel ?? 'Address';
+  // plan-589: a ProcessImage place is addressed by a Siemens byte offset, so the MQTT schema's
+  // "Topic" label and topic hint would be the wrong words for it.
+  const addressLabel = localAddressCheck
+    ? 'Address'
+    : `${schema?.addressLabel ?? 'Address'}${addressRequired ? '' : ' (optional)'}`;
   const dataTypes = schema?.dataTypes ?? [];
+
+  /** Why an empty address is fine here — the gateway's rule, said in one line. */
+  const optionalAddressHint =
+    addressRule === 'container-topic' ? `Leave empty — the topic '${topic ?? ''}' is the address.`
+      : addressRule === 'none' ? 'Leave empty — this topic keys its JSON object by the signal name.'
+        : addressRule === 'name-fallback' ? 'Leave empty to use the signal name as the address.'
+          : '';
 
   // Address helper line: parser error (blocks Save) > validated OK > syntax hint.
   const addressHelper = addressBlocked
     ? validation!.error ?? 'Invalid address'
-    : schema?.addressHint ?? '';
+    : localAddressCheck
+      ? 'Siemens process-image address — %IW13, %I3.1, %QX2.7 or a bare byte offset (96.0)'
+      : optionalAddressHint || schema?.addressHint || '';
 
   return (
     <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
       <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, fontSize: 14 }}>
         {isEdit ? <Edit sx={{ color: 'primary.main' }} /> : <Add sx={{ color: 'primary.main' }} />}
         {isEdit ? 'Edit Signal' : 'Add Signal'} — {iface.type}
+        {topic ? ` · ${topic}` : ''}
       </DialogTitle>
       <DialogContent>
-        <TextField
-          fullWidth
-          size="small"
-          label="Signal name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          helperText="Unique across all interfaces — models couple to signals by this name"
-          sx={{ mt: 1, mb: 1 }}
-        />
+        <Tooltip
+          title={nameReadOnly ? SIGNAL_NAME_HERE_READONLY : ''}
+          disableInteractive
+          disableHoverListener={!nameReadOnly}
+        >
+          <TextField
+            fullWidth
+            size="small"
+            label="Signal name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            inputProps={{
+              readOnly: nameReadOnly,
+              'aria-readonly': nameReadOnly ? 'true' : undefined,
+              // Stable handle: "Signal name" is also an ADDRESS label on several protocols
+              // (SHM, ABB, FANUC), so a label query cannot tell the two fields apart.
+              'data-testid': 'rv-signal-name-input',
+            }}
+            helperText={nameReadOnly
+              // The model couples by this name: renaming it here would unbind the model. The rename
+              // is the inspector's name row (plan-590), which carries every reference along.
+              ? SIGNAL_NAME_HERE_READONLY
+              : 'Unique across all interfaces — models couple to signals by this name'}
+            sx={{ mt: 1, mb: 1 }}
+          />
+        </Tooltip>
 
         {renamed && isBound && (
           <Alert severity="warning" sx={{ mb: 1, fontSize: 11, py: 0 }}>
@@ -272,6 +377,7 @@ export function SignalEditDialog({
           onChange={(e) => setAddress(e.target.value)}
           error={addressBlocked}
           helperText={addressHelper}
+          inputProps={{ 'data-testid': 'rv-signal-address-input' }}
           InputProps={{
             sx: { fontFamily: 'monospace' },
             endAdornment: validating
@@ -287,7 +393,10 @@ export function SignalEditDialog({
           sx={{ mb: 0.5 }}
         />
 
-        {(schema?.addressExamples.length ?? 0) > 0 && (
+        {/* The schema's examples belong to the interface-level address. In an MQTT topic container
+            they would be topics offered for a byte offset (ProcessImage) or for a field that must
+            stay empty (Single / Json), so they are shown only for the flat container. */}
+        {topic === undefined && (schema?.addressExamples.length ?? 0) > 0 && (
           <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', alignItems: 'center', mb: 1.5 }}>
             <Typography sx={{ fontSize: 10, color: 'rgba(255,255,255,0.6)' }}>e.g.</Typography>
             {schema!.addressExamples.map(ex => (

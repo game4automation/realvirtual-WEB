@@ -55,6 +55,73 @@ function stubPlugin(ruleNames) {
   };
 }
 
+// ── HMI design guardrails (plan-510) ──────────────────────────────────────
+//
+// The Property Inspector is built ONLY from the inspector building blocks
+// (InspectorRow, InspectorSubheader, InspectorActionRow, DetailsDisclosure)
+// and the design values in src/core/hmi/shared-sx.ts (see DESIGN.md). These
+// selectors make a new local colour / font size / pixel column / number input
+// in an inspector file an ERROR. Existing violations are frozen in
+// eslint-suppressions.json — that baseline may only SHRINK (`npm run
+// lint:prune`); tests/hmi-design-lint.node.test.ts fails when it grows, when it
+// is stale, or when a scope file gains a violation. The test is part of
+// `npm run test:node` / `npm run test:all`.
+
+/** The inspector files the design rule applies to (keep package.json lint:baseline / lint:prune in sync — the test checks it). */
+export const HMI_DESIGN_SCOPE = [
+  'src/core/hmi/rv-*inspector*.tsx',
+  'src/core/hmi/rv-field-*.tsx',
+  'src/core/hmi/rv-component-section.tsx',
+  'src/core/hmi/rv-signal-slot-row.tsx',
+  'src/core/hmi/rv-*-field-renderer.tsx',
+  'src/core/hmi/Fmu*.tsx',
+  'src/core/hmi/inspector-*.tsx',
+  'src/core/hmi/rv-baked-geometry-section.tsx',
+  'src/plugins/signal-bind/*.tsx',
+];
+
+/** The only files allowed to hold colour literals: the design values themselves. */
+export const HMI_DESIGN_IGNORES = ['src/core/hmi/theme.ts', 'src/core/hmi/shared-sx.ts'];
+
+const SPACING_KEYS = '^(p|pl|pr|pt|pb|px|py|m|ml|mr|mt|mb|mx|my|width|minWidth|maxWidth|gap)$';
+
+/** `no-restricted-syntax` options of the HMI design rule (also used by the fixture test). */
+export const HMI_DESIGN_RESTRICTIONS = [
+  {
+    selector: 'Literal[value=/^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/]',
+    message: 'HMI design: no hex colour literal in inspector UI — use a colour from shared-sx.ts / theme.ts (DESIGN.md).',
+  },
+  {
+    // Unanchored (deliberately stricter than plan-510 §4): also catches '1px solid rgba(…)' border strings.
+    selector: 'Literal[value=/rgba?\\(/]',
+    message: 'HMI design: no rgba() literal in inspector UI — use INK_* / DIVIDER / FIELD_* from shared-sx.ts (DESIGN.md).',
+  },
+  {
+    selector: 'TemplateLiteral > TemplateElement[value.raw=/rgba?\\(/]',
+    message: 'HMI design: no rgba() in a template literal in inspector UI — use a colour from shared-sx.ts (DESIGN.md).',
+  },
+  {
+    selector: "Property[key.name='fontSize'] Literal[raw=/^[0-9]/]",
+    message: 'HMI design: no numeric fontSize in inspector UI — use FS.* (or ICON_SIZE.* for icons) from shared-sx.ts (DESIGN.md).',
+  },
+  {
+    selector: "JSXAttribute[name.name='fontSize'] Literal[raw=/^[0-9]/]",
+    message: 'HMI design: no numeric fontSize in inspector UI — use FS.* (or ICON_SIZE.* for icons) from shared-sx.ts (DESIGN.md).',
+  },
+  {
+    selector: `Property[key.name=/${SPACING_KEYS}/] Literal[value=/^[0-9.]+px$/]`,
+    message: "HMI design: no 'NNpx' spacing/width in inspector UI — use theme spacing units or the InspectorRow grid (DESIGN.md).",
+  },
+  {
+    selector: `Property[key.name=/${SPACING_KEYS}/] Literal[value=/^(?!100%$)[0-9.]+%$/]`,
+    message: "HMI design: no percentage column in inspector UI — the InspectorRow grid owns the columns ('100%' is fine) (DESIGN.md).",
+  },
+  {
+    selector: "JSXAttribute[name.name='type'] Literal[value='number']",
+    message: 'HMI design: no type="number" input — use NumberEditor / DragNumberField (text + inputMode="decimal", parseDecimal) (DESIGN.md).',
+  },
+];
+
 export default [
   {
     // Ignore non-src directories and config files
@@ -139,6 +206,15 @@ export default [
           { from: { type: 'engine' }, disallow: { to: { type: 'viewer' } } },
         ],
       }],
+    },
+  },
+  {
+    // plan-510 — HMI design guardrails for the inspector files (see top of file).
+    name: 'rv/hmi-design',
+    files: HMI_DESIGN_SCOPE,
+    ignores: HMI_DESIGN_IGNORES,
+    rules: {
+      'no-restricted-syntax': ['error', ...HMI_DESIGN_RESTRICTIONS],
     },
   },
 ];

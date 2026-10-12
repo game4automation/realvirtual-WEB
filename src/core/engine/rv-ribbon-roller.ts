@@ -14,10 +14,12 @@
  * A roller is **driven** when a ROTATIONAL `Drive` sits on the SAME node with an
  * axis parallel (or antiparallel) to the roller axis. Its surface speed
  *
- *     v = omega * pi/180 * r * dot(driveAxisLocal, rollerAxisLocal)
+ *     v = omega * pi/180 * r * dot(driveAxisLocal, rollerAxisLocal) * contactSign
  *
  * is the web speed of its section — the only speed source there is. Everything
- * else is a **follower**: the path turns it with `v / r`.
+ * else is a **follower**: the path turns it with `v / r * contactSign`.
+ * The path resolves contactSign from its wrap side and the roller's axis;
+ * the drive remains the sole writer of a driven roller's transform.
  *
  * Decisions worth keeping:
  *
@@ -52,6 +54,10 @@
 import { Box3, Matrix4, Object3D, Quaternion, RepeatWrapping, Vector3 } from 'three';
 import type { Material, Mesh, Texture } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
+import type { GizmoOverlayManager } from './rv-gizmo-manager';
+import { createArcGizmo, type ArcGizmo } from './rv-arc-gizmo';
+
+export const SIDE_COLOR = { 1: 0x4fc3f7, '-1': 0xffb74d, 0: 0x8a8f98 } as const;
 import {
   loadSchemaFromSpec,
   registerComponent,
@@ -59,6 +65,7 @@ import {
   setComponentInstance,
 } from './rv-component-registry';
 import { MM_TO_METERS } from './rv-constants';
+import { findMaterialByName } from './rv-pre-bake';
 import { asDrive } from './rv-drive-utils';
 import type { RVDrive } from './rv-drive';
 import type { NodeRegistry } from './rv-node-registry';
@@ -129,6 +136,10 @@ export interface RibbonRollerLike {
   readonly surfaceSpeedMmPerS: number;
   /** Read the drive of THIS tick exactly once. Called by the manager. */
   sampleDrive(dt: number): void;
+  /** Configure contact orientation before sampling the drive. */
+  setContactMotion(sign: number): void;
+  /** The physical drive that a connected-line interlock must hold. */
+  driveOnNode?(): RVDrive | null;
   /** Add `dAngle` (rad) and write the node quaternion (or scroll the mantle). */
   advanceAngle(dAngle: number): void;
   /** Restore the authored pose (and, for a winder, the authored roll). */
@@ -207,12 +218,27 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
   RadiusMm = 0;
   Axis: RibbonAxis = 'X';
   RibbonSide: RibbonSideName = 'Auto';
-  /** `-1` flips the visible rotation when the CAD axis points the other way. */
+  /** @deprecated Ignored: resolved contact geometry determines rotation. */
   RotationDirection = 1;
+  private _contactSign = 1;
   /** `Texture` scrolls the mantle instead of turning the node (followers only). */
   SpinMode: RibbonSpinMode = 'Transform';
   /** The mesh that carries the mantle texture. Wire: `ComponentReference`. */
   MantleMesh: unknown = null;
+  /**
+   * Name of a material of the ribbon material library for the barrel (plan-496),
+   * resolved against the materials of the LOADED document. Applied only while
+   * {@link OverrideMaterials} is true.
+   */
+  MantleMaterialName = '';
+  /** Library material name for every mesh under a `Faces` child (plan-496). */
+  FaceMaterialName = '';
+  /**
+   * Replaces the CAD materials of the barrel and of the `Faces` children with
+   * the two named materials. A document exported from Unity carries them
+   * already assigned; resolving them here covers a hand-written document.
+   */
+  OverrideMaterials = false;
 
   // -- Runtime state --
   /** rad — rotation relative to the authored pose. */
@@ -224,6 +250,8 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
 
   // -- Drive (plan-460 F0) --
   protected _registry: NodeRegistry | null = null;
+  protected _gizmos: GizmoOverlayManager | null = null;
+  private _previewArc: ArcGizmo | null = null;
   private _nodePath = '';
   private _drive: RVDrive | null = null;
   private _lastDriveSeen: RVDrive | null = null;
@@ -243,6 +271,11 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
   private readonly _spinMaps: Texture[] = [];
   private _warnedDrivenTexture = false;
   private _warnedNoMantle = false;
+
+  // -- Material override (plan-496) -----------------------------
+  /** The authored materials of every mesh the override replaced, for the restore. */
+  private readonly _overrideOriginals = new Map<Mesh, Material | Material[]>();
+  private _warnedUnknownMaterial = false;
 
   constructor(node: Object3D) {
     this.node = node;
@@ -270,6 +303,24 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
     return this._surfaceSpeedMmPerS;
   }
 
+  /**
+   * ±1 relating the DRIVE axis to the roller axis, or 0 when no drive can turn
+   * this roller. Use driveToWebSign for the full contact-aware speed conversion.
+   */
+  get driveDot(): number {
+    return this._driveDot;
+  }
+
+  /** Signed conversion from drive angular speed to forward web speed. */
+  get driveToWebSign(): number {
+    return this._driveDot * this._contactSign;
+  }
+
+  /** Set the resolved contact orientation; zero denotes incompatible shared paths. */
+  setContactMotion(sign: number): void {
+    this._contactSign = sign;
+  }
+
   /** True while this roller is currently scrolling its mantle instead of turning. */
   get isTextureSpinning(): boolean {
     return this._textureSpin;
@@ -281,10 +332,40 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
   }
 
   init(context: ComponentContext): void {
+    this._gizmos = context.gizmoManager ?? null;
     this._registry = context.registry ?? null;
     this._nodePath = this._registry?.getPathForNode(this.node) ?? nodePathOf(this.node);
     this.initRoller();
+    this.applyMaterialOverride();
     this.rebaseDrive();
+  }
+
+  /** Shows or removes this roller's resolved wrap annotation. */
+  setEditorPreview(
+    active: boolean,
+    resolvedSide = this.sideSign,
+    geometry?: { startRad: number; spanRad: number },
+  ): void {
+    if (!active || !this._gizmos || !geometry) {
+      this._previewArc?.disposeArc();
+      this._previewArc = null;
+      return;
+    }
+    const side = resolvedSide === -1 ? -1 : resolvedSide === 1 ? 1 : 0;
+    const options = {
+      startRad: geometry.startRad,
+      endRad: geometry.startRad + (side < 0 ? -1 : 1) * geometry.spanRad,
+      radius: this.radiusMm / MM_TO_METERS,
+      axis: this.axis,
+      color: SIDE_COLOR[side],
+      kind: 'wrap-arc',
+      directionTip: true,
+    };
+    if (this._previewArc) this._previewArc.updateArc(options);
+    else {
+      this._previewArc = createArcGizmo(options);
+      this.node.add(this._previewArc);
+    }
   }
 
   /**
@@ -366,7 +447,7 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
       }
       if (this._driveDot !== 0 && dt > 0) {
         const omegaDegPerS = (drive.currentPosition - this._lastDrivePosition) / dt;
-        v = ((omegaDegPerS * Math.PI) / 180) * this._radiusMm * this._driveDot;
+        v = ((omegaDegPerS * Math.PI) / 180) * this._radiusMm * this.driveToWebSign;
       }
       this._lastDrivePosition = drive.currentPosition;
     } else {
@@ -420,7 +501,7 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
    */
   advanceAngle(dAngle: number): void {
     if (!Number.isFinite(dAngle) || dAngle === 0) return;
-    const signed = dAngle * (this.RotationDirection < 0 ? -1 : 1);
+    const signed = dAngle * this._contactSign;
     if (this._textureSpin) {
       if (!this._bindTextureSpin()) return;
       const du = signed / (2 * Math.PI);
@@ -565,6 +646,70 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
     return best;
   }
 
+  /**
+   * Resolve {@link MantleMaterialName} / {@link FaceMaterialName} against the
+   * document and write them onto the barrel and every mesh under a `Faces`
+   * child — the browser half of the Unity override (plan-496 F8).
+   *
+   * A document exported from Unity already carries the result on its meshes, so
+   * this normally re-assigns what is there; it is what makes a HAND-WRITTEN
+   * document (or one whose donor materials were reused) look the same. It runs
+   * BEFORE the texture spin binds, so the spin clones the material that is
+   * actually rendered.
+   */
+  applyMaterialOverride(): void {
+    if (!this.OverrideMaterials) return;
+    const mantleMaterial = this._resolveLibraryMaterial(this.MantleMaterialName);
+    const faceMaterial = this._resolveLibraryMaterial(this.FaceMaterialName);
+    if (mantleMaterial) {
+      const mantle = this._resolveMantleMesh();
+      if (mantle) this._overrideMesh(mantle, mantleMaterial);
+    }
+    if (faceMaterial) {
+      for (const mesh of this._collectFaceMeshes()) this._overrideMesh(mesh, faceMaterial);
+    }
+  }
+
+  /** Put the authored materials back on every mesh the override touched. */
+  restoreMaterials(): void {
+    for (const [mesh, material] of this._overrideOriginals) mesh.material = material;
+    this._overrideOriginals.clear();
+  }
+
+  /** Cache the mesh's authored material once, then fill EVERY slot with `material`. */
+  private _overrideMesh(mesh: Mesh, material: Material): void {
+    if (!this._overrideOriginals.has(mesh)) this._overrideOriginals.set(mesh, mesh.material);
+    mesh.material = Array.isArray(mesh.material)
+      ? mesh.material.map(() => material)
+      : material;
+  }
+
+  /** Every mesh below a child named `Faces` — the same rule Unity applies. */
+  private _collectFaceMeshes(): Mesh[] {
+    const out: Mesh[] = [];
+    const walk = (obj: Object3D, underFaces: boolean): void => {
+      const faces = underFaces || obj.name === 'Faces';
+      const mesh = asMesh(obj);
+      if (mesh && faces) out.push(mesh);
+      for (const child of obj.children) walk(child, faces);
+    };
+    for (const child of this.node.children) walk(child, false);
+    return out;
+  }
+
+  /** The document material of that name, or null; an unknown name warns once. */
+  private _resolveLibraryMaterial(name: string): Material | null {
+    if (!name) return null;
+    const found = findMaterialByName(this.node, name);
+    if (found) return found;
+    if (!this._warnedUnknownMaterial) {
+      this._warnedUnknownMaterial = true;
+      console.warn(`[RibbonRoller] "${this.node.name}": no material called "${name}" in this `
+        + 'document; the GLB material of that part is kept.');
+    }
+    return null;
+  }
+
   getLiveState(): Record<string, unknown> {
     return {
       RadiusMm: this._radiusMm,
@@ -576,6 +721,9 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
   }
 
   dispose(): void {
+    this._previewArc?.disposeArc();
+    this._previewArc = null;
+    this._gizmos = null;
     if (this._mantleMesh && this._authoredMantleMaterial) {
       this._mantleMesh.material = this._authoredMantleMaterial;
     }
@@ -587,6 +735,7 @@ export class RVRibbonRoller implements RVComponent, RibbonRollerLike {
     this._authoredMantleMaterial = null;
     this._spinBound = false;
     this._textureSpin = false;
+    this.restoreMaterials();
     this._registry = null;
     this._drive = null;
     this._lastDriveSeen = null;
@@ -629,11 +778,10 @@ registerComponent({
   type: 'RibbonRoller',
   schema: RVRibbonRoller.schema,
   capabilities: {
-    hoverable: true,
-    selectable: true,
+    pick: 'select',
+    bake: 'keep',    // spins (or scrolls its mantle map) — never baked
     authorable: true,
-    filterLabel: 'Web handling',
-    badgeColor: '#26a69a',
+    ui: { filter: 'Web handling', category: 'transport', badge: '#26a69a' },
   },
   create: (node) => new RVRibbonRoller(node),
   afterCreate: (inst, node) => {

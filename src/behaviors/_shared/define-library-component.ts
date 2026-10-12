@@ -52,17 +52,19 @@ import type { Object3D } from 'three';
  * Used as the default for `opts.capabilities` so every factory-built component
  * shows the same purple "Behavior" badge unless the author overrides it.
  *
- * `inspectorVisible: false` hides the stamped marker SECTION (the raw
+ * `ui.hidden: true` hides the stamped marker SECTION (the raw
  * CONVEYORBEHAVIOR field dump) from the inspector — the behavior is presented
  * instead through the design-consistent States + Hardware section. The
- * `filterLabel: 'Behavior'` stays so the hierarchy badge AND the States/Hardware
+ * `ui.filter: 'Behavior'` stays so the hierarchy badge AND the States/Hardware
  * gate still detect the component (plan-200 C1).
  */
 const STANDARD_BADGE: ComponentCapabilities = {
-  badgeColor: '#7e57c2',
-  filterLabel: 'Behavior',
-  hierarchyVisible: true,
-  inspectorVisible: false,
+  ui: {
+    badge: '#7e57c2',
+    filter: 'Behavior',
+    category: 'logic',
+    hidden: true,
+  },
 };
 
 /** Marker types whose schema/capabilities are already registered (guard). */

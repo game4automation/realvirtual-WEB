@@ -4,9 +4,17 @@
 /**
  * search-result-grouping.test.ts — pure grouping of global-search results
  * for the BottomBar dropdown (plan-283 review: "shows too much").
+ *
+ * Since plan-597 the groups are the hierarchy filter's coarse categories
+ * (`categoryOf`): one source for "which group is this type in".
  */
 
 import { describe, it, expect } from 'vitest';
+// Production capability registrations (side effects) the categories read.
+import '../src/core/engine/rv-drive';
+import '../src/core/engine/rv-sensor';
+import '../src/core/engine/rv-transport-surface';
+import '../src/plugins/aas-link-plugin';
 import {
   searchGroupLabel,
   groupSearchResults,
@@ -21,12 +29,12 @@ function r(types: string[], matchedBy?: string): GroupableResult & { id: number 
 let _id = 0;
 
 describe('searchGroupLabel', () => {
-  it('maps drives, sensors, conveyors, signals and logic to their categories', () => {
+  it('maps drives, sensors, transport, signals and logic to their categories', () => {
     expect(searchGroupLabel(r(['Drive']))).toBe('Drives');
     expect(searchGroupLabel(r(['Drive_Gear']))).toBe('Drives');
     expect(searchGroupLabel(r(['DrivesRecorder']))).toBe('Drives');
     expect(searchGroupLabel(r(['Sensor']))).toBe('Sensors');
-    expect(searchGroupLabel(r(['TransportSurface']))).toBe('Conveyors');
+    expect(searchGroupLabel(r(['TransportSurface']))).toBe('Transport');
     expect(searchGroupLabel(r(['PLCInputBool']))).toBe('Signals');
     expect(searchGroupLabel(r(['PLCOutputFloat']))).toBe('Signals');
     expect(searchGroupLabel(r(['ConnectSignal']))).toBe('Signals');
@@ -41,8 +49,12 @@ describe('searchGroupLabel', () => {
     expect(searchGroupLabel(r(['Drive'], 'PLCInputBool'))).toBe('Signals');
   });
 
-  it('groups unknown component types under their own type key', () => {
-    expect(searchGroupLabel(r(['AASLink']))).toBe('AASLink');
+  it('groups a categorised plugin type under its category', () => {
+    expect(searchGroupLabel(r(['AASLink']))).toBe('Info');
+  });
+
+  it('groups a type without category under Other', () => {
+    expect(searchGroupLabel(r(['Zeta']))).toBe('Other');
   });
 });
 
@@ -54,10 +66,10 @@ describe('groupSearchResults', () => {
       r(['Drive']),             // Drives
       r([]),                    // Objects
       r(['Drive_Gear']),        // Drives
-      r(['AASLink']),           // AASLink (other)
+      r(['AASLink']),           // Info
     ];
     const groups = groupSearchResults(results);
-    expect(groups.map(g => g.label)).toEqual(['Drives', 'Signals', 'AASLink', 'Objects']);
+    expect(groups.map(g => g.label)).toEqual(['Drives', 'Signals', 'Info', 'Objects']);
     expect(groups.map(g => g.items.length)).toEqual([2, 1, 1, 2]);
   });
 
@@ -83,11 +95,11 @@ describe('groupSearchResults', () => {
     }
   });
 
-  it('sorts non-priority groups alphabetically before Objects', () => {
+  it('orders groups by CATEGORY_ORDER, Other after the categories, Objects last', () => {
     const groups = groupSearchResults([
-      r([]), r(['Zeta']), r(['Alpha']),
+      r([]), r(['Zeta']), r(['AASLink']), r(['TransportSurface']), r(['Sensor']), r(['LogicStep_Delay']),
     ]);
-    expect(groups.map(g => g.label)).toEqual(['Alpha', 'Zeta', 'Objects']);
+    expect(groups.map(g => g.label)).toEqual(['Sensors', 'Transport', 'Logic', 'Info', 'Other', 'Objects']);
   });
 
   it('returns an empty array for no results', () => {

@@ -9,6 +9,12 @@
  * Pure by design — no viewer, no canvas, no WebGL — so the whole geometry and
  * ranking contract is provable in plain unit tests.
  *
+ * Since plan-740 P3.1 the tool builds its notes from the ID MASK of the frame
+ * in each cell ({@link summarizeVisibleGroups}) instead of from a 7×7 ray
+ * raster. `sampleGrid` and {@link summarizeViewHits} stay here, exported and
+ * tested: they are the ray-sampling contract, and a caller that has hits rather
+ * than a mask still needs it. Nothing in the tool path calls them any more.
+ *
  * The yaw convention is the one `web_camera_orbit` already uses
  * (`theta = atan2(offset.x, offset.z)`, + = counter-clockwise seen from above),
  * so an agent that reads a cell label and then orbits does not have to flip signs.
@@ -68,6 +74,30 @@ export interface ViewNote {
    * moved the camera during the sweep (plan-705 D-A14).
    */
   poseDrift?: number;
+}
+
+/**
+ * A sweep note built from the ID MASK rather than from a ray raster
+ * (plan-740 D-A13).
+ *
+ * The difference is not cosmetic. `ViewNote.coverage` was the share of 49 rays
+ * that happened to land on a part, so a thin bracket between two sample points
+ * simply did not exist, and `samples` had to be reported for the number to mean
+ * anything at all. `coverage` here is the group's share of the rendered PIXELS
+ * of a depth-tested frame: occlusion-correct by construction, and the same
+ * number `web_eye`'s sidecar reports, so an agent reading a sweep note and then
+ * looking closer with `web_eye` gets one vocabulary instead of two.
+ */
+export interface SweepViewNote {
+  index: number;
+  label: string;
+  yawDeg: number;
+  pitchDeg: number;
+  /** The pose the frame was rendered from. No drift is possible any more. */
+  cameraPosition: [number, number, number];
+  topNodes: Array<{ path: string; ownerPath?: string; coverage: number }>;
+  /** Share of the frame no group covers, 0..1. */
+  background: number;
 }
 
 const r3 = (n: number): number => +n.toFixed(3);
@@ -173,4 +203,48 @@ export function summarizeViewHits(
     if (drift > tol) note.poseDrift = r3(drift);
   }
   return note;
+}
+
+/**
+ * ID-mask `visible[]` rows → one sweep note (plan-740 P3.1).
+ *
+ * Pure, like every other function in this file: it takes the rows `buildVisible`
+ * produced for the cell and the pose the cell was rendered from, and never sees
+ * a viewer, a canvas or a renderer. `rows` arrive sorted by descending pixel
+ * count, which is the ranking the note wants, so the only work here is the cap,
+ * the projection onto the reported fields and the background share.
+ *
+ * `background` is derived rather than measured: coverage is a share of the WHOLE
+ * frame, so what no group covers is what is left of 1. That also makes it fall
+ * out correctly when the cap hides small groups — they are still counted.
+ */
+export function summarizeVisibleGroups(
+  pose: SweepPose,
+  rows: ReadonlyArray<{ path?: unknown; ownerPath?: unknown; coverage?: unknown }>,
+  topN: number = DEFAULT_TOP_N,
+): SweepViewNote {
+  const cap = clampInt(topN, 1, MAX_TOP_N, DEFAULT_TOP_N);
+  let covered = 0;
+  const topNodes: SweepViewNote['topNodes'] = [];
+  for (const row of rows) {
+    const coverage = typeof row.coverage === 'number' && Number.isFinite(row.coverage)
+      ? row.coverage : 0;
+    covered += coverage;
+    if (topNodes.length >= cap || typeof row.path !== 'string') continue;
+    topNodes.push({
+      path: row.path,
+      ...(typeof row.ownerPath === 'string' && row.ownerPath !== row.path
+        ? { ownerPath: row.ownerPath } : {}),
+      coverage: r2(coverage),
+    });
+  }
+  return {
+    index: pose.index,
+    label: pose.label,
+    yawDeg: r2(pose.yawDeg),
+    pitchDeg: r2(pose.pitchDeg),
+    cameraPosition: [r3(pose.position.x), r3(pose.position.y), r3(pose.position.z)],
+    topNodes,
+    background: r2(Math.min(1, Math.max(0, 1 - covered))),
+  };
 }

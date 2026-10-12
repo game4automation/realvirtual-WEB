@@ -16,7 +16,9 @@
  * When `onBack` is supplied the header grows an arrow, and that arrow is the
  * *only* way up a level. Escape keeps meaning "close the dashboard" on both
  * screens: a user who wants the viewport back should never have to guess how
- * many times to press it.
+ * many times to press it. The one exception is the search field with a term
+ * in it (plan-509 F10): there Escape clears the term first — the obvious
+ * "undo my typing" — and only an Escape in an EMPTY field closes.
  *
  * ## Deliberately NOT a focus trap
  *
@@ -71,6 +73,10 @@ export interface ProjectsDashboardProps {
   titleActions?: React.ReactNode;
   /** Hide the search field on screens with nothing worth filtering. */
   showSearch?: boolean;
+  /** Placeholder of the search field — says WHAT it searches. Default "Search…". */
+  searchPlaceholder?: string;
+  /** The search input, for the `/` / Ctrl+K shortcut and focus hand-backs. */
+  searchInputRef?: React.Ref<HTMLInputElement>;
   /**
    * Full-width band between the title row and the tools, for the open document
    * (plan-709 F3).
@@ -93,6 +99,8 @@ export function ProjectsDashboard({
   headerTabs,
   titleActions,
   showSearch = true,
+  searchPlaceholder = 'Search…',
+  searchInputRef,
   hero,
   headerActions,
   children,
@@ -290,9 +298,20 @@ export function ProjectsDashboard({
           {showSearch && (
             <TextField
               size="small"
-              placeholder="Search…"
+              placeholder={searchPlaceholder}
               value={snap.search}
               onChange={(e) => setProjectsSearch(e.target.value)}
+              inputRef={searchInputRef}
+              onKeyDown={(e) => {
+                // A typed term is cleared first; the dashboard's own Escape
+                // (window listener above) must not see this press, or the
+                // first Escape would both clear AND close.
+                if (e.key === 'Escape' && snap.search !== '') {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  setProjectsSearch('');
+                }
+              }}
               slotProps={{
                 input: {
                   startAdornment: (

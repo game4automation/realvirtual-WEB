@@ -132,16 +132,17 @@ async function existsAt(surface: BlobSurface, path: string): Promise<boolean> {
 // ─── Cross-source copy and move (plan-413 §2.7, phase 5) ────────────────
 
 /**
- * Where a transferred document lands by default.
+ * Where a transferred document lands by default: the target's PROJECT ROOT.
  *
- * A copy arrives as a *library asset* of the target, whatever it was in the
- * source. That is not a simplification: `library/` is the one folder every
- * writable project has, it is what the source registry lists, and a scene
- * dropped into another project's `scenes/` would need a manifest scene entry,
- * a body revision and an id the scene index agrees with — a second, larger
- * feature wearing the same verb's name.
+ * Until plan-716 a copy arrived under `library/`, because that was the one
+ * folder every writable project had. Since then a project has no `library/`
+ * notion any more — a document is a manifest row wherever its file sits, and
+ * the root is where a project's own documents live — so a transfer that still
+ * created a `library/` folder in the target was inventing a place (customer
+ * feedback 2026-09-30). The empty folder means the root; the name probe below
+ * builds a bare file name for it.
  */
-export const DEFAULT_TRANSFER_FOLDER = LIBRARY_FOLDER;
+export const DEFAULT_TRANSFER_FOLDER = '';
 
 export interface DocumentTransferOptions {
   /** Folder inside the target. Defaults to {@link DEFAULT_TRANSFER_FOLDER}. */

@@ -28,8 +28,9 @@ describe('SceneButton schema', () => {
       .toEqual(['activeOffset', 'angularMovement', 'axis', 'hoverOffset', 'mirrorHoverOffset', 'moveSpeed']);
     expect(Object.keys(loadSchemaFromSpec('PushButton3D')).sort())
       .toEqual(['activeOnStart', 'label', 'lightSignal', 'stateSignal', 'timer', 'toggle']);
+    // plan-538 F4: `NormallyClosed` is a web-side extension (PascalCase on purpose).
     expect(Object.keys(loadSchemaFromSpec('EmergencyButton3D')).sort())
-      .toEqual(['activeOnStart', 'stateSignal']);
+      .toEqual(['NormallyClosed', 'activeOnStart', 'stateSignal']);
     expect(Object.keys(loadSchemaFromSpec('HandleSwitch3D')).sort())
       .toEqual(['activeOnStart', 'stateSignal']);
   });

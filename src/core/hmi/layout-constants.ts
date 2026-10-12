@@ -143,6 +143,58 @@ export function getStoredKinematicsPanelWidth(): number {
   return KINEMATICS_PANEL_WIDTH;
 }
 
+/** Default height of the kinematics list inside the Quick Edit window (plan-518). */
+export const KINEMATICS_LIST_HEIGHT = 320;
+
+/** Resize bounds for the kinematics list. The panel additionally clamps the
+ *  shown height to what its scroll container can hold; MAX only guards
+ *  against garbage in storage. */
+export const KINEMATICS_LIST_MIN_HEIGHT = 120;
+export const KINEMATICS_LIST_MAX_HEIGHT = 1200;
+
+/** localStorage key for the user-resized kinematics list height. */
+export const LS_KEY_KINEMATICS_LIST_HEIGHT = 'rv-kinematics-list-height';
+
+/** The kinematics list height the user asked for: the persisted resize
+ *  (clamped to the bounds) or the default. */
+export function getStoredKinematicsListHeight(): number {
+  try {
+    const raw = localStorage.getItem(LS_KEY_KINEMATICS_LIST_HEIGHT);
+    if (raw != null) {
+      const n = Number(raw);
+      if (Number.isFinite(n))
+        return Math.max(KINEMATICS_LIST_MIN_HEIGHT, Math.min(KINEMATICS_LIST_MAX_HEIGHT, n));
+    }
+  } catch { /* storage unavailable — fall through to default */ }
+  return KINEMATICS_LIST_HEIGHT;
+}
+
+/** Default height of the groups list inside the Quick Edit window (plan-760). */
+export const GROUPS_LIST_HEIGHT = 240;
+
+/** Resize bounds for the groups list — same role as the kinematics bounds:
+ *  the panel clamps the shown height to its scroll container, MAX only guards
+ *  against garbage in storage. */
+export const GROUPS_LIST_MIN_HEIGHT = 120;
+export const GROUPS_LIST_MAX_HEIGHT = 1200;
+
+/** localStorage key for the user-resized groups list height. */
+export const LS_KEY_GROUPS_LIST_HEIGHT = 'rv-groups-list-height';
+
+/** The groups list height the user asked for: the persisted resize (clamped
+ *  to the bounds) or the default. */
+export function getStoredGroupsListHeight(): number {
+  try {
+    const raw = localStorage.getItem(LS_KEY_GROUPS_LIST_HEIGHT);
+    if (raw != null) {
+      const n = Number(raw);
+      if (Number.isFinite(n))
+        return Math.max(GROUPS_LIST_MIN_HEIGHT, Math.min(GROUPS_LIST_MAX_HEIGHT, n));
+    }
+  } catch { /* storage unavailable — fall through to default */ }
+  return GROUPS_LIST_HEIGHT;
+}
+
 /** Default width of the CONNECT panel (resizable — see getStoredConnectPanelWidth). */
 export const CONNECT_PANEL_WIDTH = 360;
 

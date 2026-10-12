@@ -20,7 +20,8 @@
  * BehaviorManager discovery keeps every current test green.
  */
 
-import type { ComponentSchema } from '../engine/rv-component-registry';
+import type { ComponentSchema, PickMode } from '../engine/rv-component-registry';
+import type { BakeRole } from '../engine/rv-bake-chunk';
 import type { RVBindContext } from '../behavior-runtime';
 import type { Behavior } from '../behaviors';
 import {
@@ -152,6 +153,19 @@ export interface MaterialFlowDefinition<
   readonly models?: string[];
   /** Component schema (same shape as rv-component-registry; applySchema reused). */
   readonly schema: ComponentSchema;
+  /**
+   * Bake role of the node this component sits on (plan-753 §2.3). Default
+   * `merge` = its geometry joins the enclosing chunk. A component that MOVES its
+   * own node (an Agv riding a path) must declare `chunk`, otherwise the
+   * destructive bake welds its body into the static chunk and nothing visible moves.
+   */
+  readonly bake?: BakeRole;
+  /**
+   * Pointer interaction of the node this component sits on. Default `none`.
+   * `select` makes it clickable like a drive — needed by a component whose node
+   * is an object of its own (a vehicle) rather than part of a machine.
+   */
+  readonly pick?: PickMode;
   /** Derive the DES adapter capacity from validated instance configuration. */
   readonly capacity?: (self: S) => number;
   /**

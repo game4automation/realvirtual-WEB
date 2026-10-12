@@ -4,8 +4,9 @@
 import { Object3D, Vector3, Quaternion, Euler, MathUtils } from 'three';
 import { DriveDirection, directionToGltfAxis, isRotation } from './rv-coordinate-utils';
 import type { ComponentSchema, ComponentContext, RVComponent } from './rv-component-registry';
-import { registerComponentSchema, registerCapabilities, loadSchemaFromSpec } from './rv-component-registry';
+import { registerComponentSchema, registerCapabilities, loadSchemaFromSpec, setComponentInstance } from './rv-component-registry';
 import { MM_TO_METERS } from './rv-constants';
+import { RV_DRIVE_HOME_KEY } from './rv-pre-bake-keys';
 import { parentScaleAlong } from './rv-drive-units';
 import { getDriveSpeedOverride } from './rv-speed-override';
 import {
@@ -104,6 +105,40 @@ export function computeRampedSpeed(
  */
 const SMOOTH_JOG_SENTINEL = 1e6;
 
+/**
+ * True when something OUTSIDE the viewer owns this drive's position — the number
+ * on the axis is a measurement now, not a command, and any internal controller
+ * writing a set-point to it must stand down.
+ *
+ * Three ways that happens, and they mean the same thing to a caller:
+ *
+ *  - `positionOverwrite`: a recording, a multiuser follower, an axis handed to
+ *    another owner;
+ *  - `liveControlled`: live signal bindings own the drive's command slots;
+ *  - a drive behavior with a BOUND position slot — a `Drive_FollowPosition`
+ *    wired to the real drive's position, which is exactly the state a
+ *    commissioned machine arrives in.
+ *
+ * The behavior list is tested structurally, so a component that follows an
+ * external position under another name is picked up without a registry of types
+ * here. (`Array.isArray` because the ribbon fixtures register stand-in drives
+ * that implement only the members a roller reads.)
+ */
+export function isDriveExternallyCommanded(drive: {
+  positionOverwrite?: boolean;
+  liveControlled?: boolean;
+  driveBehaviors?: unknown;
+}): boolean {
+  if (drive.positionOverwrite || drive.liveControlled) return true;
+  const behaviors = drive.driveBehaviors;
+  if (!Array.isArray(behaviors)) return false;
+  for (const behavior of behaviors) {
+    const slot = (behavior as { Position?: unknown } | null)?.Position;
+    if (typeof slot === 'string' && slot.length > 0) return true;
+  }
+  return false;
+}
+
 /** Move a signed scalar toward a target without overshooting. */
 function moveTowards(current: number, target: number, maxDelta: number): number {
   if (current < target) return Math.min(target, current + maxDelta);
@@ -180,6 +215,17 @@ export class RVDrive implements RVComponent {
   targetPosition = 0;
   targetSpeed = 0;
   isRunning = false;
+  /** Direction of the last positioning / smooth / overwrite move (+1 or -1).
+   *  `currentSpeed` stays a magnitude there (plan-281 Phase 4); the jog path
+   *  carries its sign in `currentSpeed` itself and resets this to +1. */
+  private _moveSign = 1;
+
+  /** Signed speed in mm/s, negative while moving toward lower positions —
+   *  Unity `Drive.CurrentSpeed` semantics. Read by TransportSurface so a belt
+   *  driven backward with DriveTo transports backward. */
+  get signedSpeed(): number {
+    return this.currentSpeed * this._moveSign;
+  }
 
   /** Continuous forward motion at targetSpeed. Seeded from the authored
    *  `JogForward` at init/reset; also set live by Drive_Simple signals / jog UI. */
@@ -213,8 +259,47 @@ export class RVDrive implements RVComponent {
 
   /** When true, update() skips physics and only applies transform (for DrivesPlayback) */
   positionOverwrite = false;
+  /**
+   * Set by a drive behavior during THIS tick's behavior pass to say it has just
+   * written `currentPosition` from an external command, so the drive's own jog
+   * and positioning must stay out of the way until the next tick.
+   *
+   * Cleared at the top of every behavior pass, so it cannot latch: a command
+   * signal that goes away hands the axis back on the very next tick.
+   */
+  positionClaimedThisTick = false;
   /** Previous position for computing speed in overwrite mode */
   private _prevOverwritePos = 0;
+
+  // ── Motion contract (plan-554 F3c) — read-only for consumers ──────────────
+  /**
+   * Signed distance (mm) / angle (deg) the drive actually TRAVELLED in its last `update()`,
+   * before any wrap at the limits (an endless axis that crosses `UpperLimit` reports the real
+   * step, not the jump back to `LowerLimit`). Counts: the motion integration (positioning, jog,
+   * smooth core), a coupled behavior that moves the axis without claiming it (`Drive_Gear`) and
+   * positions streamed in overwrite mode (playback, IK path). Not counted: a discontinuity.
+   */
+  stepTravel = 0;
+  /** Running sum of {@link stepTravel} — unwrapped, so several turns stay representable. */
+  travelOdometer = 0;
+  /**
+   * Incremented whenever `currentPosition` is set from OUTSIDE the motion integration: a direct
+   * write between two updates (DES, a cylinder homing, Erratic), a behavior that claims the axis
+   * with a forced position (`Drive_FollowPosition`), `reset()`, `applySyncData()` and
+   * `setPreviewPosition()`. The cinematic motion blur holds a node whose drive changed this
+   * counter during a frame instead of smearing it across the jump.
+   */
+  discontinuityRev = 0;
+  /** `currentPosition` at the end of the last update (detects writes between updates). */
+  private _motionLastPos = 0;
+  /** Position shift the smooth core's wrap applied during this update (added back to the travel). */
+  private _stepWrap = 0;
+
+  /** Marks an external (non-integrated) position change — see {@link discontinuityRev}. */
+  private markDiscontinuity(): void {
+    this.discontinuityRev++;
+    this._motionLastPos = this.currentPosition;
+  }
   /** Previous tick had an active jog command (Unity `_lastjog` parity). */
   private _wasJogging = false;
   /** Jog command was released and the drive is decelerating to zero. */
@@ -257,6 +342,16 @@ export class RVDrive implements RVComponent {
    *  {@link addAfterUpdate}; remove via {@link removeAfterUpdate}. */
   private readonly afterUpdateCallbacks: ((drive: RVDrive) => void)[] = [];
   private behaviorChangedThisTick = false;
+
+  /**
+   * True when a drive behavior claimed the axis this tick ({@link positionClaimedThisTick})
+   * AND actually changed the drive state ({@link markBehaviorChanged}) — i.e. the
+   * geometry moved without `isRunning`. A claimed but resting axis reports false,
+   * so it does not keep the on-demand renderer awake.
+   */
+  get claimedMoveThisTick(): boolean {
+    return this.positionClaimedThisTick && this.behaviorChangedThisTick;
+  }
 
   /** Mark that a behavior changed drive state without arming drive physics. */
   markBehaviorChanged(): void {
@@ -304,6 +399,7 @@ export class RVDrive implements RVComponent {
   constructor(node: Object3D) {
     this.node = node;
     this.name = node.name;
+    setComponentInstance(node, this);
   }
 
   /** Home (authored) local position captured at `initDrive` — the node's pose
@@ -349,6 +445,7 @@ export class RVDrive implements RVComponent {
    *  limit ticks — in sync). IMPLEMENTS DriveGizmoSource::setPreviewPosition */
   setPreviewPosition(pos: number): void {
     this.currentPosition = pos;
+    this.markDiscontinuity();
   }
 
   //! IMPLEMENTS DriveGizmoSource::setPreviewHome
@@ -371,9 +468,20 @@ export class RVDrive implements RVComponent {
   initDrive(): void {
     this.isRotary = isRotation(this.Direction);
 
-    // Store base transform
-    this.basePosition.copy(this.node.position);
-    this.baseQuaternion.copy(this.node.quaternion);
+    // Store base transform. plan-754 D18: on the destructive pipeline the
+    // `Drive` pre-bake hook stamped the AUTHORED home pose into `userData`
+    // before anything could move the node (the kinematic re-parent rewrites the
+    // local TRS of an axis it attaches). Prefer it; every other load path has no
+    // such stamp and reads the live transform exactly as before.
+    const home = this.node.userData?.[RV_DRIVE_HOME_KEY] as
+      { p?: number[]; q?: number[] } | undefined;
+    if (home && Array.isArray(home.p) && Array.isArray(home.q)) {
+      this.basePosition.set(home.p[0], home.p[1], home.p[2]);
+      this.baseQuaternion.set(home.q[0], home.q[1], home.q[2], home.q[3]);
+    } else {
+      this.basePosition.copy(this.node.position);
+      this.baseQuaternion.copy(this.node.quaternion);
+    }
 
     // Compute axis
     const rawAxis = directionToGltfAxis(this.Direction);
@@ -384,6 +492,7 @@ export class RVDrive implements RVComponent {
 
     // Set initial position (matches Unity Drive.Start(): CurrentPosition = StartPosition)
     this.currentPosition = this.StartPosition;
+    this._motionLastPos = this.currentPosition;
     this.targetSpeed = this.TargetSpeed;
 
     // Seed the runtime jog flags from the authored inspector values so drives
@@ -431,6 +540,7 @@ export class RVDrive implements RVComponent {
       IsAtTarget: this.isAtTarget,
       TargetPosition: this.targetPosition,
       TargetSpeed: this.targetSpeed,
+      MotionBlocked: this.motionBlocked,
       JogForward: this.jogForward,
       JogBackward: this.jogBackward,
     };
@@ -498,6 +608,22 @@ export class RVDrive implements RVComponent {
     this._smoothPlanned = false;
   }
 
+  private readonly _motionBlocks = new Set<object>();
+
+  /** True while a simulation interlock prevents this axis from moving. */
+  get motionBlocked(): boolean { return this._motionBlocks.size > 0; }
+
+  /** Hold this axis for an interlock owner; releasing it does not issue a start command. */
+  setMotionBlocked(owner: object, blocked: boolean): void {
+    if (blocked) {
+      if (this._motionBlocks.has(owner)) return;
+      this._motionBlocks.add(owner);
+      this.stop();
+    } else {
+      this._motionBlocks.delete(owner);
+    }
+  }
+
   stop() {
     this.isRunning = false;
     this.currentSpeed = 0;
@@ -529,11 +655,48 @@ export class RVDrive implements RVComponent {
     this._smoothEffectiveTarget = Number.NaN;
   }
 
-  /** Update drive physics - called every fixed timestep */
+  /**
+   * Update drive physics - called every fixed timestep. Also maintains the read-only motion
+   * contract (plan-554 F3c): {@link stepTravel}, {@link travelOdometer}, {@link discontinuityRev}.
+   */
   update(dt: number) {
+    const start = this.currentPosition;
+    this.stepTravel = 0;
+    this._stepWrap = 0;
+    // A write between two updates: streamed (overwrite mode) = motion, anything else = a jump.
+    const external = start - this._motionLastPos;
+    if (external !== 0) {
+      if (this.positionOverwrite) this.stepTravel += external;
+      else this.discontinuityRev++;
+    }
+    this.updateMotion(dt);
+    // `_stepWrap` is the shift the wrap applied (−range across UpperLimit) — added back so the
+    // travel is the real step, not the jump to the other end.
+    const delta = this.currentPosition - start - this._stepWrap;
+    if (delta !== 0) {
+      // A behavior that CLAIMED the axis forced the position (signal / hold) — a discontinuity.
+      if (this.positionClaimedThisTick) this.discontinuityRev++;
+      else this.stepTravel += delta;
+    }
+    this.travelOdometer += this.stepTravel;
+    this._motionLastPos = this.currentPosition;
+  }
+
+  /** The drive physics of one fixed timestep (behaviors, overwrite, jog, positioning). */
+  private updateMotion(dt: number) {
+    // Per-tick behavior flags are cleared before ANY early return, so a drive
+    // that stops running its behaviors (not owner, blocked, overwrite) can never
+    // report a stale claim/change — CoreSubsystems.drives() reads them for the
+    // on-demand render flag and a latched value would keep the renderer awake.
+    this.behaviorChangedThisTick = false;
+    this.positionClaimedThisTick = false;
     // When not owner (multiuser client), skip ALL local physics.
     // Positions are applied directly via applySyncData() from multiuser channel.
     if (!this.isOwner) return;
+    if (this.motionBlocked) {
+      this.stop();
+      return;
+    }
 
     // Early-return for completely idle drives (no motion, no behaviors)
     if (this.isIdle) return;
@@ -541,7 +704,9 @@ export class RVDrive implements RVComponent {
     if (this.positionOverwrite) {
       // Derive speed from position change so charts show meaningful data
       if (dt > 0) {
-        this.currentSpeed = Math.abs(this.currentPosition - this._prevOverwritePos) / dt;
+        const delta = this.currentPosition - this._prevOverwritePos;
+        this.currentSpeed = Math.abs(delta) / dt;
+        if (delta !== 0) this._moveSign = delta < 0 ? -1 : 1;
         this._prevOverwritePos = this.currentPosition;
       }
       // The core is NOT advanced while an external authority writes the
@@ -556,9 +721,19 @@ export class RVDrive implements RVComponent {
     }
 
     // Call drive behaviors first (mirrors Unity: Drive.CalcFixedUpdate calls IDriveBehavior[])
-    this.behaviorChangedThisTick = false;
     for (const behavior of this.driveBehaviors) {
       behavior.update(dt);
+    }
+
+    // A behavior that FOLLOWED an external position command owns the axis for
+    // this tick. Without this the drive's own jog — an authored `JogForward`,
+    // say — would integrate straight over the position the behavior just wrote,
+    // and a drive wired to a real controller would visibly fight it. Same rule
+    // as `positionOverwrite` above, decided one tick at a time because a command
+    // signal can be connected and disconnected while the model runs.
+    if (this.positionClaimedThisTick) {
+      this.dispatchAfterUpdate();
+      return;
     }
 
     // Central master speed override (1 = normal). Scales every drive's effective
@@ -593,6 +768,7 @@ export class RVDrive implements RVComponent {
     }
 
     const dir = Math.sign(dist);
+    this._moveSign = dir < 0 ? -1 : 1;
     const speed = this.targetSpeed * speedOverride;
 
     this.currentSpeed = computeRampedSpeed(
@@ -619,6 +795,7 @@ export class RVDrive implements RVComponent {
   private updateJog(dt: number, speedOverride: number): void {
     // Smooth jog: arm/re-arm a far target while held, plan a braking profile on
     // release. Falls through to the trapezoidal jog when no provider is loaded.
+    this._moveSign = 1; // jog carries its sign in currentSpeed (smooth jog too)
     if (this.smoothRequested && this.updateSmoothJog(dt, speedOverride)) return;
 
     const jogging = this.jogForward || this.jogBackward;
@@ -871,7 +1048,9 @@ export class RVDrive implements RVComponent {
     // direction lives in the position delta there and must keep doing so, or
     // every DriveBehaviour feedback slot and TransportSurface flips sign on a
     // backward move (plan-281 Phase 4, signed-velocity regression).
-    this.currentSpeed = Math.abs(this.smoothWallClockVelocity(override));
+    const velocity = this.smoothWallClockVelocity(override);
+    this.currentSpeed = Math.abs(velocity);
+    if (velocity !== 0) this._moveSign = velocity < 0 ? -1 : 1;
     this.currentPosition = this.applySmoothLimits(provider, this._smoothSnapshot.position);
 
     if (this._smoothSnapshot.finished) {
@@ -998,11 +1177,13 @@ export class RVDrive implements RVComponent {
       if (position > this.UpperLimit) {
         provider.shiftPosition(this._smoothHandle, -range);
         this._smoothEffectiveTarget -= range;
+        this._stepWrap -= range;
         return position - range;
       }
       if (position < this.LowerLimit) {
         provider.shiftPosition(this._smoothHandle, range);
         this._smoothEffectiveTarget += range;
+        this._stepWrap += range;
         return position + range;
       }
       return position;
@@ -1062,6 +1243,7 @@ export class RVDrive implements RVComponent {
    */
   applySyncData(position: number, speed?: number): void {
     this.currentPosition = position;
+    this.markDiscontinuity();
     if (speed !== undefined) this.currentSpeed = speed;
     // Externally written position — the core must be re-seeded before it plans
     // again (plan-281 §2.7 Multiuser/Live-Sync).
@@ -1112,6 +1294,9 @@ export class RVDrive implements RVComponent {
    */
   reset(): void {
     this.currentPosition = this.StartPosition;
+    this.markDiscontinuity();
+    this.travelOdometer = 0; // a fresh run counts from zero (deterministic per run)
+    this.stepTravel = 0;
     this.targetPosition = this.StartPosition;
     this.currentSpeed = 0;
     this.isRunning = false;
@@ -1191,15 +1376,8 @@ registerComponentSchema('Drive', RVDrive.schema);
 
 // Register capabilities for Drive
 registerCapabilities('Drive', {
-  hoverable: true,
-  selectable: true,
-  inspectorVisible: true,
+  pick: 'select',
+  bake: 'chunk',      // the mover: its subtree is one chunk that moves as a unit
   authorable: true,   // addable in the asset editor; constructed by the loader on reload
-  tooltipType: 'drive',
-  badgeColor: '#4fc3f7',
-  filterLabel: 'Drives',
-  hoverEnabledByDefault: true,
-  exclusiveHoverGroup: true,
-  hoverPriority: 10,
-  pinPriority: 5,
+  ui: { tooltip: 'drive', badge: '#4fc3f7', filter: 'Drives', category: 'drives', priority: 10 },
 });

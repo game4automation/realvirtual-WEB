@@ -25,6 +25,7 @@ import {
   type PlannerHarness,
 } from './_layout-planner-async-harness';
 import { ModelCache, resolvedCacheKey } from '../src/plugins/layout-planner/model-cache';
+import { createPickBuildPort } from '../src/core/engine/rv-pick-build-port';
 import {
   registerLibrarySourceProvider,
   resetLibrarySourceRegistryForTests,
@@ -117,9 +118,35 @@ function makeProjectLoader() {
 /** Swap the harness's URL-oriented cache for one that answers the blob url. */
 function withProjectCache(h: PlannerHarness) {
   const ctl = makeProjectLoader();
-  const cache = new ModelCache(ctl.loader as never);
-  (h.plugin as unknown as { _modelCache: ModelCache })._modelCache = cache;
+  // Same seam as the harness's own cache (plan-756): the bake AWAITS its
+  // pick-structure builds, and without the inline port every placement goes
+  // to the shared REAL worker pool — ~170 ms per bake, which no `flush()`
+  // can wait out. The swap assertions below would race that pool.
+  const cache = new ModelCache(ctl.loader as never, {
+    pickPort: () => createPickBuildPort({ createWorker: () => null }),
+  });
+  h.plugin.placements.setModelCache(cache);
   return { ...ctl, cache };
+}
+
+/**
+ * Wait until the pending load of `id` left the 'loading' state — the swap
+ * (status gone) or the failure (status 'error').
+ *
+ * Since plan-757 the pending load runs THE recipe (`prepareAndBake`: hooks,
+ * survival, materials, bake with its awaited pick build), and even with the
+ * inline pick port that chain settles one macrotask after the decode, not
+ * within a fixed number of microtask turns — so a `flush(N)` is a race, while
+ * the registry's own status is the real join signal (same shape as
+ * `waitForThumbnail` in the harness).
+ */
+async function untilSettled(p: ReturnType<typeof internals>, id: string, timeoutMs = 2000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (p._pending.statusOf(id) === 'loading') {
+    if (performance.now() > deadline) throw new Error('pending load of ' + id + ' never settled');
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  await flush();
 }
 
 type SavedHandler = (e: { relPath?: string }) => void;
@@ -155,7 +182,7 @@ describe('plan-723 §9.5 — registry entry placement', () => {
     // The placeholder is registered synchronously — that part is unchanged.
     expect(p._objectMap.get(id)).toBeDefined();
 
-    await flush(12);
+    await untilSettled(p, id);
 
     // Resolved exactly once, decoded exactly once, and the placeholder was
     // swapped for real geometry rather than painted as failed.
@@ -243,7 +270,10 @@ describe('plan-723 §9.5 — registry entry placement', () => {
     // above all no reach for the revoked handle sitting in `comp.glbUrl`.
     expect(project.resolves).toEqual([BELT_ID]);
     expect(loader.decodes).toEqual([RESOLVED_URL]);
-    expect(h.store.placed.find(c => c.id === copyId)!.label).toBe('Belt (copy)');
+    // plan-758: ONE name — the copy of `ProjectBeltRoot` (the GLB root name,
+    // which wins over the catalog label) is the next free sibling name.
+    expect(h.store.placed.find(c => c.id === copyId)!.label).toBe('ProjectBeltRoot_1');
+    expect(p._objectMap.get(copyId!)!.name).toBe('ProjectBeltRoot_1');
   });
 
   it('copySelected skips a project placement whose document left the project', async () => {

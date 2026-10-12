@@ -76,6 +76,7 @@ function snapshot(mechanismPath: string, value = 0): MechanismForcesSnapshot {
       forceWorld: [1, 2, 3], torqueWorld: [4, 5, 6],
       originWorld: [0, 0, 0], axisWorld: [0, 0, 1],
     }],
+    externalLoadN: [],
   };
 }
 
@@ -93,7 +94,9 @@ class FakeBridge implements MechanismUiBridge {
     return this.paths.map((nodePath) => ({
       nodePath, name: nodePath, active: true, converged: true, residualError: 0,
       solveTimeMs: 0, disabledReason: '', jointCount: 1, linkCount: 1, loopCount: 0, dof: 1,
-      joints: [], links: [], findings: [],
+      // plan-472: this double is about the force RECORDER; a centre of gravity is another
+      // subsystem's answer and `null` is the honest stand-in for "not produced here".
+      joints: [], links: [], cog: null, findings: [],
     }));
   }
   validate() { return []; }

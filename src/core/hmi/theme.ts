@@ -2,7 +2,7 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { createTheme, type Theme } from '@mui/material/styles';
-import { CHIP_RADIUS } from './shared-sx';
+import { ACCENT, CHIP_RADIUS, ERROR, SECONDARY, SUCCESS, WARN } from './shared-sx';
 
 /** Create a branded theme with custom primary/secondary colors. */
 export function createBrandedTheme(primary?: string, secondary?: string): Theme {
@@ -19,11 +19,12 @@ export function createBrandedTheme(primary?: string, secondary?: string): Theme 
 export const rvDarkTheme = createTheme({
   palette: {
     mode: 'dark',
-    primary:    { main: '#4fc3f7' },
-    secondary:  { main: '#e94078' },
-    success:    { main: '#66bb6a' },
-    warning:    { main: '#ffa726' },
-    error:      { main: '#ef5350' },
+    // One hex source: the values live in shared-sx.ts (plan-510).
+    primary:    { main: ACCENT },
+    secondary:  { main: SECONDARY },
+    success:    { main: SUCCESS },
+    warning:    { main: WARN },
+    error:      { main: ERROR },
     background: {
       default: 'rgba(0, 0, 0, 0)',
       // Brightest of three tiers — the glassy default for everything FLOATING
@@ -48,7 +49,7 @@ export const rvDarkTheme = createTheme({
         // element; MUI's ripple-based focus is invisible on glass surfaces.
         // :focus-visible keeps pointer clicks ring-free.
         ':focus-visible': {
-          outline: '2px solid #4fc3f7',
+          outline: `2px solid ${ACCENT}`,
           outlineOffset: '1px',
         },
         // Increase base font size on touch devices so UI is readable on phones
@@ -96,7 +97,7 @@ export const rvDarkTheme = createTheme({
           // ButtonBase resets `outline: 0` with the same specificity as the
           // global :focus-visible rule — restore the ring where it matters most.
           '&:focus-visible': {
-            outline: '2px solid #4fc3f7',
+            outline: `2px solid ${ACCENT}`,
             outlineOffset: '1px',
           },
         },

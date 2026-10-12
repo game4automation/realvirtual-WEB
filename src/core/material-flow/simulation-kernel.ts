@@ -116,6 +116,12 @@ export interface SimDesComponentStat {
   readonly blocked: number;
   readonly empty: number;
   readonly failure: number;
+  /** Time share driving between stops (vehicles), 0–100. Absent for producers that do not track it. */
+  readonly transport?: number;
+  /** plan-558: time share driving below the free profile because of traffic (vehicles), 0–100. */
+  readonly slowed?: number;
+  /** plan-558: time share standing at a traffic stop (vehicles, free time), 0–100. */
+  readonly stopped?: number;
   /** Utilization 0–100 (100 − free-state time). */
   readonly utilization: number;
   readonly outputPerHour: number;

@@ -21,7 +21,7 @@ import { SignalBadge, type SignalDirection } from './rv-signal-badge';
 
 export function SignalListItem({
   viewer, name, direction, plcType, address, dataType, comment, raw, onClick, sx, role, ariaLabel,
-  interfaceId, topic, origin,
+  interfaceId, topic, origin, unit,
   optionId, ariaSelected, ariaDisabled, ariaSetSize, ariaPosInSet, ariaDescribedBy,
 }: {
   viewer?: RVViewer;
@@ -45,6 +45,8 @@ export function SignalListItem({
   interfaceId?: string;
   topic?: string;
   origin?: 'connect' | 'internal';
+  /** Unit of the signal's raw value (plan-512 F9) — a small chip after the name. */
+  unit?: string;
   /**
    * Listbox ARIA, set when this row is an OPTION of a combobox-controlled list
    * (SignalSearchOverlay, plan-341 §2.8 d). They belong on the element that
@@ -84,6 +86,19 @@ export function SignalListItem({
       <Box sx={{ flex: 1, minWidth: 0 }}>
         <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.85)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {name}
+          {unit && (
+            <Box
+              component="span"
+              data-testid="signal-unit-chip"
+              title={`Unit of the signal: ${unit}`}
+              sx={{
+                ml: 0.5, px: 0.5, borderRadius: 0.5, fontSize: 9, fontFamily: 'monospace',
+                color: 'rgba(255,255,255,0.6)', border: '1px solid rgba(255,255,255,0.18)',
+              }}
+            >
+              {unit}
+            </Box>
+          )}
         </Typography>
         {subtitle && (
           <Typography noWrap sx={{ fontSize: 9, color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis' }}>

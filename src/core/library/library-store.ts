@@ -36,6 +36,7 @@ import {
   type LibraryOrigin,
   type LibrarySnapshot,
 } from './library-types';
+import { isSha256, setAssetHash } from './rv-asset-hash-registry';
 
 // ─── URL / entry normalization (moved verbatim) ─────────────────────────
 
@@ -51,6 +52,25 @@ export function resolveUrl(base: string, relative: string): string {
     const b = base.endsWith('/') ? base : base + '/';
     return b + relative.replace(/^\.\//, '');
   }
+}
+
+/**
+ * Carry a catalog entry's `sha256` / `sizeBytes` over to the normalized entry
+ * and record them in the url → hash registry under the RESOLVED url (plan-508
+ * F4) — the url every loader will ask with. A malformed or absent hash sets
+ * nothing: the load then keeps the url-keyed, revalidating cache path.
+ */
+function withAssetHash(
+  entry: LibraryCatalogEntry,
+  raw: Partial<LibraryCatalogEntry>,
+  url: string,
+): LibraryCatalogEntry {
+  if (!isSha256(raw.sha256)) return entry;
+  entry.sha256 = raw.sha256;
+  const size = typeof raw.sizeBytes === 'number' && Number.isFinite(raw.sizeBytes) ? raw.sizeBytes : undefined;
+  if (size !== undefined) entry.sizeBytes = size;
+  if (url) setAssetHash(url, size !== undefined ? { sha256: raw.sha256, sizeBytes: size } : { sha256: raw.sha256 });
+  return entry;
 }
 
 /** Auto-fill missing fields on a catalog entry. */
@@ -90,7 +110,7 @@ export function normalizeCatalogEntry(
     const thumbnailUrl = raw.thumbnailUrl
       ? resolveUrl(baseUrl, raw.thumbnailUrl)
       : '';
-    return {
+    return withAssetHash({
       id,
       name,
       category: raw.category ?? 'splat',
@@ -101,7 +121,7 @@ export function normalizeCatalogEntry(
       pivotToFloor: raw.pivotToFloor,
       plugin: raw.plugin,
       collections: raw.collections,
-    };
+    }, raw, splatUrl);
   }
 
   const glbUrlRaw = raw.glbUrl ?? '';
@@ -114,7 +134,7 @@ export function normalizeCatalogEntry(
   const thumbnailUrl = raw.thumbnailUrl
     ? resolveUrl(baseUrl, raw.thumbnailUrl)
     : '';
-  return {
+  return withAssetHash({
     id,
     name,
     category,
@@ -125,7 +145,7 @@ export function normalizeCatalogEntry(
     pivotToFloor: raw.pivotToFloor,
     plugin: raw.plugin,
     collections: raw.collections,
-  };
+  }, raw, glbUrl);
 }
 
 // ─── GitHub repository scanning (moved verbatim) ────────────────────────

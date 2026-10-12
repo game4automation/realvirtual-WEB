@@ -4,15 +4,20 @@
 /**
  * End-to-end: GLB object references to kinematic-group members survive the
  * full loadGLB pipeline. Unity serializes references (e.g. instruction
- * targetObjects) as authoring-hierarchy paths; Phase 8b re-parents group
- * members under their Kinematic node, so Phase 8c must keep the pre-reparent
- * paths resolvable by registering them as registry aliases.
+ * targetObjects) as authoring-hierarchy paths; the `Kinematic` pre-bake hook
+ * re-parents group members under their Kinematic node on `tmp`, so the baked
+ * asset's alias table (plan-757 D4) must keep the pre-reparent paths
+ * resolvable — registered as registry aliases when the template is placed.
+ * (Until plan-757 Phase 3 commit B the runtime init re-parented itself and
+ * loader Phase 8c registered the aliases; both are gone.)
  */
 
 import { describe, it, expect } from 'vitest';
 import { Scene, Object3D, Mesh, BoxGeometry, MeshBasicMaterial } from 'three';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { loadGLB } from '../src/core/engine/rv-scene-loader';
+import { BakeRegistry } from '../src/core/engine/rv-bake-registry';
+import { createPickBuildPort } from '../src/core/engine/rv-pick-build-port';
 import type { RVCustomRuntimeInstruction } from '../src/core/engine/rv-custom-runtime-instruction';
 
 /** Build a GLB mirroring the Unity export: a Kinematic that integrates group
@@ -51,20 +56,29 @@ async function buildGLB(): Promise<ArrayBuffer> {
 }
 
 describe('GLB round-trip: instruction target on a kinematic-group member', () => {
-  it('authoring path still resolves after kinematic re-parenting (Phase 8c alias)', async () => {
+  it('authoring path still resolves after the hook re-parented on tmp (baked asset alias, plan-757 D4)', async () => {
     const data = await buildGLB();
     const scene = new Scene();
     const result = await loadGLB('kinematic-instruction-ref.glb', scene, {
       data,
-      preserveHierarchy: true,
+      bakeRegistry: new BakeRegistry(),
+      bakePickPort: createPickBuildPort({ createWorker: () => null }),
+      // `Part` carries only a `Group` and would merge into Kine's chunk; the
+      // claim keeps it a node so the authored path has something to resolve to.
+      bakeClaims: [{ path: 'OldParent/Part', role: 'chunk' }],
     });
+    expect(result.bakedAsset).not.toBeNull();
     const registry = result.registry;
 
-    // Kinematic re-parenting happened: Part now lives under Kine.
+    // Kinematic re-parenting happened (in `prepare`): Part now lives under Kine.
     let part: Object3D | null = null;
     result.root.traverse((n) => { if (n.name === 'Part') part = n; });
     expect(part).not.toBeNull();
     expect((part as unknown as Object3D).parent?.name).toBe('Kine');
+    // The alias travelled on the asset (D4), asset-relative. (The fixture's
+    // root is the unnamed glTF scene, so the recipe spells it `/OldParent/Part`;
+    // the registry resolves the authored spelling either way — asserted below.)
+    expect(result.bakedAsset!.aliases.map((a) => a.path.replace(/^\//, ''))).toContain('OldParent/Part');
 
     // The canonical registry path is the post-reparent one...
     const canonical = registry.getPathForNode(part as unknown as Object3D);

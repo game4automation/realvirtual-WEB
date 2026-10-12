@@ -171,12 +171,22 @@ describe('applySnapshot', { timeout: 60000 }, () => {
     expect(first.seeded).toEqual(['acme', 'demo-realvirtual']);
     expect(readFileSync(join(fresh, 'projects/acme/models/machine.glb'), 'utf8')).toBe('model-v1');
 
-    // (b) A repository with history but NO delivery tag is still a first
-    //     delivery: the tag is the evidence, not the commit.
+    // (b) A repository with history but NO delivery tag is NOT a first delivery
+    //     (6.3.37): `firstDelivery` means SEED EVERYTHING and is tied to an empty
+    //     remote alone, so a customer whose tags were never pushed - or were
+    //     pruned - does not have their edited project folders replaced. Such a
+    //     repository is its own case: `untagged`, seeding folder by folder only
+    //     what is genuinely absent.
     const untagged = emptyClone(root, 'untagged');
     write(join(untagged, 'README.md'), '# theirs\n');
     commit(untagged, 'customer state');
-    expect(applySnapshot(staged, untagged, { version: '1.0.0', ...QUIET }).firstDelivery).toBe(true);
+    const untaggedSummary = applySnapshot(staged, untagged, { version: '1.0.0', ...QUIET });
+    expect(untaggedSummary.firstDelivery).toBe(false);
+    expect(untaggedSummary.untagged).toBe(true);
+    // Nothing of ours exists there yet, so every staged folder is absent and is
+    // seeded - the same files, reached by the absent-folder rule, not by "first".
+    expect(untaggedSummary.seeded).toEqual(['acme', 'demo-realvirtual']);
+    expect(untaggedSummary.replaced).toEqual([]);
 
     // (c) With a delivery tag it is NOT, and projects/ stays byte-identical —
     //     including a vendor folder that is missing on their side entirely.

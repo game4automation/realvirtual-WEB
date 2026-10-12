@@ -51,7 +51,7 @@ describe.skipIf(!hasDist)('bundle chunking (plan-271 9.8)', () => {
     const tslChunks = files.filter((f) => {
       const code = readFileSync(join(assetsDir, f), 'utf8');
       return TSL_MARKERS.some((m) => code.includes(m));
-    });
+    }, 60_000); // reads every emitted chunk of dist/ — I/O-bound, ~16 s on a dev machine
     expect(tslChunks.length, 'at least one async chunk carries the TSL code').toBeGreaterThan(0);
   });
 });

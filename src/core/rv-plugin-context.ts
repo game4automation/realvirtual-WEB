@@ -69,6 +69,10 @@ export interface ControlsFacade {
     zoomSpeed: number;
     dampingFactor: number;
     enabled: boolean;
+    /** Mouse-wheel zoom anchor: true = cursor (default), false = canvas centre. */
+    wheelZoomToCursor: boolean;
+    /** Orbit / pan anchor: false = fixed controls.target (default), true = surface point under the cursor. */
+    navigateAroundCursorPoint: boolean;
   }>): void;
 }
 
@@ -194,7 +198,10 @@ export class PluginContextImpl implements PluginContext {
     this.scene    = new SceneFacadeImpl(_viewer);
     this.camera   = new CameraFacadeImpl(_viewer);
     this.controls = new ControlsFacadeImpl(_viewer);
-    this.simLoop  = new SimLoopFacadeImpl(_viewer);
+    // Share the viewer's own sim loop: fixedUpdate() only runs the ticks of
+    // `viewer._simLoop`, so a private facade here (one per forPlugin() context)
+    // would accept onTick() subscriptions that never fire.
+    this.simLoop  = _viewer._simLoop ?? new SimLoopFacadeImpl(_viewer);
   }
 
   // ── Live getters: null vor loadModel(), neuer Pointer nach clearModel/loadModel ──

@@ -11,14 +11,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { FakeDir, asDirHandle } from './helpers/fake-fs-handles';
 import { createProjectFromScenes } from '../src/core/project/rv-project-create';
-import {
-  LS_KEY_RECENT_PROJECTS,
-  MAX_RECENT_PROJECTS,
-  forgetRecentProject,
-  listAvailableRecentProjects,
-  readRecentProjects,
-  recordRecentProject,
-} from '../src/core/project/rv-project-recent';
+import { LS_KEY_LINKED_PROJECTS } from '../src/core/project/rv-project-linked';
 import {
   deleteStoredHandle,
   projectHandleKey,
@@ -29,7 +22,7 @@ import {
   RV_PROJECT_SCHEMA_VERSION,
   sceneGlbRelPathFor,
 } from '../src/core/project/rv-project-types';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────
@@ -73,12 +66,12 @@ const cloneableHandle = (name: string) =>
 beforeEach(() => {
   bodies = new Map();
   clearAllScenes();
-  localStorage.removeItem(LS_KEY_RECENT_PROJECTS);
+  localStorage.removeItem(LS_KEY_LINKED_PROJECTS);
 });
 
 afterEach(() => {
   clearAllScenes();
-  localStorage.removeItem(LS_KEY_RECENT_PROJECTS);
+  localStorage.removeItem(LS_KEY_LINKED_PROJECTS);
 });
 
 // ─── scopeSceneMetas ────────────────────────────────────────────────────

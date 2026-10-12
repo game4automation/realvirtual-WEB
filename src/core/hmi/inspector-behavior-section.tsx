@@ -19,11 +19,12 @@
 import type { Object3D } from 'three';
 import { isPlacedLibraryAsset } from './layout-root-utils';
 import { runtimeRow, type RuntimeRowSpec } from './rv-component-section';
+import { LIVE, OCCUPIED } from './shared-sx';
 
 /** Accent color for "hot" (active / occupied) read-only values. */
-const LIVE_STATE_COLOR = '#4dd0e1';
+const LIVE_STATE_COLOR = LIVE;
 /** Accent color for an occupied sensor (amber, matches snap occupied). */
-const OCCUPIED_COLOR = '#e8b04a';
+const OCCUPIED_COLOR = OCCUPIED;
 
 // ─── Minimal viewer-shape contracts (tested without a real viewer) ──────
 export interface BehaviorViewerSnapshot {

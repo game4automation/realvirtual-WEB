@@ -27,9 +27,10 @@
 import { Box, Paper, Typography, Button, IconButton, Stack, Tooltip } from '@mui/material';
 import {
   Close, Download, Public, HourglassBottom, OpenInNew,
-  BookmarkAddOutlined, BookmarkAdded,
+  BookmarkAddOutlined, BookmarkAdded, Lock,
 } from '@mui/icons-material';
 import type { SharedGlbInfo } from './rv-share-meta';
+import { FS, ICON_SIZE, INK_LOW, INK_MID } from '../hmi/shared-sx';
 
 const ACCENT = '#4fc3f7';
 
@@ -166,6 +167,16 @@ export function SharedGlbInfoCard({
             </Stack>
           )}
 
+          {/* Encrypted — the link was opened with a password (plan-560). */}
+          {info.encrypted && (
+            <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mt: 0.5 }}>
+              <Lock sx={{ fontSize: ICON_SIZE.sm, color: INK_LOW }} />
+              <Typography data-testid="shared-glb-encrypted" sx={{ fontSize: FS.label, color: INK_MID }}>
+                Encrypted — opened with password
+              </Typography>
+            </Stack>
+          )}
+
           {info.embeddedOrigins.length > 0 && (
             <Tooltip
               title={info.embeddedOrigins.map(o => o.url ?? o.assetId).join('\n')}
@@ -220,7 +231,7 @@ export function SharedGlbInfoCard({
                   onClick={onDownload}
                   sx={{ fontSize: 11, textTransform: 'none', color: 'rgba(255,255,255,0.7)' }}
                 >
-                  GLB
+                  {info.encrypted ? 'Download (encrypted)' : 'GLB'}
                 </Button>
               )}
             </Stack>

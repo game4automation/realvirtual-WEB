@@ -54,8 +54,21 @@ import { fileURLToPath } from 'node:url';
 
 const PROJECT_MANIFEST_FILE = 'project.json';
 
-/** Bare specifiers a project script may import — resolved by the host bundle. */
-export const EXTERNAL_PACKAGES = ['three', 'react', 'react-dom', '@mui/material', '@mui/icons-material'];
+/**
+ * Bare specifiers a project script may import — resolved by the host bundle.
+ *
+ * `@rv/*` and `@rv-private/*` are the viewer's own source aliases (vite.config.ts). They
+ * belong here for the same reason `three` does: a project plugin that imports the viewer
+ * core expects THE viewer's modules (one component registry, one signal store), and
+ * inlining a second copy would be worse than failing. Without them every plugin that
+ * touches the core failed this compile outright and stopped its delivery — although the
+ * build glob (`projects/*\/plugins/**`) bundles exactly those plugins into the app, so the
+ * runtime artefact is only ever the fallback.
+ */
+export const EXTERNAL_PACKAGES = [
+  'three', 'react', 'react-dom', '@mui/material', '@mui/icons-material',
+  '@rv/*', '@rv-private/*',
+];
 
 // ─── Reference discovery ────────────────────────────────────────────────
 
@@ -200,8 +213,15 @@ async function main(argv) {
     console.error('--projects-root needs a directory.');
     return 2;
   }
+  // `rootIndex + 1` skips the VALUE of `--projects-root`. Guarded on the flag
+  // actually being present: with `rootIndex === -1` the expression is 0, which
+  // silently dropped the FIRST positional — so the documented
+  // `node compile-project-scripts.mjs <projectDir>` fell through to the default
+  // root, found nothing, and exited 0. A gate that answers "nothing to do" for
+  // the directory it was pointed at is worse than no gate (plan-479 Phase 7).
+  const skip = rootIndex >= 0 ? rootIndex + 1 : -1;
   const positional = argv.filter((token, index) =>
-    !token.startsWith('--') && index !== rootIndex + 1);
+    !token.startsWith('--') && index !== skip);
   const dirs = positional.length > 0
     ? positional.map((p) => resolve(p))
     : projectDirsUnder(root ?? resolve(dirname(fileURLToPath(import.meta.url)), '../projects'));

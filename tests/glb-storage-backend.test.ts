@@ -59,7 +59,7 @@ import {
   reportSceneConflict,
   type SceneSyncNotice,
 } from '../src/core/hmi/scene/rv-scene-live-sync';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import { writeSceneDocument } from './helpers/document-io';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────

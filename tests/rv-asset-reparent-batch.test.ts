@@ -223,7 +223,7 @@ describe('reparentNodesBatch — one op, one undo step', () => {
 });
 
 describe('reparentNodesBatch — cost per top-level op', () => {
-  it('emits ONE structure event and ONE BVH rebuild for 100 moves (legacy backend)', async () => {
+  it('emits ONE structure event and NO BVH rebuild for 100 moves (no merged pick groups since plan-753 Phase 4b)', async () => {
     const { viewer, model, register, events, rebuildGroupedBvh } = makeMockViewer();
     const parts = buildAssembly(model, 100);
     const target = new Group(); target.name = 'Link'; model.add(target);
@@ -235,10 +235,9 @@ describe('reparentNodesBatch — cost per top-level op', () => {
     await doc.reparentNodesBatch(parts.map((p) => NodeRegistry.computeNodePath(p)), 'Asset/Link');
 
     expect(events.filter((e) => e === 'editor-structure-changed')).toHaveLength(1);
-    // Measured against the SPY, not the classification helper — the helper only
-    // returns a boolean, so it cannot show how often a rebuild was requested
-    // (plan-359 §9.4, SOL-Runde 2 Finding 5).
-    expect(rebuildGroupedBvh).toHaveBeenCalledTimes(1);
+    // Pick membership is maintained inline by the instance pick index; the
+    // merged-group resync that used to fire once per transaction is gone.
+    expect(rebuildGroupedBvh).not.toHaveBeenCalled();
     doc.dispose();
   });
 

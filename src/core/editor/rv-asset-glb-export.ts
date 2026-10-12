@@ -29,10 +29,15 @@
  */
 
 import { Matrix4, Scene } from 'three';
+import { getSourceTemplateMaterial } from '../engine/rv-source';
+import { RVDrive } from '../engine/rv-drive';
+import { getComponentInstances } from '../engine/rv-component-registry';
 import type { Mesh, Object3D } from 'three';
+import { waitForMaterialTextures } from './rv-asset-material';
 import { objectToGlb } from '../import/rv-import-object';
 import { isGltfWrapperName } from '../engine/rv-gltf-unwrap';
 import { isUnresolvedReferenceNode } from '../engine/rv-asset-reference';
+import { isSensorRuntimeVizName } from '../engine/rv-sensor-viz-names';
 import {
   RV_CHAIN_ELEMENT,
   RV_CHAIN_PROXY,
@@ -43,6 +48,10 @@ import {
   RV_RIBBON_ROLL_SCALE,
 } from '../engine/rv-traverse-utils';
 import { RV_SHARE_KEY, RV_SHARE_VERSION, type RvShareMeta } from '../share/rv-share-meta';
+import {
+  binaryResources,
+  embedFmuBufferViews,
+} from '../engine/rv-binary-resources';
 import {
   RV_CLASSIFICATION_KEY,
   classificationPayload,
@@ -85,6 +94,22 @@ export function pruneRuntimeHelpers(root: Object3D): void {
     if (
       node.name.startsWith('__raycastBVH')
       || ud['_rvRaycastBVH']
+      // A BatchedMesh render arena (`rv-batched-render.ts`). Arenas are parented
+      // INTO the model tree (`anchor.add(batch)`) and their source meshes stay in
+      // the tree as well — only hidden per instance via `setVisibleAt`. Since the
+      // export passes `onlyVisible: false`, keeping the arena writes every batched
+      // mesh TWICE: once as the authored subtree, once as a flat, hierarchy-less
+      // blob serialised out of the arena geometry. The arena is rebuilt from the
+      // sources on every load, so the file must never contain one.
+      || ud['_rvBatchedRender']
+      // A baked chunk mesh (plan-753 Phase 4a): shared merged geometry under
+      // the root / a mover — rebuilt on every load, never file content. Under
+      // the destructive bake (plan-754) the merged sources are GONE rather than
+      // masked, so dropping the chunk drops their triangles: an export of a
+      // baked tree is an export of the survivors. That is why the editor never
+      // bakes (`assertBakeAllowed`) and re-decodes through
+      // `ModelCache.decodeFresh` — authoring always holds the full tree.
+      || ud['_rvBakeChunk']
       // A spawned MU (plan-711): the SIMULATION's product, never authored
       // content. It only reaches an export at all since scene and editor share
       // a document — the editor projection now holds a tree a Source is
@@ -98,8 +123,24 @@ export function pruneRuntimeHelpers(root: Object3D): void {
       || ud['_rvGizmo']
       || ud['_highlightOverlay']
       || ud['_isGhostOverlay']
+      // A Source's ghost preview of its MU template and its floor marker
+      // (rv-source.ts `_buildGhostClone`, rv-source-marker.ts). Both are rebuilt
+      // from the rv_extras on every load; saved, the next load builds them AGAIN
+      // next to the saved copies, so every round trip added one more pair. The
+      // ghost also resets its scale to 1, so a template that carried a CAD scale
+      // came back as a 1000x giant.
+      || ud['_isSourceGhost']
+      || ud['_isSourcePreview']
+      || ud['_isSourceMarker']
       || ud['_driveHoverOverlay']
-      || node.name.endsWith('_sensorViz')
+      // WebLabel runtime visual (plan-529): the Billboard sprite and the Plate
+      // mesh are rebuilt from the `WebLabel` extras on every load. Saved, the
+      // plate would become authored geometry and the next load would add a
+      // second one in front of it — every round trip one more.
+      || ud['_rvWebLabel']
+      // Sensor box / outline / ray tube, any dedup suffix — the ray was missing
+      // here, so every save added one more beam to the file.
+      || isSensorRuntimeVizName(node.name)
       || node.name === '_tankFillViz'
       // EnergyChain runtime rig (plan-362). The export must contain the
       // ORIGINAL CAD meshes, not a skinned reconstruction of them: the rig is
@@ -129,9 +170,49 @@ export function pruneRuntimeHelpers(root: Object3D): void {
       // The procedural roll a RibbonWinder builds when no RollMesh was authored. Same
       // rule: it exists because the file did NOT contain one.
       || (ud['_rvGenerated'] === true && node.name.endsWith('_Roll'))
+      // FMU signal children (plan-498): an `Fmu` component creates one leaf per
+      // supported variable on every load and attach — the file's source of
+      // truth is `FmuVariables[]`, so the leaves never belong in it. The
+      // `Signals` container goes too, but only when the FMU created it AND
+      // nothing else lives in it (a drive's provisioned signals may share it).
+      || (ud['_rvFmuSignal'] === true && isFmuSignalPrunable(node))
     ) junk.push(node);
   });
   for (const node of junk) node.removeFromParent();
+}
+
+/** An FMU-stamped node is pruned when it is a leaf, or a container of FMU leaves only. */
+function isFmuSignalPrunable(node: Object3D): boolean {
+  return node.children.every((c) => (c.userData as Record<string, unknown>)['_rvFmuSignal'] === true);
+}
+
+/** What {@link embedFmuPackages} did to one save. */
+export interface FmuEmbedReport {
+  /** The written GLB (the input, untouched, when the file has no FMU). */
+  glb: ArrayBuffer;
+  /** SHAs embedded, one bufferView each. */
+  embedded: string[];
+  /** SHAs whose bytes were not in the store — written with `bufferView: -1`. */
+  missing: string[];
+  warnings: string[];
+}
+
+/**
+ * Embed the `.fmu` package of every `Fmu` record of a written GLB as a glTF
+ * bufferView (plan-498 F2) — one view per SHA, however many nodes share it.
+ * Rewrites every `FmuEmbed.bufferView` / `byteLength` to the NEW index (a
+ * GLTFExporter pass renumbers every view, so a loaded index is always stale)
+ * and lists the views in `asset.extras.realvirtual.fmuBufferViews`. A package
+ * missing from the binary resource store is a WARNING, not an error: the
+ * record is written with `bufferView: -1` and loads as `unsupported`.
+ */
+export function embedFmuPackages(glb: ArrayBuffer): FmuEmbedReport {
+  const { glb: out, embedded, missing } = embedFmuBufferViews(glb, (sha) => binaryResources.get(sha)?.bytes);
+  const warnings = missing.map((sha) =>
+    `FMU package ${sha.slice(0, 12)}… is not loaded — saved without its bytes (bufferView -1); `
+    + 'attach the .fmu again before the next save.');
+  for (const w of warnings) console.warn(`[asset-export] ${w}`);
+  return { glb: out, embedded, missing, warnings };
 }
 
 /**
@@ -414,6 +495,8 @@ export async function exportAssetGlb(
     restoreLiveUserData();
   }
   restoreAuthoredLampMaterials(assetRoot, clone);
+  restoreDriveHomePoses(assetRoot, clone);
+  restoreSourceTemplateMaterials(assetRoot, clone);
   restoreEnergyChainSources(clone);
   restoreWebRollScales(clone);
   // Before `pruneRuntimeHelpers`, and deliberately so: this drops whole composed
@@ -458,7 +541,9 @@ export async function exportAssetGlb(
 
   // objectToGlb is the ONE Object3D→GLB serializer (it passes onlyVisible:false,
   // so authored-hidden nodes survive — hence the explicit prune above).
-  return objectToGlb(scene);
+  await waitForMaterialTextures(scene);
+  // plan-498 F2: the FMU packages ride along as bufferViews of the same file.
+  return embedFmuPackages(await objectToGlb(scene)).glb;
 }
 
 /**
@@ -592,6 +677,18 @@ function restoreWebRollScales(clone: Object3D): void {
   });
 }
 
+function restoreDriveHomePoses(live: Object3D, clone: Object3D): void {
+  if (live.userData.realvirtual?.Drive) {
+    const drive = getComponentInstances(live).find(instance => instance instanceof RVDrive) as RVDrive | undefined;
+    if (drive) {
+      drive.getHomeLocalPosition(clone.position);
+      drive.getHomeLocalQuaternion(clone.quaternion);
+      clone.updateMatrix();
+    }
+  }
+  for (let i = 0; i < live.children.length; i++) restoreDriveHomePoses(live.children[i], clone.children[i]);
+}
+
 function restoreAuthoredLampMaterials(live: Object3D, clone: Object3D): void {
   const lamp = live.userData?._rvLamp as {
     restoreAuthoredMaterialOn?: (cloneNode: Object3D) => void;
@@ -600,5 +697,16 @@ function restoreAuthoredLampMaterials(live: Object3D, clone: Object3D): void {
   const count = Math.min(live.children.length, clone.children.length);
   for (let i = 0; i < count; i++) {
     restoreAuthoredLampMaterials(live.children[i], clone.children[i]);
+  }
+}
+
+
+function restoreSourceTemplateMaterials(live: Object3D, clone: Object3D): void {
+  if ((live as Mesh).isMesh && (clone as Mesh).isMesh) {
+    const material = getSourceTemplateMaterial(live as Mesh);
+    if (material) (clone as Mesh).material = material;
+  }
+  for (let i = 0; i < live.children.length; i++) {
+    restoreSourceTemplateMaterials(live.children[i], clone.children[i]);
   }
 }

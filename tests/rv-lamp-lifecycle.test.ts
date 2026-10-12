@@ -15,6 +15,8 @@ import {
   processExtras,
   type RuntimeNodeDeps,
 } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
+import { createPreBakeContext, runPreBakeHooks } from '../src/core/engine/rv-pre-bake';
 import { RVLamp } from '../src/core/engine/rv-lamp';
 import { LampManager } from '../src/core/engine/rv-lamp-manager';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
@@ -94,20 +96,15 @@ describe('RVLamp lifecycle paths', () => {
     placement.add(lampNode, mesh);
     h.root.add(placement);
 
-    processExtras(
-      placement,
-      h.registry,
-      h.signalStore,
-      h.transportManager,
-      h.scene,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      h.lampManager,
-    );
+    // plan-757 Phase 3 commit B: the init moves nothing — the re-parent happens
+    // in the recipe's `prepare` (the Kinematic pre-bake hook), BEFORE the init.
+    runPreBakeHooks(placement, createPreBakeContext(placement));
+    expect(mesh.parent).toBe(lampNode);
+
+    processExtras(placement, buildInitContext({
+      registry: h.registry, signalStore: h.signalStore, transportManager: h.transportManager, scene: h.scene,
+      lampManager: h.lampManager,
+    }));
     const lamp = lampNode.userData._rvLamp as RVLamp;
     expect(mesh.parent).toBe(lampNode);
     expect(mesh.userData._rvLampMesh).toBe(true);

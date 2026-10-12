@@ -29,6 +29,7 @@
 import { Matrix4, Quaternion, Vector3 } from 'three';
 import type { Object3D } from 'three';
 import type { SnapAxis, SnapDirection } from './snap-name-parser';
+import { recordRootOf } from '../../core/engine/rv-placement-instancer';
 
 /**
  * @deprecated Kept for backwards compat with older call sites. Always returns
@@ -122,14 +123,21 @@ const _qTmp = new Quaternion();
  * name-sign (which is unreliable for X-axis snaps due to Unity → glTF
  * X-flip).
  *
- * Falls back to the topmost ancestor when no `_layoutId` is found
+ * plan-757 Phase 2 (F5): the owner is the RECORD root (`recordRootOf`) — a
+ * snap empty inside a NESTED placement (a reference node inside a placed
+ * asset, marked `_layoutNestedOf`, never `_layoutId`) belongs to the top-level
+ * placement the planner's store knows, and it is THAT root the alignment
+ * moves. Snap ports of nested content thus align the outer record.
+ *
+ * Falls back to the topmost ancestor when no record root is found
  * (test fixtures / unplaced ghost subtrees).
  */
 function _resolveOwnerRoot(snap: Object3D): Object3D {
+  const record = snap.parent ? recordRootOf(snap.parent) : null;
+  if (record) return record;
   let cur: Object3D | null = snap.parent;
   let topmost: Object3D = snap;
   while (cur) {
-    if (cur.userData?._layoutId) return cur;
     topmost = cur;
     cur = cur.parent;
   }

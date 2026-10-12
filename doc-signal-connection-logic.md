@@ -1,5 +1,9 @@
 # Signal Connection Logic
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 ## Overview
 
 Signal connections link a component slot in the 3D model to a signal supplied

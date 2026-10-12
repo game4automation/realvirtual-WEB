@@ -14,7 +14,7 @@
  */
 
 import { Vector3 } from 'three';
-import type { Object3D, Scene } from 'three';
+import type { Box3, Material, Object3D, Scene } from 'three';
 import rvOdt from '../../../schema/v1/rv-odt.json';
 import type { NodeRegistry, ComponentRef } from './rv-node-registry';
 import type { SignalStore } from './rv-signal-store';
@@ -22,6 +22,7 @@ import type { RVTransportManager } from './rv-transport-manager';
 import type { AABB } from './rv-aabb';
 import type { GizmoOverlayManager } from './rv-gizmo-manager';
 import type { LampManager } from './rv-lamp-manager';
+import type { WebLabelManager } from './rv-web-label-manager';
 import type { SceneButtonManager } from './rv-scene-button-manager';
 import type { EnergyChainManager } from './rv-energy-chain-manager';
 import type { ChainManager } from './rv-chain-manager';
@@ -32,11 +33,13 @@ import type { KinematicManagerLike } from './rv-kinematic-registry';
 import type { SignalReapplyRegistry } from './rv-signal-reapply-registry';
 import type { RVOutlineManager } from './rv-outline-manager';
 import type { ErrorStore } from './rv-error-store';
+import type { RVHighlightManager } from './rv-highlight-manager';
 import type { InstructionRuntimeStore } from './rv-instruction-runtime-store';
 import type { ComponentEventDispatcher } from './rv-component-event-dispatcher';
 import type { ObjectHoverData } from './rv-raycast-manager';
 import type { EventEmitter } from '../rv-events';
 import type { ViewerEvents } from '../rv-viewer-events';
+import { isBakeRole, type BakeRole } from './rv-bake-chunk';
 
 // ─── Schema Types ────────────────────────────────────────────────
 
@@ -91,6 +94,46 @@ export interface FieldDescriptor {
    * a migration tool must still be able to clear the value.
    */
   deprecated?: boolean;
+  /**
+   * Reference fields only (plan-754 D7): what this reference claims for its
+   * TARGET node in the bake. Default `'merge'` — the target survives as a node,
+   * its mesh is merged into the enclosing chunk. `'chunk'` makes the target a
+   * chunk boundary (the referrer moves, hides or clones it as a unit). Never
+   * `'keep'`: mesh ownership is always local to a component on the node itself.
+   * Read through {@link bakeTargetOf}; the TS-side table
+   * `REFERENCE_BAKE_TARGETS` (rv-bake-survival.ts) declares the tagged fields
+   * because the generated rv-ODT schema does not carry this keyword (D15).
+   */
+  bakeTarget?: ReferenceBakeTarget;
+  /**
+   * Number fields (plan-512): unit of the value (UCUM-style, e.g. `mm`,
+   * `mm/s2`, `s`). The SSOT of the inspector's unit suffix (`getFieldUnit`).
+   */
+  unit?: string;
+  /**
+   * Signal slots (`componentRef` + `signal`, plan-512): unit of the value on the
+   * COMPONENT side of the slot — a literal (`'mm'`) or a quantity token
+   * (`'@drive-position'`, `'@drive-speed'`, `'@drive-acceleration'`) resolved
+   * through `Drive.Direction` of the carrying node.
+   */
+  signalUnit?: string;
+  /**
+   * Signal slots (plan-512): the sibling number field that carries the unit
+   * factor of this slot (`Drive_FollowPosition.Position` → `Scale`). Binding a
+   * signal with a known unit writes `conversion(signalUnit → slot unit)` there.
+   */
+  scaleField?: string;
+}
+
+/** What a reference claims for its target node in the bake (plan-754 D7). */
+export type ReferenceBakeTarget = 'merge' | 'chunk';
+
+/**
+ * The single reader of {@link FieldDescriptor.bakeTarget}: `'merge'` unless the
+ * descriptor says `'chunk'`. Undefined descriptor → `'merge'`.
+ */
+export function bakeTargetOf(desc?: FieldDescriptor): ReferenceBakeTarget {
+  return desc?.bakeTarget === 'chunk' ? 'chunk' : 'merge';
 }
 
 /**
@@ -111,11 +154,17 @@ export type ComponentSchema = Record<string, FieldDescriptor>;
 // ─── rv-ODT Spec Loading ─────────────────────────────────────────
 
 /** Raw JSON property definition inside an rv-odt.json component `$def`. */
-interface OdtProperty {
+export interface OdtProperty {
   type?: string;
   $ref?: string;
-  items?: { $ref?: string };
+  items?: { $ref?: string; type?: string };
   enum?: string[];
+  /** Informative field description (single source for tooltips and tools). */
+  description?: string;
+  /** Custom keyword (plan-517): component type a non-signal ComponentReference
+   *  targets (`TransportSurface.DriveReference` → `Drive`). Metadata only — the
+   *  runtime mapper below does not read it. */
+  refType?: string;
   /** Custom keyword: explicit wire-value → internal-value map (non-identity enums). */
   enumMap?: Record<string, unknown>;
   default?: unknown;
@@ -129,15 +178,48 @@ interface OdtProperty {
   scope?: string;
   /** Custom keyword: field is kept for compatibility but drives nothing. */
   deprecated?: boolean;
+  /** Custom keyword: UCUM-style unit of a number field (plan-512: SSOT of the inspector suffix). */
+  unit?: string;
+  /** Custom keyword: unit of a signal slot's value on the component side (literal or `@drive-*` token). */
+  signalUnit?: string;
+  /** Custom keyword: sibling number field carrying a signal slot's unit factor. */
+  scaleField?: string;
 }
 
-interface OdtComponentDef {
+export interface OdtComponentDef {
+  /** Informative description of the component type. */
+  description?: string;
   properties?: Record<string, OdtProperty>;
   /** Custom keyword: primary field name → array of legacy GLB field names. */
   aliases?: Record<string, string[]>;
 }
 
 const ODT_DEFS = (rvOdt as unknown as { $defs: Record<string, OdtComponentDef> }).$defs;
+
+/** The rv-ODT index groups (`components`, `structure`, …) that list spec'd types. */
+const ODT_INDEX_GROUPS = ['components', 'structure', 'signals', 'logicSteps', 'recording', 'connections'] as const;
+
+/**
+ * The RAW rv-ODT `$def` of a type — every keyword as written in rv-odt.json
+ * (descriptions, raw `enum`, `unit`, `refType`, …), or `undefined` when the
+ * schema has no such def. Read-only metadata access for tools that describe
+ * the format (plan-517 `web_component_schema`); deliberately separate from
+ * {@link loadSchemaFromSpec}, whose output is frozen by a baseline and must not
+ * grow description or reference metadata.
+ */
+export function getRawOdtDef(type: string): Readonly<OdtComponentDef> | undefined {
+  return Object.prototype.hasOwnProperty.call(ODT_DEFS, type) ? ODT_DEFS[type] : undefined;
+}
+
+/** The rv-ODT index group (`components`, `structure`, …) that lists `type`, or null. */
+export function getOdtIndexGroup(type: string): string | null {
+  const doc = rvOdt as unknown as Record<string, Record<string, unknown> | undefined>;
+  for (const group of ODT_INDEX_GROUPS) {
+    const index = doc[group];
+    if (index && Object.prototype.hasOwnProperty.call(index, type)) return group;
+  }
+  return null;
+}
 
 /**
  * Build a runtime ComponentSchema from the rv-ODT specification (schema/v1/rv-odt.json).
@@ -201,6 +283,13 @@ export function loadSchemaFromSpec(name: string): ComponentSchema {
     if (p.readonly === true) desc.readonly = true;
     if (p.deprecated === true) desc.deprecated = true;
     if (p.scope === 'live' || p.scope === 'des' || p.scope === 'none') desc.scope = p.scope;
+    // plan-512: unit metadata. `unit` only on scalar number fields (a Vector3's
+    // `unit` documents its components and never feeds a suffix or a factor).
+    if (typeof p.unit === 'string' && p.unit && desc.type === 'number') desc.unit = p.unit;
+    if (desc.type === 'componentRef' && desc.signal) {
+      if (typeof p.signalUnit === 'string' && p.signalUnit) desc.signalUnit = p.signalUnit;
+      if (typeof p.scaleField === 'string' && p.scaleField) desc.scaleField = p.scaleField;
+    }
 
     out[field] = desc;
   }
@@ -230,6 +319,10 @@ export interface ComponentContext {
   gizmoManager?: GizmoOverlayManager;
   /** Optional viewer-owned registry for fixed-update Lamp flashing. */
   lampManager?: LampManager;
+  /** Optional viewer-owned registry for `WebLabel` components (plan-529): the
+   *  render-path screen-size / fade / toggle pass and the label link clicks.
+   *  Absent → a label is built at a fixed size and never fades. */
+  webLabelManager?: WebLabelManager;
   /** Optional viewer-owned registry for 3D scene buttons (plan-417): press/turn
    *  animation, momentary-click timers and the component lifecycle. Components
    *  that animate a button cap must null-check before use. */
@@ -245,6 +338,11 @@ export interface ComponentContext {
    *  Components that push instructions (CustomRuntimeInstruction) must null-check
    *  before use. */
   instructionStore?: InstructionRuntimeStore;
+  /** Optional — the viewer's highlight pipeline (hover / selection / aux /
+   *  flash channels, chunk-aware). A component that marks its own node
+   *  (WebError: persistent red X-ray overlay + one alarm flash on activation)
+   *  uses it instead of per-mesh gizmo copies. Must null-check before use. */
+  highlighter?: RVHighlightManager;
   /** Optional — available when RVViewer instantiates one. Components don't
    *  need to touch this directly; they just implement onHover/onClick/onSelect. */
   componentEventDispatcher?: ComponentEventDispatcher;
@@ -511,71 +609,93 @@ export function applySchema(
 export function resolveComponentRefs(
   instance: Record<string, unknown>,
   registry: NodeRegistry,
+  /**
+   * plan-757 F7: the asset the component was authored in (its subtree root).
+   * The ONE resolver reads every reference relative to it first — as written,
+   * then with the asset root's name stripped — so the same asset-relative
+   * `Mount/Kine` binds inside the main model and inside each of ten placements.
+   */
+  scope?: Object3D | null,
 ): void {
-  for (const key of Object.keys(instance)) {
-    const val = instance[key];
-
-    // Handle arrays of ComponentRefs (componentRefArray schema type)
-    if (Array.isArray(val)) {
-      const resolved: unknown[] = [];
-      let isRefArray = false;
-      for (const item of val) {
-        if (isComponentRef(item)) {
-          isRefArray = true;
-          const ref = item as ComponentRef;
-          const res = registry.resolve(ref);
-          if (res.signalAddress !== undefined) {
-            resolved.push(res.signalAddress);
-          } else if (res.sensor !== undefined) {
-            resolved.push(res.sensor);
-          } else if (res.drive !== undefined) {
-            resolved.push(res.drive);
-          } else if (res.node !== undefined) {
-            resolved.push(res.node);
-          } else if (res.component !== undefined) {
-            // Generic registered component (plan-411 §2.2) — same treatment as
-            // a Drive/Sensor element, so an array of mechanism/tool references
-            // arrives as instances rather than as strings the consumer has to
-            // resolve a second time.
-            resolved.push(res.component);
-          } else {
-            // Keep the raw ref path for DES component resolution
-            resolved.push(ref.path);
-          }
-        } else {
-          resolved.push(item);
-        }
+  // Array fields are collected first and written back whole, so a consumer
+  // never sees a half-resolved array.
+  const arrays = new Map<string, unknown[]>();
+  forEachComponentRef(instance, (key, ref, index) => {
+    const res = registry.resolve(ref, scope);
+    if (index === null) {
+      if (res.signalAddress !== undefined) {
+        instance[key] = res.signalAddress;
+      } else if (res.sensor !== undefined) {
+        instance[key] = res.sensor;
+      } else if (res.drive !== undefined) {
+        instance[key] = res.drive;
+      } else if (res.node !== undefined) {
+        // Generic node ref (Unity `Transform` field, plan-362). A resolved node
+        // must NOT be flattened to null by the fallthrough below.
+        instance[key] = res.node;
+      } else if (res.component !== undefined) {
+        // Generic registered component (plan-411 §2.2) — e.g. a
+        // `realvirtual.KinematicMechanism` reference, which used to land in the
+        // null fallthrough below and forced a per-component path workaround.
+        instance[key] = res.component;
+      } else {
+        // Unresolvable — set to null rather than throwing
+        instance[key] = null;
       }
-      if (isRefArray) {
-        instance[key] = resolved;
+      return;
+    }
+    // Element of a componentRefArray: non-ref elements stay as they are.
+    let out = arrays.get(key);
+    if (!out) {
+      out = [...(instance[key] as unknown[])];
+      arrays.set(key, out);
+    }
+    if (res.signalAddress !== undefined) {
+      out[index] = res.signalAddress;
+    } else if (res.sensor !== undefined) {
+      out[index] = res.sensor;
+    } else if (res.drive !== undefined) {
+      out[index] = res.drive;
+    } else if (res.node !== undefined) {
+      out[index] = res.node;
+    } else if (res.component !== undefined) {
+      // Generic registered component (plan-411 §2.2) — same treatment as
+      // a Drive/Sensor element, so an array of mechanism/tool references
+      // arrives as instances rather than as strings the consumer has to
+      // resolve a second time.
+      out[index] = res.component;
+    } else {
+      // Keep the raw ref path for DES component resolution
+      out[index] = ref.path;
+    }
+  });
+  for (const [key, out] of arrays) instance[key] = out;
+}
+
+/**
+ * THE iterator over raw ComponentReference values of one record (plan-754):
+ * a component INSTANCE right after `applySchema` (what
+ * {@link resolveComponentRefs} walks) or a component's raw rv extras block
+ * (what the bake survival model walks — no instance exists at that point).
+ * Visits top-level scalar refs (`index === null`) and the ref elements of
+ * top-level arrays (`index` = element position; non-ref elements are
+ * skipped). Nested objects are not descended — same reach as before the
+ * factoring. The callback may assign `record[key]` for scalar fields; array
+ * fields must be written back after the walk.
+ */
+export function forEachComponentRef(
+  record: Record<string, unknown>,
+  visit: (key: string, ref: ComponentRef, index: number | null) => void,
+): void {
+  for (const key of Object.keys(record)) {
+    const val = record[key];
+    if (Array.isArray(val)) {
+      for (let i = 0; i < val.length; i++) {
+        if (isComponentRef(val[i])) visit(key, val[i] as ComponentRef, i);
       }
       continue;
     }
-
-    if (!isComponentRef(val)) continue;
-
-    const ref = val as ComponentRef;
-    const resolved = registry.resolve(ref);
-
-    if (resolved.signalAddress !== undefined) {
-      instance[key] = resolved.signalAddress;
-    } else if (resolved.sensor !== undefined) {
-      instance[key] = resolved.sensor;
-    } else if (resolved.drive !== undefined) {
-      instance[key] = resolved.drive;
-    } else if (resolved.node !== undefined) {
-      // Generic node ref (Unity `Transform` field, plan-362). A resolved node
-      // must NOT be flattened to null by the fallthrough below.
-      instance[key] = resolved.node;
-    } else if (resolved.component !== undefined) {
-      // Generic registered component (plan-411 §2.2) — e.g. a
-      // `realvirtual.KinematicMechanism` reference, which used to land in the
-      // null fallthrough below and forced a per-component path workaround.
-      instance[key] = resolved.component;
-    } else {
-      // Unresolvable — set to null rather than throwing
-      instance[key] = null;
-    }
+    if (isComponentRef(val)) visit(key, val as ComponentRef, null);
   }
 }
 
@@ -586,56 +706,190 @@ function isComponentRef(val: unknown): boolean {
   return obj['type'] === 'ComponentReference' && typeof obj['path'] === 'string';
 }
 
-// ─── Component Capabilities ─────────────────────────────────────
+// ─── Component Capabilities (plan-753 §2.3) ─────────────────────
+
+/**
+ * How the pointer interacts with nodes of this type.
+ *   'none'   — invisible to hover/click (data-only components, structure).
+ *   'select' — hover + tooltip + click selects the node (the ordinary component).
+ *   'action' — hover + click fires `component.onClick` WITHOUT selecting the
+ *              node (3D buttons, switches, doors). Until the chunk pick backend
+ *              lands (plan-753 Phase 3) the gate treats it like 'select'.
+ */
+export type PickMode = 'none' | 'select' | 'action';
+
+/** UI-facing declarations — hierarchy badge, filter dropdown, tooltip, inspector. */
+export interface ComponentUiCapabilities {
+  /** Badge color (hex) in the hierarchy browser. Default: {@link DEFAULT_BADGE_COLOR} */
+  badge?: string;
+  /** Label in the search/filter dropdown and the visibility auto-filters; also
+   *  the membership test of the exclusive hover mode. null = not filterable. */
+  filter?: string | null;
+  /** Coarse category id for the hierarchy filter chips and the search grouping
+   *  (plan-597; ids in `CATEGORY_ORDER`, rv-component-category.ts). The
+   *  `filter` label is the fine second level inside the category. null = derive
+   *  (built-in rule, else 'other'); an unknown id is normalised to 'other'. */
+  category?: string | null;
+  /** Tooltip content type (key in tooltip-registry). null = no tooltip. */
+  tooltip?: string | null;
+  /** Tooltip section priority — LOWER renders first in the bubble (hover AND pinned). Default: 5 */
+  priority?: number;
+  /** Hide the component from the Property Inspector and the hierarchy chips. Default: false */
+  hidden?: boolean;
+}
+
+/**
+ * What an `onPreBake` hook may touch (plan-754 D18). The hook runs on the RAW
+ * temporary graph BEFORE the bake, so no component instance, no signal store
+ * and no live registry exist yet — extras and tree only.
+ */
+export interface PreBakeContext {
+  /** Root of the temporary graph the hooks run on (`tmp`). */
+  root: Object3D;
+  /** Path → node on `tmp`, resolved by the same rule as `NodeRegistry.getNode`. */
+  resolvePath(path: string): Object3D | null;
+  /** Bounds of a node's own/child source meshes in the NODE's local frame — the
+   *  ONLY sanctioned geometry read. `null` when the subtree draws nothing. */
+  localBounds(node: Object3D): Box3 | null;
+  /** Register a material object the template must carry (RibbonPath donor). */
+  keepMaterial(id: string, material: Material): void;
+  /** Record a subtree a hook re-parented, so the loader can keep the authored
+   *  path resolvable as an alias after the registry is built. */
+  notifyReparented(node: Object3D, previousPath: string): void;
+}
+
+/**
+ * Structural preparation on the raw tree before the bake (plan-754 D18). May
+ * re-parent nodes and write PLAIN-DATA numbers into `extras`; must NOT resolve
+ * other components, read signals or keep references to anything. Runs once per
+ * asset, in the `prepare` step of the pipeline.
+ */
+export type PreBakeHook = (
+  node: Object3D,
+  extras: Record<string, unknown>,
+  ctx: PreBakeContext,
+) => void;
 
 /** Capabilities that a component type can declare. */
 export interface ComponentCapabilities {
-  /** Component triggers hover/highlight on pointer move. Default: false */
-  hoverable?: boolean;
-  /** Component can be selected via click. Default: false */
-  selectable?: boolean;
-  /** Component appears in the Property Inspector. Default: true */
-  inspectorVisible?: boolean;
-  /** Component appears in Hierarchy Browser. Default: true */
-  hierarchyVisible?: boolean;
-  /** Tooltip content type on hover (must match tooltip-registry key). null = no tooltip. Default: null */
-  tooltipType?: string | null;
-  /** Badge color hex in hierarchy browser. Default: '#90a4ae' */
-  badgeColor?: string;
-  /** Label for search/filter dropdown. null = not filterable. Default: null */
-  filterLabel?: string | null;
-  /** Hover is enabled by default after scene load. Default: same as hoverable */
-  hoverEnabledByDefault?: boolean;
-  /** Part of exclusive hover mode (Drive/Sensor/MU toggle). Default: false */
-  exclusiveHoverGroup?: boolean;
-  /** Hover tooltip priority (higher = rendered first in bubble). Default: 5 */
-  hoverPriority?: number;
-  /** Pin tooltip priority. Default: 3 */
-  pinPriority?: number;
+  /** Pointer interaction. Default: 'none' */
+  pick?: PickMode;
+  /** Bake role of the node's meshes (see rv-bake-chunk.ts). Default: 'merge' */
+  bake?: BakeRole;
+  /** UI declarations (badge, filter, tooltip, priority, hidden). */
+  ui?: ComponentUiCapabilities;
   /** Component can be ADDED to nodes in the asset editor ("Add Component"
    *  inspector section). Requires a complete schema (initial field values
    *  come from `getSchemaDefaults`). Default: false */
   authorable?: boolean;
+  /** plan-754 D18 — see {@link PreBakeHook}. Default: none. */
+  onPreBake?: PreBakeHook;
+  /** plan-755 D7 — does a component of this type keep its node alive through a
+   *  destructive bake? Default: true. `false` = pure annotation (`Group`, the
+   *  Unity export markers `renderer` / `colliders` / …): the node survives only
+   *  for ANOTHER reason — reference target, plugin claim, `Snap-*`, keep mesh,
+   *  ancestor of a survivor — and otherwise DISAPPEARS from every baked model.
+   *  Read through {@link claimsNodeOf}, which also resolves `_N` dedup keys. */
+  claimsNode?: boolean;
+  /**
+   * plan-756 F9 — does a component of this type REWRITE the geometry of its
+   * meshes at runtime (CSG workpiece, ribbon band, energy-chain rig)? Such a
+   * `bake:'keep'` mesh gets no cached pick structure; it is brute-forced inside
+   * its CURRENT bounding box, because any structure would describe the geometry
+   * of the previous tick. Default: false.
+   */
+  dynamicGeometry?: boolean;
 }
 
-/** Conservative defaults — nothing enabled except visibility. */
-export const DEFAULT_CAPABILITIES: Readonly<Required<ComponentCapabilities>> = Object.freeze({
-  hoverable: false,
-  selectable: false,
-  inspectorVisible: true,
-  hierarchyVisible: true,
-  tooltipType: null,
-  badgeColor: '#90a4ae',
-  filterLabel: null,
-  hoverEnabledByDefault: false,
-  exclusiveHoverGroup: false,
-  hoverPriority: 5,
-  pinPriority: 3,
+/** Fully resolved form every consumer reads — no optional field left. */
+export interface ResolvedCapabilities {
+  readonly pick: PickMode;
+  readonly bake: BakeRole;
+  readonly ui: Readonly<Required<ComponentUiCapabilities>>;
+  readonly authorable: boolean;
+  readonly onPreBake: PreBakeHook | null;
+  readonly claimsNode: boolean;
+  readonly dynamicGeometry: boolean;
+}
+
+export const DEFAULT_BADGE_COLOR = '#90a4ae';
+export const DEFAULT_UI_PRIORITY = 5;
+
+/** Conservative defaults — nothing enabled, visible, merged into the enclosing chunk. */
+export const DEFAULT_CAPABILITIES: ResolvedCapabilities = Object.freeze({
+  pick: 'none' as PickMode,
+  bake: 'merge' as BakeRole,
+  ui: Object.freeze({
+    badge: DEFAULT_BADGE_COLOR,
+    filter: null as string | null,
+    category: null as string | null,
+    tooltip: null as string | null,
+    priority: DEFAULT_UI_PRIORITY,
+    hidden: false,
+  }),
   authorable: false,
+  onPreBake: null as PreBakeHook | null,
+  claimsNode: true,
+  dynamicGeometry: false,
 });
 
+// ── Registry ────────────────────────────────────────────────────
+
 /** Separate Map for Capabilities (contains Factory-registered AND standalone entries). */
-const capabilitiesMap = new Map<string, Readonly<Required<ComponentCapabilities>>>();
+const capabilitiesMap = new Map<string, ResolvedCapabilities>();
+
+/**
+ * Monotonic counter, bumped on EVERY change of {@link capabilitiesMap}
+ * (`registerCapabilities` — and through it `registerComponent` /
+ * `registerComponentSchema` with capabilities —, `registerPreBakeHook` and the
+ * test reset). Deliberately separate from the schema epoch: a direct
+ * `registerCapabilities` call registers no schema (plan-597). A cache token for
+ * derivations such as `categoryOf()`, not an identity.
+ */
+let _capabilitiesEpoch = 0;
+
+/** Current capability-registration epoch (plan-597). */
+export function getCapabilitiesEpoch(): number {
+  return _capabilitiesEpoch;
+}
+
+/** Merge a normalized declaration with the defaults into the frozen resolved form. */
+function resolveCapabilities(caps: ComponentCapabilities): ResolvedCapabilities {
+  return Object.freeze({
+    pick: caps.pick ?? DEFAULT_CAPABILITIES.pick,
+    bake: caps.bake ?? DEFAULT_CAPABILITIES.bake,
+    ui: Object.freeze({
+      badge: caps.ui?.badge ?? DEFAULT_CAPABILITIES.ui.badge,
+      filter: caps.ui?.filter ?? DEFAULT_CAPABILITIES.ui.filter,
+      category: caps.ui?.category ?? DEFAULT_CAPABILITIES.ui.category,
+      tooltip: caps.ui?.tooltip ?? DEFAULT_CAPABILITIES.ui.tooltip,
+      priority: caps.ui?.priority ?? DEFAULT_CAPABILITIES.ui.priority,
+      hidden: caps.ui?.hidden ?? DEFAULT_CAPABILITIES.ui.hidden,
+    }),
+    authorable: caps.authorable ?? DEFAULT_CAPABILITIES.authorable,
+    onPreBake: caps.onPreBake ?? DEFAULT_CAPABILITIES.onPreBake,
+    claimsNode: caps.claimsNode ?? DEFAULT_CAPABILITIES.claimsNode,
+    dynamicGeometry: caps.dynamicGeometry ?? DEFAULT_CAPABILITIES.dynamicGeometry,
+  });
+}
+
+/**
+ * Attach an {@link PreBakeHook} to a type that registered its capabilities
+ * elsewhere (plan-754 D18). Separate from {@link registerCapabilities} because
+ * the hook of a structural type (`Kinematic`, `Group`) lives with the pass it
+ * replaces, not with the badge declaration. Overwrites silently — a hook is
+ * code, not configuration, and re-registration is how HMR re-installs it.
+ */
+export function registerPreBakeHook(type: string, hook: PreBakeHook): void {
+  const current = capabilitiesMap.get(type) ?? DEFAULT_CAPABILITIES;
+  capabilitiesMap.set(type, Object.freeze({ ...current, onPreBake: hook }));
+  _capabilitiesEpoch++;
+}
+
+/** The pre-bake hook of a type, or null. */
+export function preBakeHookOf(type: string): PreBakeHook | null {
+  return capabilitiesMap.get(type)?.onPreBake ?? null;
+}
 
 /** Register capabilities for a type (standalone, without factory). */
 export function registerCapabilities(
@@ -645,34 +899,139 @@ export function registerCapabilities(
   if (import.meta.env.DEV && capabilitiesMap.has(type)) {
     console.warn(`[rv] Capabilities for '${type}' already registered — overwriting`);
   }
-  const resolved = Object.freeze({ ...DEFAULT_CAPABILITIES, ...capabilities });
-  capabilitiesMap.set(type, resolved);
+  capabilitiesMap.set(type, resolveCapabilities(capabilities));
+  _capabilitiesEpoch++;
 }
 
 /** Reset all capability registrations (test-only). */
 export function _resetCapabilitiesForTesting(): void {
   capabilitiesMap.clear();
+  _capabilitiesEpoch++;
 }
 
 /** Get resolved capabilities for a type. Returns defaults for unknown types. */
-export function getCapabilities(type: string): Readonly<Required<ComponentCapabilities>> {
+export function getCapabilities(type: string): ResolvedCapabilities {
   return capabilitiesMap.get(type) ?? DEFAULT_CAPABILITIES;
 }
 
-/** Get all types that have a specific boolean capability set to true. */
-export function getTypesWithCapability(
-  cap: keyof ComponentCapabilities,
-): string[] {
+/**
+ * plan-755 D7 — does a component under extras key `key` keep its node alive
+ * through a destructive bake ({@link ComponentCapabilities.claimsNode})?
+ *
+ * Extras keys follow the `_N` dedup convention (`Group`, `Group_1`, `Group_2`,
+ * …): a second `Group` on one node is the SAME annotation, so a key with no
+ * registration of its own falls back to its base type (`/_\d+$/` stripped —
+ * the rule `buildGroups` / `collectGroups` use). The exact key wins, so a type
+ * that really is called `Foo_1` keeps its own declaration. An unknown type
+ * claims (conservative default: it may still be addressed by path at runtime).
+ *
+ * Deliberately NOT applied to `bakeRoleOf` / `pickModeOf`: those stay
+ * exact-key, so a `Drive_1` block still carries no role of its own — this
+ * helper only answers the survival question. Allocation-free on the exact hit.
+ */
+export function claimsNodeOf(key: string): boolean {
+  const exact = capabilitiesMap.get(key);
+  if (exact) return exact.claimsNode;
+  const base = key.replace(/_\d+$/, '');
+  if (base === key) return DEFAULT_CAPABILITIES.claimsNode;
+  return (capabilitiesMap.get(base) ?? DEFAULT_CAPABILITIES).claimsNode;
+}
+
+/** All registered types whose resolved capabilities satisfy `pred`. */
+export function getTypesWhere(pred: (caps: ResolvedCapabilities) => boolean): string[] {
   const result: string[] = [];
   for (const [type, caps] of capabilitiesMap) {
-    if (caps[cap]) result.push(type);
+    if (pred(caps)) result.push(type);
   }
   return result;
 }
 
+/**
+ * Types with a top-level capability "on": `'pick'` = any mode but 'none',
+ * `'bake'` = any role but 'merge', `'authorable'` = true.
+ */
+export function getTypesWithCapability(cap: 'pick' | 'bake' | 'authorable'): string[] {
+  if (cap === 'pick') return getTypesWhere((c) => c.pick !== 'none');
+  if (cap === 'bake') return getTypesWhere((c) => c.bake !== 'merge');
+  return getTypesWhere((c) => c.authorable);
+}
+
+/** All types the pointer can interact with (`pick !== 'none'`). */
+export function getPickableTypes(): string[] {
+  return getTypesWhere((c) => c.pick !== 'none');
+}
+
+/** All types that appear in the filter dropdown / auto-filters (`ui.filter` set). */
+export function getFilterableTypes(): string[] {
+  return getTypesWhere((c) => c.ui.filter !== null);
+}
+
 /** Get all registered capabilities as a ReadonlyMap. */
-export function getRegisteredCapabilities(): ReadonlyMap<string, Readonly<Required<ComponentCapabilities>>> {
+export function getRegisteredCapabilities(): ReadonlyMap<string, ResolvedCapabilities> {
   return capabilitiesMap;
+}
+
+/** The UI declarations of a type (defaults for unknown types). */
+export function uiOf(type: string): Readonly<Required<ComponentUiCapabilities>> {
+  return getCapabilities(type).ui;
+}
+
+const PICK_RANK: Record<PickMode, number> = { none: 0, select: 1, action: 2 };
+
+/**
+ * Pick mode of a type, or the STRONGEST pick mode across every component on a
+ * node (`action` > `select` > `none`). Reads `node.userData.realvirtual`; a node
+ * without registered components is 'none'. Allocation-free — safe on the hover path.
+ */
+export function pickModeOf(typeOrNode: string | Object3D): PickMode {
+  if (typeof typeOrNode === 'string') return getCapabilities(typeOrNode).pick;
+  const rv = typeOrNode.userData?.realvirtual as Record<string, unknown> | undefined;
+  if (!rv) return 'none';
+  let best: PickMode = 'none';
+  for (const key in rv) {
+    if (!rv[key]) continue;
+    const caps = capabilitiesMap.get(key);
+    if (!caps) continue;
+    if (PICK_RANK[caps.pick] > PICK_RANK[best]) best = caps.pick;
+  }
+  return best;
+}
+
+/** rv extras key that overrides the type-declared bake role on ONE node. */
+export const RV_BAKE_ROLE_KEY = 'BakeRole';
+
+/**
+ * Bake role of a node (plan-753 §2.3):
+ *   1. an authored `rv.BakeRole` extras value wins,
+ *   2. otherwise the STRONGEST role across the node's REGISTERED components
+ *      (`keep` > `chunk` > `merge`),
+ *   3. `undefined` when the node carries no registered component — the bake
+ *      then inherits the enclosing node's role (Phase 2).
+ *
+ * `skip(type, config)` lets a caller ignore one component instance — the
+ * plan-460 `RibbonRoller { SpinMode: 'Texture' }` case, which is the one web
+ * component that does not move. Allocation-free.
+ */
+export function bakeRoleOf(
+  node: Object3D,
+  skip?: (type: string, config: unknown) => boolean,
+): BakeRole | undefined {
+  const rv = node.userData?.realvirtual as Record<string, unknown> | undefined;
+  if (!rv) return undefined;
+  const override = rv[RV_BAKE_ROLE_KEY];
+  if (isBakeRole(override)) return override;
+  let best: BakeRole | undefined;
+  for (const key in rv) {
+    const cfg = rv[key];
+    if (!cfg) continue;
+    const caps = capabilitiesMap.get(key);
+    if (!caps) continue;
+    if (skip && skip(key, cfg)) continue;
+    if (caps.bake === 'keep') return 'keep';
+    if (caps.bake === 'chunk') best = 'chunk';
+    else if (best === undefined) best = 'merge';
+  }
+  return best;
 }
 
 // ─── Component Factory Registration ─────────────────────────────
@@ -688,7 +1047,7 @@ export interface ComponentFactory {
   readonly schema: ComponentSchema;
   /** Whether this component needs an AABB from BoxCollider extras */
   readonly needsAABB?: boolean;
-  /** Optional capabilities for this component type */
+  /** Optional capabilities for this component type (legacy shape accepted, warns once) */
   readonly capabilities?: ComponentCapabilities;
   /** Create the component instance */
   create(node: Object3D, aabb: AABB | null): RVComponent;
@@ -880,6 +1239,15 @@ export function getConsumedFieldsFromSchema(componentType: string): string[] {
     }
   }
   return fields;
+}
+
+/**
+ * The registered runtime schema of a type (from `registerComponent` or
+ * `registerComponentSchema`), or undefined. Read-only view — used to describe
+ * types that have no rv-ODT `$def` (inline schemas such as NodeKnowledge).
+ */
+export function getRegisteredSchema(componentType: string): Readonly<ComponentSchema> | undefined {
+  return registeredSchemas.get(componentType);
 }
 
 /**

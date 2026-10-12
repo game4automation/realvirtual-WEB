@@ -314,7 +314,18 @@ describe('ui blur token — source invariant', () => {
     // Nothing replaced its glass — the red Stop segment and the greyed-out
     // authoring buttons carry the "a run is live" signal now — so this is one
     // inline blur fewer, not one relocated.
-    expect(scaled.length).toBe(42);
+    //
+    // 07.10.2026: 44. Two surfaces, both checked to go through the factor —
+    // CommissioningTrustBanner.tsx gained a second 8px glass card with plan-560
+    // (encrypted ?glb= share links, 06.10.2026), and the AGV maze HUD
+    // (maze-hud.tsx, 16px) arrived NAKED with the agv-maze public move and was
+    // converted to the scaled form, as this invariant demands.
+    //
+    // 12.10.2026: 45. One surface, checked to go through the factor — the
+    // antialias reload hint (plan-591, `reload-hint-store.tsx`, 8px). It is a
+    // small glass card of its own because the shared info overlay has a single
+    // state slot and dims the whole viewport, which an open-ended hint must not.
+    expect(scaled.length).toBe(45);
   });
 
   it('the uiBlur() helper emits the same form as the inline declarations', () => {

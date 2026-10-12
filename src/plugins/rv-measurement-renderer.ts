@@ -38,6 +38,7 @@ import type { Measurement } from '../core/types/plugin-types';
 // to avoid the previous core → plugin layer violation. External plugins
 // importing `MEASUREMENT_LAYER` from this module continue to work.
 import { MEASUREMENT_LAYER } from '../core/engine/rv-constants';
+import { LABEL_SUPERSAMPLE, applyLabelSpriteContract, createLabelMaterial, createLabelTexture } from '../core/engine/rv-label-sprite';
 export { MEASUREMENT_LAYER } from '../core/engine/rv-constants';
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -209,8 +210,7 @@ export class MeasurementRenderer {
     label.position.set(mid[0], mid[1], mid[2]);
     const labelH = 0.08;
     label.scale.set(labelH * aspect, labelH, 1);
-    label.layers.set(MEASUREMENT_LAYER);
-    label.renderOrder = RENDER_ORDER;
+    applyLabelSpriteContract(label, { layer: MEASUREMENT_LAYER, renderOrder: RENDER_ORDER });
     this.group.add(label);
 
     this._resources.set(m.id, {
@@ -586,9 +586,11 @@ export class MeasurementRenderer {
     const radius = 8;
 
     const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
+    canvas.width = w * LABEL_SUPERSAMPLE;
+    canvas.height = h * LABEL_SUPERSAMPLE;
     const ctx = canvas.getContext('2d')!;
+    // Draw in logical (w × h) coordinates on the supersampled canvas.
+    ctx.scale(LABEL_SUPERSAMPLE, LABEL_SUPERSAMPLE);
 
     // Clear to fully transparent first
     ctx.clearRect(0, 0, w, h);
@@ -639,17 +641,12 @@ export class MeasurementRenderer {
     ctx.textBaseline = 'middle';
     ctx.fillText(text, w / 2, h / 2);
 
-    const texture = new CanvasTexture(canvas);
+    // Shared label contract (rv-label-sprite.ts): sRGB, anisotropy, no tone
+    // mapping, no depth. 'linear' filtering — the LOD scaler keeps these at
+    // screen size, so mipmaps would only blur.
+    const texture = createLabelTexture(canvas, 'linear');
     texture.premultiplyAlpha = false;
-    texture.generateMipmaps = false;
-    texture.minFilter = LinearFilter;
-    texture.magFilter = LinearFilter;
-    texture.needsUpdate = true;
-    const material = new SpriteMaterial({
-      map: texture,
-      transparent: true,
-      depthTest: false,
-    });
+    const material = createLabelMaterial(texture);
 
     // Use full canvas aspect (256/64 = 4) — the box is centered within
     return { texture, material, aspect: w / h };

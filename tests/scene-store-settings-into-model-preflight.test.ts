@@ -17,6 +17,7 @@ import { freshOpId } from '../src/core/hmi/scene/rv-scene-edits';
 import type { RVViewer } from '../src/core/rv-viewer';
 import { getProjectStore } from '../src/core/project/project-store';
 import type { ProjectBackend } from '../src/core/project/backends/project-backend';
+import type { RvProject } from '../src/core/project/rv-project-types';
 
 const builtinDemo: SceneBase = { kind: 'builtin', url: '/models/Demo.glb', label: 'Demo' };
 
@@ -32,6 +33,10 @@ function makeViewer() {
       // The check itself is covered in rv-scene-settings-into-model.node.test.ts.
       getGltfNodeNames: () => [],
       getNode: () => undefined,
+      // Every component instance at a path. Empty is the honest answer for a
+      // mock scene that has no live instances — and it has to be ANSWERED:
+      // `reapplySchemaForComponent` calls it for every setField op.
+      getComponentsAt: () => [],
     },
     loadScene: vi.fn(async (s: RvScene) => {
       v.loadScenes.push(s);
@@ -49,23 +54,49 @@ function fakeBackend(overrides: Partial<ProjectBackend> = {}): ProjectBackend & 
   const writes: string[] = [];
   return {
     kind: 'browser', id: 'test', writable: true, isActive: true, writes,
-    listModels: async () => [],
+    listDocuments: async () => [],
     writeDocument: async (ref: string | { path: string }) => {
       writes.push(typeof ref === 'string' ? ref : ref.path);
       return { revision: 'rev' };
     },
     // The adoption re-reads what was just written (plan-709 §2.5). Serving the
     // same fixture back keeps the happy path actually reachable in these tests.
+    //
+    // Only for a path this backend actually wrote — `null` is the contract's
+    // "no such document" and what every sibling fake returns. Answering with
+    // bytes for EVERY path tells `planDocument` that every candidate name is
+    // taken, and its unbounded rename probe then spins forever on resolved
+    // promises: the page never yields to the timer queue, so even a per-test
+    // timeout cannot fire and the whole browser suite wedges (2026-09-09).
     readDocument: async (ref: string | { path: string }) => {
       const path = typeof ref === 'string' ? ref : ref.path;
+      if (!writes.includes(path)) return null;
       return { bytes: demoGlbBytes(), meta: { id: '', name: path, path }, revision: 'rev' };
     },
     ...overrides,
   } as unknown as ProjectBackend & { writes: string[] };
 }
 
-function setBackend(backend: ProjectBackend | null): void {
-  (getProjectStore() as unknown as { _backend: ProjectBackend | null })._backend = backend;
+/**
+ * Install the backend AND the project that owns it — both halves, always.
+ *
+ * `commitDocuments` writes its rows into the PROJECT and returns early when
+ * there is none, so a writable backend with no project mints documents whose
+ * rows go nowhere: `newEmpty()` then throws on the document it just created.
+ * That pairing is not a state the product can reach.
+ */
+function setBackend(
+  backend: ProjectBackend | null,
+  documents: Array<{ id: string; name: string; path: string }> = [],
+): void {
+  const store = getProjectStore() as unknown as {
+    _backend: ProjectBackend | null;
+    _project: RvProject | null;
+  };
+  store._backend = backend;
+  store._project = backend === null ? null : ({
+    schemaVersion: 3, id: 'prj_preflight', name: 'Pre-flight fixture', documents,
+  } as unknown as RvProject);
 }
 
 const opBase = () => ({ id: freshOpId(), ts: Date.now(), schemaV: 1 as const });
@@ -167,7 +198,11 @@ describe('saveSettingsIntoModel pre-flight', () => {
   });
 
   it('refuses an empty scene, which has no model file to write into', async () => {
-    setBackend(fakeBackend());
+    // Read-only on purpose. Since plan-716 F5 "New" MINTS a document wherever
+    // it can, so a writable project leaves a builtin base with a real file
+    // behind it. An empty base — the thing this test is about — is what
+    // `newEmpty()` falls back to when there is nowhere to put a document.
+    setBackend(fakeBackend({ writable: false }));
     await store.newEmpty();
     expect(await store.saveSettingsIntoModel('Untitled')).toEqual({ kind: 'no-model-base' });
   });
@@ -227,7 +262,10 @@ describe('saveSettingsIntoModel is transactional', () => {
       const outcome = await writing;
       expect(outcome.kind).toBe('scene-changed');
       // The file is complete and stays; only the adoption was skipped.
-      expect(backend.writes).toEqual(['models/Demo.glb']);
+      // `newEmpty()` mints a document of its own (plan-716 F5) and so writes
+      // too. The claim here is about the BAKED file: written once, left alone.
+      expect(backend.writes.filter(p => p === 'models/Demo.glb'))
+        .toEqual(['models/Demo.glb']);
     } finally {
       glbFetch.restore();
     }
@@ -259,10 +297,12 @@ describe('saveSettingsIntoModel is transactional', () => {
   });
 
   it('reports the deduplicated filename, not the requested one', async () => {
-    const backend = fakeBackend({
-      listModels: async () => [{ path: 'models/Demo.glb' }],
-    } as Partial<ProjectBackend>);
-    setBackend(backend);
+    const backend = fakeBackend();
+    // The name taken lives in the PROJECT, not in a backend listing of its own
+    // (plan-744 §8): `uniqueModelFileName` reads the store's snapshot, so a
+    // bake no longer pays for a full directory walk to answer a filename
+    // question about a folder the store has already enumerated.
+    setBackend(backend, [{ id: 'doc_demo', name: 'Demo', path: 'models/Demo.glb' }]);
     (getProjectStore() as unknown as {
       resolveAssetSource: (p: string) => Promise<{ kind: 'bytes'; bytes: ArrayBuffer }>;
     }).resolveAssetSource = async () => ({

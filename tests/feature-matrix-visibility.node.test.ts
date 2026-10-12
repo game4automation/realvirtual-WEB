@@ -52,7 +52,10 @@ describe('feature matrix visibility', () => {
     // 18 since plan-281 added the jerk-limited smooth-motion core as a licensed
     // feature of its own (17 came from plan-434 moving the asset editor UI out
     // of the AGPL core).
-    expect(Object.keys(manifest.registrations)).toHaveLength(18);
+    // 19 since plan-550 added the cinematic render (path-traced video frames, commercial).
+    // 20 since plan-551 added the "Record video" dialog (commercial UI over the capture engine).
+    // 21 since plan-560 added the decryptor of encrypted `?glb=` share links (commercial).
+    expect(Object.keys(manifest.registrations)).toHaveLength(21);
     // The internal report still shows what an unentitled restricted feature costs: a "no".
     expect(matrix).toMatch(/\| agents \| restricted \| stable \| no \|/);
   });
@@ -85,5 +88,18 @@ describe('feature matrix visibility', () => {
     // The three beta features that register providers instead of plugins have no runtime
     // row at all, so they are legitimately absent from the chip mapping.
     expect(new Set(Object.values(BETA_PLUGIN_FEATURES))).toEqual(new Set(['des', 'plc', 'physics']));
+  });
+});
+
+describe('private-plugins.ts registers the commercial features in manifest order (plan-551 F10)', () => {
+  it('the useFeature list equals the commercial registrations of tier-manifest.json, in order', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(resolve(privateRoot, 'src/private-plugins.ts'), 'utf8');
+    const used = [...src.matchAll(/useFeature\(viewer, '([^']+)'/g)].map((m) => m[1]);
+    const commercial = Object.keys(manifest.registrations).filter((f) => !RESTRICTED_FEATURES.includes(f));
+    expect(used).toEqual(commercial);
+    expect(used).toContain('video-record-ui');
+    // plan-560: encrypted share links are a customer-tier feature (the demo needs them).
+    expect(used).toContain('share-decrypt');
   });
 });

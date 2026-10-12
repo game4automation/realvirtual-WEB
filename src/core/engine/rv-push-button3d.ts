@@ -65,12 +65,11 @@ registerComponent({
   type: 'PushButton3D',
   schema: RVPushButton3D.schema,
   capabilities: {
-    // The click target is the SceneButtonBase below this node, never the
-    // wrapper itself (plan-417 §2.4).
-    hoverable: false,
-    selectable: false,
-    filterLabel: 'Buttons',
-    badgeColor: '#7e57c2',
+    // A clickable ACTION, not a selectable part: the click fires the button,
+    // the node is never selected (plan-753 §2.3; the SceneButtonBase below
+    // this node is the physical click target, plan-417 §2.4).
+    pick: 'action',
+    ui: { filter: 'Buttons', category: 'hmi', badge: '#7e57c2' },
   },
   create: (node: Object3D) => new RVPushButton3D(node),
   afterCreate: (inst, node) => {

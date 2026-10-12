@@ -23,7 +23,9 @@ import {
 import type { RVViewer } from '../src/core/rv-viewer';
 import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { scratchAssetDocument } from './helpers/scratch-asset-document';
-import { pivotToCircle } from '@rv-private/plugins/asset-editor/kinematics/transform-actions';
+import {
+  circleToWorld, pivotToCircle, pivotToCircleWorld,
+} from '@rv-private/plugins/asset-editor/kinematics/transform-actions';
 
 function makeViewer() {
   const scene = new Scene();
@@ -274,6 +276,67 @@ describe('pivotToCircle guards', () => {
     await pivotToCircle(viewer, doc, 'Asset/Axis', null, new Vector3(), new Vector3(0, 0, 1));
     // A zero axis would compose a NaN quaternion and poison every matrix below.
     await pivotToCircle(viewer, doc, 'Asset/Axis', target, new Vector3(), new Vector3());
+    await doc.whenIdle();
+    expect(doc.document.opCount).toBe(opsBefore);
+    doc.dispose();
+  });
+});
+
+// plan-499 follow-up: `pivotToCircle` is a thin wrapper over the WORLD-space
+// core the `editor.pivotToCircle` command runs. Same inputs, same pose.
+describe('pivotToCircleWorld (the command core)', () => {
+  /** An axis node with a child, and a rotated / scaled / translated bore mesh. */
+  function setup() {
+    const { viewer, model, register } = makeViewer();
+    const axisNode = new Object3D();
+    axisNode.name = 'Axis';
+    axisNode.position.set(1, 2, 3);
+    axisNode.quaternion.setFromEuler(new Euler(0.3, -0.2, 0.7));
+    const child = new Object3D();
+    child.name = 'Child';
+    child.position.set(0.5, -1, 2);
+    axisNode.add(child);
+    const target = stubMesh('Bore');
+    target.position.set(4, -3, 7);
+    target.quaternion.setFromEuler(new Euler(-0.9, 0.4, 1.1));
+    target.scale.set(2, 2, 2);
+    model.add(axisNode, target);
+    register();
+    const doc = scratchAssetDocument(viewer);
+    return { viewer, model, axisNode, child, target, doc };
+  }
+
+  it('the mesh-local wrapper lands exactly where the world core does', async () => {
+    const localCenter = new Vector3(0.25, -0.5, 1.5);
+    const localAxis = new Vector3(0.2, 0.3, 1);
+
+    const a = setup();
+    await pivotToCircle(a.viewer, a.doc, 'Asset/Axis', a.target, localCenter, localAxis);
+    await a.doc.whenIdle();
+    a.model.updateMatrixWorld(true);
+
+    const b = setup();
+    const { worldCenter, worldAxis } = circleToWorld(b.target, localCenter, localAxis);
+    await pivotToCircleWorld(b.viewer, b.doc, 'Asset/Axis', worldCenter, worldAxis);
+    await b.doc.whenIdle();
+    b.model.updateMatrixWorld(true);
+
+    const ea = a.axisNode.matrixWorld.elements;
+    const eb = b.axisNode.matrixWorld.elements;
+    for (let i = 0; i < 16; i++) expect(ea[i]).toBeCloseTo(eb[i], 9);
+    expect(a.axisNode.getWorldPosition(new Vector3()).distanceTo(worldCenter)).toBeLessThan(1e-6);
+    // The child is compensated identically in both.
+    expect(a.child.getWorldPosition(new Vector3())
+      .distanceTo(b.child.getWorldPosition(new Vector3()))).toBeLessThan(1e-9);
+    a.doc.dispose();
+    b.doc.dispose();
+  });
+
+  it('refuses a degenerate or non-finite world axis without writing', async () => {
+    const { viewer, doc } = setup();
+    const opsBefore = doc.document.opCount;
+    await pivotToCircleWorld(viewer, doc, 'Asset/Axis', new Vector3(5, 5, 5), new Vector3());
+    await pivotToCircleWorld(viewer, doc, 'Asset/Axis', new Vector3(5, 5, 5), new Vector3(Number.NaN, 1, 0));
     await doc.whenIdle();
     expect(doc.document.opCount).toBe(opsBefore);
     doc.dispose();

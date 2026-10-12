@@ -22,7 +22,7 @@ import {
   signGlbBytes,
   verifyGlbBytes,
 } from '../scripts/rv-sign-glb.mjs';
-import { selectFilesToUpload, stagePrivateProject } from '../scripts/_bunny-lib.mjs';
+import { selectFilesToUpload, stageHostedProject } from '../scripts/_bunny-lib.mjs';
 // @ts-expect-error Node deploy modules intentionally have no declaration files.
 import { decryptGlb, generateFragmentSecret } from '../scripts/lib/rv-crypto.mjs';
 
@@ -192,7 +192,7 @@ describe('rv_sig deploy integration', () => {
     writeFileSync(join(projectDir, 'models', 'machine.glb'), makeGlb());
 
     const fragmentSecret = generateFragmentSecret();
-    const staging = await stagePrivateProject({
+    const staging = await stageHostedProject({
       distDir,
       projectDir,
       signing,
@@ -203,7 +203,7 @@ describe('rv_sig deploy integration', () => {
       },
     });
     try {
-      const encrypted = readFileSync(join(staging, 'models', 'machine.glb'));
+      const encrypted = readFileSync(join(staging, 'p', 'models', 'machine.glb'));
       const plaintext = Buffer.from(await decryptGlb(encrypted, 'secret', fragmentSecret));
       expect(verifyGlbBytes(plaintext, rawPublicKey(root.publicKey))).toBe('valid');
     } finally {

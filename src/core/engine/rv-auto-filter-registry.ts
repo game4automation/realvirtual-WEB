@@ -7,7 +7,7 @@
  *
  * Unlike GroupRegistry (which stores explicitly defined groups from GLB extras),
  * AutoFilterRegistry generates "virtual" filter groups from the component
- * capabilities registry. Any component type that has a `filterLabel` capability
+ * capabilities registry. Any component type that has a `ui.filter` capability
  * becomes an auto-filter entry, collecting all scene nodes of that type.
  *
  * Visibility and isolate follow the same patterns as GroupRegistry:
@@ -25,7 +25,7 @@ import { getAutoFilterNodesByType } from './rv-visibility-owners';
 export interface AutoFilterGroup {
   /** Component type key (e.g. 'Drive', 'Sensor'). */
   type: string;
-  /** Display label from filterLabel capability (e.g. 'Drives', 'Sensors'). */
+  /** Display label from the `ui.filter` capability (e.g. 'Drives', 'Sensors'). */
   label: string;
   /** Badge color hex from capabilities. */
   badgeColor: string;
@@ -61,7 +61,7 @@ export class AutoFilterRegistry {
 
   /**
    * Build auto-filter groups from NodeRegistry + capabilities.
-   * Only includes types with `filterLabel !== null` AND at least one scene node.
+   * Only includes types with `ui.filter !== null` AND at least one scene node.
    */
   build(nodeRegistry: NodeRegistry): void {
     this._filters.clear();
@@ -74,11 +74,11 @@ export class AutoFilterRegistry {
     const capabilities = getRegisteredCapabilities();
     for (const [type, nodes] of nodesByType) {
       const caps = capabilities.get(type);
-      if (!caps?.filterLabel) continue;
+      if (!caps?.ui.filter) continue;
       this._filters.set(type, {
         type,
-        label: caps.filterLabel,
-        badgeColor: caps.badgeColor,
+        label: caps.ui.filter,
+        badgeColor: caps.ui.badge,
         nodes,
         visible: true,
       });

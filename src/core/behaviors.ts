@@ -64,6 +64,9 @@ import {
   type KinematizeReport,
 } from './behavior-runtime';
 import { instanceScope } from './engine/rv-instance-scope';
+import { GENERATED_SIGNAL_FIELD, setTrackedSignal } from './engine/rv-signal-construction';
+import { SignalStore } from './engine/rv-signal-store';
+import { DEDUP_SUFFIX_RE } from './engine/rv-node-naming';
 import { NodeRegistry } from './engine/rv-node-registry';
 // Glob matcher lives in its own dependency-free module (cycle break — see the
 // re-export note below). Imported here for this module's own internal use.
@@ -420,12 +423,19 @@ export class BehaviorManager {
         }
         // userData.realvirtual[sigType] = { Name, Status:{ Value } } — the exact
         // shape the hierarchy scan + signal badge read (parity with rv_extras).
+        // plan-589: persist the ASSET-LOCAL name (a global keeps its leading
+        // `/`) plus the `Generated` provenance flag — on load `resolveSignalName`
+        // re-applies the scope exactly once from those two.
+        const persisted = scope && !sig.name.startsWith(`${scope}.`) ? `/${sig.name}` : local;
         const ud = node.userData as { realvirtual?: Record<string, unknown> };
-        (ud.realvirtual ??= {})[sig.type] = { Name: sig.name, Status: { Value: seed } };
+        (ud.realvirtual ??= {})[sig.type] = {
+          Name: persisted, [GENERATED_SIGNAL_FIELD]: true, Status: { Value: seed },
+        };
         // Node + store + registry under the node path (mirrors registerSignal).
         registerNode(path, node);
         store.register?.(sig.name, path, seed, sig.type);
         registerComp(sig.type, path, { address: path, signalName: sig.name });
+        if (store instanceof SignalStore) setTrackedSignal(store, node, { type: sig.type, name: sig.name, path });
         registered++;
       } else {
         // No registry write surface — keep the store-only seed (preserve existing).
@@ -487,14 +497,21 @@ export class BehaviorManager {
     return !!(rv && rv.LayoutObject);
   }
 
-  /** Stable per-object key: the layout placement id, else the node uuid. */
+  /**
+   * Stable per-object key: the layout placement id, else the NESTED
+   * placement's occurrence-chain id (`_layoutNestedId`, plan-757 Phase 2b — a
+   * reference inside a placed asset is content, not a record, but its binds
+   * must still be keyed by something that survives a reload), else the uuid.
+   */
   private layoutKey(node: Object3D): string {
-    return (node.userData?._layoutId as string | undefined) ?? node.uuid;
+    const ud = node.userData as Record<string, unknown> | undefined;
+    return (ud?._layoutId as string | undefined) ?? (ud?._layoutNestedId as string | undefined) ?? node.uuid;
   }
 
-  /** Asset name to match against: the node name minus the `_N` duplicate suffix. */
+  /** Asset name to match against: the node name minus the `_N` duplicate suffix
+   *  (the one convention of `rv-node-naming`, plan-758). */
   private layoutMatchName(node: Object3D): string {
-    return node.name.replace(/_\d+$/, '');
+    return node.name.replace(DEDUP_SUFFIX_RE, '');
   }
 
   /**

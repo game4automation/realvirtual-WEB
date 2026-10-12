@@ -165,7 +165,7 @@ describe('RVSource — separate-template ghost clone', () => {
 
 describe('RVSource — self-template detection survives planner rename', () => {
   it('uses _originalName so a renamed 2nd placement stays self-template', () => {
-    const { node } = makeMultiMeshNode('Pallet_2'); // renamed by resolveUniqueName
+    const { node } = makeMultiMeshNode('Pallet_2'); // renamed by resolveUniqueName (any _N suffix)
     node.userData._originalName = 'Pallet';          // original GLB root name
 
     const source = new RVSource(node);

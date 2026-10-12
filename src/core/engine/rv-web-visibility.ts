@@ -10,19 +10,20 @@
  *    browser equivalent of Unity's `Renderer.enabled`. Invertible, with a
  *    default state when no signal is bound.
  *  - Error state: a second PLCOutputBool signal marks the part as faulty. While
- *    high the part flashes red (mesh-glow-hull / floor-disk ring), a backed
- *    error-text badge appears, and the error registers in the central
- *    `ErrorStore` (right-side error panel). This mirrors RVWebError 1:1.
+ *    high the part flashes red (mesh-glow-hull / floor-disk ring) and the error
+ *    registers in the central `ErrorStore` (right-side error panel, which
+ *    carries the error text — there is no world-space badge). This mirrors
+ *    RVWebError's store wiring.
  *
  * Priority rule (from WebVisibility.cs `ApplyError`): a HIDDEN part never shows
  * an error highlight — and is never an active ErrorStore entry. Visibility wins
  * over the error state.
  *
- * The error visualization (badge + highlight + small-part heuristic) is shared
- * with RVWebError via `rv-error-visual.ts`.
+ * The error visualization (highlight + small-part heuristic) is shared with
+ * RVWebError via `rv-error-visual.ts`.
  */
 
-import { type Object3D, type Texture } from 'three';
+import { type Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
@@ -34,7 +35,6 @@ import {
   normalizeHighlightStyle,
   parseColorToHex,
   createErrorHighlightGizmo,
-  createErrorBadgeGizmo,
   type HighlightStyle,
 } from './rv-error-visual';
 
@@ -72,8 +72,6 @@ export class RVWebVisibility implements RVComponent {
   private _additionalNodes: Object3D[] = [];
 
   private _highlightGizmo?: GizmoHandle;
-  private _badgeGizmo?: GizmoHandle;
-  private _badgeTexture?: Texture;
   private _unsubVisible?: () => void;
   private _unsubError?: () => void;
   private _ctx?: ComponentContext;
@@ -141,9 +139,8 @@ export class RVWebVisibility implements RVComponent {
     this._highlightGizmo = createErrorHighlightGizmo(
       ctx.gizmoManager, this.node, this.HighlightStyle, this._errorColorHex, this._blinkHz,
     );
-    const badge = createErrorBadgeGizmo(ctx.gizmoManager, this.node, this.ErrorText, this._errorColorHex);
-    this._badgeGizmo = badge.gizmo;
-    this._badgeTexture = badge.texture;
+    // No world-space error-text badge (removed 2026-10-12, same as RVWebError):
+    // the text lives in the error card of the message panel.
 
     // Apply the captured initial state now that everything exists.
     this._applyVisibility(this._visible);
@@ -218,7 +215,6 @@ export class RVWebVisibility implements RVComponent {
   private _applyError(): void {
     const effective = this._error && this._visible;
     this._highlightGizmo?.setVisible(effective);
-    this._badgeGizmo?.setVisible(effective);
     this._ctx?.errorStore?.setActive(this.path, effective, this.ErrorText);
   }
 
@@ -239,10 +235,6 @@ export class RVWebVisibility implements RVComponent {
     this._unsubError = undefined;
     this._highlightGizmo?.dispose();
     this._highlightGizmo = undefined;
-    this._badgeGizmo?.dispose();
-    this._badgeGizmo = undefined;
-    this._badgeTexture?.dispose();
-    this._badgeTexture = undefined;
     this._ctx?.errorStore?.remove(this.path);
     this._additionalNodes = [];
     this._error = false;
@@ -257,10 +249,9 @@ registerComponent({
   schema: RVWebVisibility.schema,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    hoverable: false,
-    selectable: false,
-    filterLabel: 'Web Visibility',
-    badgeColor: '#ef5350',
+    pick: 'none',
+    bake: 'chunk',      // toggles its subtree's visibility — needs its own chunk (setVisibleAt)
+    ui: { filter: 'Web Visibility', category: 'hmi', badge: '#ef5350' },
   },
   create: (node) => new RVWebVisibility(node),
   afterCreate: (inst, node) => {

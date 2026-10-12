@@ -35,6 +35,7 @@
  */
 
 import { Code } from '@mui/icons-material';
+import type { Object3D } from 'three';
 import type { RVViewerPlugin } from '../core/rv-plugin';
 import type { RVViewer } from '../core/rv-viewer';
 import type { UISlotEntry } from '../core/rv-ui-plugin';
@@ -42,6 +43,11 @@ import { modeContext } from '../core/rv-mode-manager';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { RVDrive } from '../core/engine/rv-drive';
 import type { RVSensor } from '../core/engine/rv-sensor';
+import type { RVSource } from '../core/engine/rv-source';
+import type { RVSink } from '../core/engine/rv-sink';
+import type { RVGrip } from '../core/engine/rv-grip';
+import { RVJavaScriptStep } from '../core/engine/rv-logic-step';
+import { createSceneScriptAccess } from '../core/sdk/rv-sdk-scene';
 import { createSignalWriter, type SignalStore } from '../core/engine/rv-signal-store';
 import { RVScriptHost } from '../core/engine/rv-script-host';
 import {
@@ -55,7 +61,7 @@ import {
 } from '../core/engine/rv-web-component-registry';
 import type { SdkBeltTarget, SdkSensorTarget, SdkTransportTarget } from '../core/sdk/rv-sdk-self';
 import { createSnapGraphPortsBackend } from '../core/sdk/rv-sdk-ports';
-import { createLocalFlowBackend } from '../core/sdk/rv-sdk-flow';
+import { createLocalFlowBackend, trackFlowLedger } from '../core/sdk/rv-sdk-flow';
 import {
   createPathNetworkPathsBackend,
   createPathNetworkRoutingBackend,
@@ -120,6 +126,8 @@ export class WebComponentPlugin implements RVViewerPlugin {
   /** Guards async wiring against a newer load/clear racing the WASM load. */
   private wireToken = 0;
   private lastLoad: { result: LoadResult; viewer: RVViewer } | null = null;
+  /** Wiring in flight (`wire` / `wirePlaced`) — what {@link whenWired} joins on. */
+  private readonly pendingWires = new Set<Promise<void>>();
 
   constructor(opts: WebComponentPluginOptions = {}) {
     this.allowScripts = opts.allowScripts === true;
@@ -160,6 +168,18 @@ export class WebComponentPlugin implements RVViewerPlugin {
         // holds/reply handles are reset by the ConnectionSystemPlugin.
         for (const flow of this.liveFlows) flow.reset();
       }),
+      // plan-757 §2.8: placed content is wired under the SAME session-wide
+      // `allowScripts` rule as the main model — a placement is the main model
+      // at another origin. Nothing here binds execution to the asset's
+      // signature; tightening that for BOTH paths is its own plan.
+      viewer.on('layout-content-added', (data: unknown) => {
+        const root = (data as { root?: Object3D } | undefined)?.root;
+        if (root) this.track(this.wirePlaced(root, viewer));
+      }),
+      viewer.on('layout-content-removed', (data: unknown) => {
+        const root = (data as { root?: Object3D } | undefined)?.root;
+        if (root) this.unwirePlaced(root);
+      }),
     );
     this.registerEditScriptAction();
   }
@@ -168,7 +188,7 @@ export class WebComponentPlugin implements RVViewerPlugin {
 
   onModelLoaded(result: LoadResult, viewer: RVViewer): void {
     this.lastLoad = { result, viewer };
-    void this.wire(result, viewer);
+    this.track(this.wire(result, viewer));
   }
 
   onModelCleared(): void {
@@ -213,13 +233,35 @@ export class WebComponentPlugin implements RVViewerPlugin {
     this.registry?.dispose();
     this.registry = null;
     if (allow && this.lastLoad) {
-      void this.wire(this.lastLoad.result, this.lastLoad.viewer);
+      this.track(this.wire(this.lastLoad.result, this.lastLoad.viewer));
     }
   }
 
   /** Live script instances (empty while the trust gate is closed). */
   get instances(): WebComponentInstance[] {
     return this.registry?.list() ?? [];
+  }
+
+  /**
+   * Resolves once every wiring in flight has settled — the main model's
+   * (`onModelLoaded`), every placement's announced so far
+   * (`layout-content-added`) and a trust-gate flip's. Wiring is asynchronous
+   * because the QuickJS host loads lazily on the first scripted model, so a
+   * caller that reads {@link instances} right after `whenSceneReady()` may
+   * see the count BEFORE the scripts exist. This is the join for that; a
+   * caller with nothing in flight resolves immediately. Never rejects — a
+   * failed wire has already warned.
+   */
+  async whenWired(): Promise<void> {
+    while (this.pendingWires.size > 0) await Promise.all([...this.pendingWires]);
+  }
+
+  /** Register an in-flight wire for {@link whenWired}; errors are swallowed here, the wire itself reports. */
+  private track(wire: Promise<void>): void {
+    const settled: Promise<void> = wire
+      .catch((err: unknown) => { console.warn('[web-component] wiring failed:', err); })
+      .finally(() => { this.pendingWires.delete(settled); });
+    this.pendingWires.add(settled);
   }
 
   /**
@@ -295,6 +337,44 @@ export class WebComponentPlugin implements RVViewerPlugin {
     const wired = wireWebComponents(result.root, registry, { allowScripts: true });
     if (wired.malformed > 0) {
       console.warn(`[web-component] ${wired.malformed} WebComponent entr${wired.malformed === 1 ? 'y' : 'ies'} failed the defensive parse and were skipped`);
+    }
+  }
+
+  /**
+   * plan-757 §2.8 — wire the `WebComponent` entries of ONE placed subtree,
+   * announced by `layout-content-added`. Same trust gate, same registry, same
+   * env factory as the main model's `wire()`: the placement lives under the
+   * document root, and its scripts see the document's registry and signals.
+   * A placement that arrives before any model was loaded cannot happen
+   * (placements follow a load); one that is removed while the WASM host loads
+   * is skipped.
+   */
+  private async wirePlaced(root: Object3D, viewer: RVViewer): Promise<void> {
+    const found = countWebComponents(root);
+    if (found === 0) return;
+    if (!this.allowScripts) {
+      console.info(`[web-component] ${found} script component(s) in placed "${root.name}" — execution disabled (trust gate, plan-210 §10). Enable via setAllowScripts(true) or ?scripts.`);
+      return;
+    }
+    const load = this.lastLoad;
+    if (!load) return;
+    const registry = this.registry ?? await this.ensureRegistry(load.result, viewer);
+    if (!registry || registry !== this.registry) return;   // superseded by a newer load/clear
+    if (!root.parent) return;                              // removed while the host loaded
+    const wired = wireWebComponents(root, registry, { allowScripts: true });
+    if (wired.malformed > 0) {
+      console.warn(`[web-component] ${wired.malformed} WebComponent entr${wired.malformed === 1 ? 'y' : 'ies'} of placed "${root.name}" failed the defensive parse and were skipped`);
+    }
+  }
+
+  /** The reverse of {@link wirePlaced}: dispose every instance whose node is under `root`. */
+  private unwirePlaced(root: Object3D): void {
+    const registry = this.registry;
+    if (!registry) return;
+    for (const inst of registry.list()) {
+      let under = false;
+      for (let cur: Object3D | null = inst.node; cur; cur = cur.parent) if (cur === root) { under = true; break; }
+      if (under) registry.disposeInstance(inst.nodePath);
     }
   }
 
@@ -412,6 +492,47 @@ export class WebComponentPlugin implements RVViewerPlugin {
     };
 
     return ({ nodePath, nodeName, node, props, scheduler, addTeardown }) => {
+      const sourceTarget = (p: string) => {
+        const s = registry.getByPath<RVSource>('Source', p);
+        return s ? {
+          node: s.node,
+          spawn: () => {
+            const mu = viewer.transportManager?.spawnFromSource(s);
+            return mu ? { id: mu.id, prop: {} } : null;
+          },
+          get automatic() { return s.AutomaticGeneration; },
+          set automatic(v: boolean) { s.AutomaticGeneration = v; s.reapplyConfig(); },
+          get interval() { return s.Interval; },
+          set interval(v: number) {
+            if (!Number.isFinite(v) || v < 0) throw new Error('Source interval must be nonnegative seconds');
+            s.Interval = v;
+            s.reapplyConfig();
+          },
+        } : null;
+      };
+      const sinkTarget = (p: string) => {
+        const s = registry.getByPath<RVSink>('Sink', p);
+        return s ? { node: s.node, subscribe: (cb: (mu: { id: number; prop: Record<string, never> }) => void) =>
+          s.subscribeConsumed(mu => cb({ id: mu.id, prop: {} })) } : null;
+      };
+      const gripTarget = (p: string) => {
+        const g = registry.getByPath<RVGrip>('Grip', p);
+        return g ? {
+          node: g.node, pick: () => g.pick(), place: () => g.place(),
+          get gripped() { return g.grippedMUs.map(mu => ({ id: mu.id, prop: {} })); },
+          get range() { return g.GripRange; },
+        } : null;
+      };
+      const logicTarget = (p: string) => {
+        const step = viewer.logicEngine?.stepByPath.get(p);
+        return step ? {
+          node: registry.getNode(p) ?? undefined,
+          get state() { return step.state; }, get progress() { return step.progress; },
+          get runId() { return step instanceof RVJavaScriptStep ? step.runId : 0; },
+          start: () => step.start(), reset: () => step.reset(),
+          complete: step instanceof RVJavaScriptStep ? () => step.complete() : undefined,
+        } : null;
+      };
       const errorSignal = ensureWebComponentErrorSignal(signals, nodeName, nodePath);
       const signalWriter = createSignalWriter(
         signals,
@@ -456,6 +577,9 @@ export class WebComponentPlugin implements RVViewerPlugin {
       addTeardown(() => replyFns.clear());
       this.liveFlows.add(flow);
       addTeardown(() => this.liveFlows.delete(flow));
+      // plan-567: a carrier deleted or moved by hand in Commissioning is struck
+      // from this ledger (forgetMuInFlowLedgers) — no ghost MU stays parked.
+      addTeardown(trackFlowLedger(flow));
 
       // Per-instance statistics sink (plan-201 pattern of the library factory):
       // registered under the node path, unregistered on dispose.
@@ -479,7 +603,12 @@ export class WebComponentPlugin implements RVViewerPlugin {
         node,
         props,
         resolveNode: (p) => registry.getNode(p),
+        scene: createSceneScriptAccess(registry, result.root),
         components: {
+          source: sourceTarget,
+          sink: sinkTarget,
+          grip: gripTarget,
+          logicStep: logicTarget,
           drive: (p) => registry.getByPath<RVDrive>('Drive', p),
           sensor: (p) => {
             const s = registry.getByPath<RVSensor>('Sensor', p);
@@ -489,6 +618,10 @@ export class WebComponentPlugin implements RVViewerPlugin {
           transport: makeTransportTarget,
         },
         componentsAll: {
+          source: () => registry.getAll('Source').map(e => sourceTarget(e.path)!),
+          sink: () => registry.getAll('Sink').map(e => sinkTarget(e.path)!),
+          grip: () => registry.getAll('Grip').map(e => gripTarget(e.path)!),
+          logicStep: () => [...(viewer.logicEngine?.stepByPath.keys() ?? [])].map(p => logicTarget(p)!),
           drive: () => registry.getAll<RVDrive>('Drive').map((e) => e.instance),
           sensor: () => registry.getAll<RVSensor>('Sensor').map((e) => makeSensorTarget(e.instance)),
         },

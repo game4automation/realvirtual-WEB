@@ -31,7 +31,7 @@ import {
   emitSceneMutation,
 } from '../src/core/hmi/scene/rv-scene-mutations';
 import { sceneGlbRelPathFor, type RvProject } from '../src/core/project/rv-project-types';
-import { sceneDocumentsOf } from '../src/core/project/rv-project-documents';
+import { sceneDocumentsOf } from './helpers/document-sections';
 import type { RvScene } from '../src/core/hmi/scene/rv-scene-types';
 import { writeSceneDocument, writeBlobDocument } from './helpers/document-io';
 

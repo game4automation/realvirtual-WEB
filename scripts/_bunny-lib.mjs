@@ -26,14 +26,18 @@ import {
   mkdtempSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   rmSync,
 } from 'node:fs';
-import { encryptGlb } from './lib/rv-crypto.mjs';
+import { encryptGlb, makeKeyProbe, randomBytes, DEFAULT_CHUNK_SIZE } from './lib/rv-crypto.mjs';
+import { existsOnDiskExactly } from './lib/rv-fs.mjs';
+import { sha256Buffer } from './lib/rv-hash.mjs';
 import { signGlbBytes } from './rv-sign-glb.mjs';
 import { join, extname, basename, dirname, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { hasDeliveryConfig, loadDeliveryConfig } from './_workspace-lib.mjs';
-import { documentsInSection, withDerivedDocuments } from './_rv-manifest.mjs';
+import { withDerivedDocuments } from './_rv-manifest.mjs';
+import { hostedDeployDenyReason, readProjectIgnoreRules, HOSTED_DEPLOY_WARN_FILE_BYTES } from './_rv-guards.mjs';
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -50,11 +54,17 @@ import { documentsInSection, withDerivedDocuments } from './_rv-manifest.mjs';
 //! cached like a hashed build asset, so it is always re-uploaded and the pull
 //! zone is purged afterwards (`maybePurge`), which together are what let the
 //! rollback in plan-726 §5.6 be "replace one file" rather than "redeploy".
+//!
+//! `catalog.json` (every file with that basename — the bundled library's and
+//! any other) joined in plan-508 F2b: it carries `sha256` per asset, and a
+//! changed hash leaves the byte count untouched. A size-skipped catalog would
+//! keep the OLD hashes on the CDN while the browser verifies the NEW bytes.
 export const ALWAYS_UPLOAD_FILES = new Set([
   'settings.json',
   'models.json',
   'manifest.json',
   'project.json',
+  'catalog.json',
 ]);
 
 const DEFAULT_REGION = 'storage.bunnycdn.com';
@@ -145,8 +155,16 @@ export function mimeType(filePath) {
 export function isAlwaysUploadFile(filePath) {
   const ext = extname(filePath).toLowerCase();
   if (ext === '.html') return true;
+  // plan-596: a project's AASX index is rewritten by the viewer; an edit that
+  // keeps the byte count (an id swapped for one of equal length) must still
+  // reach the CDN. Matched on the folder, not the bare name — a generic
+  // `index.json` elsewhere keeps the size diff.
+  if (AASX_INDEX_REL_RE.test(normalizePath(filePath))) return true;
   return ALWAYS_UPLOAD_FILES.has(basename(filePath).toLowerCase());
 }
+
+//! `aasx/index.json` at any depth (project-relative or `p/aasx/index.json`).
+const AASX_INDEX_REL_RE = /(^|\/)aasx\/index\.json$/i;
 
 // ─── Config ──────────────────────────────────────────────────────────────
 
@@ -263,12 +281,18 @@ export function collectLocalFiles(rootDir) {
 //! RVE1 envelope has fresh random salt/IVs on every publish, so a password
 //! change produces different bytes at the IDENTICAL size and the size diff
 //! would silently keep the old-password ciphertext on the CDN.
+//! `alwaysUploadRel` (plan-508 F2b) is a set of rels selected regardless of
+//! size — the catalogued binaries whose `sha256` differs from the previously
+//! published catalog (`catalogChangedBinaries`). Compared case-insensitively.
 // SOURCE: BunnyCdnUploader.cs:287 (diff check) — keep in sync
 export function selectFilesToUpload(local, remote, opts = {}) {
   if (opts.force || !remote) return [...local];
+  const forced = new Set([...(opts.alwaysUploadRel ?? [])].map((rel) => normalizePath(rel).toLowerCase()));
   const result = [];
   for (const f of local) {
-    if (isAlwaysUploadFile(f.rel) || (opts.alwaysUploadGlbs && extname(f.rel).toLowerCase() === '.glb')) {
+    if (isAlwaysUploadFile(f.rel)
+      || (opts.alwaysUploadGlbs && extname(f.rel).toLowerCase() === '.glb')
+      || forced.has(f.rel.toLowerCase())) {
       result.push(f);
       continue;
     }
@@ -292,12 +316,33 @@ export function buildRemoteIndex(entries) {
   return map;
 }
 
-// ─── Bunny HTTP client ───────────────────────────────────────────────────
+/// ─── Bunny HTTP client ───────────────────────────────────────────────────
+
+const MAX_RETRY_AFTER_MS = 60_000;
+// Retrying these cannot succeed: the credentials are wrong, the answer will not change.
+const NON_RETRYABLE_STATUSES = new Set([401, 403]);
+
+//! Parses an HTTP `Retry-After` header (delta-seconds or an HTTP date) into milliseconds,
+//! capped at one minute. Returns null when the header is absent or unparseable.
+export function retryAfterMs(value, now = Date.now()) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  let ms;
+  if (/^\d+(?:\.\d+)?$/.test(text)) ms = Number(text) * 1000;
+  else {
+    const at = Date.parse(text);
+    if (Number.isNaN(at)) return null;
+    ms = at - now;
+  }
+  return Math.min(Math.max(0, Math.round(ms)), MAX_RETRY_AFTER_MS);
+}
 
 //! Thin HTTP client over the Bunny Storage + CDN APIs. Uses global fetch with
 //! a 5-minute AbortSignal.timeout (R4) and exponential backoff + jitter (R7).
+//! `sleep` is a test seam for the backoff wait.
 export class BunnyClient {
-  constructor({ region, zone, storageKey, accountKey = '', pullZoneId = '', dryRun = false, log = () => {} }) {
+  constructor({ region, zone, storageKey, accountKey = '', pullZoneId = '', dryRun = false, log = () => {}, sleep = null }) {
     this.region = region;
     this.zone = zone.replace(/^\/+|\/+$/g, '');
     this.storageKey = storageKey;
@@ -305,15 +350,45 @@ export class BunnyClient {
     this.pullZoneId = pullZoneId;
     this.dryRun = dryRun;
     this.log = log;
+    this.sleep = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   _host() {
     return this.region.startsWith('https://') ? this.region : `https://${this.region}`;
   }
 
+  //! The one retry loop behind putFile, getFile, deleteFile and the listing (plan-487).
+  //! Up to MAX_ATTEMPTS tries on network errors and on every status `accept` refuses, except
+  //! 401/403. The wait is `Retry-After` when a 429/503 sends one, else 2^attempt * 1000 ms +
+  //! jitter. Returns the accepted Response; throws `${failure} after N attempts: …`.
+  async _requestWithRetry(url, init, { accept, failure }) {
+    let lastErr = '';
+    let attempts = 0;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      attempts = attempt;
+      let wait = null;
+      try {
+        const resp = await fetch(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+        if (accept(resp)) return resp;
+        const body = await resp.text().catch(() => '');
+        lastErr = `HTTP ${resp.status}: ${body.slice(0, 200)}`;
+        if (NON_RETRYABLE_STATUSES.has(resp.status)) break;
+        if (resp.status === 429 || resp.status === 503) {
+          wait = retryAfterMs(resp.headers?.get?.('retry-after'));
+        }
+      } catch (ex) {
+        lastErr = ex?.message ?? String(ex);
+      }
+      if (attempt < MAX_ATTEMPTS) {
+        await this.sleep(wait ?? Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500));
+      }
+    }
+    throw new Error(`${failure} after ${attempts} attempt${attempts === 1 ? '' : 's'}: ${lastErr}`);
+  }
+
   //! Uploads a single file (Buffer/Uint8Array) to the given remote path.
-  //! Accepts HTTP 200/201. Retries up to 3 times on 5xx / network error with
-  //! exponential backoff (2^n * 1000 ms) + jitter.
+  //! Accepts HTTP 200/201. Retries up to 3 times with exponential backoff
+  //! (2^n * 1000 ms) + jitter, honouring Retry-After — see _requestWithRetry.
   // SOURCE: BunnyCdnUploader.cs:308 (per-file PUT + retry loop) — keep in sync
   async putFile(bytes, remotePath, mimeOverride) {
     if (this.dryRun) {
@@ -322,30 +397,14 @@ export class BunnyClient {
     }
     const url = buildUploadUrl(this.region, this.zone, normalizePath(remotePath));
     const contentType = mimeOverride || mimeType(remotePath);
-    let lastErr = '';
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        const resp = await fetch(url, {
-          method: 'PUT',
-          headers: {
-            AccessKey: this.storageKey,
-            'Content-Type': contentType,
-          },
-          body: bytes,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        });
-        if (resp.status === 201 || resp.status === 200) return;
-        const body = await resp.text().catch(() => '');
-        lastErr = `HTTP ${resp.status}: ${body.slice(0, 200)}`;
-      } catch (ex) {
-        lastErr = ex?.message ?? String(ex);
-      }
-      if (attempt < MAX_ATTEMPTS) {
-        const backoff = Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500);
-        await new Promise((r) => setTimeout(r, backoff));
-      }
-    }
-    throw new Error(`Upload failed after ${MAX_ATTEMPTS} attempts: ${lastErr}`);
+    await this._requestWithRetry(url, {
+      method: 'PUT',
+      headers: {
+        AccessKey: this.storageKey,
+        'Content-Type': contentType,
+      },
+      body: bytes,
+    }, { accept: (resp) => resp.status === 201 || resp.status === 200, failure: 'Upload failed' });
   }
 
   //! Downloads a single file from Bunny Storage for byte-for-byte verification.
@@ -356,50 +415,51 @@ export class BunnyClient {
       return null;
     }
     const url = buildUploadUrl(this.region, this.zone, normalizePath(remotePath));
-    let lastErr = '';
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        const resp = await fetch(url, {
-          method: 'GET',
-          headers: { AccessKey: this.storageKey },
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        });
-        if (resp.ok) return Buffer.from(await resp.arrayBuffer());
-        const body = await resp.text().catch(() => '');
-        lastErr = `HTTP ${resp.status}: ${body.slice(0, 200)}`;
-      } catch (ex) {
-        lastErr = ex?.message ?? String(ex);
-      }
-      if (attempt < MAX_ATTEMPTS) {
-        const backoff = Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 500);
-        await new Promise((resolve) => setTimeout(resolve, backoff));
-      }
-    }
-    throw new Error(`Download failed after ${MAX_ATTEMPTS} attempts: ${lastErr}`);
+    const resp = await this._requestWithRetry(url, {
+      method: 'GET',
+      headers: { AccessKey: this.storageKey },
+    }, { accept: (r) => r.ok, failure: 'Download failed' });
+    return Buffer.from(await resp.arrayBuffer());
   }
 
-  //! Deletes one remote file after local snapshot validation has succeeded.
+  //! Like getFile(), but a missing file (HTTP 404) is `null` instead of a retried
+  //! failure — the previously published catalog of a first deploy (plan-508 F2b).
+  //! Dry-run answers null.
+  async getFileIfExists(remotePath) {
+    if (this.dryRun) {
+      this.log(`[dry-run] GET ${remotePath}`);
+      return null;
+    }
+    const url = buildUploadUrl(this.region, this.zone, normalizePath(remotePath));
+    const resp = await this._requestWithRetry(url, {
+      method: 'GET',
+      headers: { AccessKey: this.storageKey },
+    }, { accept: (r) => r.ok || r.status === 404, failure: 'Download failed' });
+    if (resp.status === 404) return null;
+    return Buffer.from(await resp.arrayBuffer());
+  }
+
+  //! Deletes one remote file. A missing file (404) counts as deleted. Retries with the same
+  //! policy as putFile() — shared with embed-deploy.mjs, which uses this client too.
   async deleteFile(remotePath) {
     if (this.dryRun) {
       this.log(`[dry-run] DELETE ${remotePath}`);
       return;
     }
     const url = buildUploadUrl(this.region, this.zone, normalizePath(remotePath));
-    const response = await fetch(url, {
+    await this._requestWithRetry(url, {
       method: 'DELETE',
       headers: { AccessKey: this.storageKey },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!response.ok && response.status !== 404) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Delete failed for ${remotePath}: HTTP ${response.status}: ${body.slice(0, 200)}`);
-    }
+    }, { accept: (r) => r.ok || r.status === 404, failure: `Delete failed for ${remotePath}` });
   }
 
   //! Recursively lists a remote storage path. Returns a flat array of
   //! { rel, size, isDirectory:false } where `rel` is relative to `remoteRoot`.
-  //! Directories are descended into, not emitted. A failed/empty listing
-  //! returns [] (first deploy: nothing remote yet).
+  //! Directories are descended into, not emitted. A path that does not exist
+  //! (HTTP 404) is an empty listing — the first deploy to a new prefix. Every
+  //! other failure (auth, network, 5xx after retries, invalid JSON, a non-array
+  //! body) THROWS: a half-blind listing used to report success (plan-487).
+  //! Deliberately sequential — Bunny allows only 5 concurrent listings.
   // SOURCE: BunnyCdnUploader.cs:378 (ListStorageRecursiveAsync) — keep in sync
   async listRecursive(remoteRoot) {
     const root = normalizePath(remoteRoot || '').replace(/^\/+|\/+$/g, '');
@@ -411,20 +471,21 @@ export class BunnyClient {
   async _listInto(currentPath, rootPath, result) {
     const segment = currentPath ? `/${currentPath}/` : '/';
     const url = `${this._host()}/${this.zone}${segment}`;
+    const where = currentPath || '/';
+    const resp = await this._requestWithRetry(url, {
+      method: 'GET',
+      headers: { AccessKey: this.storageKey, Accept: 'application/json' },
+    }, { accept: (r) => r.ok || r.status === 404, failure: `Listing ${where} failed` });
+    if (resp.status === 404) return;
     let entries;
     try {
-      const resp = await fetch(url, {
-        method: 'GET',
-        headers: { AccessKey: this.storageKey, Accept: 'application/json' },
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
-      if (!resp.ok) return;
       entries = await resp.json();
     } catch (ex) {
-      this.log(`[bunny] failed to list ${currentPath || '/'}: ${ex?.message ?? ex}`);
-      return;
+      throw new Error(`Listing ${where} returned invalid JSON: ${ex?.message ?? ex}`);
     }
-    if (!Array.isArray(entries)) return;
+    if (!Array.isArray(entries)) {
+      throw new Error(`Listing ${where} returned ${entries === null ? 'null' : typeof entries} instead of an array`);
+    }
     for (const entry of entries) {
       const name = String(entry.ObjectName ?? '').replace(/^\/+|\/+$/g, '');
       const entryPath = currentPath ? `${currentPath}/${name}` : name;
@@ -467,6 +528,105 @@ export class BunnyClient {
       return false;
     }
   }
+
+  //! Purges ONE URL on every edge (plan-598): `POST /purge?url=…&async=true`.
+  //! Returns true on success; never throws (the caller decides the fallback).
+  async purgeUrl(url) {
+    if (this.dryRun) {
+      this.log(`[dry-run] purge url ${url}`);
+      return true;
+    }
+    try {
+      const resp = await fetch(`https://api.bunny.net/purge?url=${encodeURIComponent(url)}&async=true`, {
+        method: 'POST',
+        headers: { AccessKey: this.accountKey },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => '');
+        this.log(`[bunny] url purge ${url} returned HTTP ${resp.status}: ${body.slice(0, 200)}`);
+        return false;
+      }
+      return true;
+    } catch (ex) {
+      this.log(`[bunny] url purge ${url} failed: ${ex?.message ?? ex}`);
+      return false;
+    }
+  }
+
+  //! Purges a list of URLs, a few at a time. Without credentials nothing is
+  //! purged and every URL counts as failed (so the caller's fallback — the zone
+  //! purge — reports the same "skipped" it always did). Returns { purged, failed }.
+  async purgeUrls(urls, { concurrency = 6 } = {}) {
+    if (!this.accountKey) {
+      this.log('[bunny] url purge skipped (no account key)');
+      return { purged: [], failed: [...urls] };
+    }
+    const purged = [];
+    const failed = [];
+    const queue = [...urls];
+    const worker = async () => {
+      while (queue.length > 0) {
+        const url = queue.shift();
+        if (await this.purgeUrl(url)) purged.push(url); else failed.push(url);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
+    return { purged, failed };
+  }
+
+  //! Makes the pull zone carry exactly the {@link RV_EDGE_RULES} (plan-598 F5),
+  //! idempotently: rules are recognised by their Description; an identical one
+  //! is left alone, a drifted one is updated in place (same Guid), a missing one
+  //! is created. Rules that are not ours are never touched. Non-fatal: a failure
+  //! is logged and reported, the deploy goes on (the cache headers are an
+  //! optimisation, not a correctness condition — every URL still revalidates
+  //! through the deploy's purge). Returns { created, updated, unchanged } or
+  //! null when it could not run.
+  //! VOR ERSTEM LIVE-LAUF PER GET VERIFIZIEREN: see BUNNY_EDGE_ACTION.
+  async ensureEdgeRules(rules = RV_EDGE_RULES) {
+    if (!this.pullZoneId || !this.accountKey) {
+      this.log('[bunny] edge rules skipped (no account key / pull zone id)');
+      return null;
+    }
+    if (this.dryRun) {
+      for (const rule of rules) this.log(`[dry-run] ensure edge rule "${rule.description}"`);
+      return { created: 0, updated: 0, unchanged: 0 };
+    }
+    try {
+      const zoneResp = await fetch(`https://api.bunny.net/pullzone/${this.pullZoneId}`, {
+        headers: { AccessKey: this.accountKey, Accept: 'application/json' },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!zoneResp.ok) {
+        this.log(`[bunny] edge rules: reading the pull zone returned HTTP ${zoneResp.status} — skipped`);
+        return null;
+      }
+      const zone = await zoneResp.json();
+      const existing = Array.isArray(zone?.EdgeRules) ? zone.EdgeRules : [];
+      const result = { created: 0, updated: 0, unchanged: 0 };
+      for (const rule of rules) {
+        const current = existing.find((r) => r?.Description === rule.description) ?? null;
+        if (edgeRuleMatches(current, rule)) { result.unchanged++; continue; }
+        const resp = await fetch(`https://api.bunny.net/pullzone/${this.pullZoneId}/edgerules/addOrUpdate`, {
+          method: 'POST',
+          headers: { AccessKey: this.accountKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify(edgeRuleBody(rule, current?.Guid ?? null)),
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        });
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => '');
+          this.log(`[bunny] edge rule "${rule.description}" returned HTTP ${resp.status}: ${body.slice(0, 200)}`);
+          return null;
+        }
+        if (current) result.updated++; else result.created++;
+      }
+      return result;
+    } catch (ex) {
+      this.log(`[bunny] edge rules failed (non-fatal): ${ex?.message ?? ex}`);
+      return null;
+    }
+  }
 }
 
 // ─── Private project: load / validate ────────────────────────────────────
@@ -479,9 +639,8 @@ export class BunnyClient {
 //! lifts a genuinely unmigrated customer's `scenes[]` / `models[]` / `library[]`
 //! into the one list and drops the arrays — in memory only, nothing is written,
 //! no marker is minted. Consumers downstream therefore never have to ask which
-//! shape they were handed, and no consumer needs a legacy fallback of its own:
-//! `publishedSceneIndex()` carried one until this line existed, and a fallback
-//! per consumer is how two readers of the same file drift apart.
+//! shape they were handed, and no consumer needs a legacy fallback of its own —
+//! a fallback per consumer is how two readers of the same file drift apart.
 // SOURCE: WebViewerToolbar.cs:1135 (LoadProject) + R6 validation — keep in sync
 export function loadProject(projectDir) {
   const jsonPath = join(projectDir, 'project.json');
@@ -532,43 +691,11 @@ export function discoverPrivateProjects(baseDir) {
 
 // ─── Private project: settings.json ──────────────────────────────────────
 
-//! Generates the settings.json content for a private project.
-//! Private CUSTOMER deploys never carry analytics: googleAnalyticsId is
-//! hardcoded empty (the runtime skips gtag injection for ''). GA stays a
-//! public-demo-only concern (injectGaIntoSettings on the public path).
-//!
-//! plan-700 Phase 6 (B14): the project's own `settings/project-settings.json`
-//! is merged in as the BASE when the caller passes it. It is a base, never an
-//! override: every key this function owns (`projectAssetsPath`, `analytics`,
-//! `encryption`, `generated`, and `defaultModel` when the manifest declares
-//! one) is written afterwards and wins. A project file can therefore add
-//! settings the deploy did not know about, but can never switch analytics back
-//! on, aim the assets path elsewhere, or claim the build is unencrypted.
-// SOURCE: WebViewerToolbar.cs:1185 (GeneratePrivateSettings) — keep in sync
-export function generatePrivateSettings(project, projectFolderName, opts = {}) {
-  let defaultModel = project?.settings?.defaultModel ?? '';
-  if (defaultModel && !defaultModel.startsWith('models/')) {
-    defaultModel = 'models/' + defaultModel;
-  }
-  const settings = {};
-  for (const [key, value] of Object.entries(projectSettingsBase(opts.projectSettings))) {
-    settings[key] = value;
-  }
-  if (defaultModel) settings.defaultModel = defaultModel;
-  if (projectFolderName) settings.projectAssetsPath = `private-assets/${projectFolderName}/`;
-  // plan-267: signal the runtime to install the password gate + decrypt models.
-  // The GLBs keep their .glb name but hold an RVE1 envelope; salt/iterations live
-  // in each envelope header, so this flag only needs to be a boolean.
-  if (opts.encryption) settings.encryption = { enabled: true };
-  settings.analytics = { googleAnalyticsId: '' }; // no tracking in customer deploys
-  settings.generated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-  return JSON.stringify(settings, null, 2);
-}
-
 //! Keys of the generated settings.json that a project file must never set.
 //! `analytics` and `encryption` are security statements about the artifact,
 //! `projectAssetsPath` and `generated` are deploy mechanics.
 export const SETTINGS_RESERVED_KEYS = Object.freeze([
+  'projectUrl',
   'projectAssetsPath',
   'analytics',
   'encryption',
@@ -601,154 +728,6 @@ export function readProjectSettingsFile(projectDir) {
   }
 }
 
-//! The curated Examples manifest (`scenes/index.json`, `[{file,name,mode,level}]`)
-//! derived from the manifest's scene documents — plan-700 Phase 6, moved onto
-//! `documents[]` by plan-413 phase 6.
-//!
-//! Only `baseKind: 'published'` entries whose `path` points into `scenes/`
-//! qualify: a customer's own scenes are Zone C and are not published Examples.
-//! Returns null when the manifest declares none, in which case the folder's own
-//! `index.json` (if any) is left exactly as it was — the folder stays SSOT for
-//! everything the manifest does not speak about (P0-3).
-//!
-//! The file must be a `.glb`. Since plan-413 phase 3 an example scene is a GLB
-//! like every other scene, and phase 6 removed the reader for anything else —
-//! publishing a `.scene.json` entry would deploy a catalogue row pointing at a
-//! format the viewer can no longer open.
-//!
-//! **No `scenes[]` fallback** (removed in plan-703 phase 9). It used to sit here
-//! for the customer nobody has opened in a current client; that case is now
-//! answered once, upstream, by `withDerivedDocuments()` in `loadProject()`, so
-//! by the time a manifest reaches this function it has a document list whatever
-//! shape it had on disk. Measured before deleting: of the eight real projects
-//! exactly one still carried a legacy `scenes[]` (`demo-realvirtual`), and both
-//! of its entries are `.scene.json`, which the `.glb` gate below rejects anyway
-//! — so the fallback published nothing on any input that exists.
-export function publishedSceneIndex(project) {
-  const out = [];
-  for (const scene of documentsInSection(project, 'scenes')) {
-    if (scene.baseKind !== 'published') continue;
-    const path = typeof scene.path === 'string' ? scene.path.replace(/^\.?\//, '') : '';
-    if (!path.startsWith('scenes/')) continue;
-    const file = path.slice('scenes/'.length);
-    if (!file || file.includes('/') || !file.toLowerCase().endsWith('.glb')) continue;
-    const entry = { file };
-    if (typeof scene.name === 'string' && scene.name) entry.name = scene.name;
-    if (typeof scene.mode === 'string' && scene.mode) entry.mode = scene.mode;
-    // The classification cache travels into the catalogue so the dashboard can
-    // draw a bundled deploy's chips without downloading every example to read
-    // its bytes (plan-413 §2.5: a bundled source is never scanned).
-    const level = scene.classification && typeof scene.classification.level === 'string'
-      ? scene.classification.level
-      : null;
-    if (level) entry.level = level;
-    out.push(entry);
-  }
-  return out.length > 0 ? out : null;
-}
-
-//! The GLBs a project publishes, in `readdirSync` order first — the exact
-//! contents of the deployed `models.json`.
-//!
-//! **The folder is the source of truth, not the manifest** (plan-700 P0-3).
-//! plan-372 turned the browser-side `FolderBackend.listModels()` directory-driven
-//! for the same reason and removed `models[]` from all six manifests: every GLB in
-//! `models/` belongs to the project, and nobody should have to remember to
-//! register one. Publishing from `models[]` would have re-imposed exactly the
-//! bookkeeping that decision removed — and, with the manifests already emptied,
-//! would have published nothing.
-//!
-//! **Since plan-720 the list is a UNION, never a replacement** (Z2). P0-3 stands
-//! unchanged: a manifest can never HIDE a GLB that sits in `models/`. What it can
-//! do is ADD one the folder glob cannot see — a ROOT-LEVEL document, which is the
-//! layout the browser writes today (`wmyb/P1002_SAIER.glb`) and which published an
-//! empty `models.json` for as long as the glob was the whole answer. So:
-//!
-//!   union = every `models/*.glb` on disk
-//!         ∪ every `documents[]` entry that names an existing root-level or
-//!           `models/`-level `.glb`
-//!
-//! Documents under `scenes/` or `library/` are deliberately NOT in the union:
-//! staging copies those folders wholesale and they are catalogued elsewhere
-//! (`publishedSceneIndex()` / the library catalogue). Pulling them into
-//! `models.json` would duplicate their bytes into `models/` and list a library
-//! part as a machine model.
-//!
-//! Extracted from `stagePrivateProject` only so the derivation can be asserted
-//! against the real project folders without staging half a gigabyte of GLB.
-export function projectModelNames(projectDir) {
-  return projectModelNamesWithReport(projectDir).list;
-}
-
-//! `projectModelNames()` plus the bookkeeping it deliberately does not throw on:
-//! `{ list, sources, discrepancies }`.
-//!
-//! - `list` — the union of filenames written to `models.json`.
-//! - `sources` — Map<name, absolute source path>. A root-level document is
-//!   staged INTO `models/` under its bare filename, so the staging step needs to
-//!   know where each name actually came from.
-//! - `discrepancies` — `{ kind, path, reason }[]`. A manifest entry whose file is
-//!   gone is reported and NOT published (a dead `models.json` row 404s in the
-//!   viewer); a `models/` GLB with no manifest entry is reported and IS published
-//!   (P0-3). Both used to be silent, which is how the wmyb defect survived a
-//!   delivery: nothing that runs printed the fact that the publish list was empty.
-//!
-//! Reads the manifest defensively rather than through `loadProject()`: deriving a
-//! file list must never throw on a project that fails `code`/`name` validation —
-//! that verdict belongs to the deploy gate, one layer up. The manifest projection
-//! itself is still the shared one (`withDerivedDocuments()`), so an unmigrated
-//! customer's `models[]`/`library[]` is seen exactly as everywhere else.
-export function projectModelNamesWithReport(projectDir) {
-  const list = [];
-  const sources = new Map();
-  const discrepancies = [];
-
-  const modelsDir = join(projectDir, 'models');
-  if (existsSync(modelsDir)) {
-    for (const entry of readdirSync(modelsDir, { withFileTypes: true })) {
-      if (!entry.isFile() || extname(entry.name).toLowerCase() !== '.glb') continue;
-      list.push(entry.name);
-      sources.set(entry.name, join(modelsDir, entry.name));
-    }
-  }
-
-  const manifest = readProjectManifest(projectDir);
-  const documents = Array.isArray(manifest?.documents) ? manifest.documents : [];
-  const declared = new Set();
-  for (const doc of documents) {
-    const raw = typeof doc?.path === 'string' ? doc.path.replace(/^\.?\//, '').replace(/\\/g, '/') : '';
-    if (!raw || !raw.toLowerCase().endsWith('.glb')) continue;
-    // Only the two places a "model" can live. scenes/ and library/ are staged as
-    // folders and catalogued separately — see the union note above.
-    const segments = raw.split('/');
-    const isRootLevel = segments.length === 1;
-    const isModelsLevel = segments.length === 2 && segments[0].toLowerCase() === 'models';
-    if (!isRootLevel && !isModelsLevel) continue;
-    const name = segments[segments.length - 1];
-    declared.add(name);
-    if (list.includes(name)) continue; // folder already has it — P0-3, folder wins
-    const absolute = join(projectDir, ...segments);
-    if (!existsSync(absolute)) {
-      discrepancies.push({ kind: 'missing-file', path: raw, reason: 'declared in documents[] but not on disk' });
-      continue;
-    }
-    list.push(name);
-    sources.set(name, absolute);
-  }
-
-  // Informational only: the folder wins, but an unregistered GLB usually means a
-  // manifest that drifted from the folder, and that is worth saying out loud.
-  if (documents.length > 0) {
-    for (const name of list) {
-      if (!declared.has(name)) {
-        discrepancies.push({ kind: 'unregistered', path: `models/${name}`, reason: 'on disk but not in documents[]' });
-      }
-    }
-  }
-
-  return { list, sources, discrepancies };
-}
-
 //! The THIRD read entry point for a manifest, and the one the public deploy needs
 //! (plan-726 Phase 3).
 //!
@@ -756,8 +735,8 @@ export function projectModelNamesWithReport(projectDir) {
 //! can never land under `undefined/`. The PUBLIC demo deliberately has no `code`
 //! — its URL is the site itself — so `loadProject()` would throw on it, which is
 //! why the allowlist could not simply reuse it. `readProjectManifest()` is the
-//! non-throwing reader that already existed for `projectModelNamesWithReport()`;
-//! this only exports it under a name that says which manifest is meant.
+//! non-throwing reader; this only exports it under a name that says which
+//! manifest is meant.
 //!
 //! `rootDir` is a DEPLOY ROOT (a `dist/` or a staged `public/`), not a project
 //! folder — but the file, its name and its projection are the same, so there is
@@ -768,7 +747,7 @@ export function readDeployManifest(rootDir) {
 
 //! Parses `<projectDir>/project.json` through the shared document projection,
 //! or null when it is absent or unparseable. Unlike `loadProject()` this neither
-//! validates nor throws — see `projectModelNamesWithReport()`.
+//! validates nor throws.
 function readProjectManifest(projectDir) {
   const jsonPath = join(projectDir, 'project.json');
   if (!existsSync(jsonPath)) return null;
@@ -779,8 +758,9 @@ function readProjectManifest(projectDir) {
   }
 }
 
-// ─── Private project: staging ────────────────────────────────────────────
+// ─── Hosted project: staging (plan-759) ──────────────────────────────────
 
+//! Copies ONE directory subtree of dist/ into the staging dir (the runtime part).
 function copyDirRecursive(sourceDir, destDir, excludeExtensions) {
   mkdirSync(destDir, { recursive: true });
   for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
@@ -795,131 +775,224 @@ function copyDirRecursive(sourceDir, destDir, excludeExtensions) {
   }
 }
 
-//! Stages a private project into a fresh temp directory ready for upload.
-//! Copies dist/ (root files flat; subdirs except models/; assets/ without .glb),
-//! the project's own models/*.glb, then writes models.json + settings.json.
-//! Returns the staging directory path. Does NOT build (caller builds first).
-//! Caller is responsible for cleaning up the returned dir (try/finally).
+//! The relative path a hosted deploy publishes the project under. The runtime
+//! sits at the deploy root, the project folder verbatim below this prefix, and
+//! the generated settings.json names it as `projectUrl`.
+export const HOSTED_PROJECT_PREFIX = 'p/';
+
+/**
+ * Copies a project folder byte-for-byte into `destDir`, minus what
+ * `hostedDeployDenyReason()` refuses. Works on `lstat`: a symlink is never
+ * dereferenced (a link pointing outside the project would otherwise land on a
+ * CDN), it is skipped and reported. Returns the report the deploy prints as
+ * its preflight:
+ *
+ *   { copied: string[], denied: {rel, reason}[], symlinks: string[], oversized: string[] }
+ */
+export function copyProjectVerbatim(projectDir, destDir, { ignoreRules = null } = {}) {
+  const rules = ignoreRules ?? readProjectIgnoreRules(projectDir);
+  const report = { copied: [], denied: [], symlinks: [], oversized: [] };
+  const root = projectDir.replace(/[\\/]+$/, '');
+  const visit = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const abs = join(dir, entry.name);
+      const rel = normalizePath(abs.substring(root.length + 1));
+      const st = lstatSync(abs);
+      if (st.isSymbolicLink()) {
+        report.symlinks.push(rel);
+        continue;
+      }
+      const isDir = st.isDirectory();
+      const reason = hostedDeployDenyReason(rel, { isDir, ignoreRules: rules });
+      if (reason) {
+        report.denied.push({ rel: isDir ? `${rel}/` : rel, reason });
+        continue;
+      }
+      if (isDir) {
+        mkdirSync(join(destDir, rel), { recursive: true });
+        visit(abs);
+        continue;
+      }
+      mkdirSync(dirname(join(destDir, rel)), { recursive: true });
+      copyFileSync(abs, join(destDir, rel));
+      report.copied.push(rel);
+      if (st.size > HOSTED_DEPLOY_WARN_FILE_BYTES) report.oversized.push(rel);
+    }
+  };
+  mkdirSync(destDir, { recursive: true });
+  visit(root);
+  return report;
+}
+
+//! True for a `p/`-relative path a password-protected deploy encrypts: every
+//! `.glb` (any depth) plus the project AASX — `aasx/*.aasx` (flat, like the
+//! viewer's scan) and `aasx/index.json` (plan-596).
+export function isEncryptablePath(rel) {
+  const p = normalizePath(rel);
+  if (extname(p).toLowerCase() === '.glb') return true;
+  return /^aasx\/[^/]+\.aasx$/i.test(p) || /^aasx\/index\.json$/i.test(p);
+}
+
+//! Every encryptable file below `dir` (see {@link isEncryptablePath}), as
+//! `p/`-relative POSIX paths, sorted.
+export function encryptablePathsBelow(dir) {
+  const out = [];
+  const root = dir.replace(/[\\/]+$/, '');
+  const visit = (d) => {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      const abs = join(d, entry.name);
+      if (entry.isDirectory()) visit(abs);
+      else {
+        const rel = normalizePath(abs.substring(root.length + 1));
+        if (isEncryptablePath(rel)) out.push(rel);
+      }
+    }
+  };
+  visit(root);
+  return out.sort();
+}
+
+//! The rels a hosted publish must upload regardless of the size diff: the
+//! catalog-hash diff (plan-508) united with every file the staging encrypted
+//! (plan-596 SOL #1 — a fresh salt per publish gives new ciphertext at the
+//! identical size). `encrypted` is `p/`-relative (`aasx/a.aasx`), the upload
+//! works staging-relative (`p/aasx/a.aasx`). Both inputs accept any iterable
+//! (`catalogHashDiff` returns a `Set`) or null/undefined.
+export function hostedForcedUploadRels(encrypted = [], catalogDiff = []) {
+  const out = new Set([...(catalogDiff ?? [])].map((r) => normalizePath(r)));
+  for (const rel of encrypted ?? []) out.add(`${HOSTED_PROJECT_PREFIX}${normalizePath(rel).replace(/^\/+/, '')}`);
+  return [...out].sort();
+}
+
+//! Generates the settings.json of a hosted deploy.
 //!
-//! When `encryption` is provided ({ password, fragmentSecret, iterations?,
-//! chunkSize? }), each GLB is AES-256-GCM encrypted (plan-267) and staged under
-//! its SAME .glb name (the bytes are an RVE1 envelope, self-describing via magic);
-//! settings.json then carries `encryption:{enabled:true}`. Async because encryption is.
-// SOURCE: WebViewerToolbar.cs:1215 (StagePrivateProject) — keep in sync
+//! A hosted deploy carries NO `defaultModel` (D14): the root always opens the
+//! dashboard of the served project, a document opens through its own `?doc=`
+//! URL. The project's `settings/project-settings.json` is the BASE; every key
+//! this function owns (`projectUrl`, `projectAssetsPath`, `analytics`,
+//! `encryption`, `generated`) is written afterwards and wins, so a project file
+//! can add settings but never re-enable analytics, aim the project elsewhere
+//! or claim the build is unencrypted. Private customer deploys never carry
+//! analytics: the GA id is hardcoded empty.
+export function generateHostedSettings(opts = {}) {
+  const settings = {};
+  for (const [key, value] of Object.entries(projectSettingsBase(opts.projectSettings))) {
+    settings[key] = value;
+  }
+  // D14: the root of a hosted deploy is the dashboard; a document opens only
+  // through its own `?doc=` URL. A `defaultModel` from the project file would
+  // make the boot auto-open it, so it is dropped here rather than reserved.
+  delete settings.defaultModel;
+  settings.projectUrl = HOSTED_PROJECT_PREFIX;
+  settings.projectAssetsPath = HOSTED_PROJECT_PREFIX;
+  // plan-267 / plan-759: signal the runtime to install the boot password gate.
+  // `probe` is a tiny envelope over a fixed plaintext with the publish salt, so
+  // the gate verifies the key without downloading a model (F5).
+  if (opts.encryption) settings.encryption = { enabled: true, probe: opts.encryption.probe };
+  settings.analytics = { googleAnalyticsId: '' }; // no tracking in customer deploys
+  settings.generated = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  return JSON.stringify(settings, null, 2);
+}
+
+//! Stages a hosted project into a fresh temp directory ready for upload:
+//!
+//!   staging/            ← dist/ root files + subdirs (without the demo's
+//!                          models/, scenes/, library/; assets/ without .glb)
+//!   staging/settings.json
+//!   staging/p/**        ← the project folder verbatim (copyProjectVerbatim)
+//!
+//! With `encryption` ({ password, fragmentSecret, iterations?, chunkSize? })
+//! every `.glb` below `p/` — and the project AASX (`aasx/*.aasx`,
+//! `aasx/index.json`, plan-596) — becomes an RVE1 envelope under its own name:
+//! ONE salt for the whole publish (one key derivation, one probe), the file's
+//! `p/`-relative path as `hkdfInfo` (per-file AAD binding, F6b), 16 MiB chunks.
+//! Signing, when configured, runs on the plaintext BEFORE encryption — and ONLY
+//! on `.glb` (SOL #2): an AASX or a JSON index is no GLB container.
+//!
+//! Returns the staging directory path. Does NOT build (caller builds first).
+//! Caller is responsible for cleaning up the returned dir (try/finally). The
+//! preflight report is handed to `onReport` when given.
 /**
  * @param {{
  *   distDir: string,
  *   projectDir: string,
  *   encryption?: { password: string, fragmentSecret: Uint8Array, iterations?: number, chunkSize?: number } | null,
  *   signing?: { privateKey: import('node:crypto').KeyObject, customerCert?: object | null } | null,
+ *   onReport?: (report: { copied: string[], denied: {rel:string,reason:string}[], symlinks: string[], oversized: string[], encrypted: string[] }) => void,
  * }} opts
  * @returns {Promise<string>} staging directory path
  */
-export async function stagePrivateProject({ distDir, projectDir, encryption = null, signing = null }) {
+export async function stageHostedProject({ distDir, projectDir, encryption = null, signing = null, onReport = null }) {
   if (!existsSync(distDir)) {
     throw new Error(`dist/ not found: ${distDir}`);
   }
   const project = loadProject(projectDir);
-  const folderName = basename(projectDir);
 
   // Fresh atomic staging dir (R9).
-  const stagingDir = mkdtempSync(join(tmpdir(), `realvirtual-private-${project.code}-`));
+  const stagingDir = mkdtempSync(join(tmpdir(), `realvirtual-hosted-${project.code}-`));
 
-  // Copy dist/ root files flat.
+  // Runtime: dist/ root files flat, subdirectories EXCEPT the demo content
+  // (models/, scenes/, library/ are the public demo's; a customer deploy must
+  // not surface a generic realvirtual example), assets/ without .glb.
   for (const entry of readdirSync(distDir, { withFileTypes: true })) {
     if (entry.isFile()) {
       copyFileSync(join(distDir, entry.name), join(stagingDir, entry.name));
     }
   }
-  // Copy dist/ subdirectories EXCEPT models/, scenes/ and library/; strip .glb out of assets/.
-  // scenes/ holds realvirtual's curated "Example" demos (public/scenes/*.glb +
-  // index.json); they are intentional only on the public demo deploy. A private/kiosk
-  // customer build must not surface a generic realvirtual "Planner Demo" in its Models
-  // panel, so the scenes/ folder is dropped here (the Examples section then stays hidden).
-  // library/ is the same case and became one only when the DemoRealvirtual project moved
-  // into `public/` (it used to reach dist/ solely via the public deploy's staging step):
-  // the bundled realvirtual component library is demo content, and a customer deploy must
-  // show the customer's own assets. The project's own library/ is copied back in below.
   for (const entry of readdirSync(distDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const name = entry.name.toLowerCase();
     if (name === 'models' || name === 'scenes' || name === 'library') continue;
+    if (name === HOSTED_PROJECT_PREFIX.replace('/', '')) continue; // never let a dist/p/ shadow the project
     const exclude = name === 'assets' ? new Set(['.glb']) : null;
     copyDirRecursive(join(distDir, entry.name), join(stagingDir, entry.name), exclude);
   }
 
-  // Copy the project's publishable GLBs — `models/*.glb` plus any root-level
-  // document the manifest declares (plan-720 union, see projectModelNames()).
-  // Everything lands in `models/` under its bare filename, which is the path
-  // `models.json` and `settings.defaultModel` both address.
-  const stagingModelsDir = join(stagingDir, 'models');
-  mkdirSync(stagingModelsDir, { recursive: true });
-  const { list: glbNames, sources: glbSources, discrepancies } = projectModelNamesWithReport(projectDir);
-  for (const d of discrepancies) {
-    console.log(`[bunny] models.json ${d.kind}: ${d.path} (${d.reason})`);
+  // The project, verbatim.
+  const projectStage = join(stagingDir, HOSTED_PROJECT_PREFIX);
+  const report = copyProjectVerbatim(projectDir, projectStage);
+  report.encrypted = [];
+  if (!existsSync(join(projectStage, 'project.json'))) {
+    throw new Error(`Hosted staging of ${basename(projectDir)} lost project.json — the deny list must never remove it.`);
   }
-  if (glbNames.length === 0) {
-    console.log(`[bunny] WARNING: ${basename(projectDir)} publishes an EMPTY models.json `
-      + `(no models/*.glb and no root-level document in project.json).`);
-  }
-  for (const name of glbNames) {
-    const src = glbSources.get(name);
-    const dst = join(stagingModelsDir, name);
-    // Provenance order is security-sensitive: sign the finished plaintext
-    // GLB first, then wrap those signed bytes in the optional RVE1 envelope.
-    const plain = readFileSync(src);
-    const signedPlain = signing ? signGlbBytes(plain, signing) : plain;
+
+  // Provenance order is security-sensitive: sign the finished plaintext GLB
+  // first, then wrap those signed bytes in the optional RVE1 envelope.
+  let probe = null;
+  const salt = encryption ? randomBytes(16) : null;
+  for (const rel of encryptablePathsBelow(projectStage)) {
+    const isGlb = extname(rel).toLowerCase() === '.glb';
+    // Without a password only the GLBs are touched (signing); AASX stay as they are.
+    if (!isGlb && !encryption) continue;
+    const abs = join(projectStage, rel);
+    const plain = readFileSync(abs);
+    const signedPlain = signing && isGlb ? signGlbBytes(plain, signing) : plain;
     if (encryption) {
-      // Encrypt in place: same .glb name, RVE1 envelope as the file body.
-      const cipher = await encryptGlb(
-        signedPlain,
-        encryption.password,
-        encryption.fragmentSecret,
-        { iterations: encryption.iterations, chunkSize: encryption.chunkSize },
-      );
-      writeFileSync(dst, cipher);
-    } else {
-      writeFileSync(dst, signedPlain);
+      const cipher = await encryptGlb(signedPlain, encryption.password, encryption.fragmentSecret, {
+        salt,
+        iterations: encryption.iterations,
+        chunkSize: encryption.chunkSize ?? DEFAULT_CHUNK_SIZE,
+        hkdfInfo: rel,
+      });
+      writeFileSync(abs, cipher);
+      report.encrypted.push(rel);
+    } else if (signing && isGlb) {
+      writeFileSync(abs, signedPlain);
     }
   }
-
-  // A project's OWN scenes/ folder is staged (the drop above targets the
-  // build's generic Examples, which a customer must not see — a project that
-  // authored its own example scenes is the opposite case).
-  const projectLibraryDir = join(projectDir, 'library');
-  if (existsSync(projectLibraryDir)) {
-    copyDirRecursive(projectLibraryDir, join(stagingDir, 'library'), null);
+  if (encryption) {
+    probe = await makeKeyProbe(encryption.password, encryption.fragmentSecret, { salt, iterations: encryption.iterations });
   }
 
-  const projectScenesDir = join(projectDir, 'scenes');
-  if (existsSync(projectScenesDir)) {
-    copyDirRecursive(projectScenesDir, join(stagingDir, 'scenes'), null);
-    // plan-700 Phase 6: the manifest's `scenes[]` publishes the Examples
-    // catalogue. Written only when the manifest actually declares published
-    // scenes — otherwise the folder's own index.json (if it has one) stands.
-    const index = publishedSceneIndex(project);
-    if (index) {
-      writeFileSync(join(stagingDir, 'scenes', 'index.json'), JSON.stringify(index, null, 2));
-    }
-  }
-
-  // models.json (array of GLB filenames) — AlwaysUpload file.
-  // Folder-derived FIRST: the folder is the single source of truth for assets
-  // (plan-700 P0-3) and the manifest can never shorten this list. Since plan-720
-  // the manifest may LENGTHEN it by a root-level document — the only asset the
-  // glob structurally cannot see.
-  writeFileSync(join(stagingDir, 'models.json'), JSON.stringify(glbNames));
-
-  // settings.json with project assets path + analytics, on top of the
-  // project's own settings/project-settings.json when it has one (B14).
   writeFileSync(
     join(stagingDir, 'settings.json'),
-    generatePrivateSettings(project, folderName, {
-      encryption: !!encryption,
+    generateHostedSettings({
+      encryption: encryption ? { probe } : null,
       projectSettings: readProjectSettingsFile(projectDir),
     }),
   );
 
+  if (onReport) onReport(report);
   return stagingDir;
 }
 
@@ -1172,22 +1245,9 @@ export function publicDemoManifestMisses(distDir) {
   return misses;
 }
 
-//! `existsSync` that also insists on the SPELLING, one path segment at a time.
-//!
-//! `existsSync` alone answers "yes" for `Models/Demo.glb` on Windows and macOS,
-//! which is precisely the typo this guard is here to catch — it would survive
-//! every local check and break only on the Linux storage zone.
-function existsOnDiskExactly(rootDir, relPath) {
-  let current = rootDir;
-  for (const segment of relPath.split('/')) {
-    if (segment === '') continue;
-    let entries;
-    try { entries = readdirSync(current); } catch { return false; }
-    if (!entries.includes(segment)) return false;
-    current = join(current, segment);
-  }
-  return true;
-}
+//! `existsOnDiskExactly` lives in `lib/rv-fs.mjs` since plan-508 (the Vite 404
+//! guard needs it too); re-exported here for the deploy callers and tests.
+export { existsOnDiskExactly };
 
 // ─── Public deploy: test-scene pruning ───────────────────────────────────
 
@@ -1370,6 +1430,220 @@ export function injectNoindex(indexPath, { dryRun = false } = {}) {
   return true;
 }
 
+// ─── Deploy-time manifest preload (plan-598 Phase 2) ────────────────────
+
+//! Marker attribute of the ONE injected manifest preload — what makes the
+//! injection idempotent (a re-run replaces it instead of adding a second one).
+export const MANIFEST_PRELOAD_ATTR = 'data-rv-manifest-preload';
+
+//! Which manifest a deploy's `index.html` should preload, or `null` for none.
+//!
+//! The preload used to be STATIC in `index.html` (`%BASE_URL%project.json`),
+//! and that was wrong on two of the three channels: the public demo boots from
+//! `demo-realvirtual/project.json` (the root one is a 404 there — "preloaded but
+//! not used"), and a hosted deploy reads `p/project.json`. Only the deploy knows
+//! which manifest the runtime will actually fetch, so it writes the tag:
+//!
+//!   | deploy                         | preload                        |
+//!   |--------------------------------|--------------------------------|
+//!   | public demo                    | `demo-realvirtual/project.json` |
+//!   | root / customer, no password   | `project.json`                 |
+//!   | hosted, no password            | `p/project.json`               |
+//!   | hosted WITH password           | none — the manifest may only be requested after the password gate |
+//!
+//! `kind: 'public'` decides from the build output: a root `project.json` wins
+//! (a deploy that IS one project), else the demo folder's manifest.
+export function manifestPreloadFor({ kind, distDir = null, encrypted = false }) {
+  if (kind === 'hosted') return encrypted ? null : 'p/project.json';
+  if (kind === 'public') {
+    if (distDir && existsSync(join(distDir, 'project.json'))) return 'project.json';
+    if (distDir && existsSync(join(distDir, 'demo-realvirtual', 'project.json'))) return 'demo-realvirtual/project.json';
+    return null;
+  }
+  throw new Error(`manifestPreloadFor: unknown deploy kind "${kind}"`);
+}
+
+//! Pure: `html` with exactly one manifest preload for `href` (or none when
+//! `href` is null). Any earlier injected preload is removed first.
+//!
+//! The options must match `BundledBackend._fetchJson()` — `fetch(url, { cache:
+//! 'no-cache' })` — or the browser downloads the file twice: `as="fetch"` (a
+//! fetch consumes it) and `crossorigin` (anonymous, what a credential-less
+//! same-origin fetch matches). The href is RELATIVE to the page, so it follows
+//! whatever sub-path the deploy is served under (`/demo/`, `/<code>/`).
+export function withManifestPreload(html, href) {
+  const existing = new RegExp(`\\s*<link[^>]*${MANIFEST_PRELOAD_ATTR}[^>]*>`, 'gi');
+  let out = String(html).replace(existing, '');
+  if (!href) return out;
+  const tag = `<link rel="preload" href="${href}" as="fetch" type="application/json" crossorigin ${MANIFEST_PRELOAD_ATTR} />`;
+  if (/<title[\s>]/i.test(out)) out = out.replace(/(\s*)<title([\s>])/i, `$1${tag}$1<title$2`);
+  else out = out.replace(/\s*<\/head>/i, `\n  ${tag}\n</head>`);
+  return out;
+}
+
+//! Writes {@link withManifestPreload} into `<dir>/index.html`. Idempotent;
+//! `dryRun` writes nothing. Returns the href that is (or would be) in place.
+export function injectManifestPreload(indexPath, { href, dryRun = false } = {}) {
+  if (!existsSync(indexPath)) return null;
+  const html = readFileSync(indexPath, 'utf8');
+  const next = withManifestPreload(html, href);
+  if (!dryRun && next !== html) writeFileSync(indexPath, next);
+  return href ?? null;
+}
+
+// ─── CDN caching: edge rules + URL purge (plan-598 Phase 2) ─────────────
+
+//! Bunny edge-rule enum values (https://bunny.net/docs/api-reference/core/pull-zone/addupdate-edge-rule.md).
+//! VOR ERSTEM LIVE-LAUF PER GET VERIFIZIEREN: the public docs list the enum
+//! names but not which ActionParameter carries what. The intended mapping for
+//! SetResponseHeader is ActionParameter1 = header name, ActionParameter2 = value.
+//! Create one such rule by hand in the dashboard, read it back with
+//! `GET /pullzone/{id}` and compare before the first real deploy runs this.
+export const BUNNY_EDGE_ACTION = Object.freeze({
+  OVERRIDE_CACHE_TIME: 3,
+  SET_RESPONSE_HEADER: 5,
+  //! OverrideBrowserCacheTime. NOT used: its parameter (seconds in
+  //! ActionParameter1?) is undocumented, and it cannot express `immutable`.
+  //! VOR ERSTEM LIVE-LAUF PER GET VERIFIZIEREN, should it ever be used.
+  OVERRIDE_BROWSER_CACHE_TIME: 16,
+});
+export const BUNNY_EDGE_TRIGGER_URL = 0;
+export const BUNNY_PATTERN_MATCH_ANY = 0;
+export const BUNNY_TRIGGER_MATCH_ANY = 0;
+
+export const IMMUTABLE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+export const REVALIDATE_CACHE_CONTROL = 'no-cache';
+
+//! The two browser-cache rules, recognised on the zone by their Description.
+//! ORDERED: Bunny runs every matching rule in order, so for a URL matched by
+//! both the LATER rule's header stands — the revalidating rule therefore comes
+//! last (a hashed `assets/x.json` revalidates rather than going immutable; that
+//! is never wrong, the other way round would be).
+//!
+//! `immutable` is ONLY for `*/assets/*` — Vite's content-hashed output, whose
+//! names change with every byte. `draco/*` has FIXED names
+//! (`draco_decoder.wasm`, vite.config.ts) and must revalidate, like every
+//! HTML page (`*.html`, a directory URL `*/`), manifest (`*.json`) and model
+//! (`*.glb`) — those keep their URL across deploys. So does EVERYTHING under a
+//! hosted project's `p/` (plan-759): it is the customer's project folder,
+//! published verbatim, and its own `p/assets/…` has NO content hash — without
+//! the `*/p/*` pattern the `*/assets/*` rule would pin such a file in every
+//! browser for a year (the deploy's URL purge only reaches the edges).
+export const RV_EDGE_RULES = Object.freeze([
+  Object.freeze({
+    description: 'rv-webviewer: immutable content-hashed assets (plan-598)',
+    patterns: ['*/assets/*'],
+    cacheControl: IMMUTABLE_CACHE_CONTROL,
+  }),
+  Object.freeze({
+    description: 'rv-webviewer: revalidate html, manifests, models, draco, hosted projects (plan-598)',
+    patterns: ['*.html', '*/', '*/?*', '*.json', '*.json?*', '*.glb', '*.glb?*', '*/draco/*', '*/p/*'],
+    cacheControl: REVALIDATE_CACHE_CONTROL,
+  }),
+]);
+
+//! The addOrUpdate body of one rule spec (`guid` set = update in place).
+export function edgeRuleBody(spec, guid = null) {
+  return {
+    ...(guid ? { Guid: guid } : {}),
+    ActionType: BUNNY_EDGE_ACTION.SET_RESPONSE_HEADER,
+    ActionParameter1: 'Cache-Control',
+    ActionParameter2: spec.cacheControl,
+    Triggers: [{
+      Type: BUNNY_EDGE_TRIGGER_URL,
+      PatternMatches: [...spec.patterns],
+      PatternMatchingType: BUNNY_PATTERN_MATCH_ANY,
+      Parameter1: '',
+    }],
+    TriggerMatchingType: BUNNY_TRIGGER_MATCH_ANY,
+    Description: spec.description,
+    Enabled: true,
+  };
+}
+
+//! Does an existing zone rule already say what `spec` says?
+export function edgeRuleMatches(existing, spec) {
+  if (!existing) return false;
+  const want = edgeRuleBody(spec);
+  const trig = Array.isArray(existing.Triggers) ? existing.Triggers : [];
+  const patterns = trig.length === 1 && Array.isArray(trig[0].PatternMatches) ? trig[0].PatternMatches : null;
+  return existing.ActionType === want.ActionType
+    && existing.ActionParameter1 === want.ActionParameter1
+    && existing.ActionParameter2 === want.ActionParameter2
+    && existing.Enabled === true
+    && trig.length === 1
+    && trig[0].Type === BUNNY_EDGE_TRIGGER_URL
+    && patterns !== null
+    && patterns.length === spec.patterns.length
+    && patterns.every((p, i) => p === spec.patterns[i]);
+}
+
+function wildcardRegex(pattern) {
+  return new RegExp(`^${pattern.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 'i');
+}
+
+//! The Cache-Control the rules above give `url` (later matching rule wins), or
+//! null when no rule matches. The rules' behaviour as a function — what the
+//! tests pin, and what to compare a `curl -I` against after a deploy.
+export function cacheControlForUrl(url, rules = RV_EDGE_RULES) {
+  let result = null;
+  for (const rule of rules) {
+    if (rule.patterns.some((p) => wildcardRegex(p).test(url))) result = rule.cacheControl;
+  }
+  return result;
+}
+
+//! Most URLs one deploy purges one by one; above this the zone purge is cheaper
+//! and Bunny's purge API rate limit is not worth testing.
+export const URL_PURGE_LIMIT = 500;
+
+//! Vite's content-hashed output lives in the deploy root's `assets/`. Such a
+//! file never needs a purge: a change is a NEW name. A `p/assets/…` of a hosted
+//! project is NOT hashed and is purged like any other file.
+export function isContentHashedRel(rel) {
+  return /^assets\//i.test(String(rel).replace(/\\/g, '/').replace(/^\/+/, ''));
+}
+
+//! The URLs one deploy must purge: every uploaded AND every deleted file that
+//! is not content-hashed, under `baseUrl` (ends with `/`). An `index.html` also
+//! purges its directory URL — `…/demo/` is cached apart from `…/demo/index.html`.
+//! `extraUrls` (absolute) are added as they are (the zone-root robots.txt).
+export function purgeUrlsFor({ baseUrl, uploaded = [], deleted = [], extraUrls = [] }) {
+  const base = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+  const urls = new Set();
+  for (const raw of [...uploaded, ...deleted]) {
+    const rel = String(raw).replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!rel || isContentHashedRel(rel)) continue;
+    const encoded = rel.split('/').map(encodeURIComponent).join('/');
+    urls.add(`${base}${encoded}`);
+    const m = rel.match(/^(.*\/)?index\.html$/i);
+    if (m) urls.add(`${base}${m[1] ?? ''}`);
+  }
+  for (const u of extraUrls) urls.add(u);
+  return [...urls];
+}
+
+//! Purges what one deploy changed (plan-598). URL purge for the changed,
+//! non-hashed URLs — the rest of the zone (other deploys, the hashed assets)
+//! stays warm on every edge. Falls back to the ZONE purge when the deploy was
+//! only partly applied (a stale file could not be deleted), when more than
+//! {@link URL_PURGE_LIMIT} URLs changed, or when any single URL purge failed.
+//! Returns { mode: 'none' | 'url' | 'zone', urls, ok }.
+export async function purgeDeployChanges(client, { baseUrl, uploaded = [], deleted = [], extraUrls = [], partial = false, log = () => {} }) {
+  const urls = purgeUrlsFor({ baseUrl, uploaded, deleted, extraUrls });
+  if (urls.length === 0 && !partial) return { mode: 'none', urls, ok: true };
+  if (partial || urls.length > URL_PURGE_LIMIT) {
+    log(`[bunny] zone purge (${partial ? 'partially applied deploy' : `${urls.length} URLs > ${URL_PURGE_LIMIT}`})`);
+    return { mode: 'zone', urls, ok: await client.purge() };
+  }
+  const { failed } = await client.purgeUrls(urls);
+  if (failed.length > 0) {
+    log(`[bunny] ${failed.length} URL purge(s) failed — falling back to the zone purge`);
+    return { mode: 'zone', urls, ok: await client.purge() };
+  }
+  return { mode: 'url', urls, ok: true };
+}
+
 //! Writes the crawler artifacts for the canonical public deploy into dist/:
 //!
 //!  - `sitemap.xml` — currently the single canonical page URL; per-scene landing
@@ -1399,4 +1673,228 @@ export function writeSeoArtifacts(distDir, { pageUrl, dryRun = false }) {
     writeFileSync(join(distDir, 'robots.txt'), robots);
   }
   return { robots, sitemap };
+}
+
+// ─── Library catalog integrity (plan-508) ────────────────────────────────
+
+//! The probe path that must NEVER exist in a deploy — its only job is to be
+//! missing, so the CDN's answer for a missing asset can be observed.
+export const PROBE_MISSING_ASSET = 'library/__rv-probe-missing__.glb';
+
+//! Every `catalog.json` under `rootDir`, as forward-slash rels.
+export function findCatalogFiles(rootDir) {
+  return collectLocalFiles(rootDir)
+    .filter((f) => basename(f.rel).toLowerCase() === 'catalog.json')
+    .map((f) => f.rel);
+}
+
+//! The deploy-relative path of an entry's binary (`glbUrl`, else `splatUrl`),
+//! or null when the url is not a relative file url (http(s), blob, data,
+//! root-absolute): such an entry is not part of this deploy's upload set.
+export function catalogEntryBinaryRel(catalogRel, entry) {
+  const url = typeof entry?.glbUrl === 'string' && entry.glbUrl !== ''
+    ? entry.glbUrl
+    : (typeof entry?.splatUrl === 'string' ? entry.splatUrl : '');
+  if (!url || /^[a-z][a-z0-9+.-]*:/i.test(url) || url.startsWith('/')) return null;
+  let decoded;
+  try { decoded = decodeURIComponent(url.split(/[?#]/, 1)[0]); } catch { return null; }
+  const dir = normalizePath(dirname(normalizePath(catalogRel)));
+  const parts = [];
+  for (const seg of `${dir === '.' ? '' : dir}/${decoded}`.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (parts.length === 0) return null;
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  return parts.join('/');
+}
+
+//! Re-stamps `sha256` + `sizeBytes` into every `catalog.json` under `rootDir`
+//! from the bytes that are there NOW (plan-508 F2).
+//!
+//! Runs in the deploy AFTER `signGlbsInDirectory`: signing is size-preserving
+//! but changes the bytes, and the hash must describe what the browser gets —
+//! a catalog stamped before signing makes every signed library GLB a hash
+//! mismatch. Entries whose file is absent keep what they had (a 404 is its own,
+//! louder failure). Returns { catalogs, stamped }.
+export function stampCatalogHashes(rootDir, { dryRun = false } = {}) {
+  let catalogs = 0;
+  let stamped = 0;
+  for (const rel of findCatalogFiles(rootDir)) {
+    const path = join(rootDir, rel);
+    let catalog;
+    try { catalog = JSON.parse(readFileSync(path, 'utf8')); } catch { continue; }
+    if (!catalog || !Array.isArray(catalog.entries)) continue;
+    catalogs++;
+    for (const entry of catalog.entries) {
+      const binRel = catalogEntryBinaryRel(rel, entry);
+      if (!binRel || !existsSync(join(rootDir, binRel))) continue;
+      const bytes = readFileSync(join(rootDir, binRel));
+      entry.sha256 = sha256Buffer(bytes);
+      entry.sizeBytes = bytes.byteLength;
+      stamped++;
+    }
+    if (!dryRun) writeFileSync(path, JSON.stringify(catalog, null, 2) + '\n', 'utf8');
+  }
+  return { catalogs, stamped };
+}
+
+//! The catalogued binaries of ONE local catalog whose hash differs from the
+//! previously published catalog (plan-508 F2b), as `localDir`-relative rels.
+//!
+//! `remoteText` is the remote `catalog.json` body (string/Buffer) or null when
+//! there is none — then EVERY catalogued binary counts as changed. An entry
+//! without a local hash is never forced (nothing to compare). Matching is by
+//! the entry's url, the one key both catalogs share.
+export function catalogChangedBinaries(localDir, catalogRel, remoteText) {
+  let local;
+  try { local = JSON.parse(readFileSync(join(localDir, catalogRel), 'utf8')); } catch { return []; }
+  const entries = Array.isArray(local?.entries) ? local.entries : [];
+  let remoteByUrl = null;
+  if (remoteText != null) {
+    try {
+      const remote = JSON.parse(String(remoteText));
+      remoteByUrl = new Map();
+      for (const e of Array.isArray(remote?.entries) ? remote.entries : []) {
+        const key = e?.glbUrl || e?.splatUrl;
+        if (key) remoteByUrl.set(key, e.sha256 ?? null);
+      }
+    } catch { remoteByUrl = null; }
+  }
+  const changed = [];
+  for (const e of entries) {
+    const binRel = catalogEntryBinaryRel(catalogRel, e);
+    if (!binRel || typeof e.sha256 !== 'string') continue;
+    const before = remoteByUrl?.get(e.glbUrl || e.splatUrl);
+    if (remoteByUrl === null || before !== e.sha256) changed.push(binRel);
+  }
+  return changed;
+}
+
+//! Post-deploy probe (plan-508 F8): proves on the LIVE host that
+//!  1. a missing asset is a 404 (no SPA fallback, no global
+//!     "404 -> index.html, rewrite to 200" edge rule). The STATUS is the
+//!     contract, not the content type: Bunny answers every missing file with
+//!     its standard `text/html` error page (observed on the live pull zone
+//!     2026-09-27), and a 404 is never stored as an asset by the viewer. Only
+//!     a 200 (any type) or another non-404 status is a finding,
+//!  2. `library/catalog.json` is served, is JSON and is BYTE-EQUAL to the one
+//!     in `distDir` (catches a size-skipped or edge-cached catalog),
+//!  3. the first catalogued asset is served as a binary and its bytes hash to
+//!     the catalog `sha256` (catches a size-preserving re-sign not stamped).
+//! `baseUrl` ends with `/` (e.g. `https://web.realvirtual.io/demo/`). The
+//! catalog and asset GETs carry an `rv-probe` query so a stale edge copy cannot
+//! answer for them. Returns { ok, findings[], checks[] }; never throws.
+export async function probePublishedAssets({
+  baseUrl,
+  distDir,
+  timeoutMs = FETCH_TIMEOUT_MS,
+  fetchImpl = globalThis.fetch,
+  catalogRel = 'library/catalog.json',
+  now = Date.now,
+}) {
+  const base = String(baseUrl).endsWith('/') ? String(baseUrl) : `${baseUrl}/`;
+  const findings = [];
+  const checks = [];
+  const get = async (rel) => {
+    try {
+      return await fetchImpl(base + rel, { signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
+    } catch (ex) {
+      return { error: ex?.message ?? String(ex) };
+    }
+  };
+  const bust = `?rv-probe=${now()}`;
+  const done = () => ({ ok: findings.length === 0, findings, checks });
+
+  if (existsSync(join(distDir, PROBE_MISSING_ASSET))) {
+    findings.push(`${PROBE_MISSING_ASSET} exists in the build output — the probe path must never be deployed`);
+  }
+
+  // 1 — the missing asset.
+  const missing = await get(PROBE_MISSING_ASSET);
+  if (missing.error) {
+    findings.push(`GET ${PROBE_MISSING_ASSET} failed: ${missing.error}`);
+  } else {
+    const type = missing.headers?.get?.('content-type') ?? '';
+    if (missing.status === 200) {
+      findings.push(`GET ${PROBE_MISSING_ASSET} answered HTTP 200 (${type || 'no content-type'}) — `
+        + 'a missing asset answered 200 — the host serves a fallback page instead of 404; '
+        + 'check the pull zone for a global "404 -> index.html, rewrite to 200" edge rule');
+    } else if (missing.status !== 404) {
+      findings.push(`GET ${PROBE_MISSING_ASSET} answered HTTP ${missing.status} (${type || 'no content-type'}) — `
+        + 'a missing asset must be a 404');
+    } else if (/text\/html/i.test(type)) {
+      // Bunny's standard error page — accepted, the status is what counts.
+      checks.push(`${PROBE_MISSING_ASSET} -> 404 (text/html error page, accepted)`);
+    } else {
+      checks.push(`${PROBE_MISSING_ASSET} -> 404${type ? ` ${type}` : ''}`);
+    }
+  }
+
+  // 2 — the catalog, byte for byte.
+  const localCatalogPath = join(distDir, catalogRel);
+  if (!existsSync(localCatalogPath)) {
+    checks.push(`${catalogRel}: not in the build output — catalog checks skipped`);
+    return done();
+  }
+  const localBytes = readFileSync(localCatalogPath);
+  const remoteCatalog = await get(catalogRel + bust);
+  if (remoteCatalog.error) {
+    findings.push(`GET ${catalogRel} failed: ${remoteCatalog.error}`);
+  } else if (remoteCatalog.status !== 200) {
+    findings.push(`GET ${catalogRel} answered HTTP ${remoteCatalog.status}`);
+  } else {
+    const remoteBytes = Buffer.from(await remoteCatalog.arrayBuffer());
+    let isJson = true;
+    try { JSON.parse(remoteBytes.toString('utf8')); } catch { isJson = false; }
+    if (!isJson) {
+      findings.push(`${catalogRel} on the host is not JSON (content-type ${remoteCatalog.headers?.get?.('content-type') ?? '?'})`);
+    } else if (!remoteBytes.equals(localBytes)) {
+      findings.push(`${catalogRel} on the host differs from the build output (${remoteBytes.length} vs ${localBytes.length} bytes) — `
+        + 'a size-skipped upload or a stale edge copy; browsers would verify against the old hashes');
+    } else {
+      checks.push(`${catalogRel} -> 200, byte-equal to dist`);
+    }
+  }
+  let catalog = null;
+  try { catalog = JSON.parse(localBytes.toString('utf8')); } catch { catalog = null; }
+
+  // 3 — the first catalogued asset, hashed.
+  const entries = Array.isArray(catalog?.entries) ? catalog.entries : [];
+  const first = entries.find((e) => catalogEntryBinaryRel(catalogRel, e) !== null);
+  if (!first) {
+    checks.push(`${catalogRel}: no relative asset entry — asset check skipped`);
+    return done();
+  }
+  const assetRel = catalogEntryBinaryRel(catalogRel, first);
+  const encodedRel = assetRel.split('/').map((s) => encodeURIComponent(s)).join('/');
+  const asset = await get(encodedRel + bust);
+  if (asset.error) {
+    findings.push(`GET ${assetRel} failed: ${asset.error}`);
+  } else if (asset.status !== 200) {
+    findings.push(`GET ${assetRel} answered HTTP ${asset.status}`);
+  } else {
+    const type = (asset.headers?.get?.('content-type') ?? '').toLowerCase();
+    const bytes = Buffer.from(await asset.arrayBuffer());
+    if (!/^(model\/gltf-binary|application\/octet-stream)\b/.test(type)) {
+      findings.push(`GET ${assetRel} answered content-type "${type || 'none'}" — expected model/gltf-binary or application/octet-stream`);
+    }
+    if (typeof first.sha256 === 'string') {
+      const got = sha256Buffer(bytes);
+      if (got !== first.sha256) {
+        findings.push(`${assetRel}: served bytes hash to ${got.slice(0, 12)}…, the catalog says ${first.sha256.slice(0, 12)}… `
+          + `(${bytes.length} bytes) — every browser load would fail with "hash mismatch"`);
+      } else {
+        checks.push(`${assetRel} -> 200 ${type}, sha256 matches the catalog`);
+      }
+    } else if (typeof first.sizeBytes === 'number' && first.sizeBytes !== bytes.length) {
+      findings.push(`${assetRel}: served ${bytes.length} bytes, the catalog says ${first.sizeBytes}`);
+    } else {
+      checks.push(`${assetRel} -> 200 ${type} (catalog carries no hash)`);
+    }
+  }
+  return done();
 }

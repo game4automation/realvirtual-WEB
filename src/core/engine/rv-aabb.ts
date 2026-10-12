@@ -147,6 +147,26 @@ export class AABB {
   }
 
   /**
+   * plan-469 F4 — the same result as {@link update} for a node-backed AABB, but
+   * from an ALREADY decomposed world transform instead of two fresh world walks.
+   *
+   * `update()` on a clone MU costs `getWorldPosition` + `getWorldQuaternion`,
+   * each of which walks the parent chain; together with the walk in
+   * `RVMovingUnit.updateAABB` that is three walks per MU per tick. The caller
+   * can do ONE `updateWorldMatrix` + one `decompose` and hand both parts here.
+   *
+   * The `localCenter` semantics are identical to `update()`: the local offset is
+   * rotated by the world quaternion and added to the world position.
+   */
+  updateFrom(position: Vector3, quaternion: Quaternion): void {
+    this.center.copy(position);
+    _scratchOffset.copy(this.localCenter).applyQuaternion(quaternion);
+    this.center.add(_scratchOffset);
+    this.min.copy(this.center).sub(this.halfSize);
+    this.max.copy(this.center).add(this.halfSize);
+  }
+
+  /**
    * Set the world axis-aligned `halfSize` as the TIGHT enclosure of a box with
    * the given LOCAL half-extents rotated by `worldQuat`:
    * `worldHalf_i = Σ_j |R_ij|·localHalf_j`. Lets a moving box (a rotated MU, a

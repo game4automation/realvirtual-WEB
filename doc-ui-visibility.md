@@ -1,18 +1,15 @@
 # UI Visibility — Which Axis Decides What
 
-Two independent mechanisms decide whether you see something in realvirtual WEB, and they are
-routinely confused for one another. This document exists because that confusion has already
-produced two discarded designs: a "shell contract" and a "UI/runtime separation" were both
-designed from scratch before anyone found `UIPluginRegistry.register()`, where the mechanism already
-lived. One of those detours alone would have cost ~6h.
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
 
-The knowledge that was missing is a single sentence:
+Runtime participation and UI visibility are independent. In particular:
 
-> **`core: true` + `modes: [...]` = "the runtime runs always, the UI appears only in the listed
-> modes".**
+> **`core: true` + `modes: [...]` means the runtime runs in every mode,
+> while its UI appears only in the listed modes.**
 
-Neither docstring was wrong. They were each locally complete and simply did not point at each
-other, so the rule that lives *between* them was invisible.
+Use the runtime flags for execution and the UI visibility rules for presentation.
 
 Related: [doc-extending-webviewer.md](doc-extending-webviewer.md) (plugin authoring, UI slots),
 [doc-webviewer.md](doc-webviewer.md) (architecture).

@@ -334,6 +334,33 @@ export function materialise(ops: ReadonlyArray<RvOp>): MaterialisedEdits {
   };
 }
 
+/**
+ * The part of `edits` an AUTHORED TREE does not already carry.
+ *
+ * While the editor projection holds a document, every node-level edit lives in
+ * the tree it is authoring: the scene half came in through the bake the tree was
+ * loaded from, the editor's half was applied to it by the asset executor. A save
+ * that starts from an export of that tree must therefore not bake the node-level
+ * categories a second time — and could not address them anyway, because the only
+ * registry in reach indexes the bytes the tree was LOADED from, not the export.
+ * What is left is what a tree has no place for: camera, connections and
+ * connection types, which live on the file rather than on a node.
+ *
+ * Placements are node-level too: a placement IS its reference node, and the
+ * authored tree holds that node in the state the user last gave it.
+ */
+export function editsBeyondAuthoredTree(edits: MaterialisedEdits): MaterialisedEdits {
+  return {
+    overlay: emptyOverlay(),
+    placements: [],
+    cameraStart: edits.cameraStart,
+    addedNodes: [],
+    nodeTransforms: [],
+    connections: edits.connections,
+    connectionTypes: edits.connectionTypes,
+  };
+}
+
 function flattenOps(ops: ReadonlyArray<RvOp>): RvPrimitiveOp[] {
   const out: RvPrimitiveOp[] = [];
   for (const op of ops) {

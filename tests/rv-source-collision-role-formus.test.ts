@@ -25,6 +25,7 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 import { processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import { RVSource } from '../src/core/engine/rv-source';
 import { RVCollisionManager } from '../src/core/engine/rv-collision-manager';
 import { __resetCollisionAlertStore } from '../src/core/hmi/collision-alert-store';
@@ -76,7 +77,7 @@ function beltWithSource(sourceExtras: Record<string, unknown>): {
 
   const manager = new RVTransportManager();
   manager.scene = scene;
-  processExtras(root, new NodeRegistry(), new SignalStore(), manager, scene);
+  processExtras(root, buildInitContext({ registry: new NodeRegistry(), signalStore: new SignalStore(), transportManager: manager, scene }));
 
   const source = manager.sources[0];
   expect(source, 'processExtras should have built the Source').toBeTruthy();

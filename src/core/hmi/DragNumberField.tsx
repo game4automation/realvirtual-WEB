@@ -8,8 +8,10 @@
  * the default/inline layouts, or a minimal 1px vertical bar in `compact` mode
  * (the Property Inspector). Horizontal click-drag on the handle scrubs the
  * value (compact uses a col-resize cursor; others ew-resize); Shift slows the
- * scrub by 10x for fine control. The browser's default number spin buttons are
- * hidden — drag and direct typing are the only ways to change the value.
+ * scrub by 10x for fine control. The input is a TEXT field with
+ * `inputMode="decimal"` (plan-510): `type="number"` follows the browser locale
+ * and silently empties a value typed with the "wrong" separator, so both "0,5"
+ * and "0.5" are accepted and parsed by `parseDecimal` (rv-number-format.ts).
  *
  * The value is exposed as a string draft (caller owns the state) so callers
  * can let users type freely without each keystroke committing. The `onCommit`
@@ -22,6 +24,7 @@ import type { ReactNode } from 'react';
 import { Box, TextField, Typography } from '@mui/material';
 import type { SxProps, Theme } from '@mui/material/styles';
 import { MathUtils } from 'three';
+import { parseDecimal } from './rv-number-format';
 
 export interface DragNumberFieldProps {
   /** Drag handle content — usually a small MUI icon. Ignored in `compact` mode,
@@ -70,6 +73,8 @@ export interface DragNumberFieldProps {
   label?: ReactNode;
   /** Fixed width (px) of the input in inline-label mode. Default 92. */
   inputWidth?: number;
+  /** Error state — the draft can never become a number (e.g. "1.000,5"). */
+  error?: boolean;
 }
 
 export function DragNumberField({
@@ -89,6 +94,7 @@ export function DragNumberField({
   compact = false,
   label,
   inputWidth = 92,
+  error = false,
 }: DragNumberFieldProps) {
   const inline = label != null;
   const dragRef = useRef<{ startX: number; startValue: number } | null>(null);
@@ -100,10 +106,10 @@ export function DragNumberField({
     if (disabled) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
-    const parsed = parseFloat(value);
+    const parsed = parseDecimal(value);
     dragRef.current = {
       startX: e.clientX,
-      startValue: Number.isFinite(parsed) ? parsed : min,
+      startValue: parsed ?? min,
     };
   }, [value, min, disabled]);
 
@@ -222,9 +228,10 @@ export function DragNumberField({
       )}
       <TextField
         size="small"
-        type="number"
+        type="text"
         value={value}
         disabled={disabled}
+        error={error}
         onChange={(e) => onValueChange(e.target.value)}
         onBlur={onCommit}
         onKeyDown={(e) => {
@@ -233,7 +240,7 @@ export function DragNumberField({
             (e.currentTarget as HTMLElement).blur();
           }
         }}
-        inputProps={{ min, max, step, 'aria-label': ariaLabel }}
+        inputProps={{ min, max, inputMode: 'decimal', 'aria-label': ariaLabel, 'aria-invalid': error || undefined }}
         slotProps={{
           input: {
             endAdornment: unit ? (
@@ -268,12 +275,9 @@ export function DragNumberField({
               '& fieldset': { borderColor: 'rgba(255,255,255,0.08)' },
               '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.15)' },
               '&.Mui-focused fieldset': { borderColor: 'primary.main' },
+              '&.Mui-error fieldset': { borderColor: 'error.main' },
             },
           }),
-          '& input[type=number]::-webkit-outer-spin-button, & input[type=number]::-webkit-inner-spin-button': {
-            WebkitAppearance: 'none', margin: 0,
-          },
-          '& input[type=number]': { MozAppearance: 'textfield' },
         }}
       />
     </Box>

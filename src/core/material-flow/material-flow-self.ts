@@ -243,6 +243,14 @@ export interface TweenSpec {
         readonly target?: unknown | null;
         /** Optional MU whose visual is resolved lazily at execution/restore. */
         readonly muId?: number;
+        /**
+         * plan-558: motion-profile sampler — the arc address (m) on `path`
+         * at sim time t (a vehicle's closed-form profile; `path` may be a
+         * multi-piece route sampler). Replaces the linear fromS→toS lerp, so
+         * accelerating / braking vehicles render exactly. Not serialisable (a
+         * closure) — AGV snapshots are an explicit non-goal (plan-558).
+         */
+        readonly sAt?: (t: number) => number;
       }
     | {
         readonly kind: 'axes';
@@ -429,6 +437,8 @@ export interface MaterialFlowSelf<
   at(time: number, hook: DesHookName, mu?: MU | null, data?: unknown): number;
   cancel(eventId: number): void;
   readonly now: number;
+  /** plan-558: time of the next queued DES event (+∞ when none / not DES). */
+  readonly nextEventTime: number;
   /**
    * Build a PATH tween spec (plan-268 Phase 3) for a DES duration event: pass
    * it as the `data` of `self.in(transit, 'Arrival', mu, self.pathTween(...))`
@@ -444,7 +454,7 @@ export interface MaterialFlowSelf<
    * register no visual. Pure data — inert in continuous mode like every
    * TweenSpec (the continuous sim animates via fixedUpdate anyway).
    */
-  pathTween(path: unknown, fromM: number, toM: number, target?: unknown | null, muId?: number): TweenSpec;
+  pathTween(path: unknown, fromM: number, toM: number, target?: unknown | null, muId?: number, sAt?: (t: number) => number): TweenSpec;
   /** Build a JSON-safe multi-axis tween over normalized phase windows. */
   axesTween(
     anchorRef: string,
@@ -764,6 +774,12 @@ export interface CreateSelfOptions<
    * Absent (continuous) → only the `statistics` sink is fed.
    */
   onStatState?: ((name: string) => void) | null;
+  /**
+   * DES output forwarder: `self.statOutput(n)` ALSO counts here, for components
+   * whose output is not an MU leaving them (a vehicle finishing a job). The DES
+   * bind wires it to `DESComponent.recordOutput`. Absent → continuous sink only.
+   */
+  onStatOutput?: ((n: number) => void) | null;
 }
 
 /** DES scheduling backend the DESRunner injects (P5). */
@@ -772,6 +788,8 @@ export interface SelfScheduler {
   at(time: number, hook: DesHookName, mu?: MU | null, data?: unknown): number;
   cancel(eventId: number): void;
   readonly now: number;
+  /** plan-558: time of the next queued (uncancelled) event, +∞ when empty. */
+  readonly nextEventTime?: number;
 }
 
 /**
@@ -804,6 +822,7 @@ export function createSelf<
   const local = (opts.local ?? {}) as S;
   const statistics = opts.statistics ?? null;
   const onStatState = opts.onStatState ?? null;
+  const onStatOutput = opts.onStatOutput ?? null;
   let lastStat = ''; // last canonical category booked via statState (de-dupe)
   let localMuId = 0;
 
@@ -995,6 +1014,9 @@ export function createSelf<
       }
       continuousTimers?.cancel(eventId);
     },
+    get nextEventTime(): number {
+      return scheduler?.nextEventTime ?? Number.POSITIVE_INFINITY;
+    },
     get now(): number {
       if (scheduler) return scheduler.now;
       // Lazily start the continuous clock on first read — otherwise a
@@ -1002,7 +1024,7 @@ export function createSelf<
       getContinuousTimers();
       return continuousNow;
     },
-    pathTween(path: unknown, fromM: number, toM: number, target?: unknown | null, muId?: number): TweenSpec {
+    pathTween(path: unknown, fromM: number, toM: number, target?: unknown | null, muId?: number, sAt?: (t: number) => number): TweenSpec {
       // `undefined` target → the shared root pose target (position + quaternion
       // of this component's root). An EXPLICIT null stays null (no visual).
       if (target === undefined) {
@@ -1024,6 +1046,7 @@ export function createSelf<
           toS: toM,
           target: target ?? null,
           ...(typeof muId === 'number' ? { muId } : {}),
+          ...(sAt ? { sAt } : {}),
         },
       };
     },
@@ -1084,6 +1107,7 @@ export function createSelf<
     },
     statOutput(n = 1): void {
       statistics?.output(n);
+      onStatOutput?.(n);         // DES forwarder → DESComponent.recordOutput (no-op when absent)
     },
     statCycleStart(): void {
       statistics?.cycleStart();

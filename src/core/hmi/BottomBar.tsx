@@ -38,7 +38,7 @@ import {
 import { collectSearchAiContext, docHintsForNodes, withExtraDocHints } from './search-ai-context';
 import { SearchAiDialog } from './SearchAiDialog';
 import { groupSearchResults, flattenGroupedResults } from './search-result-grouping';
-import { isSearchShortcut } from './search-shortcut';
+import { isUnclaimedSearchShortcut } from './search-shortcut';
 
 const DEBOUNCE_MS = 250;
 const ASK_AI_TOOLTIP = 'Ask the machine documentation (AI)';
@@ -236,11 +236,12 @@ export function BottomBar() {
   // Global keyboard route to the search: `/` (Onshape pattern) or Ctrl/Cmd+K
   // expands + focuses the field. Guarded against editable contexts in
   // isSearchShortcut() so it never steals focus mid-typing; preventDefault
-  // stops Firefox quick-find and the `/` being typed twice.
+  // stops Firefox quick-find and the `/` being typed twice. A press the open
+  // Projects dashboard already claimed (capture phase, plan-507) is left alone.
   useEffect(() => {
     if (isMobile) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!isSearchShortcut(e)) return;
+      if (!isUnclaimedSearchShortcut(e)) return;
       e.preventDefault();
       expandSearch(true);
     };
@@ -305,13 +306,13 @@ export function BottomBar() {
       for (const key of Object.keys(rv)) {
         if (typeof rv[key] !== 'object') continue;
         const caps = getCapabilities(key);
-        if (!caps.tooltipType) continue;
-        const resolver = tooltipRegistry.getDataResolver(caps.tooltipType);
+        if (!caps.ui.tooltip) continue;
+        const resolver = tooltipRegistry.getDataResolver(caps.ui.tooltip);
         if (!resolver) continue;
         const data = resolver(node, viewer);
         if (!data) continue;
 
-        const hoverId = `search-hover:${caps.tooltipType}`;
+        const hoverId = `search-hover:${caps.ui.tooltip}`;
         searchHoverIds.current.push(hoverId);
         tooltipStore.show({
           id: hoverId,
@@ -320,7 +321,7 @@ export function BottomBar() {
           data: data as TooltipData,
           mode: 'world',
           worldTarget: node,
-          priority: caps.hoverPriority ?? 5,
+          priority: caps.ui.priority,
         });
       }
     },

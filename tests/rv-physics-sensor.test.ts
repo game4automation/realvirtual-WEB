@@ -204,6 +204,11 @@ class MockPhysicsProvider implements PhysicsProvider {
     }
   }
   getSettledBodies(): string[] { return [...this.settled]; }
+  // plan-467 moving colliders — this mock does not exercise them; the methods
+  // exist so the mock still satisfies the PhysicsProvider contract.
+  addKinematicBody(): void {}
+  setKinematicPose(): void {}
+  forEachContactLoad(): void {}
 }
 
 // ─── Fake viewer + plugin build (rv-physics-surface.test.ts pattern) ────────

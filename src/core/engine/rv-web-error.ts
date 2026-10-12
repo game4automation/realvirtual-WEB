@@ -5,27 +5,34 @@
  * RVWebError — TypeScript counterpart of Unity `WebError.cs`.
  *
  * A semantic error marker: binds a PLCOutputBool error signal + a plain-text
- * message to a node. While the signal is high the part is highlighted in red
- * (mesh-glow-hull flash, or a floor-disk ring for very small parts), a backed
- * error-text badge appears above the part, and the error is registered in the
- * central ErrorStore (which drives the right-side error panel). No latching,
- * no acknowledgement — the error mirrors the signal 1:1.
+ * message to a node. While the signal is high the part carries a steady red
+ * X-ray overlay (the highlight pipeline's aux channel in ERROR_COLOR — the same
+ * fill + edges / chunk-overlay look as hover and selection, no per-mesh hull
+ * copies, chunk-aware on baked models), ONE alarm flash fires on the rising
+ * edge (the pulsing OutlinePass flash channel — the same pulse the error card
+ * click re-triggers), and the error is registered in the central ErrorStore
+ * (which drives the right-side error panel — the error TEXT lives only there,
+ * there is no world-space badge). Very small parts (Auto heuristic / `Circle`) keep
+ * the floor-disk ring gizmo, because an overlay on a 5 cm part is invisible;
+ * without a highlighter in the context (minimal viewers, tests) the legacy
+ * mesh-glow-hull gizmo is used. No latching, no acknowledgement — the error
+ * mirrors the signal 1:1.
  *
  * Component naming/Gizmo patterns mirror RVWebSensor; the error registry
  * (ErrorStore) is the only new building block.
  */
 
-import { type Object3D, type Texture } from 'three';
+import { type Object3D } from 'three';
 import type { ComponentContext, ComponentSchema, RVComponent } from './rv-component-registry';
 import { registerComponent, setComponentInstance, loadSchemaFromSpec } from './rv-component-registry';
 import type { GizmoHandle } from './rv-gizmo-manager';
 import { NodeRegistry } from './rv-node-registry';
 import { wireValueSignal } from './rv-signal-wiring';
 import {
+  ERROR_COLOR,
   normalizeHighlightStyle,
   resolveUseRing,
   createErrorHighlightGizmo,
-  createErrorBadgeGizmo,
   type HighlightStyle,
 } from './rv-error-visual';
 
@@ -49,11 +56,15 @@ export class RVWebError implements RVComponent {
   readonly path: string;
 
   private _highlightGizmo?: GizmoHandle;
-  private _badgeGizmo?: GizmoHandle;
-  private _badgeTexture?: Texture;
   private _unsubscribe?: () => void;
   private _ctx?: ComponentContext;
   private _active = false;
+  /** True while the highlighter's aux channel shows this error (so an inactive
+   *  error never triggers an aux rebuild). */
+  private _auxShown = false;
+  /** Set in onSceneReady: the mark goes through the highlight pipeline
+   *  (overlay + flash) rather than a gizmo. */
+  private _useHighlighter = false;
 
   constructor(node: Object3D) {
     this.node = node;
@@ -97,13 +108,17 @@ export class RVWebError implements RVComponent {
     if (!ctx.gizmoManager) return;
     this._ctx = ctx;
 
-    // ── 3D highlight gizmo (red flash / floor-disk ring) ──
-    this._highlightGizmo = createErrorHighlightGizmo(ctx.gizmoManager, this.node, this.HighlightStyle);
+    // ── 3D mark: highlight pipeline (steady red X-ray overlay + one flash on
+    // activation) for normal-sized parts when a highlighter is available;
+    // the floor-disk ring gizmo for very small parts; the legacy glow-hull
+    // gizmo only without a highlighter (minimal viewers, tests).
+    this._useHighlighter = !!ctx.highlighter && !resolveUseRing(this.node, this.HighlightStyle);
+    if (!this._useHighlighter) {
+      this._highlightGizmo = createErrorHighlightGizmo(ctx.gizmoManager, this.node, this.HighlightStyle);
+    }
 
-    // ── Backed error-text badge (dark panel + red border + white text) ──
-    const badge = createErrorBadgeGizmo(ctx.gizmoManager, this.node, this.ErrorText);
-    this._badgeGizmo = badge.gizmo;
-    this._badgeTexture = badge.texture;
+    // No world-space error-text badge (removed 2026-10-12): the text lives in
+    // the error card of the message panel; in 3D the mark is the overlay alone.
 
     // Apply the captured initial state now that gizmos exist.
     this._applyActive(this._active);
@@ -126,8 +141,29 @@ export class RVWebError implements RVComponent {
 
   private _applyActive(active: boolean): void {
     this._highlightGizmo?.setVisible(active);
-    this._badgeGizmo?.setVisible(active);
+    this._applyHighlighterMark(active);
     this._ctx?.errorStore?.setActive(this.path, active, this.ErrorText);
+  }
+
+  /** Aux-channel id of this error's overlay (one set per error node). */
+  private get _auxId(): string {
+    return `web-error:${this.path}`;
+  }
+
+  /** Steady red X-ray overlay while active (aux channel) + ONE alarm flash on
+   *  the rising edge (flash channel — the same pulse the error card re-fires
+   *  on click, so both read as one effect). */
+  private _applyHighlighterMark(active: boolean): void {
+    const hl = this._ctx?.highlighter;
+    if (!hl || !this._useHighlighter) return;
+    if (active) {
+      hl.setAuxEmphasis(this._auxId, [this.node], { color: ERROR_COLOR });
+      this._auxShown = true;
+      hl.flash([this.node], { color: ERROR_COLOR });
+    } else if (this._auxShown) {
+      hl.setAuxEmphasis(this._auxId, null);
+      this._auxShown = false;
+    }
   }
 
   /** Current active state (test/inspection helper). */
@@ -138,12 +174,12 @@ export class RVWebError implements RVComponent {
   dispose(): void {
     this._unsubscribe?.();
     this._unsubscribe = undefined;
+    if (this._auxShown) {
+      this._ctx?.highlighter?.setAuxEmphasis(this._auxId, null);
+      this._auxShown = false;
+    }
     this._highlightGizmo?.dispose();
     this._highlightGizmo = undefined;
-    this._badgeGizmo?.dispose();
-    this._badgeGizmo = undefined;
-    this._badgeTexture?.dispose();
-    this._badgeTexture = undefined;
     this._ctx?.errorStore?.remove(this.path);
     this._active = false;
   }
@@ -157,10 +193,8 @@ registerComponent({
   schema: RVWebError.schema,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
-    hoverable: false,
-    selectable: false,
-    filterLabel: 'Web Errors',
-    badgeColor: '#ef5350',
+    pick: 'none',
+    ui: { filter: 'Web Errors', category: 'hmi', badge: '#ef5350' },
   },
   create: (node) => new RVWebError(node),
   afterCreate: (inst, node) => {

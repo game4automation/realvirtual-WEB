@@ -47,7 +47,7 @@ export interface DiffFile { rel: string; size: number; }
 export function selectFilesToUpload<T extends DiffFile>(
   local: T[],
   remote: Map<string, number> | null,
-  opts?: { force?: boolean; alwaysUploadGlbs?: boolean },
+  opts?: { force?: boolean; alwaysUploadGlbs?: boolean; alwaysUploadRel?: Iterable<string> },
 ): T[];
 
 export interface RemoteEntry { rel: string; size: number; isDirectory: boolean; }
@@ -67,7 +67,39 @@ export class BunnyClient {
   putFile(bytes: Uint8Array | Buffer, remotePath: string, mimeOverride?: string): Promise<void>;
   listRecursive(remoteRoot: string): Promise<RemoteEntry[]>;
   purge(): Promise<boolean>;
+  getFile(remotePath: string): Promise<Buffer | null>;
+  getFileIfExists(remotePath: string): Promise<Buffer | null>;
+  /** plan-598: purge one URL (`POST /purge?url=…&async=true`). Never throws. */
+  purgeUrl(url: string): Promise<boolean>;
+  /** plan-598: purge a URL list; without an account key every URL counts as failed. */
+  purgeUrls(urls: string[], opts?: { concurrency?: number }): Promise<{ purged: string[]; failed: string[] }>;
+  /** plan-598 F5: idempotent browser-cache edge rules; null when it could not run. */
+  ensureEdgeRules(rules?: readonly EdgeRuleSpec[]): Promise<{ created: number; updated: number; unchanged: number } | null>;
 }
+
+// ─── plan-598 Phase 2: CDN caching ───────────────────────────────────────
+export interface EdgeRuleSpec { description: string; patterns: string[]; cacheControl: string }
+export const BUNNY_EDGE_ACTION: Readonly<{ OVERRIDE_CACHE_TIME: number; SET_RESPONSE_HEADER: number; OVERRIDE_BROWSER_CACHE_TIME: number }>;
+export const BUNNY_EDGE_TRIGGER_URL: number;
+export const BUNNY_PATTERN_MATCH_ANY: number;
+export const BUNNY_TRIGGER_MATCH_ANY: number;
+export const IMMUTABLE_CACHE_CONTROL: string;
+export const REVALIDATE_CACHE_CONTROL: string;
+export const RV_EDGE_RULES: readonly EdgeRuleSpec[];
+export function edgeRuleBody(spec: EdgeRuleSpec, guid?: string | null): Record<string, unknown>;
+export function edgeRuleMatches(existing: Record<string, unknown> | null | undefined, spec: EdgeRuleSpec): boolean;
+export function cacheControlForUrl(url: string, rules?: readonly EdgeRuleSpec[]): string | null;
+export const URL_PURGE_LIMIT: number;
+export function isContentHashedRel(rel: string): boolean;
+export function purgeUrlsFor(opts: { baseUrl: string; uploaded?: string[]; deleted?: string[]; extraUrls?: string[] }): string[];
+export function purgeDeployChanges(
+  client: { purge(): Promise<boolean>; purgeUrls(urls: string[]): Promise<{ purged: string[]; failed: string[] }> },
+  opts: { baseUrl: string; uploaded?: string[]; deleted?: string[]; extraUrls?: string[]; partial?: boolean; log?: (msg: string) => void },
+): Promise<{ mode: 'none' | 'url' | 'zone'; urls: string[]; ok: boolean }>;
+export const MANIFEST_PRELOAD_ATTR: string;
+export function manifestPreloadFor(opts: { kind: 'public' | 'hosted'; distDir?: string | null; encrypted?: boolean }): string | null;
+export function withManifestPreload(html: string, href: string | null): string;
+export function injectManifestPreload(indexPath: string, opts?: { href?: string | null; dryRun?: boolean }): string | null;
 
 export interface PrivateProject {
   name: string;
@@ -100,10 +132,13 @@ export function discoverPrivateProjects(
   baseDir: string,
 ): Array<{ project: PrivateProject; projectDir: string; folderName: string }>;
 
-export function generatePrivateSettings(
-  project: PrivateProjectLike,
-  projectFolderName?: string,
-  opts?: { encryption?: boolean; projectSettings?: unknown },
+/**
+ * The generated settings.json of a hosted deploy (plan-759): `projectUrl` and
+ * `projectAssetsPath` name `p/`, `encryption` carries the key probe, analytics
+ * is always off, and there is never a `defaultModel` (D14).
+ */
+export function generateHostedSettings(
+  opts?: { encryption?: { probe: string } | null; projectSettings?: unknown },
 ): string;
 
 /** Keys of the generated settings.json a project file may never set (B14). */
@@ -112,39 +147,6 @@ export const SETTINGS_RESERVED_KEYS: readonly string[];
 export function projectSettingsBase(raw: unknown): Record<string, unknown>;
 /** `<projectDir>/settings/project-settings.json`, or null when absent/broken. */
 export function readProjectSettingsFile(projectDir: string): unknown | null;
-
-/** One entry of the curated `scenes/index.json` Examples catalogue. */
-export interface PublishedSceneIndexEntry {
-  file: string;
-  name?: string;
-  mode?: string;
-  /** Classification level cache, so a bundled deploy needs no scan (plan-413). */
-  level?: string;
-}
-/** The Examples catalogue derived from `documents[]`, or null when none apply. */
-export function publishedSceneIndex(project: PrivateProjectLike | null): PublishedSceneIndexEntry[] | null;
-
-/**
- * The GLBs a project publishes: the union of `models/*.glb` on disk (P0-3 — the
- * folder can never be shortened by the manifest) and the `documents[]` entries
- * that name an existing root-level GLB (plan-720).
- */
-export function projectModelNames(projectDir: string): string[];
-
-/** A manifest/folder disagreement `projectModelNamesWithReport()` reports instead of swallowing. */
-export interface ProjectModelDiscrepancy {
-  /** `missing-file` = declared but absent (not published); `unregistered` = on disk but undeclared (published). */
-  kind: 'missing-file' | 'unregistered';
-  path: string;
-  reason: string;
-}
-
-/** `projectModelNames()` plus the source paths staging needs and the discrepancy report. */
-export function projectModelNamesWithReport(projectDir: string): {
-  list: string[];
-  sources: Map<string, string>;
-  discrepancies: ProjectModelDiscrepancy[];
-};
 
 /** plan-267: optional AES-256-GCM encryption of GLBs at publish time. */
 export interface PrivateEncryptionOptions {
@@ -159,11 +161,54 @@ export interface PrivateSigningOptions {
   customerCert?: { pub: string; org: string; sig: string } | null;
 }
 
-export function stagePrivateProject(opts: {
+/** The deploy-relative folder the project is published under (`p/`). */
+export const HOSTED_PROJECT_PREFIX: string;
+
+/** What `copyProjectVerbatim` / `stageHostedProject` report for the preflight. */
+export interface HostedStageReport {
+  copied: string[];
+  denied: { rel: string; reason: string }[];
+  symlinks: string[];
+  oversized: string[];
+  /** Only set by `stageHostedProject`. */
+  encrypted: string[];
+}
+
+/** Copies a project folder byte-for-byte minus the hosted deny list; symlinks are skipped. */
+export function copyProjectVerbatim(
+  projectDir: string,
+  destDir: string,
+  opts?: { ignoreRules?: unknown[] | null },
+): Omit<HostedStageReport, 'encrypted'>;
+
+/** True for a `p/`-relative path a password deploy encrypts: `.glb`, `aasx/*.aasx`, `aasx/index.json` (plan-596). */
+export function isEncryptablePath(rel: string): boolean;
+
+/** Every encryptable file below `dir`, `p/`-relative POSIX paths, sorted. */
+export function encryptablePathsBelow(dir: string): string[];
+
+/**
+ * The rels a hosted publish uploads regardless of size: the catalog diff united
+ * with every encrypted file, translated from `p/`-relative to staging-relative.
+ */
+export function hostedForcedUploadRels(
+  encrypted?: Iterable<string> | null,
+  catalogDiff?: Iterable<string> | null,
+): string[];
+
+/**
+ * Stages a hosted project: runtime at the root, the project verbatim under
+ * `p/`, generated settings.json; every `.glb` — and the project AASX
+ * (`aasx/*.aasx`, `aasx/index.json`) — an RVE1 envelope when `encryption` is
+ * given (one salt per publish, the file path as `hkdfInfo`). Signing touches
+ * `.glb` only.
+ */
+export function stageHostedProject(opts: {
   distDir: string;
   projectDir: string;
   encryption?: PrivateEncryptionOptions | null;
   signing?: PrivateSigningOptions | null;
+  onReport?: ((report: HostedStageReport) => void) | null;
 }): Promise<string>;
 
 export const PUBLIC_MODEL_PREFIX: string;
@@ -252,3 +297,28 @@ export function writeSeoArtifacts(
   distDir: string,
   opts: { pageUrl: string; dryRun?: boolean },
 ): SeoArtifacts;
+
+// ─── Library catalog integrity (plan-508) ────────────────────────────────
+
+/** The reserved probe path that must never exist in a deploy. */
+export const PROBE_MISSING_ASSET: string;
+/** `existsSync` that insists on the spelling per segment and on the last segment being a file. */
+export function existsOnDiskExactly(rootDir: string, relPath: string): boolean;
+/** Every `catalog.json` under `rootDir` (forward-slash rels). */
+export function findCatalogFiles(rootDir: string): string[];
+/** Deploy-relative path of an entry's `glbUrl` / `splatUrl`, or null for non-relative urls. */
+export function catalogEntryBinaryRel(catalogRel: string, entry: { glbUrl?: string; splatUrl?: string }): string | null;
+/** Re-stamp `sha256` + `sizeBytes` into every catalog under `rootDir` from the bytes there now. */
+export function stampCatalogHashes(rootDir: string, opts?: { dryRun?: boolean }): { catalogs: number; stamped: number };
+/** Catalogued binaries whose hash differs from the remote catalog (null = none published: all). */
+export function catalogChangedBinaries(localDir: string, catalogRel: string, remoteText: string | Buffer | null): string[];
+export interface ProbeResult { ok: boolean; findings: string[]; checks: string[]; }
+/** Post-deploy probe: missing asset 404 (any type — Bunny's text/html error page is accepted; a 200 fails), catalog byte-equal, first asset hashes to its sha256. */
+export function probePublishedAssets(opts: {
+  baseUrl: string;
+  distDir: string;
+  timeoutMs?: number;
+  fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
+  catalogRel?: string;
+  now?: () => number;
+}): Promise<ProbeResult>;

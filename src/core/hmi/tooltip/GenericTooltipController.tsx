@@ -7,7 +7,7 @@
  *
  * Core logic:
  * 1. On hover: iterate Object.keys(node.userData.realvirtual), skip non-objects,
- *    check getCapabilities(key).tooltipType, call registered data resolver,
+ *    check getCapabilities(key).ui.tooltip, call registered data resolver,
  *    fire tooltipStore.show() for each matched section.
  * 2. Generic PDF links: also checks node.userData._rvPdfLinks and auto-stacks
  *    a 'pdf' section at the bottom of the tooltip bubble.
@@ -86,15 +86,15 @@ export function GenericTooltipController() {
           if (typeof rv[key] !== 'object') continue;
 
           const caps = getCapabilities(key);
-          if (!caps.tooltipType) continue;
+          if (!caps.ui.tooltip) continue;
 
-          const resolver = tooltipRegistry.getDataResolver(caps.tooltipType);
+          const resolver = tooltipRegistry.getDataResolver(caps.ui.tooltip);
           if (!resolver) continue;
 
           const data = resolver(node, viewer);
           if (!data) continue;
 
-          const hoverId = `tooltip-hover:${caps.tooltipType}`;
+          const hoverId = `tooltip-hover:${caps.ui.tooltip}`;
           newHoverIds.push(hoverId);
 
           tooltipStore.show({
@@ -104,7 +104,7 @@ export function GenericTooltipController() {
             data: data as TooltipData,
             mode: 'cursor',
             cursorPos: { x: hover.pointer.x, y: hover.pointer.y },
-            priority: caps.hoverPriority ?? 5,
+            priority: caps.ui.priority,
           });
         }
       }
@@ -176,15 +176,15 @@ export function GenericTooltipController() {
             if (typeof rv[key] !== 'object') continue;
 
             const caps = getCapabilities(key);
-            if (!caps.tooltipType) continue;
+            if (!caps.ui.tooltip) continue;
 
-            const resolver = tooltipRegistry.getDataResolver(caps.tooltipType);
+            const resolver = tooltipRegistry.getDataResolver(caps.ui.tooltip);
             if (!resolver) continue;
 
             const data = resolver(node, viewer);
             if (!data) continue;
 
-            const pinId = `tooltip-pin:${caps.tooltipType}:${path}`;
+            const pinId = `tooltip-pin:${caps.ui.tooltip}:${path}`;
             newPinnedIds.add(pinId);
 
             tooltipStore.show({
@@ -197,7 +197,7 @@ export function GenericTooltipController() {
               worldAnchor: viewer.selectionManager?.lastHitPoint
                 ? worldToLocal(viewer.selectionManager.lastHitPoint, node)
                 : undefined,
-              priority: caps.pinPriority ?? 3,
+              priority: caps.ui.priority,
             });
           }
         }

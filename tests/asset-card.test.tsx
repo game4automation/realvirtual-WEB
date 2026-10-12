@@ -14,7 +14,7 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
-import { AssetCard } from '../src/core/library/AssetCard';
+import { AssetCard, fileGlyphOf, isCadExtension } from '../src/core/library/AssetCard';
 import type { LibraryCatalogEntry } from '../src/core/library/library-types';
 
 afterEach(() => cleanup());
@@ -94,5 +94,54 @@ describe('AssetCard behaviour stays with the caller', () => {
     render(<AssetCard entry={entry({ tags: ['fast', 'belt'] })} />);
     expect(screen.getByText('fast')).toBeTruthy();
     expect(screen.getByText('belt')).toBeTruthy();
+  });
+});
+
+describe('AssetCard file glyphs (dashboard project files)', () => {
+  it('labels the knowledge tile MD, not Knowledge', () => {
+    render(<AssetCard entry={entry()} glyph="knowledge" />);
+    expect(screen.getByText('MD')).toBeTruthy();
+    expect(screen.queryByText('Knowledge')).toBeNull();
+  });
+
+  it('labels a file tile with its extension in capitals, and a bare file "File"', () => {
+    expect(fileGlyphOf('docs/Manual.PDF')).toBe('file:pdf');
+    expect(fileGlyphOf('deck.pptx')).toBe('file:pptx');
+    expect(fileGlyphOf('README')).toBe('file:');
+    render(<AssetCard entry={entry()} glyph={fileGlyphOf('docs/Manual.PDF')} />);
+    // The tile uppercases via CSS; the text node is the raw extension.
+    expect(screen.getByText('pdf')).toBeTruthy();
+    // A media file is neutral grey — neither magenta (MD) nor amber (CAD).
+    const pdfColor = getComputedStyle(screen.getByText('pdf')).color;
+    expect(pdfColor).toContain('255, 255, 255');
+    expect(pdfColor).not.toContain('233, 64, 120');
+    cleanup();
+    render(<AssetCard entry={entry()} glyph="file:" />);
+    expect(screen.getByText('File')).toBeTruthy();
+  });
+});
+
+describe('AssetCard CAD glyph', () => {
+  it('knows the CAD formats by extension, case-insensitively', () => {
+    for (const ext of ['step', 'STP', 'iges', 'jt', 'stl', 'obj', 'fbx', 'dxf', 'sldprt']) {
+      expect(isCadExtension(ext), ext).toBe(true);
+    }
+    expect(isCadExtension('pdf')).toBe(false);
+    expect(isCadExtension('md')).toBe(false);
+  });
+
+  it('renders a CAD file with the extension label and the CAD accent, not the document one', () => {
+    const { container } = render(<AssetCard entry={entry()} glyph={fileGlyphOf('cad/Frame.STEP')} />);
+    expect(screen.getByText('step')).toBeTruthy();
+    expect(container.querySelector('[data-testid="CategoryOutlinedIcon"]')).toBeTruthy();
+    // Only the label and icon carry the accent — amber for CAD, never magenta;
+    // the tile behind them stays the neutral grey of every other placeholder.
+    const label = screen.getByText('step');
+    const labelColor = getComputedStyle(label).color;
+    expect(labelColor).toContain('255, 167, 38');
+    expect(labelColor).not.toContain('233, 64, 120');
+    const tile = getComputedStyle(label.parentElement!);
+    expect(tile.borderColor).not.toContain('255, 167, 38');
+    expect(tile.backgroundColor).toContain('255, 255, 255');
   });
 });

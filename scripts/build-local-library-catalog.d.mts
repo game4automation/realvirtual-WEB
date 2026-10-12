@@ -8,8 +8,22 @@ export const OUTPUT: string;
 export function humanize(s: string): string;
 /** Stable, URL-safe id from a path-ish string. */
 export function slug(s: string): string;
-/** Recursively collect all `.glb` files under `dir`, as paths relative to LIBRARY_DIR (native separators). */
-export function collectGlbs(dir: string): Promise<string[]>;
+/** Recursively collect all `.glb` files under `dir`, as paths relative to `root` (default LIBRARY_DIR, native separators). */
+export function collectGlbs(dir: string, root?: string): Promise<string[]>;
+/** One catalog entry as the builder writes it (plan-508: `sha256` + `sizeBytes` of the bytes behind `glbUrl`). */
+export interface LocalCatalogEntry {
+  id: string;
+  name: string;
+  category: string;
+  glbUrl: string;
+  sha256: string;
+  sizeBytes: number;
+}
+/** Build the catalog object for `libraryDir` (default LIBRARY_DIR); `filterIgnored` defaults to true only for LIBRARY_DIR. */
+export function buildLocalCatalog(
+  libraryDir?: string,
+  options?: { filterIgnored?: boolean; log?: (message: string) => void },
+): Promise<{ version: '1.0'; name: string; entries: LocalCatalogEntry[] }>;
 /** Git-ignored entries among `relPaths` (relative to LIBRARY_DIR); empty outside a Git checkout. */
 export function gitIgnored(relPaths: string[]): Set<string>;
 /**

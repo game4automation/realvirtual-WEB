@@ -157,9 +157,10 @@ describe('scene indexing', () => {
     });
     const documents = manifest.documents as Array<Record<string, unknown>>;
     expect(documents).toHaveLength(2);
-    // Every field of the entry the user annotated survives; `section` is the
-    // one addition, and it says where the bytes live, not what they are called.
-    expect(documents[0]).toEqual({ ...existing, section: 'scenes' });
+    // Every field of the entry the user annotated survives, and NOTHING is
+    // added: the `section: 'scenes'` stamp that used to be the one addition
+    // is gone (plan-744 Phase 2). The row is the row the user wrote.
+    expect(documents[0]).toEqual({ ...existing });
     expect(documents[1].path).toBe('scenes/b.scene.json');
     expect(manifest.scenes).toBeUndefined();
   });
@@ -250,11 +251,12 @@ describe('documents[] derivation (plan-413 §2.4 step A, offline)', () => {
       'models/machine.glb',
       'library/gripper.glb',
     ]);
-    // plan-736 F5/F6: the Node twin lifts the same rows as the TS side and
-    // stamps the same single `section` — the scene one, kept as the
-    // transitional Alt-Client guard. Drift between the two would show up here.
+    // plan-744 Phase 2: the Node twin lifts the same rows as the TS side and
+    // stamps NOTHING. The single surviving `section` — the scene one, kept as
+    // the transitional Alt-Client guard of plan-736 — went with its gate.
+    // Drift between the two twins would show up here.
     expect(manifest.documents.map((d: Record<string, unknown>) => d.section))
-      .toEqual(['scenes', undefined, undefined]);
+      .toEqual([undefined, undefined, undefined]);
     expect(manifest[DOCUMENTS_MIGRATION_MARKER]).toEqual({
       at: '2026-08-08T00:00:00.000Z', schemaVersion: 2,
       counts: { scenes: 1, models: 1, library: 1 },

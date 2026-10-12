@@ -39,7 +39,8 @@ function mech(name: string, joints: MechanismJointView[]): MechanismView {
     nodePath: `/${name}`, name,
     active: true, converged: true, residualError: 0, solveTimeMs: 0, disabledReason: '',
     jointCount: joints.length, linkCount: 0, loopCount: 0, dof: joints.length,
-    joints, links: [], findings: [],
+    // plan-472: the overview reads joints only; the centre of gravity is not its subject.
+    joints, links: [], cog: null, findings: [],
   };
 }
 

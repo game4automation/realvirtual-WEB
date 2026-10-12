@@ -137,6 +137,6 @@ function isRef(v: unknown): v is ComponentRef {
 registerComponent({
   type: 'IKTarget',
   schema: RVIKTarget.schema,
-  capabilities: { selectable: true, badgeColor: '#ce93d8', filterLabel: 'IK Targets' },
+  capabilities: { pick: 'select', ui: { badge: '#ce93d8', filter: 'IK Targets', category: 'robotics' } },
   create: (node: Object3D) => new RVIKTarget(node),
 });

@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { BoxGeometry, Group, Mesh, MeshStandardMaterial, Object3D } from 'three';
 
 describe('loadGLB phase functions', () => {
   it('exports loadAndPrepareGLTF as an async function', async () => {
@@ -75,10 +76,11 @@ describe('loadGLB phase functions', () => {
     expect(typeof mod.applyWebGPUFixes).toBe('function');
   });
 
-  it('exports applyKinematicParenting as a function', async () => {
+  it('exports resolveKinematicGroupNames as a function (the re-parent passes went with plan-757 Phase 3)', async () => {
     const mod = await import('../src/core/engine/rv-scene-loader');
-    expect(mod.applyKinematicParenting).toBeDefined();
-    expect(typeof mod.applyKinematicParenting).toBe('function');
+    expect(mod.resolveKinematicGroupNames).toBeDefined();
+    expect(typeof mod.resolveKinematicGroupNames).toBe('function');
+    expect('applyKinematicParenting' in mod).toBe(false);
   });
 
   it('still exports loadGLB as the main orchestrator', async () => {
@@ -169,5 +171,37 @@ describe('parseCompactRecording and parseScriptableObjectRecording moved to rv-d
   it('parseScriptableObjectRecording returns null for empty data', async () => {
     const { parseScriptableObjectRecording } = await import('../src/core/engine/rv-drives-playback');
     expect(parseScriptableObjectRecording({})).toBeNull();
+  });
+});
+
+// ─── Placement classifier (plan-745 F12) ────────────────────────────────
+
+describe('loader bake order (plan-753 F10)', () => {
+  it('bakes BEFORE the init, and has no home-pose window left (plan-757 Phase 3 commit B)', async () => {
+    // History: the in-place bake had to sit inside a home-pose window (init
+    // drives to home, bake, Phase 10e restores). The destructive recipe bakes
+    // on `tmp` before any component exists — the `Drive` hook stamps the
+    // authored home, the `Kinematic` hook re-parents — so the window and its
+    // restore are gone. Pinned as source order: the recipe call precedes the
+    // one init, and no restore / home-pose mode is spelled anywhere.
+    const source = (await import(
+      '../src/core/engine/rv-scene-loader.ts?raw'
+    )).default as unknown as string;
+    const recipe = source.indexOf('bakedAsset = await prepareAndBake(root, {');
+    const init = source.indexOf('const initResult = initSubtree(root, {');
+    expect(recipe).toBeGreaterThan(0);
+    expect(init).toBeGreaterThan(recipe);
+    expect(source).not.toContain('restoreDriveHomePose');
+    expect(source).not.toContain('DriveHomePoseMode');
+    expect(source).not.toContain('applyKinematicParenting(');
+  });
+
+  it('has no flag any more: the bake is the only batching path (Phase 4b)', async () => {
+    const source = (await import(
+      '../src/core/engine/rv-scene-loader.ts?raw'
+    )).default as unknown as string;
+    expect(source).not.toContain('rv-loader-bake-flag');
+    expect(source).not.toContain('buildBatchedScene');
+    expect(source).not.toContain('buildRaycastGeometries');
   });
 });

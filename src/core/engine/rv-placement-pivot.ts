@@ -78,12 +78,45 @@ export function pivotToFloorCenter(obj: Object3D): void {
   // any non-zero obj.position would offset the gizmo from the mesh by
   // exactly obj.position (Unity-authored library objects whose root sat at
   // a non-origin position are the typical trigger).
+  //
+  // plan-757 Phase 2 (spike S2, review F12): the same holds for obj's
+  // ANCESTORS. A top-level placement hangs under the layout root at the world
+  // origin, but a NESTED placement (a reference node inside a placed asset)
+  // hangs under an instance that sits wherever the user put it — and a grafted
+  // reference (`compose()`) under a transformed CAD sub-assembly likewise.
+  // `setFromObject` would then measure the parent's world offset into the
+  // pivot (Slide at −10 instead of 0, tests/placement-pivot.test.ts). So obj
+  // is measured DETACHED: unlinked from its parent for the duration, re-linked
+  // at the same index afterwards, no `add`/`remove` events. Callers refresh
+  // `matrixWorld` after the pivot anyway (`materialize`, `compose`).
+  const parent = obj.parent;
+  const index = parent ? parent.children.indexOf(obj) : -1;
+  if (parent && index >= 0) {
+    parent.children.splice(index, 1);
+    obj.parent = null;
+  }
+  try {
+    pivotToFloorCenterDetached(obj);
+  } finally {
+    if (parent && index >= 0) {
+      parent.children.splice(index, 0, obj);
+      obj.parent = parent;
+    }
+  }
+}
+
+function pivotToFloorCenterDetached(obj: Object3D): void {
   _pivotOrigPos.copy(obj.position);
   const origRotX = obj.rotation.x;
   const origRotY = obj.rotation.y;
   const origRotZ = obj.rotation.z;
   obj.position.set(0, 0, 0);
   obj.rotation.set(0, 0, 0);
+  // Explicit (F12): `updateMatrixWorld` recomposes the LOCAL matrix only for a
+  // `matrixAutoUpdate` node — a frozen root (loader Phase 11 turned it off, or
+  // a caller that never turned it on) would be measured through its stale
+  // matrix, parent offset and all.
+  obj.updateMatrix();
   obj.updateMatrixWorld(true);
 
   const marker = findWebPivotMarker(obj);
@@ -104,6 +137,7 @@ export function pivotToFloorCenter(obj: Object3D): void {
     if (_pivotBox.isEmpty()) {
       obj.position.copy(_pivotOrigPos);
       obj.rotation.set(origRotX, origRotY, origRotZ);
+      if (!obj.matrixAutoUpdate) obj.updateMatrix();
       return;
     }
     _pivotBox.getCenter(_pivotCenter);
@@ -116,8 +150,14 @@ export function pivotToFloorCenter(obj: Object3D): void {
     child.position.x += offsetX;
     child.position.y += offsetY;
     child.position.z += offsetZ;
+    // Static chunk meshes of a baked placement are `matrixAutoUpdate=false`
+    // (plan-753): the shift must reach their local matrix by hand.
+    if (!child.matrixAutoUpdate) child.updateMatrix();
   }
 
   obj.position.copy(_pivotOrigPos);
   obj.rotation.set(origRotX, origRotY, origRotZ);
+  // A frozen root gets its authored matrix back by hand — the caller's
+  // `updateMatrixWorld(true)` will not recompose it either.
+  if (!obj.matrixAutoUpdate) obj.updateMatrix();
 }

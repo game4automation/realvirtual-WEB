@@ -190,11 +190,11 @@ describe('plan-717 F9 — `stableDocumentId` is called only where an id is born'
       // carries, so the fallback and the row agree by construction — pinned
       // against that row by the test below.
       'WelcomeModal.tsx',
-      // A read-only manifest row that arrived WITHOUT an id (hand-edited
-      // bundled project.json): `listDocuments` mints one from the path so the
-      // row is addressable at all. Read-only — nothing is persisted from here,
-      // which is the same allowance `rv-project-documents.ts` carries below.
-      'bundled-backend.ts',
+      // `bundled-backend.ts` is GONE from this list (plan-744 F2). It spelled
+      // the mint out itself, for a read-only manifest row that arrived without
+      // an id; it now calls `documentOfEntry`, which carries the same default.
+      // One call site fewer for the same behaviour — and the name derivation
+      // that travelled with it stopped disagreeing with everyone else's.
       // The mint itself: `previewAssetId()` is the intent-named wrapper the
       // adopt verb and the reference resolver share.
       'rv-asset-identity.ts',

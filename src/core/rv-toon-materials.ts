@@ -63,6 +63,7 @@ import type { Renderer } from 'three/webgpu';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import type { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { createGBufferMaterial } from './engine/rv-gbuffer-material';
 import { getTslMaterials } from './engine/materials/material-factory';
 import type {
   ToonRecolorStateTsl,
@@ -220,39 +221,10 @@ const ALBEDO_INJECT = /* glsl */`{
   diffuseColor.rgb = clamp(rvAlb, 0.0, 1.0);
 }`;
 
-// ─── Normal+depth gbuffer override material (portable, no DepthTexture) ──────
-
-// This material is applied via `scene.overrideMaterial`, so it renders EVERY
-// object in the scene — including the BatchedMesh arenas of the batched render
-// pipeline. Any such override material MUST be batching-aware: the renderer
-// injects `#define USE_BATCHING` and binds the batching textures per object,
-// but only the <batching_pars_vertex> / <batching_vertex> chunks make the
-// per-instance matrix available; <defaultnormal_vertex> and <project_vertex>
-// then apply it. Without these includes, batched geometry renders with its
-// instance transforms unapplied and the gbuffer (and thus every edge) is wrong.
-const GBUFFER_VERT = /* glsl */`
-#include <common>
-#include <batching_pars_vertex>
-uniform float uNear;
-uniform float uFar;
-varying vec3 vNrm;
-varying float vDepth;
-void main() {
-  #include <batching_vertex>
-  #include <beginnormal_vertex>
-  #include <defaultnormal_vertex>
-  vNrm = normalize(transformedNormal);
-  #include <begin_vertex>
-  #include <project_vertex>
-  vDepth = clamp((-mvPosition.z - uNear) / max(uFar - uNear, 1e-4), 0.0, 1.0);
-}`;
-
-const GBUFFER_FRAG = /* glsl */`
-varying vec3 vNrm;
-varying float vDepth;
-void main() {
-  gl_FragColor = vec4(normalize(vNrm) * 0.5 + 0.5, vDepth);
-}`;
+// ─── Normal+depth gbuffer override material ─────────────────────────────────
+// Lives in `engine/rv-gbuffer-material.ts` since plan-740 P2.2 — the agent
+// eye's `normals`/`edges` channels need the identical batching-aware override,
+// and a second copy would drift. The batching contract is documented there.
 
 // ─── Sobel outline shader (reads the single packed gbuffer + scene color) ────
 
@@ -324,6 +296,10 @@ export class RVToonMaterialManager {
   private readonly host: ToonHostViewer;
 
   private _active = false;
+  // Set by the viewer while the editor's wireframe view is on: the outline and
+  // the saturation grade are post passes over the SOLID image and would redraw
+  // the surfaces the wireframe just removed. Materials stay converted.
+  private _suppressed = false;
 
   // Material cache: original material instance → its toon counterpart
   // (classic MeshToonMaterial on WebGL, MeshToonNodeMaterial via the TSL
@@ -433,7 +409,7 @@ export class RVToonMaterialManager {
    *  the shared saturation node on the TSL post pipeline. */
   get saturationActive(): boolean {
     if (this.host.isWebGPU) {
-      return this._active && !!this._tslPost && this._albedoSaturation !== 1;
+      return this._active && !this._suppressed && !!this._tslPost && this._albedoSaturation !== 1;
     }
     return this._active
       && !!this._saturationPass
@@ -449,6 +425,28 @@ export class RVToonMaterialManager {
       && !!this._sobelPass
       && this._sobelPass.enabled
       && !!this._gbufferRT;
+  }
+
+  /**
+   * Switch the toon POST passes (outline + saturation grade) off without leaving
+   * toon mode — the wireframe view sits on top of whatever render mode is active.
+   * Idempotent; un-suppressing brings the passes back with the current settings.
+   */
+  setSuppressed(suppressed: boolean): void {
+    if (this._suppressed === suppressed) return;
+    this._suppressed = suppressed;
+    this._syncPassEnabled();
+    this._applyTslSaturation();
+    this.host.markRenderDirty();
+  }
+
+  /** The ONE rule for whether the two composer passes run. */
+  private _syncPassEnabled(): void {
+    const on = this._active && !this._suppressed;
+    if (this._sobelPass) {
+      this._sobelPass.enabled = on && this._outlineAmount > 0 && this._outlineThickness > 0;
+    }
+    if (this._saturationPass) this._saturationPass.enabled = on && this._albedoSaturation !== 1;
   }
 
   // ─── Lifecycle (driven by RVViewer) ───────────────────────────────────────
@@ -555,7 +553,7 @@ export class RVToonMaterialManager {
       this._applyTslSaturation();
     } else if (this._saturationPass) {
       this._saturationPass.uniforms.uSaturation.value = this._albedoSaturation;
-      this._saturationPass.enabled = this._active && this._albedoSaturation !== 1;
+      this._syncPassEnabled();
     }
     this.host.markRenderDirty();
   }
@@ -580,7 +578,7 @@ export class RVToonMaterialManager {
       u.threshold.value = this._outlineThreshold;
       u.uEdgeCutoff.value = this._outlineDistance;
       (u.outlineColor.value as Color).copy(this._outlineColor);
-      this._sobelPass.enabled = this._active && this._outlineAmount > 0 && this._outlineThickness > 0;
+      this._syncPassEnabled();
     }
     this.host.markRenderDirty();
   }
@@ -903,13 +901,13 @@ export class RVToonMaterialManager {
       if (outputIdx >= 0) composer.insertPass(this._sobelPass!, outputIdx + 1);
       else composer.addPass(this._sobelPass!);
     }
-    this._sobelPass!.enabled = this._outlineAmount > 0 && this._outlineThickness > 0;
+    this._sobelPass!.enabled = !this._suppressed && this._outlineAmount > 0 && this._outlineThickness > 0;
   }
 
   /** Push the current toon saturation into the TSL pipeline's shared node
    *  (WebGPURenderer paths). Identity (1) while toon is inactive. */
   private _applyTslSaturation(): void {
-    this._tslPost?.setSaturation(this._active ? this._albedoSaturation : 1);
+    this._tslPost?.setSaturation(this._active && !this._suppressed ? this._albedoSaturation : 1);
   }
 
   /**
@@ -943,7 +941,7 @@ export class RVToonMaterialManager {
       });
       composer.addPass(this._saturationPass);
     }
-    this._saturationPass.enabled = this._active && this._albedoSaturation !== 1;
+    this._syncPassEnabled();
   }
 
   private _buildOutlineResources(): void {
@@ -952,12 +950,7 @@ export class RVToonMaterialManager {
     const dh = renderer.domElement.height || 1;
 
     this._rebuildGbuffer(); // creates _gbufferRT at the right size / filter / MSAA samples
-    this._gbufferMat = new ShaderMaterial({
-      uniforms: { uNear: { value: 0.1 }, uFar: { value: 1000 } },
-      vertexShader: GBUFFER_VERT,
-      fragmentShader: GBUFFER_FRAG,
-      clippingPlanes: this._clippingPlanes,
-    });
+    this._gbufferMat = createGBufferMaterial(this._clippingPlanes);
 
     this._sobelPass = new ShaderPass({
       uniforms: {

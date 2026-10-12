@@ -16,6 +16,8 @@ dist-internal/
 .runtime/
 .playwright-profile
 test-results/
+# plan-503: post-deploy demo smoke output of a local release deploy (<repo>/.smoke/<time>/)
+.smoke/
 *.local
 *.tsbuildinfo
 .mcp.json
@@ -90,3 +92,14 @@ tests/**/__screenshots__/
 # computed from, plus their logs. Regenerated per run, never source.
 .rv-395-*.json
 .rv-395-*.log
+
+# Scratch screenshots written by ad-hoc UI checks at the repo root (/tidy 2026-09-15).
+.temp-*
+
+# plan-753 hmi-highlight-parity run artefacts (baseline files are committed)
+e2e/__baseline__/**/*.bake-run.*
+e2e/__baseline__/**/*.diff.png
+
+# plan-753 §9.15: hmi-highlight-parity baselines are headless-rasteriser specific and
+# compared within ONE run pair (RV_PARITY_MODE=baseline, then bake) on one machine.
+e2e/__baseline__/hmi-highlight-parity/

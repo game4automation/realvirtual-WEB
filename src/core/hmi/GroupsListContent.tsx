@@ -24,11 +24,85 @@ import { RV_SCROLL_CLASS } from './shared-sx';
 import {
   loadGroupVisibilitySettings,
   saveGroupVisibilitySettings,
+  subscribeGroupVisibilitySettings,
 } from './group-visibility-store';
+import type { LoadResult } from '../engine/rv-scene-loader';
 import type { GroupInfo } from '../engine/rv-group-registry';
 import type { AutoFilterGroup } from '../engine/rv-auto-filter-registry';
 import { useOverlayVisibilityState } from '../../hooks/use-overlay-visible';
 import { setOverlayVisible, showAllOverlays } from '../overlay-visibility-store';
+
+/**
+ * Apply the persisted group / auto-filter visibility to a freshly loaded
+ * model, and reconcile the panel's kinematic auto-exclusion.
+ *
+ * Runs on EVERY `model-loaded` from the always-mounted overlay host
+ * (GroupsOverlay) — HMI load, editor open, editor close — not from the list,
+ * which exists only while the panel is open. Idempotent: a second run on the
+ * same registry changes nothing.
+ */
+export function applyPersistedGroupVisibility(viewer: RVViewer, result?: Pick<LoadResult, 'drivenKinematicGroupNames' | 'kinematicGroupNames'>): void {
+  const groups = viewer.groups;
+  if (groups) {
+    const saved = loadGroupVisibilitySettings();
+
+    // Auto-exclude the kinematic groups a DRIVE moves (structure) — a
+    // drive-less `Kinematic` is a rigid group the operator toggles
+    // (Festo `Cover`, 2026-09-24) and stays listed.
+    const kinNames = result?.drivenKinematicGroupNames ?? result?.kinematicGroupNames ?? [];
+    // Release what THIS panel excluded earlier and this model no longer
+    // drives (a Kinematic that lost its drive, or a group that became a
+    // plain group — the Festo `Cover`). A name the user excluded by hand
+    // is not in `autoExcludedKinematic` and stays excluded.
+    const modelGroups = new Set(groups.getAll().map(g => g.name));
+    const stillDriven = new Set(kinNames);
+    // A profile from before this record existed (2026-09-24) holds only
+    // the old rule's auto-exclusions for this model's groups — treat them
+    // as auto-added ONCE so the first load releases what is no longer
+    // driven (the Festo `Cover`). From then on the record is authoritative.
+    const auto = saved.autoExcludedKinematic
+      ?? (saved.excludedFromOverlay ?? []).filter(n => modelGroups.has(n));
+    const released = auto.filter(n => modelGroups.has(n) && !stillDriven.has(n));
+    const excludedNow = (saved.excludedFromOverlay ?? []).filter(n => !released.includes(n));
+    const merged = [...new Set([...excludedNow, ...kinNames])];
+    // Only what THIS run adds becomes auto-owned. A driven name the user had
+    // already excluded by hand keeps its manual ownership, so it is not
+    // released later when the group loses its drive (Codex review, 2026-09-24).
+    const addedNow = kinNames.filter(n => !excludedNow.includes(n));
+    const autoNext = [...new Set([...auto.filter(n => !released.includes(n)), ...addedNow])];
+    if (merged.length !== (saved.excludedFromOverlay ?? []).length || released.length > 0
+      || autoNext.length !== auto.length || saved.autoExcludedKinematic === undefined) {
+      saved.excludedFromOverlay = merged;
+      saved.autoExcludedKinematic = autoNext;
+      saveGroupVisibilitySettings(saved);
+    }
+
+    const defaultHidden = saved.defaultHiddenGroups ?? [];
+    groups.setDefaultHiddenGroups(defaultHidden);
+
+    if (saved.isolatedGroup && groups.get(saved.isolatedGroup)) {
+      groups.isolate(saved.isolatedGroup);
+      viewer.markShadowsDirty();
+    } else if (saved.hiddenGroups.length > 0) {
+      for (const name of saved.hiddenGroups) groups.setVisible(name, false);
+      viewer.markShadowsDirty();
+    } else if (defaultHidden.length > 0) {
+      for (const name of defaultHidden) groups.setVisible(name, false);
+      viewer.markShadowsDirty();
+    }
+  }
+
+  const af = viewer.autoFilters;
+  if (af) {
+    const saved = loadGroupVisibilitySettings();
+    for (const type of saved.hiddenAutoFilters ?? []) af.setVisible(type, false);
+    if (saved.isolatedAutoFilter && af.get(saved.isolatedAutoFilter)) {
+      af.isolate(saved.isolatedAutoFilter);
+      viewer.markShadowsDirty();
+    }
+  }
+  viewer.markRenderDirty?.();
+}
 
 /** Persist the CURRENT visibility/isolate state of both registries. Reads
  *  the isolate state straight from the registries so it works without access
@@ -89,6 +163,13 @@ export function GroupsListContent({
     viewer.markRenderDirty?.();
   }, [viewer]);
 
+  // The exclusion filter lives in localStorage; re-read it whenever the store
+  // is written (Settings → Groups, an MCP tool, the model-loaded reconciliation)
+  // — a memo keyed on the group array alone showed a stale list until the
+  // panel happened to rebuild (Festo `Cover`, 2026-09-24).
+  const [settingsTick, setSettingsTick] = useState(0);
+  useEffect(() => subscribeGroupVisibilitySettings(() => setSettingsTick(t => t + 1)), []);
+
   const filteredGroups = useMemo(() => {
     const settings = loadGroupVisibilitySettings();
     const excluded = settings.excludedFromOverlay ?? [];
@@ -98,7 +179,8 @@ export function GroupsListContent({
       result = result.filter(g => g.name.toLowerCase().includes(lc));
     }
     return result;
-  }, [groups, filter]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups, filter, settingsTick]);
 
   const filteredAutoFilters = useMemo(() => {
     if (!filter) return autoFilters;
@@ -157,57 +239,18 @@ export function GroupsListContent({
     setTick(t => t + 1);
   }, [active, viewer, viewer.groups, viewer.autoFilters]);
 
-  // Also refresh when model loads
+  // Also refresh when model loads. The persisted state itself is applied by
+  // `applyPersistedGroupVisibility` from the ALWAYS-mounted overlay host
+  // (GroupsOverlay) — this list is unmounted while the panel is closed, and a
+  // restore that lived only here ran only while the panel was open, so a group
+  // hidden in the editor came back visible in the HMI (2026-09-24).
   useEffect(() => {
-    const off = viewer.on('model-loaded', ({ result }) => {
-      if (viewer.groups) {
-        setGroups(viewer.groups.getAll());
-        const saved = loadGroupVisibilitySettings();
-
-        // Auto-exclude kinematic groups from overlay
-        const kinNames = result.kinematicGroupNames ?? [];
-        if (kinNames.length > 0) {
-          const existingExcluded = saved.excludedFromOverlay ?? [];
-          const merged = [...new Set([...existingExcluded, ...kinNames])];
-          saved.excludedFromOverlay = merged;
-          saveGroupVisibilitySettings(saved);
-        }
-
-        const defaultHidden = saved.defaultHiddenGroups ?? [];
-        viewer.groups.setDefaultHiddenGroups(defaultHidden);
-
-        if (saved.isolatedGroup && viewer.groups.get(saved.isolatedGroup)) {
-          viewer.groups.isolate(saved.isolatedGroup);
-          setIsolatedGroup(saved.isolatedGroup);
-          viewer.markShadowsDirty();
-        } else if (saved.hiddenGroups.length > 0) {
-          for (const name of saved.hiddenGroups) {
-            viewer.groups.setVisible(name, false);
-          }
-          viewer.markShadowsDirty();
-        } else if (defaultHidden.length > 0) {
-          for (const name of defaultHidden) {
-            viewer.groups.setVisible(name, false);
-          }
-          viewer.markShadowsDirty();
-        }
-      }
-
-      // Auto-filters
-      if (viewer.autoFilters) {
-        setAutoFilters(viewer.autoFilters.getAll());
-        const saved = loadGroupVisibilitySettings();
-        const hiddenAF = saved.hiddenAutoFilters ?? [];
-        for (const type of hiddenAF) {
-          viewer.autoFilters.setVisible(type, false);
-        }
-        if (saved.isolatedAutoFilter && viewer.autoFilters.get(saved.isolatedAutoFilter)) {
-          viewer.autoFilters.isolate(saved.isolatedAutoFilter);
-          setIsolatedFilter(saved.isolatedAutoFilter);
-          viewer.markShadowsDirty();
-        }
-      }
-
+    const off = viewer.on('model-loaded', () => {
+      if (viewer.groups) setGroups(viewer.groups.getAll());
+      if (viewer.autoFilters) setAutoFilters(viewer.autoFilters.getAll());
+      const saved = loadGroupVisibilitySettings();
+      setIsolatedGroup(saved.isolatedGroup && viewer.groups?.get(saved.isolatedGroup) ? saved.isolatedGroup : null);
+      setIsolatedFilter(saved.isolatedAutoFilter && viewer.autoFilters?.get(saved.isolatedAutoFilter) ? saved.isolatedAutoFilter : null);
       setTick(t => t + 1);
     });
     return off;

@@ -201,3 +201,36 @@ export function documentsUsingRef(
   }
   return out;
 }
+
+// ─── File size for the detail pane ──────────────────────────────────────
+
+/**
+ * What the host keeps per document out of one `statDocuments()` pass: the
+ * mtime that versions the card thumbnails, and the size the detail pane
+ * prints. Both optional — a browser-backed blob has no reliable mtime and a
+ * backend that cannot size a body reports none.
+ */
+export interface DocumentStatEntry {
+  /** Epoch milliseconds of the last write, where the medium has one. */
+  mtime?: number;
+  /** Bytes on disk. Never 0 — an unsizable body is simply absent. */
+  size?: number;
+}
+
+/**
+ * The "Size" value of a selected GLB, or null when there is nothing honest to
+ * print.
+ *
+ * Null rather than "0 B" for an absent, zero or non-finite size: the browser
+ * backend reports `size: 0` for a blob it indexes but cannot measure, and
+ * printing that as a size would tell the user a model is empty when the pane
+ * simply does not know. Decimal units (kB / MB / GB, 1000-based) with one
+ * decimal from kB up — the same units a file manager shows next to the file.
+ */
+export function formatDocumentSize(bytes: number | null | undefined): string | null {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return null;
+  if (bytes < 1000) return `${Math.round(bytes)} B`;
+  if (bytes < 1000 * 1000) return `${(bytes / 1000).toFixed(1)} kB`;
+  if (bytes < 1000 * 1000 * 1000) return `${(bytes / (1000 * 1000)).toFixed(1)} MB`;
+  return `${(bytes / (1000 * 1000 * 1000)).toFixed(2)} GB`;
+}

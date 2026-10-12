@@ -313,3 +313,52 @@ export function parseArgs(argv) {
   }
   return out;
 }
+
+// ── GPU class (plan-492 F6 / R9) ─────────────────────────────────────────
+
+/**
+ * Which rasteriser actually drew the frames: `hardware` or `swiftshader`.
+ *
+ * Headless Chromium falls back to SwiftShader — a CPU rasteriser — unless the
+ * GPU is explicitly forced on. Its frame times are perfectly reproducible and
+ * completely unrelated to what a machine with a GPU does, so a report that
+ * mixed the two in one table would be worse than no report. Every cell records
+ * this, and the renderer strings behind the verdict come along so the call can
+ * be second-guessed.
+ *
+ * Never throws: a page without WebGL answers `unknown`, which the gate treats
+ * as "say so", not as hardware.
+ */
+export async function detectGpu(page) {
+  try {
+    return await page.evaluate(() => {
+      const out = { gpu: 'unknown', renderer: '', vendor: '', webgpu: false };
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+        if (gl) {
+          const ext = gl.getExtension('WEBGL_debug_renderer_info');
+          out.renderer = String(ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
+          out.vendor = String(ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR));
+          const hay = `${out.renderer} ${out.vendor}`.toLowerCase();
+          out.gpu = /swiftshader|llvmpipe|software|subzero/.test(hay) ? 'swiftshader' : 'hardware';
+        }
+      } catch { /* no WebGL on this page */ }
+      out.webgpu = typeof navigator !== 'undefined' && 'gpu' in navigator;
+      return out;
+    });
+  } catch {
+    return { gpu: 'unknown', renderer: '', vendor: '', webgpu: false };
+  }
+}
+
+/**
+ * GPU flags for Chromium. `swiftshader` FORCES the CPU rasteriser, which is the
+ * only way to get a reproducible CPU baseline out of a machine that has a GPU.
+ */
+export function gpuArgs(mode = 'default') {
+  const base = ['--ignore-gpu-blocklist', '--enable-gpu-rasterization', '--use-gl=angle'];
+  return mode === 'swiftshader'
+    ? [...base, '--use-angle=swiftshader']
+    : [...base, '--use-angle=default', '--enable-unsafe-webgpu'];
+}

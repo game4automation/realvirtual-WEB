@@ -24,6 +24,7 @@ import {
   ConnectEmbedGate,
 } from '../src/plugins/connect-embed/ConnectEmbedGate';
 import { closeConnectEmbedDemo } from '../src/plugins/connect-embed/connect-embed-actions';
+import { modeManagerDouble } from './fixtures/mode-manager-double';
 import {
   beginConnectEmbedDemoLoad,
   completeConnectEmbedDemoLoad,
@@ -207,6 +208,7 @@ function createActivityBarViewer() {
   return {
     leftPanelManager,
     uiRegistry,
+    modes: modeManagerDouble(),
     applyVisualSettings: vi.fn(),
     clearModel: vi.fn(),
     currentModelUrl: null as string | null,
@@ -238,7 +240,7 @@ function GateActivityBarHarness() {
 function renderGate() {
   const leftPanelManager = new LeftPanelManager();
   leftPanelManager.open('connect', 360);
-  const viewer = { leftPanelManager };
+  const viewer = { leftPanelManager, modes: modeManagerDouble() };
   return render(
     <ThemeProvider theme={rvDarkTheme}>
       <RVViewerProvider value={viewer as never}>
@@ -250,7 +252,8 @@ function renderGate() {
 
 function renderDemoControls() {
   const leftPanelManager = new LeftPanelManager();
-  const viewer = { clearModel: vi.fn(), leftPanelManager, getPlugin: () => null };
+  const viewer = { clearModel: vi.fn(), leftPanelManager, getPlugin: () => null,
+    modes: modeManagerDouble() };
   const result = render(
     <ThemeProvider theme={rvDarkTheme}>
       <RVViewerProvider value={viewer as never}>

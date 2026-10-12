@@ -55,8 +55,14 @@ describe('projectAssetsBase', () => {
 describe('resolveAssetsBase precedence', () => {
   const p = project({ aasx: { basePath: 'aasx' } });
 
+  // plan-596: for `aasx` the result is the aasx DIRECTORY (index.json + files),
+  // so an assets ROOT (explicit / fallback) gets `aasx/` appended, while the
+  // project's `aasx.basePath` already names the directory. Before, the parser
+  // appended `aasx/` again and a project path ended in `…/aasx/aasx/index.json`.
   it('an explicit per-model path wins over the project', () => {
     expect(resolveAssetsBase({ explicit: '/model/assets', project: p, kind: 'aasx', fallbackBase: '/d/' }))
+      .toBe('/model/assets/aasx/');
+    expect(resolveAssetsBase({ explicit: '/model/assets', project: p, kind: 'docs', fallbackBase: '/d/' }))
       .toBe('/model/assets/');
   });
 
@@ -67,12 +73,17 @@ describe('resolveAssetsBase precedence', () => {
 
   it('falls back to the deployment base when nothing else applies', () => {
     // A bundled deploy has no manifest at all and must keep working unchanged.
-    expect(resolveAssetsBase({ project: null, kind: 'aasx', fallbackBase: '/d/' })).toBe('/d/');
+    expect(resolveAssetsBase({ project: null, kind: 'aasx', fallbackBase: '/d/' })).toBe('/d/aasx/');
+    expect(resolveAssetsBase({ project: null, kind: 'docs', fallbackBase: '/d/' })).toBe('/d/');
   });
 
   it('an empty explicit string does not beat the project', () => {
     expect(resolveAssetsBase({ explicit: '   ', project: p, kind: 'aasx', fallbackBase: '/d/' }))
       .toBe('/d/aasx/');
+  });
+
+  it('never doubles the aasx segment for a project-declared aasx directory', () => {
+    expect(resolveAssetsBase({ project: p, kind: 'aasx', fallbackBase: '/d/' })).toBe('/d/aasx/');
   });
 
   it('always ends in exactly one slash so callers can concatenate', () => {

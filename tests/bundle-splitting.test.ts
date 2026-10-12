@@ -308,8 +308,53 @@ const distFiles = import.meta.glob('../dist/**/*.{html,js}', {
  *    not attempted here. Measurement changed with this re-pin: the budget is now
  *    read in real UTF-8 bytes (see `entryByteLength`), not UTF-16 code units, so
  *    the constant finally means what its name says.
+ *
+ * E) 2026-09-14 — re-pinned to 3_855_000 after a fresh internal `npm run build`:
+ *    3_779_416 bytes, ~2.0 % headroom, the same margin (D) left. The growth over
+ *    (D) is +151_366 B across the 111 public and 54 private commits since c83a11f,
+ *    and it is NOT a splitting regression: T3/T4 are green, every split panel still
+ *    lives in its own chunk reached only by `import()`, and the features whose
+ *    source grew most are correctly ABSENT from the entry — `rv-perf-probe`,
+ *    `rv-synthetic-line`, `perf-test-plugin` and `ProjectsDashboardHost` are all in
+ *    lazy chunks. What did land in the entry, source-map attributed:
+ *      · rv-batched-render.ts     11_941
+ *      · rv-eye-channels.ts       10_557
+ *      · rv-agent-eye.ts           4_574
+ *      · rv-ribbon-path.ts        28_395  (grew by ~1_331 source lines)
+ *    the rest being diffuse growth spread over ~878 modules with no single block
+ *    worth naming. The lever named in (C) and (D) is unchanged and still the way to
+ *    bring this number DOWN rather than up: `register-des-runner`, still reached
+ *    statically from `rv-viewer.ts`, is worth ~112 kB — the private DES plugin group
+ *    is the third-largest block in this build after @mui/material and react-dom.
+ *
+ * F) 2026-09-26 — re-pinned to 4_145_000 after a fresh internal `npm run build`
+ *    (web build 1075, 1d61d431): 4_065_075 bytes, ~2.0 % headroom as before. The
+ *    growth over (E) is +285_659 B across 133 public and 51 private commits since
+ *    2026-09-14, and it is NOT a splitting regression: T3/T4/T6/T8/T10 are green and
+ *    every split panel still lives in its own `import()` chunk. Decision to raise
+ *    rather than trim: Thomas, 2026-09-26 (the limit had been exceeded since before
+ *    plan-499; 499 itself added 2_221 B, its phases 3-4 another 17_092 B, measured
+ *    in the plan). What landed in the entry, by feature (commit-level, not
+ *    source-map attributed this time):
+ *      · seven ported drive behaviours       bc64714a  (rv-drive-*.ts, statically
+ *        imported by the component registry — the vite build lists them)
+ *      · command registry + views            353c1be4 / 4fa0eca0 (plan-499)
+ *      · mechanism section commands          3f611ab9 (plan-504)
+ *      · FMU component, editor, parameters   371979e8 / adccb3b3 / 4b822f31 (plan-498/502)
+ *      · baked chunk rows + inspector        ba104c09 (plan-505)
+ *      · placements-as-references, pick      97455a7a / c095a7c3 / f2e00e70 (plan-756/757)
+ *    Levers to bring this number DOWN, still untouched: `register-des-runner`
+ *    (~112 kB, see C/D/E) and lazy-loading the planner/sim command implementations
+ *    (~15 kB, plan-499 report). Both need plugin-lifecycle work and were not part of
+ *    this re-pin.
+ *
+ * G) 2026-10-05 — re-pinned to 4_425_000 after a fresh internal `npm run build`
+ *    (6.3.47): 4_335_678 bytes, ~2.0 % headroom as before. The growth over (F) is
+ *    +270_603 B since 2026-09-26; T3/T4/T6/T8/T10 are green, so it is not a
+ *    splitting regression. Decision to raise rather than trim: Thomas, 2026-10-05.
+ *    Not attributed per feature this time. The levers named in (F) are unchanged.
  */
-const ENTRY_BUDGET_BYTES = 3_700_000;
+const ENTRY_BUDGET_BYTES = 4_425_000;
 
 /**
  * The entry chunk's size in BYTES, which is what the budget above is named in.
@@ -522,4 +567,97 @@ describe('bundle cost — plan-707 self-describing MCP tooling', () => {
     // The whole feature is bounded by the number the file already defends.
     expect(entryByteLength()).toBeLessThan(ENTRY_BUDGET_BYTES);
   });
+});
+
+/**
+ * plan-498 — the FMU model-description reader (`fflate` + `fast-xml-parser`)
+ * is an EDITOR-only lazy chunk. It must never reach the entry: loading a model
+ * with FMUs needs neither library (the load path only slices bytes).
+ *
+ * Marker: an error literal that exists only in `rv-fmu-model-description.ts`
+ * and survives minification because it is a thrown message.
+ *
+ * Two legitimate shapes, one forbidden one:
+ *  - full build (private sibling present): the attach action is reachable, the
+ *    reader is emitted as its OWN chunk and reached only by `import()`;
+ *  - community build (no private sibling): the asset editor that opens a
+ *    document — the only caller of `setActiveAssetContext` — does not exist, so
+ *    Rollup proves `runAttachFmu` dead and emits NO reader chunk at all
+ *    (measured 2026-09-26 in the plan-498 worktree). That is correct, not a
+ *    regression — the entry still carries none of it;
+ *  - FORBIDDEN in both: the reader inside the entry, or a static import of it.
+ */
+describe('bundle splitting — plan-498 FMU model-description reader', () => {
+  const FMU_PARSER_MARKER = 'Not a readable FMU (zip) archive';
+  const SCAN_TIMEOUT_MS = 120_000;
+
+  it('T10 the reader is never in the entry; where emitted, it is its own chunk reached only by dynamic import', async () => {
+    expect(entryText, 'the FMU reader landed in the entry chunk').not.toContain(FMU_PARSER_MARKER);
+    let home: string | null = null;
+    for (const name of assetNames) {
+      if (name === entryPath) continue;
+      const text = await distFiles[distKey(`/dist/assets/${name}`)!]();
+      if (text.includes(FMU_PARSER_MARKER)) { home = name; break; }
+    }
+    if (home === null) {
+      // Community build: the attach path is dead code. Then the entry must not
+      // reference the parser at all (neither statically nor dynamically).
+      expect(entryText).not.toContain('fmiModelDescription');
+      return;
+    }
+    expect(entryText).not.toContain(`from"./${home}"`);
+    expect(entryText).not.toContain(`import"./${home}"`);
+  }, SCAN_TIMEOUT_MS);
+
+  it('T11 the entry budget still holds with the Fmu component in', () => {
+    expect(entryByteLength()).toBeLessThan(ENTRY_BUDGET_BYTES);
+  });
+});
+
+/**
+ * plan-517 — `web_component_schema` serves the authoring rules from
+ * `schema/v1/specification.md` (~180 kB). The spec must be its OWN chunk,
+ * reached only through the tool's `import()` on the first detail call:
+ *  - not inside the entry, and not inside any other chunk (it is not inlined
+ *    into the MCP-bridge chunk either — that one is downloaded whenever the
+ *    bridge is switched on, a list call must not pay for the spec);
+ *  - no chunk imports it statically, index.html does not modulepreload it;
+ *  - some chunk reaches it through `import("./<chunk>")`.
+ * Holds for both build flavours: the tool is public (AGPL) code, so the
+ * community build (no private sibling) and the internal build emit the same
+ * chunk. Measured on a community build in the plan-517 worktree.
+ *
+ * Marker: the spec's title line — present only in specification.md.
+ */
+describe('bundle splitting — plan-517 component-schema specification chunk', () => {
+  const SPEC_MARKER = 'realvirtual Open Digital Twin Format (rv-ODT) — Specification v1.0';
+  const SCAN_TIMEOUT_MS = 120_000;
+
+  it('T12 the specification is its own dynamic chunk, never static, never preloaded', async () => {
+    expect(entryText, 'the specification landed in the entry chunk').not.toContain(SPEC_MARKER);
+    const homes: string[] = [];
+    const texts = new Map<string, string>();
+    for (const name of assetNames) {
+      const text = await distFiles[distKey(`/dist/assets/${name}`)!]();
+      texts.set(name, text);
+      if (text.includes(SPEC_MARKER)) homes.push(name);
+    }
+    expect(homes, 'the specification must live in exactly one emitted chunk').toHaveLength(1);
+    const home = homes[0];
+    expect(home).not.toBe(entryPath);
+    // Its own chunk: the tool implementation is NOT in it.
+    expect(texts.get(home)!).not.toContain('List authorable component types');
+
+    let dynamicImporters = 0;
+    for (const [name, text] of texts) {
+      if (name === home) continue;
+      expect(text, `${name} imports the specification statically`).not.toContain(`from"./${home}"`);
+      expect(text, `${name} imports the specification statically`).not.toContain(`import"./${home}"`);
+      if (text.includes(`import("./${home}")`)) dynamicImporters++;
+    }
+    expect(dynamicImporters, 'no chunk reaches the specification through import()').toBeGreaterThan(0);
+
+    const preloaded = [...indexHtml.matchAll(/rel="modulepreload"[^>]*href="([^"]+)"/g)].map((m) => m[1]);
+    for (const href of preloaded) expect(href).not.toContain(home);
+  }, SCAN_TIMEOUT_MS);
 });

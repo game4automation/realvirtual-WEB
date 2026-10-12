@@ -187,7 +187,12 @@ describe('commissioningTrust_ProvenanceLifecycle', () => {
     // cannot leave the previous model's record on screen.
     const clearAt = viewerSource.indexOf('clearModel(): void {');
     expect(clearAt).toBeGreaterThan(-1);
-    expect(viewerSource.slice(clearAt, clearAt + 1200))
+    // Bounded by the plugin notification rather than a fixed character window:
+    // plan-757 added per-document problem resets ahead of it, which pushed the
+    // reset past the old 1200-char window without changing the behaviour.
+    const notifyAt = viewerSource.indexOf('this._notifyPluginsModelCleared();', clearAt);
+    expect(notifyAt).toBeGreaterThan(clearAt);
+    expect(viewerSource.slice(clearAt, notifyAt))
       .toContain('this._setModelProvenance(LOCAL_PROVENANCE);');
   });
 
@@ -415,7 +420,7 @@ describe('commissioningTrust_WhatTrustBuys', () => {
   });
 
   it('the CONNECT per-model stream uses the same one gate', () => {
-    expect(connectPluginSource).toContain('if (!viewer.loadTrust.trusted) return;');
+    expect(connectPluginSource).toContain('if (connectStreamBlock(true, viewer.loadTrust.trusted) !== null) return;');
   });
 });
 
@@ -487,7 +492,7 @@ describe('commissioningTrust_WritingIsCONNECTsBusiness', () => {
     // The existing refusal, unchanged: `sendSignals` drops the write when there
     // is no transport port — which is what an unauthorised/absent CONNECT
     // leaves behind. The viewer adds no second fence in front of it.
-    expect(connectPluginSource).toContain('if (!viewer.loadTrust.trusted) return;');
+    expect(connectPluginSource).toContain('if (connectStreamBlock(true, viewer.loadTrust.trusted) !== null) return;');
     const store = new SignalStore();
     store.set('Conveyor.Start', true);
     // Local value is set regardless — a viewer that may not move anything is

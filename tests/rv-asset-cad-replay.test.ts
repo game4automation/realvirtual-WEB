@@ -201,7 +201,9 @@ describe('importCad → draft replay', () => {
 
     const missing = restored.executor.takeMissingCadGeometry();
     expect(missing).toHaveLength(1);
-    expect(missing[0].File).toBe('gearbox.step');
+    expect(missing[0].cadlink.File).toBe('gearbox.step');
+    // No provider refused anything — the cache is simply gone, so no cause is attached.
+    expect(missing[0].reason).toBeUndefined();
     // Draining is destructive — the plugin prompts once, not on every op.
     expect(restored.executor.takeMissingCadGeometry()).toEqual([]);
     restored.dispose();

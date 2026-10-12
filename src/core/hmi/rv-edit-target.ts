@@ -61,7 +61,21 @@ export interface EditTarget {
    * this, not `available` (see `getActivePersistenceTarget`).
    */
   readonly persistsTo?: PersistenceTarget;
+  /**
+   * The document instance ops of this target land in (plan-512). Serialising
+   * callers key on it rather than on the target object, because one document
+   * can be reached through different target objects (the asset editor swaps
+   * its adapter while the document stays). Undefined → key on the target.
+   */
+  readonly documentKey?: object;
   setField(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): void;
+  /**
+   * Awaitable `setField` (plan-512): resolves once the op has been applied,
+   * rejects when it was not. Inside a transaction a rejection is what makes the
+   * transaction roll back — the fire-and-forget `setField` cannot report it.
+   * Optional: a target without it keeps working through `setField`.
+   */
+  setFieldAsync?(nodePath: string, componentType: string, fieldName: string, value: unknown, prev: unknown): Promise<void>;
   unsetField(nodePath: string, componentType: string, fieldName: string, prev: unknown): void;
   withTransaction(label: string, fn: () => Promise<void>): Promise<void>;
   // Editor-only capabilities — undefined ⇒ the UI hides the affordance.
@@ -81,10 +95,21 @@ const sceneStoreTarget: EditTarget = {
     if (!store) return 'none';
     return store.isTransient() ? 'none' : 'scene';
   },
+  get documentKey(): object | undefined {
+    return getSceneStore() ?? undefined;
+  },
   setField(nodePath, componentType, fieldName, value, prev): void {
     const store = getSceneStore();
     if (!store) return;
     void store.applyOp({
+      id: freshOpId(), ts: Date.now(), schemaV: 1,
+      kind: 'setField', nodePath, componentType, fieldName, value, prev,
+    });
+  },
+  setFieldAsync(nodePath, componentType, fieldName, value, prev): Promise<void> {
+    const store = getSceneStore();
+    if (!store) return Promise.resolve();
+    return store.applyOp({
       id: freshOpId(), ts: Date.now(), schemaV: 1,
       kind: 'setField', nodePath, componentType, fieldName, value, prev,
     });

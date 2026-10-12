@@ -1,6 +1,6 @@
 # realvirtual
 
-**The browser platform for industrial digital twins — 3D HMI, Machine Information System, simulation and layout planning**
+**The browser platform for industrial digital twins — 3D HMI, virtual commissioning, Machine Information System, simulation and layout planning**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue.svg)](https://www.typescriptlang.org/)
@@ -9,7 +9,7 @@
 
 ![realvirtual — browser-based 3D HMI and digital twin platform](docs/images/realvirtual-web-demo.jpg)
 
-realvirtual (formerly *realvirtual WEB*) is an open-source, browser-based 3D HMI and digital twin platform for manufacturing. Open GLB/glTF models in the browser, simulate drives and material flow, connect machine signals, and build operator dashboards. Simulation components use `rv_extras` metadata, which you can export from [realvirtual for Unity](https://realvirtual.io) Professional or author with your own tools. Viewers need no desktop installation; developers can build the Community application with Node.js.
+realvirtual (formerly *realvirtual WEB*) is an open-source, browser-based 3D HMI and digital twin platform for manufacturing. Open GLB/glTF models in the browser, simulate drives and material flow, connect real or simulated PLCs for virtual commissioning, and build operator dashboards. Simulation components use `rv_extras` metadata, which you can export from [realvirtual for Unity](https://realvirtual.io) Professional or author with your own tools. Viewers need no desktop installation; developers can build the Community application with Node.js.
 
 **One link. Any device. Live Digital Twin.** Try it: [web.realvirtual.io/demo](https://web.realvirtual.io/demo)
 
@@ -25,6 +25,7 @@ realvirtual replaces traditional desktop HMI and SCADA visualization with a mode
 
 - **Workspace Modes** — Viewer for presentation, HMI for operation, Planner for layouts, and Commissioning for commissioning workflows. DES and Editor require the corresponding commercial modules. Select a workspace from the toolbar or use `?mode=viewer`, `hmi`, `planner`, `commissioning`, `des` or `editor`; selecting a mode does not install its required features.
 - **Live 3D HMI** — Real-time PLC signal visualization. Machines connect through realvirtual CONNECT — Siemens S7, TwinCAT ADS, OPC UA, EtherNet/IP, Modbus, MQTT, ctrlX, robot controllers and more. Drive monitoring, sensor states, KPI overlays, alarm dashboards, and production charts powered by [Apache ECharts](https://echarts.apache.org/).
+- **Virtual Commissioning** — Test PLC programs against the digital twin before the machine exists. Connect a real or simulated controller (e.g. Siemens PLCSIM Advanced, SIMIT, TwinCAT) through realvirtual CONNECT, link signals to drives and sensors, force and monitor signals, and jog axes in the dedicated Commissioning workspace — all in the browser.
 - **Signal Linking by Drag & Drop** — Drag a live interface signal straight onto a component slot (Forward, TargetSpeed, SensorOccupied, …). Direction and value type are checked, connections are saved with the layout, and signals can be monitored and forced.
 - **Collision Detection** — Give a node one of six collision roles (Tool, Workpiece, Machine, Robot, Environment, None); while the simulation runs, every pair of bodies with *different* roles is checked against each other.
 - **Machine Information System** — Attach documents, maintenance guides, technical drawings, and manuals directly to 3D components. Technicians click a part and see its documentation in context — accessible from any device on the shop floor.
@@ -88,6 +89,9 @@ Assemble factory layouts directly in the browser — drag conveyors, robots, fix
 
 **Try it live:** Open the [public demo](https://web.realvirtual.io/demo) and choose **Layout planning** on the welcome screen.
 
+### Virtual Commissioning
+Validate PLC code against the simulated machine instead of on the shop floor. Connect the controller — real hardware or a virtual PLC such as Siemens PLCSIM Advanced — through realvirtual CONNECT and open the model in the **Commissioning** workspace (`?mode=commissioning`): link interface signals to drives and sensors by drag & drop, force and monitor signals, test axes, and run the transport simulation against the live PLC. Because the twin runs in the browser, automation engineers, integrators and customers can commission together from anywhere — no Unity or desktop installation required.
+
 ### Training & Onboarding
 Operators learn machine behavior interactively before touching the real system. No software installation, no VPN, no IT department required.
 
@@ -95,6 +99,8 @@ Operators learn machine behavior interactively before touching the real system. 
 Share virtual commissioning models with customers for review and sign-off — worldwide, instantly.
 
 ## Quick Start
+
+Follow the [complete Community walkthrough](doc-getting-started.md) for project saving, reopening and self-hosting.
 
 ```bash
 # Use Node.js 22 or 24 LTS
@@ -154,8 +160,8 @@ only the browser side of the contract (see [doc-webviewer-interface.md](doc-webv
 ## Deployment Options
 
 - **Self-hosted application** — Build with `npm run build` and serve `dist/` from your own static host. See [hosting and deployment](doc-deploy.md).
-- **Embedded viewer** — Build with `npm run build:embed` and integrate the custom element or lightweight viewer API into your site.
-- **Project delivery** — Keep `project.json`, models, attachments and compiled plugins together. See [persistence](doc-persistence.md).
+- **Embedded viewer** — Build with `npm run build:embed` and integrate the custom element or lightweight viewer API into your site. See [embedding](doc-embedding.md).
+- **Project delivery** — Keep `project.json`, models, attachments and compiled plugins together. See [projects and saving](doc-projects.md).
 - **Kiosk display** — Hide configuration controls for shop-floor panels. Configure access restrictions on your hosting infrastructure; a hidden control or an unguessable link is not authentication.
 
 Publishing to realvirtual's hosted demo uses maintainer credentials and infrastructure.
@@ -196,7 +202,7 @@ Full list with addressing and settings: [CONNECT interfaces](https://realvirtual
 
 ## Architecture
 
-realvirtual loads GLB/glTF geometry from compatible exporters. See [Quick Start](#quick-start) for the loading options.
+realvirtual loads GLB/glTF geometry from compatible exporters. Project setup and loading options are covered in [Getting started](doc-getting-started.md).
 
 The GLB stores model geometry and `rv_extras` metadata such as signal bindings, drives and sensors. The project manifest (`project.json`) identifies documents and their plugin bindings; attachments and compiled project plugins can be separate files. Keep these together when delivering a project. [realvirtual for Unity](https://realvirtual.io) Professional can export enriched GLBs, and the metadata format is also documented for other toolchains.
 
@@ -213,6 +219,7 @@ src/
   private-stubs/     # No-op stubs for commercial modules — what makes this community
                      #   edition build and run without the private sibling repository
   embed/             # Lightweight embedding entry points
+examples/community-first-project/  # Portable project with a TypeScript plugin
 tests/               # Vitest browser and Node tests
 e2e/                 # Playwright E2E tests
 public/demo-realvirtual/  # Bundled demo project: its GLBs and its project.json manifest
@@ -228,7 +235,7 @@ Plugins can contribute UI components to predefined **slots** in the HMI layout �
 
 ![Settings Panel — tabbed configuration for model, visual, interfaces, and AI](docs/images/screenshot-settings.png)
 
-For a project-specific extension, bind a TypeScript module to a document through `documents[].scriptRef` in the project manifest:
+For a project-specific extension, start with the [runnable Community plugin example](doc-project-plugin-example.md). It binds a TypeScript module to a document through `documents[].scriptRef` in the project manifest:
 
 ```json
 {
@@ -239,7 +246,14 @@ For a project-specific extension, bind a TypeScript module to a document through
 }
 ```
 
-The module exports paired `registerModelPlugins` and `unregisterModelPlugins` functions that register its plugins with `viewer.use()` and clean them up again. Compile the project's scripts with `npm run build:project-scripts -- <project-folder>`, open the project folder in the application and allow its native project code after reviewing it. Distribute the compiled `.js` alongside the `.ts` source and manifest.
+Prepare and compile the example from the repository root:
+
+```bash
+node examples/community-first-project/prepare.mjs
+npm run build:project-scripts -- examples/community-first-project
+```
+
+Open the project folder in the application and allow its native project code after reviewing it. The [counter plugin](examples/community-first-project/plugins/counter.ts) exports paired `registerModelPlugins` and `unregisterModelPlugins` functions. It demonstrates `viewer.use()`, signal subscriptions, and cleanup on model close, plugin disable and disposal. Distribute the compiled `.js` alongside the `.ts` source and manifest.
 
 Built-in model plugin packs under `src/plugins/models/` are compiled into the application. Use project `scriptRef` bindings for extensions that should travel with a project. For JavaScript behaviors stored inside a GLB, see [Component Scripting](doc-scripting.md).
 
@@ -248,13 +262,18 @@ For the full plugin API — UI slots, event bus, hooks, context menus, and toolt
 ## Documentation
 
 End users start at the **[realvirtual documentation site](https://realvirtual.io/doc/web/)**.
-Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo documentation set:
+For this Community checkout, start with **[Getting started](doc-getting-started.md)**, then the **[project plugin example](doc-project-plugin-example.md)** or **[Architecture](doc-webviewer.md)**. The full in-repo documentation set:
 
 **Getting started & architecture**
 
 | Document | Contents |
 |----------|----------|
 | [Architecture](doc-webviewer.md) | Full architecture, component reference, configuration, workspace modes |
+| [Getting started](doc-getting-started.md) | Standalone Community install, first project, build and hosting |
+| [Projects and saving](doc-projects.md) | Documents, save/autosave, recovery and moving projects |
+| [Project plugin example](doc-project-plugin-example.md) | Runnable public scriptRef project with cleanup |
+| [Embedding](doc-embedding.md) | Custom element and direct lightweight viewer API |
+| [Migration](doc-migration.md) | Move older projects to current contracts |
 | [AGV and fleet control](doc-path-fleet-control.md) | Paths, tasks, docking and project control |
 | [Virtual PLC (commercial beta)](doc-plc-programming.md) | Requires an enabled commercial build; not in Community |
 | [From Unity to the Web](doc-unity-to-web.md) | Porting patterns and the AI coding-agent workflow |
@@ -298,6 +317,13 @@ Developers start with **[Architecture](doc-webviewer.md)**. The full in-repo doc
 | [Building & Deploying](doc-deploy.md) | Community self-hosting and separate maintainer publishing workflows |
 | [Debugging Guide](doc-web-debugging.md) | Debugging tools, debug API, E2E tests, workflow |
 
+## Documentation checks
+
+Run `npm run docs:generate` after changing `ViewerEvents`, then `npm run docs:check`.
+The check validates the working tree, including new untracked files. Before publishing,
+run `node scripts/assert-docs-publishable.mjs` after adding the intended files to Git;
+its default mode validates the tracked mirror payload.
+
 ## AI-Enabled Development (MCP)
 
 realvirtual and realvirtual for Unity are fully AI-enabled through the **Model Context Protocol (MCP)**. AI coding assistants like [Claude Code](https://claude.ai/code) can drive the running scene directly.
@@ -329,7 +355,7 @@ realvirtual is the browser platform and the default way to work. Both runtimes s
 | | realvirtual (browser) | realvirtual for Unity |
 |---|---|---|
 | **For** | Drag & drop users and everyone building 3D HMIs, Machine Information Systems or their own web apps | Unity developers and teams that need native builds |
-| **Scope** | 3D HMI, Machine Information System, simulation, layout planning, collaboration; commercial asset authoring, CAD import and DES | Engineering in the Unity Editor, virtual commissioning, native protocol drivers |
+| **Scope** | 3D HMI, virtual commissioning, Machine Information System, simulation, layout planning, collaboration; commercial asset authoring, CAD import and DES | Engineering in the Unity Editor, virtual commissioning, native protocol drivers |
 | **Technology** | Three.js, TypeScript, React | Unity Engine, C# |
 | **Deployment** | Any modern browser | Desktop (.exe, Linux), XR headsets, mobile |
 | **PLC connection** | realvirtual CONNECT gateway, or direct WebSocket, MQTT over WebSocket and REST | Native protocol drivers |

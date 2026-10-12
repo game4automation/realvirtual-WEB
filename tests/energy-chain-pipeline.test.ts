@@ -6,17 +6,16 @@
  *
  * A rigged chain has to fall out of FOUR scene-wide passes. Three of them
  * (material dedup, uber bake, layout-planner aux raycast targets) walk EVERY
- * mesh and knew nothing about skinning before Phase 0; the fourth (batching)
- * already excluded `mesh.skeleton` by contract and is verified here rather than
+ * mesh and knew nothing about skinning before Phase 0; the fourth (the bake,
+ * plan-753) keeps skinned meshes by contract and is verified here rather than
  * assumed.
  *
  * Modelled on `tests/rv-lamp-pipeline.test.ts`.
  */
 
 import { describe, expect, it } from 'vitest';
-import { Mesh, Object3D, SkinnedMesh } from 'three';
-import { BatchTable } from '../src/core/engine/rv-batch-table';
-import { buildBatchedScene } from '../src/core/engine/rv-batched-render';
+import { Mesh, Object3D, SkinnedMesh, Vector3 } from 'three';
+import { freezeStaticMatrices } from '../src/core/engine/rv-freeze-static';
 import { deduplicateMaterials } from '../src/core/engine/rv-material-dedup';
 import { applyUberMaterial } from '../src/core/engine/rv-uber-material';
 import { constructComponentOnNode } from '../src/core/engine/rv-scene-loader';
@@ -36,6 +35,26 @@ function setup() {
 }
 
 describe('EnergyChain render-pipeline exclusion', () => {
+  it('still deforms visible vertices after the loader freezes static matrices', () => {
+    const { h, chain, skinned } = setup();
+    // The follower is an external moving transform, as with the Festo drive.
+    freezeStaticMatrices(h.root, [h.follower]);
+    const mesh = skinned[0];
+    const positions = mesh.geometry.getAttribute('position');
+    h.moveFollower(-200);
+    chain.updatePose(0.016);
+    h.scene.updateMatrixWorld(true);
+    let movement = 0;
+    const original = new Vector3(), deformed = new Vector3();
+    for (let i = 0; i < positions.count; i += 37) {
+      original.fromBufferAttribute(positions, i);
+      mesh.applyBoneTransform(i, deformed.copy(original));
+      movement = Math.max(movement, original.distanceTo(deformed));
+    }
+    expect(movement).toBeGreaterThan(0.01);
+    expect(chain.skeleton!.bones.every(bone => bone.matrixWorldAutoUpdate)).toBe(true);
+  });
+
   it('survives material dedup with its own material instances', () => {
     const { h, skinned } = setup();
     const before = skinned.map(m => m.material);
@@ -66,21 +85,6 @@ describe('EnergyChain render-pipeline exclusion', () => {
     const original = h.chain.getObjectByName('28') as Mesh;
     expect(original.userData._rvUberBaked).toBeUndefined();
     expect(chain.pickProxy!.userData._rvUberBaked).toBeUndefined();
-  });
-
-  it('is excluded from batching by the existing skeleton contract', async () => {
-    const { h, chain, skinned } = setup();
-    const dedup = deduplicateMaterials(h.root);
-    const uber = applyUberMaterial(h.root, dedup.uniqueMaterials, false);
-    h.root.updateMatrixWorld(true);
-
-    const table = new BatchTable();
-    await buildBatchedScene(h.root, uber.sharedMaterial, new Set<Object3D>(), table);
-
-    for (const mesh of skinned) {
-      expect(mesh.userData._rvBatchSource).toBeUndefined();
-    }
-    expect(chain.pickProxy!.userData._rvBatchSource).toBeUndefined();
   });
 
   it('exposes the proxy — and only the proxy — to the planner drop path', () => {
@@ -125,5 +129,26 @@ describe('EnergyChain render-pipeline exclusion', () => {
       removeAuxRaycastTarget: () => {},
     });
     expect(added).toEqual([chain.pickProxy]);
+  });
+});
+
+// ─── plan-753: exclusion under the loader bake ──────────────────────────
+import { bake } from '../src/core/engine/rv-bake-pipeline';
+import { createPickBuildPort } from '../src/core/engine/rv-pick-build-port';
+
+describe('EnergyChain under bake() (plan-753)', () => {
+  it('the skinned rig and the pick proxy are keep meshes — never staged into a chunk', async () => {
+    const { h, chain, skinned } = setup();
+    const dedup = deduplicateMaterials(h.root);
+    const uber = applyUberMaterial(h.root, dedup.uniqueMaterials, false);
+    h.root.updateMatrixWorld(true);
+    const staged = new Set<Mesh>();
+    const baked = await bake(h.root, { assetId: 'chain', uberMaterial: uber.sharedMaterial, pickPort: createPickBuildPort({ createWorker: () => null }), onStaged: (m) => staged.add(m) });
+    const keep = new Set(baked.keep.map((k) => k.mesh));
+    for (const mesh of skinned) {
+      expect(staged.has(mesh)).toBe(false);
+      expect(keep.has(mesh)).toBe(true);
+    }
+    expect(staged.has(chain.pickProxy as Mesh)).toBe(false);
   });
 });

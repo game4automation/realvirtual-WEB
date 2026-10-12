@@ -13,8 +13,9 @@
  * resolve. Before this module each surface asked the parser on its own — and each
  * one rendered its own red `AAS ID not found in index` on hover.
  *
- * The resolvability is therefore determined ONCE, where the project-specific
- * `assetsBasePath` is known (the model load), and stored on the node as
+ * The resolvability is therefore determined ONCE, against the active AAS source
+ * (`getActiveAasSource()`: project `aasx/` over the deploy-wide directory,
+ * plan-596), and stored on the node as
  * `userData._rvAasResolution`. Tooltip, detail panel, inspector button, doc-mode
  * click, sidebar counter and the "Add to Cart" action all read that one marking,
  * so they can never disagree.
@@ -42,20 +43,29 @@
  */
 
 import type { Object3D } from 'three';
-import { loadIndexResult, type AasIndexResult } from './aas-link-parser';
+import type { AasIndexResult } from './aas-link-parser';
+import {
+  asAasSource,
+  getActiveAasSource,
+  setAasDeployContext,
+  subscribeAasSources,
+  type AasSource,
+} from '../core/aas/rv-aas-source';
 
-// ─── Types ──────────────────────────────────────────────────────────────
+// ─── Node marking (aas-resolution-mark.ts, re-exported) ────────────────
 
-/** Resolution state of a single AAS link. Stored as `node.userData._rvAasResolution`. */
-export type AasResolution =
-  | 'resolved'
-  | 'unknown-id'
-  | 'index-missing'
-  | 'index-error'
-  | 'pending';
-
-/** userData key carrying the resolution. Kept as a constant so tests cannot drift. */
-export const AAS_RESOLUTION_KEY = '_rvAasResolution';
+// The marking lives in its own module so the scene loader can mark nodes
+// without pulling the active-source machinery (project store) into its graph.
+import { AAS_RESOLUTION_KEY, markAasPending, type AasResolution } from './aas-resolution-mark';
+export {
+  AAS_RESOLUTION_KEY,
+  getAasResolution,
+  isAasNodeVisible,
+  isAasUnresolvable,
+  isAasVisible,
+  markAasPending,
+  type AasResolution,
+} from './aas-resolution-mark';
 
 /**
  * Minimal viewer surface this module needs — keeps it testable without a full
@@ -67,48 +77,6 @@ interface AasResolutionViewer {
   projectAssetsPath?: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on?: (event: any, handler: any) => unknown;
-}
-
-// ─── Node marking ───────────────────────────────────────────────────────
-
-/**
- * Read a node's AAS resolution. A node that carries an AAS link but no marking
- * yet counts as `'pending'` — never as resolved, so nothing is shown before the
- * index answered.
- */
-export function getAasResolution(node: Object3D | null | undefined): AasResolution {
-  const raw = node?.userData?.[AAS_RESOLUTION_KEY] as AasResolution | undefined;
-  return raw ?? 'pending';
-}
-
-/**
- * True when every AAS surface must stay silent for this state: the id is unknown
- * or the index was never shipped. `'pending'` is handled by {@link isAasVisible}
- * (render nothing, but it is not a final answer).
- */
-export function isAasUnresolvable(resolution: AasResolution): boolean {
-  return resolution === 'unknown-id' || resolution === 'index-missing';
-}
-
-/** True when an AAS surface may render for this state (`resolved` or a visible error). */
-export function isAasVisible(resolution: AasResolution): boolean {
-  return resolution === 'resolved' || resolution === 'index-error';
-}
-
-/** True when the node carries an AAS link that may be shown. */
-export function isAasNodeVisible(node: Object3D | null | undefined): boolean {
-  return isAasVisible(getAasResolution(node));
-}
-
-/**
- * Mark a node as not-yet-classified. Called synchronously wherever an AAS link is
- * attached, so an unmarked AAS node never exists — a node without a marking would
- * otherwise be indistinguishable from one that resolved.
- */
-export function markAasPending(node: Object3D | null | undefined): void {
-  if (!node) return;
-  const ud = node.userData as Record<string, unknown>;
-  if (ud[AAS_RESOLUTION_KEY] === undefined) ud[AAS_RESOLUTION_KEY] = 'pending';
 }
 
 // ─── Load generation (stale-completion guard) ───────────────────────────
@@ -155,27 +123,34 @@ export function classifyAas(result: AasIndexResult, aasId: string): AasResolutio
   return aasId && result.index[aasId] ? 'resolved' : 'unknown-id';
 }
 
-/** Deduplicates repeat passes over the same root within one generation + basePath. */
-const passes = new WeakMap<Object3D, { basePath: string; generation: number; promise: Promise<void> }>();
+/** Deduplicates repeat passes over the same root within one generation + source revision. */
+const passes = new WeakMap<Object3D, { passKey: string; generation: number; promise: Promise<void> }>();
 
 /**
  * Mark every AAS node under `root` with its resolution. Safe to call repeatedly:
- * a second call with the same root, basePath and generation joins the first pass
- * instead of re-traversing.
+ * a second call with the same root, source revision and generation joins the
+ * first pass instead of re-traversing.
  *
- * @param generation load generation this pass belongs to — results are dropped
+ * @param source     the AAS source to classify against: an {@link AasSource}
+ *                   (normally `getActiveAasSource()`), or a legacy assets-root
+ *                   string; `undefined` = the default deploy directory.
+ * @param generation load generation this pass belongs to; results are dropped
  *                   when a newer load started in the meantime.
  */
 export function resolveAasSubtree(
   root: Object3D | null | undefined,
-  assetsBasePath: string | undefined,
+  source: AasSource | string | undefined,
   generation: number,
 ): Promise<void> {
   if (!root) return Promise.resolve();
 
-  const key = assetsBasePath ?? '';
+  const src = asAasSource(source);
+  // The source REVISION is part of the key (plan-596 SOL #6): after a scan or an
+  // import changed the index, the same root must be classified again.
+  const revision = src.revision;
+  const passKey = `${src.key}#${revision}`;
   const cached = passes.get(root);
-  if (cached && cached.basePath === key && cached.generation === generation) return cached.promise;
+  if (cached && cached.passKey === passKey && cached.generation === generation) return cached.promise;
 
   const nodes: Object3D[] = [];
   root.traverse((node) => {
@@ -185,10 +160,13 @@ export function resolveAasSubtree(
   });
   if (nodes.length === 0) return Promise.resolve();
 
-  const promise = loadIndexResult(assetsBasePath).then((result) => {
-    // A newer model load started while the index was in flight — its nodes must
-    // not be classified against this (now foreign) basePath.
+  const promise = src.readIndex().then((result) => {
+    // A newer model load started while the index was in flight: its nodes must
+    // not be classified against this (now foreign) source.
     if (generation !== _generation) return;
+    // The index changed while this pass read it: a newer pass (started by the
+    // change notification) owns the answer, this one is stale.
+    if (src.revision !== revision) return;
     for (const node of nodes) {
       const aasId = (node.userData._rvAasLink as { aasId?: string } | undefined)?.aasId ?? '';
       (node.userData as Record<string, unknown>)[AAS_RESOLUTION_KEY] = classifyAas(result, aasId);
@@ -196,7 +174,7 @@ export function resolveAasSubtree(
     notifyResolution();
   });
 
-  passes.set(root, { basePath: key, generation, promise });
+  passes.set(root, { passKey, generation, promise });
   return promise;
 }
 
@@ -214,24 +192,52 @@ export function installAasResolution(viewer: AasResolutionViewer): () => void {
   const off1 = viewer.on?.('model-loaded', (payload: { result?: { root?: Object3D; modelConfig?: unknown } }) => {
     const result = payload?.result;
     if (!result?.root) return;
-    void resolveAasSubtree(result.root, aasBasePathFor(viewer, result.modelConfig), beginAasLoadGeneration());
+    // The model's own explicit aasx base and the deploy root feed the ONE active
+    // source (plan-596) that every AAS surface reads.
+    setAasDeployContext({
+      explicitBase: explicitAasBaseOf(result.modelConfig) ?? null,
+      deployBase: viewer.projectAssetsPath ?? null,
+    });
+    void resolveAasSubtree(result.root, getActiveAasSource(), beginAasLoadGeneration());
   });
   if (typeof off1 === 'function') offs.push(off1 as () => void);
 
   const off2 = viewer.on?.('layout-content-added', (payload: { root?: Object3D }) => {
     if (!payload?.root) return;
-    void resolveAasSubtree(payload.root, aasBasePathFor(viewer, undefined), currentAasLoadGeneration());
+    void resolveAasSubtree(payload.root, getActiveAasSource(), currentAasLoadGeneration());
   });
   if (typeof off2 === 'function') offs.push(off2 as () => void);
 
-  return () => { for (const off of offs) off(); offs.length = 0; };
+  // A source changed its index (project scan, import, project switch): classify
+  // the whole scene again against the active source (missing -> available after
+  // the first index write, resolved -> unknown-id after a removal).
+  offs.push(subscribeAasSources(() => {
+    if (!viewer.scene) return;
+    void resolveAasSubtree(viewer.scene, getActiveAasSource(), currentAasLoadGeneration());
+  }));
+
+  // The project AASX scan follows the open project (plan-596 Phase 3). Loaded
+  // lazily: the scanner and the zip reader stay off the entry chunk.
+  let disposed = false;
+  void import('../core/aas/rv-aasx-project-index')
+    .then((m) => { if (!disposed) offs.push(m.installAasxProjectIndex()); })
+    .catch((e) => console.warn('[aas-resolution] project AASX index unavailable', e));
+
+  return () => { disposed = true; for (const off of offs) off(); offs.length = 0; };
+}
+
+/** The explicit per-model `assetsBasePath` of the `aas-link` plugin config, if any. */
+export function explicitAasBaseOf(modelConfig: unknown): string | undefined {
+  const cfg = (modelConfig as { pluginConfig?: Record<string, { assetsBasePath?: string } | undefined> } | undefined)
+    ?.pluginConfig?.['aas-link'];
+  return cfg?.assetsBasePath;
 }
 
 /**
- * The base path AASX assets are served from: the model's own `aas-link` plugin
- * config wins, otherwise the deployment-wide project assets path. Reading it here
- * is what keeps a customer-specific AAS from being checked against the default
- * index (and then wrongly hidden).
+ * The assets ROOT the deploy-wide AASX are served from: the model's own
+ * `aas-link` plugin config wins, otherwise the deployment-wide project assets
+ * path. Kept for callers outside the AAS chain; the chain itself reads
+ * `getActiveAasSource()` since plan-596.
  */
 export function aasBasePathFor(viewer: AasResolutionViewer, modelConfig: unknown): string | undefined {
   const cfg = (modelConfig as { pluginConfig?: Record<string, { assetsBasePath?: string } | undefined> } | undefined)

@@ -36,16 +36,15 @@
 
 import { migrateManifest } from '../rv-project-storage';
 import { assertReadableScenePath } from '../rv-legacy-format';
+import { decryptServedBytes, isEncryptedDeploy } from '../../persistence/rv-served-bytes';
 import {
   isValidProjectV2,
   type RvProject,
-  type RvProjectAssetEntry,
 } from '../rv-project-types';
 import {
-  documentsFromLists,
+  documentOfEntry,
+  documentsOf,
   readDocuments,
-  sceneDocumentsOf,
-  stableDocumentId,
   withDerivedDocuments,
   type DocumentStat,
 } from '../rv-project-documents';
@@ -113,9 +112,6 @@ export const DEMO_BASE_PATH = `${DEMO_PROJECT_FOLDER}/`;
  */
 export const REALVIRTUAL_LIBRARY_PATH = 'library/catalog.json';
 
-/** A document that lives under `library/` — the place, read off the path. */
-const LIBRARY_PREFIX = /^library\//i;
-
 /**
  * The asset endings a manifest row must carry to BE a document — the same list
  * `FolderBackend.ASSET_EXTENSIONS` walks for. Everything else a manifest
@@ -128,7 +124,12 @@ function isBundledAssetPath(path: string): boolean {
   const lower = path.toLowerCase();
   return ASSET_EXTENSIONS.some(ext => lower.endsWith(ext));
 }
-/** A document that lives under `models/`. See {@link BundledBackend.listModels}. */
+/**
+ * A document that lives under `models/` — the place, read off the path.
+ *
+ * One caller left: `_withDiscoveredModels` asks "does this host already declare
+ * models of its own?" before folding a foreign deploy's `models.json` in.
+ */
 const MODELS_PREFIX = /^models\//i;
 
 /** @deprecated Use {@link DEMO_PROJECT_ID}. */
@@ -181,8 +182,10 @@ export interface BundledBackendOptions {
    * it always has: `main.ts` resolves that list through several deploy-specific
    * paths and a second discovery here would eventually disagree with it. A
    * *foreign* base URL has no such resolver — nobody ran a build against it —
-   * so for that case `models.json`, the file every deploy publishes, is read
-   * directly. (`scenes/index.json` was read here too until plan-735; a foreign
+   * so for that case a `models.json`, if the host publishes one, is read
+   * directly (realvirtual's own deploys stopped publishing it with plan-759 —
+   * a hosted deploy's manifest lists every document itself; a foreign host
+   * from an older build may still carry one). (`scenes/index.json` was read here too until plan-735; a foreign
    * deploy's scenes are `documents[]` rows of its manifest now.)
    *
    * Discovery only ever FILLS IN: a `project.json` that lists its own models
@@ -206,7 +209,15 @@ export class BundledBackend implements ProjectBackend {
   private _discovered = false;
   private _active = false;
   private _manifest: RvProject | null = null;
-  private _manifestRead = false;
+  /**
+   * The ONE in-flight-or-settled manifest read (plan-598 F3). A promise, not a
+   * "was read" flag: with a bool the second of two CONCURRENT callers saw the
+   * flag already set and returned the still-empty `_manifest` (`null`) while the
+   * first request was in flight — which is exactly the situation once `main.ts`
+   * starts the demo-manifest read early and `resolveActiveProject()` asks the
+   * same backend later. Every caller now awaits the same request.
+   */
+  private _manifestPromise: Promise<RvProject | null> | null = null;
   private _hasDeployedManifest = false;
 
   constructor(opts: BundledBackendOptions = {}) {
@@ -264,9 +275,16 @@ export class BundledBackend implements ProjectBackend {
    * `!resp.ok` and the other two are a thrown `fetch`. Naming all three in one
    * sentence is honest; pretending to have diagnosed one of them would not be.
    */
-  async readManifest(): Promise<RvProject | null> {
-    if (this._manifestRead) return this._manifest;
-    this._manifestRead = true;
+  readManifest(): Promise<RvProject | null> {
+    if (this._manifestPromise) return this._manifestPromise;
+    const first = this._readManifestOnce();
+    // Same posture as the old flag on a THROWING read: the first caller sees
+    // the error, every later (or concurrent) caller gets the empty answer.
+    this._manifestPromise = first.catch(() => this._manifest);
+    return first;
+  }
+
+  private async _readManifestOnce(): Promise<RvProject | null> {
     await this._discoverSources();
     const deployed = await this._fetchJson('project.json');
     const parsed = deployed ? migrateManifest(deployed) : null;
@@ -361,7 +379,12 @@ export class BundledBackend implements ProjectBackend {
     assertReadableScenePath(relPath);
     const bytes = await this._fetchBytes(relPath);
     if (!bytes) return null;
-    const meta = sceneDocumentsOf(await this.readManifest()).find(e => e.path === relPath);
+    // By PATH over the ONE list (plan-744 F3). It used to ask
+    // `sceneDocumentsOf()` first, which filtered the same list down to the
+    // rows whose path happened to start with `scenes/` — so a deploy's
+    // root-level document was read back without the `id`/`name` its own
+    // manifest row carries.
+    const meta = documentsOf(await this.readManifest()).find(e => e.path === relPath);
     return documentRecord(bytes, { ...meta, path: relPath });
   }
 
@@ -370,43 +393,6 @@ export class BundledBackend implements ProjectBackend {
   }
 
   // ─── Listing ──────────────────────────────────────────────────────────
-
-  /**
-   * The model documents of this deploy.
-   *
-   * Selected by PLACE since plan-736: a `models/` path, or the URL of a model
-   * this backend discovered itself. The second half is not a special case but
-   * the whole reason this cannot be a plain prefix test — `_withDiscoveredModels`
-   * folds a FOREIGN deploy's `models.json` in, and those rows carry the absolute
-   * URL the foreign host published (`https://cdn…/customer/models/Press.glb`).
-   * They used to be found because `documentOfAssetEntry` stamped
-   * `section: 'models'` on them; nothing stamps now, so the backend answers from
-   * what it actually discovered.
-   */
-  async listModels(): Promise<RvProjectAssetEntry[]> {
-    const declared = readDocuments(await this.readManifest()) ?? [];
-    const discovered = new Set(this._models.map(m => m.url));
-    return declared.filter((d) => {
-      const path = typeof d.path === 'string' ? d.path : '';
-      return MODELS_PREFIX.test(path) || discovered.has(path);
-    }) as unknown as RvProjectAssetEntry[];
-  }
-
-  /**
-   * Only what the manifest declares — nothing is discovered.
-   *
-   * The deploy catalog (`library/catalog.json`) is deliberately NOT read as a
-   * fallback anymore: a library exists only when it was explicitly referenced,
-   * either as `library[]` contents or as a `libraries[]` subscription in a
-   * deployed manifest. A deploy without such a declaration has no library.
-   *
-   * By PATH since plan-736, for the same reason as {@link listModels}. Nothing
-   * is discovered here, so the prefix is the whole rule.
-   */
-  async listLibrary(): Promise<RvProjectAssetEntry[]> {
-    return (readDocuments(await this.readManifest()) ?? [])
-      .filter(d => LIBRARY_PREFIX.test(typeof d.path === 'string' ? d.path : '')) as unknown as RvProjectAssetEntry[];
-  }
 
   /**
    * Every file the manifest declares — the manifest IS the walk here.
@@ -442,14 +428,11 @@ export class BundledBackend implements ProjectBackend {
     const out: RvDocumentEntry[] = [];
     for (const row of declared) {
       if (!row || typeof row.path !== 'string' || !isBundledAssetPath(row.path)) continue;
-      // A hand-edited manifest may omit id or name; mint them the way every
-      // other listing does — id from the path, name from the file stem.
-      const id = typeof row.id === 'string' && row.id.trim() !== ''
-        ? row.id : stableDocumentId(row.path);
-      const stem = (row.path.split('/').pop() ?? row.path).replace(/\.[^.]+$/, '');
-      const name = typeof row.name === 'string' && row.name.trim() !== ''
-        ? row.name : (stem || row.path);
-      out.push({ ...row, id, name });
+      // A hand-edited manifest may omit id or name; the ONE lift mints them
+      // (plan-744 F2) — id from the path, name from label-then-stem. It used
+      // to be spelled out again here, and the local copy stripped only the
+      // last extension, so `Line.scene.glb` listed as "Line.scene".
+      out.push(documentOfEntry(row));
     }
     return out;
   }
@@ -493,6 +476,17 @@ export class BundledBackend implements ProjectBackend {
   }
 
   async readDocumentUrl(ref: DocRef): Promise<ResolvedBackendBlob | null> {
+    // plan-759 F6: on an encrypted deploy the CDN URL would hand the caller an
+    // RVE1 envelope, and every caller of this method fetches the URL itself
+    // (thumbnails, the library provider, document transfer). So the bytes are
+    // fetched and decrypted HERE and handed out as a blob URL that `release()`
+    // revokes — the callers stay untouched, and none of them can see ciphertext.
+    if (isEncryptedDeploy()) {
+      const bytes = await this._fetchBytes(docPathOf(ref));
+      if (!bytes) return null;
+      const url = URL.createObjectURL(new Blob([bytes as unknown as BlobPart]));
+      return { url, release: () => URL.revokeObjectURL(url) };
+    }
     // Nothing to revoke: a deploy URL is already loadable as it stands.
     return { url: this._url(docPathOf(ref)), release: () => {} };
   }
@@ -536,9 +530,7 @@ export class BundledBackend implements ProjectBackend {
     if (declared.some(d => MODELS_PREFIX.test(typeof d.path === 'string' ? d.path : ''))) {
       return project;
     }
-    const added = documentsFromLists({
-      models: this._models.map(m => ({ path: m.url, label: m.label })),
-    });
+    const added = this._models.map(m => documentOfEntry({ path: m.url, label: m.label }));
     if (added.length === 0) return project;
     return { ...project, documents: [...declared, ...added] };
   }
@@ -597,13 +589,18 @@ export class BundledBackend implements ProjectBackend {
   /** Same posture as {@link _fetchJson}, for a binary body. */
   private async _fetchBytes(relPath: string): Promise<Uint8Array | null> {
     if (!this._fetch) return null;
+    let resp: Response;
     try {
-      const resp = await this._fetch(this._url(relPath), { cache: 'no-store' });
-      if (!resp.ok) return null;
-      return new Uint8Array(await resp.arrayBuffer());
+      // `no-cache`, not `no-store` — same reasoning as _fetchJson (plan-726 §8): an
+      // unchanged document costs a conditional request, not a full re-download.
+      resp = await this._fetch(this._url(relPath), { cache: 'no-cache' });
     } catch {
       return null;
     }
+    if (!resp.ok) return null;
+    // plan-759 F6: THE decrypt seam. An envelope without a session key is an
+    // error the caller must see, never a null that reads like "no such file".
+    return new Uint8Array(await decryptServedBytes(await resp.arrayBuffer(), this._url(relPath)));
   }
 
   private async _fetchJson(relPath: string): Promise<unknown | null> {

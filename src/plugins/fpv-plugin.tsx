@@ -20,6 +20,10 @@ import type { RVViewer } from '../core/rv-viewer';
 import type { LoadResult } from '../core/engine/rv-scene-loader';
 import type { UISlotEntry } from '../core/rv-ui-plugin';
 import { loadVisualSettings } from '../core/hmi/visual-settings-store';
+import {
+  fpvScaleDefaults, FPV_DEFAULT_EYE_HEIGHT, FPV_DEFAULT_SPEED, FPV_DEFAULT_SPRINT_SPEED,
+  type FpvScaleDefaults, type ScaleLike,
+} from '../core/engine/rv-scale-constants';
 import { activateContext, deactivateContext } from '../core/hmi/ui-context-store';
 import type { WebXRPlugin } from './webxr-plugin';
 
@@ -31,11 +35,12 @@ const GROUND_SNAP_LERP = 8;
 /** Maximum raycast distance downward for ground detection. */
 const GROUND_RAY_MAX = 50;
 
-/** Default FPV settings from plan. */
-const DEFAULT_SPEED = 2.5;
-const DEFAULT_SPRINT_SPEED = 5.0;
+/** Default FPV settings from plan. Eye height / speeds for models < 3 m come
+ *  from the scene scale instead (plan-515 F10, {@link fpvScaleDefaults}). */
+const DEFAULT_SPEED = FPV_DEFAULT_SPEED;
+const DEFAULT_SPRINT_SPEED = FPV_DEFAULT_SPRINT_SPEED;
 const DEFAULT_SENSITIVITY = 0.002;
-const DEFAULT_EYE_HEIGHT = 1.7;
+const DEFAULT_EYE_HEIGHT = FPV_DEFAULT_EYE_HEIGHT;
 
 // ─── Key codes for WASD + arrows ────────────────────────────────────────
 
@@ -69,6 +74,11 @@ export function useFpvActive(): boolean {
     return () => { _listeners.delete(cb); };
   }, []);
   return active;
+}
+
+/** A stored value that differs from the store default is a user override; else the derived value. */
+function pickSetting(stored: number | undefined, storeDefault: number, derived: number): number {
+  return stored !== undefined && stored !== storeDefault ? stored : derived;
 }
 
 // ─── FPV Plugin ─────────────────────────────────────────────────────────
@@ -114,6 +124,11 @@ export class FpvPlugin extends BaseViewerPlugin {
   private _overlay: HTMLDivElement | null = null;
   private _overlayClickHandler: (() => void) | null = null;
 
+  // Scale-derived defaults (reused record)
+  private readonly _scaleDefaults: FpvScaleDefaults = {
+    eyeHeight: DEFAULT_EYE_HEIGHT, speed: DEFAULT_SPEED, sprintSpeed: DEFAULT_SPRINT_SPEED,
+  };
+
   // Track whether listeners have been set up
   private _listenersSetUp = false;
 
@@ -132,8 +147,10 @@ export class FpvPlugin extends BaseViewerPlugin {
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     this._viewer = viewer;
 
-    // Load settings
+    // Load settings (scale-derived defaults follow the scene scale, plan-515 F10)
     this._loadSettings();
+    const scale = (viewer as unknown as { sceneScale?: { onChange?(cb: () => void): () => void } }).sceneScale;
+    if (scale?.onChange) this.sub(scale.onChange(() => this._loadSettings()));
 
     // Cache ground targets (scene fixtures that are flat meshes on XZ plane)
     this._groundTargets = [];
@@ -277,6 +294,9 @@ export class FpvPlugin extends BaseViewerPlugin {
     // Cancel any in-progress camera animation
     viewer.cancelCameraAnimation();
 
+    // Scale-derived defaults as of NOW (placements may have changed the scale).
+    this._loadSettings();
+
     // Save orbit state (position + controls.target) for restore on exit
     this._savedCamPos.copy(viewer.camera.position);
     this._savedCamTarget.copy(viewer.controls.target);
@@ -373,12 +393,21 @@ export class FpvPlugin extends BaseViewerPlugin {
 
   // ── Private: Settings ──────────────────────────────────────────────
 
+  /**
+   * Settings: a value the user changed in the store (anything but the store
+   * default) wins; otherwise eye height / walk / sprint speed come from the
+   * scene scale — human scale for models >= 3 m, `maxDim`-derived below
+   * (plan-515 F10). The derived values bypass the store's accepted ranges on
+   * purpose: they are never persisted.
+   */
   private _loadSettings(): void {
     const s = loadVisualSettings();
-    this.speed = s.fpvSpeed ?? DEFAULT_SPEED;
-    this.sprintSpeed = s.fpvSprintSpeed ?? DEFAULT_SPRINT_SPEED;
+    const scale = (this._viewer as unknown as { sceneScale?: { get(): ScaleLike } } | null)?.sceneScale?.get() ?? null;
+    const d = fpvScaleDefaults(scale, this._scaleDefaults);
+    this.speed = pickSetting(s.fpvSpeed, DEFAULT_SPEED, d.speed);
+    this.sprintSpeed = pickSetting(s.fpvSprintSpeed, DEFAULT_SPRINT_SPEED, d.sprintSpeed);
     this.sensitivity = s.fpvSensitivity ?? DEFAULT_SENSITIVITY;
-    this.eyeHeight = s.fpvEyeHeight ?? DEFAULT_EYE_HEIGHT;
+    this.eyeHeight = pickSetting(s.fpvEyeHeight, DEFAULT_EYE_HEIGHT, d.eyeHeight);
   }
 
   // ── Private: Info Overlay ───────────────────────────────────────────

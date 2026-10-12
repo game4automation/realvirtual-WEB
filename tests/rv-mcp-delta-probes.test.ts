@@ -144,8 +144,14 @@ describe('T1 — a throwing probe is swallowed', () => {
 describe('T1 — the policy table is a decision, not an accident', () => {
   it('viewport-transient writes carry no probe', () => {
     for (const t of ['web_camera_set', 'web_camera_focus', 'web_camera_orbit',
-      'web_camera_projection', 'web_view_isolate', 'web_view_pick', 'web_view_gaze',
-      'web_select', 'web_select_similar', 'web_view_source_markers', 'web_node_bounds']) {
+      'web_camera_projection', 'web_view_isolate',
+      'web_select', 'web_select_similar', 'web_view_source_markers', 'web_node_bounds',
+      // plan-761: a view setting (localStorage, like the source markers) — it
+      // writes no op into a document, so there is no delta to verify.
+      'web_view_render_mode',
+      // plan-591: the quality preset is the same class of write — visual
+      // settings in localStorage plus renderer state, never a document op.
+      'web_view_visual_preset']) {
       expect(DELTA_PROBES[t], `${t} persists nothing and must have no probe`).toBeUndefined();
     }
   });

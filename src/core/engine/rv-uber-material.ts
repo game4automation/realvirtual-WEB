@@ -194,6 +194,111 @@ export function classifyUberEligible(materials: Set<Material>): Set<Material> {
 }
 
 /**
+ * Has this geometry already been baked onto an uber material?
+ *
+ * The test is the `rmPacked` attribute — the physical evidence — and
+ * deliberately NOT `userData._rvUberBaked` (plan-752 I3). Two reasons, and
+ * they point the same way:
+ *
+ *  - `BufferGeometry.userData` is NOT serialized by `GLTFExporter` (only
+ *    `Object3D.userData` is), so the marker is gone after a GLB round-trip
+ *    while the baked attributes are still there. A second bake on top of them
+ *    would overwrite `color` with the now identity-white uber material's own
+ *    color and wash the asset out.
+ *  - `BufferGeometry.copy()` assigns `userData` BY REFERENCE, so a clone and
+ *    its source share one object. Marking a freshly baked clone therefore
+ *    marks the unbaked source too — a false positive that would make the next
+ *    mesh on that source skip its bake and render white. The attribute cannot
+ *    lie that way: `clone()` copies attributes, it does not alias them.
+ *
+ * `isUberEligible` rejects a re-imported baked mesh in the common case anyway
+ * (`vertexColors` is true once `COLOR_0` came back), but that depends on an
+ * exporter detail we do not control. This is the guard that does not.
+ */
+export function isGeometryUberBaked(geom: BufferGeometry): boolean {
+  return geom.getAttribute('rmPacked') !== undefined;
+}
+
+/**
+ * Temporarily take the WebViewer-private `rmPacked` attribute off every baked
+ * geometry in a tree, so an export cannot ship it (plan-752 I2).
+ *
+ * Why this exists. The uber bake stores per-vertex roughness/metalness in
+ * `rmPacked`, an attribute core glTF has no concept of. `GLTFExporter` does not
+ * drop it — it underscore-prefixes it (`_RMPACKED`, `GLTFExporter.js:1928`),
+ * which IS conformant, but it writes a viewer-private encoding into a file that
+ * `exportSceneGlb({ embedReferences: true })` hands out as self-contained. The
+ * baked base color needs no such treatment: it rides on `color`, which becomes
+ * the standard `COLOR_0` and is read correctly by every glTF tool.
+ *
+ * Shape deliberately copied from `markReferencesEmbedded` /
+ * `unmarkReferencesEmbedded` (`scene-store.ts`): mark the live tree, export,
+ * restore in a `finally`. There is no precedent for a MATERIAL restore anywhere
+ * in this repo (verified: zero hits for one in `rv-asset-glb-export.ts`), and
+ * this is deliberately not one — a full restore would need the pre-bake
+ * material per mesh, which nothing keeps.
+ *
+ * Cost: while the export runs, the shader's `rmPacked` varying reads the WebGL
+ * default and baked meshes render with roughness 0 for those frames. The
+ * alternative — exporting from a full clone of the scene — costs a second copy
+ * of every buffer on exactly the large documents this path is used for.
+ *
+ * Restoring puts back the SAME `BufferAttribute` objects, so the GPU buffers
+ * behind them are never re-uploaded.
+ */
+export interface UberAttributeShield {
+  /** Geometries the attribute was taken off. */
+  readonly stripped: number;
+  /** Put every attribute back. Idempotent. */
+  restore(): void;
+}
+
+export function stripUberPrivateAttributes(root: Object3D): UberAttributeShield {
+  const removed = new Map<BufferGeometry, BufferAttribute>();
+  traverseMeshes(root, (mesh) => {
+    const geom = mesh.geometry;
+    if (!geom || removed.has(geom)) return;
+    const rm = geom.getAttribute('rmPacked') as BufferAttribute | undefined;
+    if (!rm) return;
+    removed.set(geom, rm);
+    geom.deleteAttribute('rmPacked');
+  });
+  let restored = false;
+  return {
+    stripped: removed.size,
+    restore(): void {
+      if (restored) return;
+      restored = true;
+      for (const [geom, attr] of removed) geom.setAttribute('rmPacked', attr);
+    },
+  };
+}
+
+/**
+ * Create the session's shared uber material — the ONE place that decides
+ * between the GLSL and the TSL variant (plan-752 S2).
+ *
+ * Renderer-aware variant selection (plan-271 Phase 2): under a WebGPURenderer
+ * (BOTH backends) the pre-warmed TSL variant replaces the GLSL
+ * `onBeforeCompile` patch. Without a successful pre-warm the F4 guard fallback
+ * stays active (`RVUberMaterial(true)`: warn once, vertexColors kept, rm
+ * overlay skipped). The TSL material is a `MeshStandardNodeMaterial` —
+ * downstream code only uses the shared reference structurally (assign to
+ * `mesh.material`, `Set<Material>`, name/userData), so the cast is safe.
+ *
+ * Callers should go through `RVViewer.ensureUberMaterial()` rather than call
+ * this directly: a second instance means a second `onBeforeCompile` program
+ * and, worse, a second arena bucket for the same geometry (three.js#19377).
+ */
+export function createUberMaterial(isWebGPU = false): RVUberMaterial {
+  if (!isWebGPU) return new RVUberMaterial(false);
+  const tsl = getTslMaterials();
+  return tsl
+    ? (tsl.createUberMaterialTsl() as unknown as RVUberMaterial)
+    : new RVUberMaterial(true);
+}
+
+/**
  * Bake the uniform color / roughness / metalness of `originalMat` into
  * per-vertex attributes on `mesh.geometry`, then swap the mesh over to the
  * shared uber material.
@@ -267,6 +372,69 @@ export function bakeMaterialToAttributes(
 }
 
 /**
+ * Bake the uniform colour / roughness / metalness of every ELIGIBLE material
+ * of a multi-material mesh into per-vertex attributes, group by group
+ * (plan-753 Phase 2, F7). Vertices of non-eligible groups receive the
+ * defaults (white, rough, non-metal) — their own material never reads them.
+ * A vertex shared by two eligible groups takes the LAST group's values
+ * (glTF-derived groups have disjoint vertex sets, so this does not occur in
+ * practice). Returns false when nothing was eligible or the geometry is
+ * already baked (a second bake would wash the asset out — plan-752 I3).
+ */
+function bakeMultiMaterialGroups(
+  mesh: Mesh,
+  sharedUber: RVUberMaterial,
+  eligible: Set<Material>,
+  shareGeometry: boolean,
+): boolean {
+  const mats = mesh.material as Material[];
+  const srcGeom = mesh.geometry;
+  if (isGeometryUberBaked(srcGeom)) return false;
+  const pos = srcGeom.attributes.position;
+  if (!pos || srcGeom.groups.length === 0) return false;
+  let anyEligible = false;
+  for (const g of srcGeom.groups) {
+    const mat = mats[g.materialIndex ?? 0];
+    if (mat && eligible.has(mat)) { anyEligible = true; break; }
+  }
+  if (!anyEligible) return false;
+
+  const geom = shareGeometry ? srcGeom : srcGeom.clone();
+  const vCount = pos.count;
+  const colArr = new Uint8Array(vCount * 3).fill(255);
+  const rmArr = new Uint8Array(vCount * 2);
+  for (let i = 0; i < vCount; i++) rmArr[i * 2] = 255;
+  const index = geom.index;
+  const total = index ? index.count : vCount;
+  const newMats = mats.slice();
+  for (const g of geom.groups) {
+    const mi = g.materialIndex ?? 0;
+    const mat = mats[mi] as MeshStandardMaterial | undefined;
+    if (!mat || !eligible.has(mat)) continue;
+    const r = Math.round(mat.color.r * 255);
+    const gg = Math.round(mat.color.g * 255);
+    const b = Math.round(mat.color.b * 255);
+    const rough = Math.round(Math.max(0, Math.min(1, mat.roughness ?? 1)) * 255);
+    const metal = Math.round(Math.max(0, Math.min(1, mat.metalness ?? 0)) * 255);
+    const start = Math.min(g.start, total);
+    const end = Math.min(start + (g.count === Infinity ? total - start : g.count), total);
+    for (let k = start; k < end; k++) {
+      const v = index ? index.getX(k) : k;
+      colArr[v * 3] = r; colArr[v * 3 + 1] = gg; colArr[v * 3 + 2] = b;
+      rmArr[v * 2] = rough; rmArr[v * 2 + 1] = metal;
+    }
+    newMats[mi] = sharedUber;
+  }
+  geom.setAttribute('color', new BufferAttribute(colArr, 3, true));
+  geom.setAttribute('rmPacked', new BufferAttribute(rmArr, 2, true));
+  geom.userData._rvUberBaked = true;
+  mesh.geometry = geom;
+  mesh.material = newMats;
+  mesh.userData._rvUberBaked = true;
+  return true;
+}
+
+/**
  * Walk the scene, identify every mesh whose material is uber-eligible, and
  * bake each one onto the shared uber material. Mutates `dedupedMaterials`:
  * eligible materials are removed from the Set (they no longer exist on any
@@ -281,6 +449,7 @@ export function applyUberMaterial(
   root: Object3D,
   dedupedMaterials: Set<Material>,
   isWebGPU = false,
+  existingShared?: RVUberMaterial | null,
 ): UberResult {
   const eligible = classifyUberEligible(dedupedMaterials);
   if (eligible.size === 0) {
@@ -294,22 +463,14 @@ export function applyUberMaterial(
     };
   }
 
-  // Renderer-aware variant selection (plan-271 Phase 2): under a
-  // WebGPURenderer (BOTH backends) the pre-warmed TSL variant replaces the
-  // GLSL onBeforeCompile patch. Without a successful pre-warm the F4 guard
-  // fallback stays active (RVUberMaterial(true): warn once, vertexColors
-  // kept, rm overlay skipped). The TSL material is a MeshStandardNodeMaterial
-  // — downstream code only uses the shared reference structurally (assign to
-  // mesh.material, Set<Material>, name/userData), so the cast is safe.
-  let sharedUber: RVUberMaterial;
-  if (isWebGPU) {
-    const tsl = getTslMaterials();
-    sharedUber = tsl
-      ? (tsl.createUberMaterialTsl() as unknown as RVUberMaterial)
-      : new RVUberMaterial(true);
-  } else {
-    sharedUber = new RVUberMaterial(false);
-  }
+  // ONE owner of the uber material per session (plan-752 S2): the caller
+  // hands in `RVViewer.ensureUberMaterial()`, and both the document load and
+  // every ModelCache master bake collapse onto that same reference. Without
+  // it, each bake site minted its own instance, every placement landed in its
+  // own arena bucket, and the "one arena per asset" promise held only for the
+  // reload path. The fallback (no reference handed in) keeps the standalone
+  // signature working for tests and embedders.
+  const sharedUber: RVUberMaterial = existingShared ?? createUberMaterial(isWebGPU);
   let bakedMeshCount = 0;
   let sharedGeometryReuses = 0;
   let clonedGeometryCount = 0;
@@ -334,7 +495,12 @@ export function applyUberMaterial(
   // either — that would write shared color/rmPacked attributes into geometry a
   // SkinnedMesh renders and a dispose() has to hand back untouched.
   const rigGeometries = new Set<BufferGeometry>();
+  // Mesh count per geometry, ANY material shape — the share/clone decision of
+  // a multi-material bake (plan-753 Phase 2) needs to know whether another
+  // mesh still renders the same buffers.
+  const meshUsers = new Map<BufferGeometry, number>();
   traverseMeshes(root, (mesh) => {
+    if (mesh.geometry) meshUsers.set(mesh.geometry, (meshUsers.get(mesh.geometry) ?? 0) + 1);
     if (isRuntimeRigMesh(mesh)) {
       if (mesh.geometry) rigGeometries.add(mesh.geometry);
       return;
@@ -358,11 +524,6 @@ export function applyUberMaterial(
   const cloneCache = new Map<BufferGeometry, Map<Material, BufferGeometry>>();
 
   traverseMeshes(root, (mesh) => {
-    // Skip multi-material meshes — baking per-submesh would require splitting
-    // the geometry by groups and is out of scope for Phase 2. They continue to
-    // use the deduped (but not uber-collapsed) materials.
-    if (Array.isArray(mesh.material)) return;
-
     // Skip pipe and tank meshes — ProcessIndustryPlugin swaps their materials
     // at runtime to show the fluid color. Uber baking freezes the color into
     // a shared vertex attribute, which would make `mesh.material = newMat` a
@@ -379,6 +540,23 @@ export function applyUberMaterial(
     // invisible picking proxy has no business in the bake at all.
     if (isRuntimeRigMesh(mesh)) return;
 
+    // Multi-material mesh (plan-753 Phase 2): bake colour / rmPacked PER
+    // GROUP for every eligible material and swap those entries to the shared
+    // uber reference. Non-eligible groups keep their material (they ignore
+    // the new attributes — `vertexColors` is false on them). The bake
+    // pipeline later splits the mesh by `geometry.groups`, so each group
+    // lands in its material's chunk with the right vertex colours.
+    if (Array.isArray(mesh.material)) {
+      const canShareMulti = (meshUsers.get(mesh.geometry) ?? 0) === 1 && !rigGeometries.has(mesh.geometry);
+      const sourceGeom = mesh.geometry;
+      if (bakeMultiMaterialGroups(mesh, sharedUber, eligible, canShareMulti)) {
+        bakedMeshCount++;
+        if (canShareMulti) sharedGeometryReuses++;
+        else { clonedGeometryCount++; replacedSources.add(sourceGeom); }
+      }
+      return;
+    }
+
     const mat = mesh.material;
     if (!mat || !eligible.has(mat)) return;
 
@@ -386,11 +564,13 @@ export function applyUberMaterial(
     const canShare = users !== undefined && users.size === 1
       && !rigGeometries.has(mesh.geometry);
 
-    // Second (or later) visit of a shared geometry that has already been
-    // baked in-place by an earlier mesh in this traversal. The geometry
-    // already carries the color+rmPacked attributes — we only need to swap
-    // the material reference on this mesh.
-    if (canShare && mesh.geometry.userData._rvUberBaked === true) {
+    // Second (or later) visit of a geometry that already carries the
+    // color+rmPacked attributes — either baked in-place by an earlier mesh in
+    // this traversal, or baked in an earlier life and read back from a GLB
+    // (plan-752 I3). Either way there is nothing left to bake: we only swap
+    // the material reference. Baking on top would overwrite `color` with the
+    // identity white of the uber material and wash the asset out.
+    if (isGeometryUberBaked(mesh.geometry)) {
       mesh.material = sharedUber;
       mesh.userData._rvUberBaked = true;
       bakedMeshCount++;
@@ -486,4 +666,19 @@ export function applyUberMaterial(
     clonedGeometryCount,
     disposedSourceGeometries: disposedSources,
   };
+}
+
+/**
+ * Is `material` the shared uber material (either the GLSL {@link RVUberMaterial}
+ * or its TSL twin)?
+ *
+ * The ONE place the convention lives (plan-505 F10): both constructors mark
+ * the instance `userData._rvShared = true` and name it `__rvUberMaterial`.
+ * Either marker is accepted, so a caller does not have to know which renderer
+ * built the instance. Used by the hierarchy's chunk labels and the inspector's
+ * "Baked geometry" section — an uber chunk is "Merged", never "Uber".
+ */
+export function isUberMaterial(material: Material | null | undefined): boolean {
+  if (!material) return false;
+  return material.userData?._rvShared === true || material.name === '__rvUberMaterial';
 }

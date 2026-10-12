@@ -10,6 +10,7 @@ import { NodeRegistry } from '../src/core/engine/rv-node-registry';
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 import { processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import {
   removePlacedFromScene,
   type SceneMutationDeps,
@@ -39,20 +40,9 @@ function setup() {
   const transportManager = new RVTransportManager();
   transportManager.scene = scene;
   const lampManager = new LampManager();
-  processExtras(
-    placement,
-    registry,
-    signalStore,
-    transportManager,
-    scene,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    lampManager,
-  );
+  processExtras(placement, buildInitContext({
+    registry, signalStore, transportManager, scene, lampManager,
+  }));
   const lamp = placement.userData._rvLamp as RVLamp;
   lamp.SignalLampOn = 'Signals/LampOn';
   lamp.reapplyConfig();
@@ -128,20 +118,10 @@ describe('RVLamp removal cleanup', () => {
     h.root.add(h.placement);
     h.objectMap.set('beacon-1', h.placement);
     h.idByObject.set(h.placement, 'beacon-1');
-    processExtras(
-      h.placement,
-      h.registry,
-      h.signalStore,
-      h.transportManager,
-      h.scene,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      h.lampManager,
-    );
+    processExtras(h.placement, buildInitContext({
+      registry: h.registry, signalStore: h.signalStore, transportManager: h.transportManager, scene: h.scene,
+      lampManager: h.lampManager,
+    }));
     expect(h.lampManager.size).toBe(1);
     expect(h.mesh.userData._rvLampMesh).toBe(true);
     removePlacedFromScene(h.deps, 'beacon-1');

@@ -143,7 +143,7 @@ function hasScheme(url: string): boolean {
  * result to the document origin, and the result is also a cache key — an origin
  * baked into it would split the cache per page.
  */
-export function resolveReferencePath(baseUrl: string, path: string): string {
+export function resolveReferenceUrl(baseUrl: string, path: string): string {
   if (!path) return baseUrl;
   if (hasScheme(path)) return path;
   if (hasScheme(baseUrl)) {
@@ -396,9 +396,29 @@ export interface MissingReference {
   label: string;
 }
 
+/**
+ * A reference composition was told NOT to resolve (plan-753, Reload =
+ * Planner-Instanzen): the node stays exactly as the file wrote it — extras +
+ * transform, no children — and the caller instantiates the asset later.
+ */
+export interface DeferredReference {
+  referenceNode: Object3D;
+  ref: AssetReference;
+  occurrence: string;
+  /**
+   * `ref.path` resolved against the CONTAINING file's url (`resolveReferenceUrl`),
+   * `''` without a path. The instancer fetches a deferred document-level
+   * reference from this (plan-757 Phase 2b) — the same base the graft would
+   * have used, so a relative `path` means the same thing on both paths.
+   */
+  resolvedPath: string;
+}
+
 export interface ComposeResult {
   /** Every resolved occurrence, outermost first. */
   frames: ComposedFrame[];
+  /** References handed back unresolved by `ComposeOptions.deferReference`. */
+  deferred: DeferredReference[];
   /** Overrides whose target no longer exists (F9). */
   orphanedOverrides: OrphanedOverride[];
   /** References that resolved to nothing. */
@@ -430,6 +450,14 @@ export interface ComposeOptions {
   /** Checked before and after every await; true abandons the composition. */
   shouldAbort?: () => boolean;
   maxDepth?: number;
+  /**
+   * A reference this predicate accepts is NOT resolved: no template load, no
+   * graft, no overrides — it is returned in `ComposeResult.deferred` for the
+   * caller to instantiate (plan-753: the loader defers planner placements to
+   * the layout planner's shared `BakedAsset` path). Cycle and depth guards
+   * still run first, so a self-referencing placement is refused as before.
+   */
+  deferReference?: (node: Object3D, ref: AssetReference) => boolean;
 }
 
 // ─── Internals ───────────────────────────────────────────────────────────
@@ -503,6 +531,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
   const shouldAbort = options.shouldAbort ?? ((): boolean => false);
 
   const frames: ComposedFrame[] = [];
+  const deferred: DeferredReference[] = [];
   const orphanedOverrides: OrphanedOverride[] = [];
   const missing: MissingReference[] = [];
   const grafted: Array<{ parent: Object3D; child: Object3D }> = [];
@@ -557,7 +586,7 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
       if (shouldAbort()) abort();
       const segment = occurrenceSegment(referenceNode, ordinal++);
       const occurrence = childOccurrence(frame.occurrence, segment);
-      const resolvedPath = ref.path ? resolveReferencePath(frame.baseUrl, ref.path) : '';
+      const resolvedPath = ref.path ? resolveReferenceUrl(frame.baseUrl, ref.path) : '';
       const key = referenceKey(ref, resolvedPath);
       const label = ref.assetId || resolvedPath || '<unnamed>';
 
@@ -568,6 +597,14 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
       if (frame.depth + 1 > maxDepth) {
         dispose();
         throw new ReferenceDepthError(frame.depth + 1, [...frame.trail, label]);
+      }
+
+      // Deferred (plan-753): the caller instantiates this one itself. Nothing
+      // is fetched, nothing is grafted — the node is returned as the file
+      // wrote it, and `dispose()` has nothing to undo for it.
+      if (options.deferReference?.(referenceNode, ref)) {
+        deferred.push({ referenceNode, ref, occurrence, resolvedPath });
+        continue;
       }
 
       const context: ResolveContext = {
@@ -711,13 +748,15 @@ export async function compose(root: Object3D, options: ComposeOptions): Promise<
 
   await composeSubtree(root, rootFrame);
 
-  if (frames.length > 0) {
+  if (frames.length > 0 || deferred.length > 0) {
     debug('loader', `Composition: ${frames.length} occurrence(s) from ${cache.size} file(s), `
-      + `${cache.loads} load(s), ${missing.length} unresolved, ${orphanedOverrides.length} orphaned override(s)`);
+      + `${cache.loads} load(s), ${deferred.length} deferred placement(s), `
+      + `${missing.length} unresolved, ${orphanedOverrides.length} orphaned override(s)`);
   }
 
   return {
     frames,
+    deferred,
     orphanedOverrides,
     missing,
     updated: frames.filter((f) => f.updated),

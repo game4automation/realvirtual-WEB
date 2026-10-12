@@ -91,7 +91,7 @@ describe('resolveBindableSlots', () => {
     expect(new Set(slots.map((slot) => slot.kind)))
       .toEqual(new Set(['direct-property', 'direct-feedback']));
     expect(slots.filter(slot => slot.kind === 'direct-property').map(slot => slot.slot))
-      .toEqual(['Speed', 'Accelaration', 'Forward', 'Backward']);
+      .toEqual(['Speed', 'Accelaration', 'Forward', 'Backward', 'Enable']);
     expect(slots.filter(slot => slot.kind === 'direct-feedback').map(slot => slot.slot))
       .toEqual(['IsAtPosition', 'IsAtSpeed', 'IsDriving']);
   });
@@ -99,7 +99,7 @@ describe('resolveBindableSlots', () => {
   it('resolves a partially wired instance per slot', () => {
     const fixture = buildFixture([{ name: 'Wired', authoredSlots: ['Forward'] }]);
     const slots = resolveBindableSlots(fixture.root, fixture.store, fixture.registry);
-    expect(slots).toHaveLength(7);
+    expect(slots).toHaveLength(8); // plan-539 F14: + Enable
     expect(slots.find(slot => slot.slot === 'Forward')).toMatchObject({
       kind: 'mapped-signal',
       slot: 'Forward',

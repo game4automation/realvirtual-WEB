@@ -23,6 +23,7 @@ import { NodeRegistry, type ComponentRef } from '../src/core/engine/rv-node-regi
 import { SignalStore } from '../src/core/engine/rv-signal-store';
 import { RVTransportManager } from '../src/core/engine/rv-transport-manager';
 import { registerNodeAliases, processExtras } from '../src/core/engine/rv-scene-loader';
+import { buildInitContext } from '../src/core/engine/rv-init-context';
 import { RV_ORIG_NAME_KEY, collectRenamedNodes } from '../src/core/engine/rv-glb-parse';
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -194,7 +195,7 @@ describe('9.9 placed asset gets subtree aliases too', () => {
     const registry = new NodeRegistry();
     const signalStore = new SignalStore();
 
-    processExtras(asset, registry, signalStore, new RVTransportManager(), scene);
+    processExtras(asset, buildInitContext({ registry, signalStore, transportManager: new RVTransportManager(), scene }));
 
     // Node alias for a DESCENDANT of the renamed node.
     expect(registry.getNode('Asset/Pusher/Signals/Fwd')).toBe(signalNode);
@@ -209,7 +210,7 @@ describe('9.9 placed asset gets subtree aliases too', () => {
     const registry = new NodeRegistry();
     const signalStore = new SignalStore();
 
-    processExtras(asset, registry, signalStore, new RVTransportManager(), scene);
+    processExtras(asset, buildInitContext({ registry, signalStore, transportManager: new RVTransportManager(), scene }));
 
     expect(signalStore.getPath('Fwd')).toBe('Asset/Pusher_1/Signals/Fwd');
     expect(signalStore.getType('Fwd')).toBe('PLCOutputBool');

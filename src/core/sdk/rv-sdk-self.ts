@@ -34,6 +34,7 @@
 
 import { Box3, Quaternion, Vector3, type Object3D } from 'three';
 import type { SdkScheduler, ScriptMuRef } from './rv-script-hook';
+import type { SdkSceneAccess } from './rv-sdk-scene';
 import { findAll as findKindNodes, NODE_KIND_TESTS } from '../library-component-loader';
 
 // ─── Host-side narrow component targets (duck-typed engine slices) ─────────
@@ -76,7 +77,7 @@ export interface SdkTransportTarget {
 }
 
 export interface SdkSourceTarget {
-  spawn(): ScriptMuRef;
+  spawn(): ScriptMuRef | null;
   automatic?: boolean;
   interval?: number;
   node?: Object3D;
@@ -96,10 +97,12 @@ export interface SdkGripTarget {
 }
 
 export interface SdkLogicStepTarget {
+  readonly runId?: number;
   readonly state: string;
   readonly progress?: number;
   start(): void;
   reset(): void;
+  complete?(): void;
   node?: Object3D;
 }
 
@@ -338,6 +341,7 @@ export interface SdkSignalAccess {
  * viewer (NodeRegistry / SignalStore / transport manager).
  */
 export interface SdkEnvironment {
+  scene?: SdkSceneAccess;
   /** Component node name (leaf). */
   name: string;
   /** Full hierarchy path of the component node (also the RNG seed source). */
@@ -553,6 +557,13 @@ export class SdkBridge {
     const op = String(raw[0]);
     const a = raw.slice(1);
     switch (op) {
+      case 'scene.list': return this.env.scene?.list(a[0] == null ? undefined : String(a[0])) ?? [];
+      case 'scene.read': return this.env.scene?.read(String(a[0]), String(a[1])) ?? null;
+      case 'scene.set': {
+        if (!this.env.scene) throw new Error('Scene access is unavailable');
+        this.env.scene.set(String(a[0]), String(a[1]), String(a[2]), a[3]);
+        return undefined;
+      }
       // ── time / lifecycle ─────────────────────────────────────────────
       case 'now': return this.env.scheduler.now;
       case 'log': {
@@ -1011,6 +1022,7 @@ export class SdkBridge {
       case 'grip.gripped': return ((t as unknown as SdkGripTarget).gripped ?? []).map((m) => ({ id: m.id, prop: m.prop ?? {} }));
       case 'grip.range': return (t as unknown as SdkGripTarget).range ?? 0;
       case 'logicStep.state': return (t as unknown as SdkLogicStepTarget).state;
+      case 'logicStep.runId': return (t as unknown as SdkLogicStepTarget).runId ?? 0;
       case 'logicStep.progress': return (t as unknown as SdkLogicStepTarget).progress ?? 0;
       default:
         throw new Error(`unknown component read '${entry.kind}.${field}'`);
@@ -1053,7 +1065,7 @@ export class SdkBridge {
       }
       case 'source.spawn': {
         const mu = (entry.target as SdkSourceTarget).spawn();
-        return { id: mu.id, prop: mu.prop ?? {} };
+        return mu ? { id: mu.id, prop: mu.prop ?? {} } : null;
       }
       case 'source.setAutomatic': {
         (entry.target as SdkSourceTarget).automatic = args[0] === true;
@@ -1067,6 +1079,12 @@ export class SdkBridge {
       case 'grip.place': (entry.target as SdkGripTarget).place(); return undefined;
       case 'logicStep.start': (entry.target as SdkLogicStepTarget).start(); return undefined;
       case 'logicStep.reset': (entry.target as SdkLogicStepTarget).reset(); return undefined;
+      case 'logicStep.complete': {
+        const target = entry.target as SdkLogicStepTarget;
+        if (!target.complete) throw new Error('Only a JavaScript logic step supports complete()');
+        target.complete();
+        return undefined;
+      }
       default:
         throw new Error(`unknown component method '${entry.kind}.${method}'`);
     }
@@ -1200,9 +1218,11 @@ export const SDK_SELF_SOURCE = String.raw`
     var c = r.c;
     return {
       get state() { return call('comp.read', c, 'state'); },
+      get runId() { return call('comp.read', c, 'runId'); },
       get progress() { return call('comp.read', c, 'progress'); },
       start: function () { call('comp.call', c, 'start', []); },
       reset: function () { call('comp.call', c, 'reset', []); },
+      complete: function () { call('comp.call', c, 'complete', []); },
       node: nodeHandle(r.node),
     };
   }
@@ -1392,6 +1412,11 @@ export const SDK_SELF_SOURCE = String.raw`
       sink: function (p) { return resolveComp('sink', p); },
       grip: function (p) { return resolveComp('grip', p); },
       logicStep: function (p) { return resolveComp('logicStep', p); },
+      scene: {
+        list: function (type) { return call('scene.list', type); },
+        read: function (path, type) { return call('scene.read', path, type); },
+        set: function (path, type, field, value) { call('scene.set', path, type, field, value); },
+      },
 
       signal: signalHandle,
       signalAt: signalHandle,

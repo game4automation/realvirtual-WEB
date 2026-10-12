@@ -6,14 +6,20 @@
  *
  * Both are the same failure in two places: a `RibbonPath` rewrites its band buffer
  * whenever a roll changes size, a `RibbonWinder` scales its roll every tick, and every
- * roller spins. Baked into a static arena, or frozen by `freezeStaticMatrices`,
+ * roller spins. Staged into a bake chunk, or frozen by `freezeStaticMatrices`,
  * the whole machine would stand still while the numbers kept moving — which is
  * the exact symptom the `Chain` entries in both lists exist for.
  */
 
 import { describe, expect, it } from 'vitest';
 import { BufferAttribute, BufferGeometry, Mesh, MeshStandardMaterial, Object3D } from 'three';
-import { isBatchSafe } from '../src/core/engine/rv-batched-render';
+// plan-753 Phase 1: the exclusion is no longer a key list but the component's
+// declared `bake:'keep'` role, resolved through the registry — which knows a
+// type only once its module has registered. Importing the loader registers the
+// production set (exactly what the viewer does), so this test sees the same
+// roles as a real load instead of stamping extras nobody has declared.
+import '../src/core/engine/rv-scene-loader';
+import { bakeFateOf } from './helpers/bake-fate';
 import { freezeStaticMatrices } from '../src/core/engine/rv-freeze-static';
 
 function mesh(name: string): Mesh {
@@ -46,13 +52,14 @@ function scene(): { root: Object3D; plain: Mesh; byKey: Map<string, Mesh> } {
 }
 
 describe('web components and the static pipelines', () => {
-  it('RibbonPath/RibbonWinder/RibbonRoller/RibbonDancer subtrees are excluded from the batched arena', () => {
+  it('RibbonPath/RibbonWinder/RibbonRoller/RibbonDancer subtrees are keep meshes of the bake (never in a chunk)', async () => {
     const { root, plain, byKey } = scene();
-    // The control: an ordinary frame mesh IS batch-safe, so the assertions
-    // below are about the exclusion and not about some unrelated rejection.
-    expect(isBatchSafe(plain, root)).toBe(true);
+    // The control: an ordinary frame mesh IS staged into the static chunk, so
+    // the assertions below are about the role and not about some unrelated
+    // rejection.
+    expect(await bakeFateOf(plain, root)).toBe('static');
     for (const [key, child] of byKey) {
-      expect(isBatchSafe(child, root), `${key} subtree must not be batched`).toBe(false);
+      expect(await bakeFateOf(child, root), `${key} subtree must not be baked into a chunk`).toBe('keep');
     }
   });
 

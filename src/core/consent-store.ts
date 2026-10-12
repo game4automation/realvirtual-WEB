@@ -16,15 +16,26 @@
  * When no analytics id is configured (e.g. private/self-hosted deploys),
  * isAnalyticsConfigured() is false and the whole consent flow is skipped —
  * the app boots normally with no banner and no gate.
+ *
+ * A SESSION DECLINE (plan-564 F6/F14) is a third, separate state: the link
+ * parameter `?consent=decline` answers the dialog with "no" for this browser
+ * session — the app starts, analytics never loads. It is kept apart from the
+ * opt-in on purpose: it can never be read as consent, it is not persisted
+ * beyond the session (sessionStorage), and declining unlocks nothing that the
+ * Decline button does not — which is why any link may carry it.
  */
 
 import { useSyncExternalStore } from 'react';
 import { getAppConfig } from './rv-app-config';
 
 const STORAGE_KEY = 'rv-analytics-consent';
+/** sessionStorage key of the per-session decline (plan-564). */
+export const SESSION_DECLINE_KEY = 'rv-analytics-declined-session';
 
 const listeners = new Set<() => void>();
 let granted = readInitial();
+/** In-memory mirror of the session decline (sessionStorage may be disabled). */
+let sessionDeclined = false;
 
 function readInitial(): boolean {
   try {
@@ -62,6 +73,38 @@ export function resetAnalyticsConsent(): void {
   granted = false;
   try { localStorage.removeItem(STORAGE_KEY); } catch { /* private mode */ }
   emit();
+}
+
+/**
+ * The consent directive a link carries: `?consent=decline` → 'decline'.
+ * Nothing else is recognised — in particular there is no URL way to GRANT.
+ */
+export function readConsentUrlDirective(search: string): 'decline' | null {
+  try {
+    return new URLSearchParams(search).get('consent') === 'decline' ? 'decline' : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record a decline for this browser session (never persisted beyond it). */
+export function declineAnalyticsForSession(): void {
+  try { sessionStorage.setItem(SESSION_DECLINE_KEY, '1'); } catch { /* storage disabled */ }
+  sessionDeclined = true;
+  emit();
+}
+
+/** Forget the session decline — the dialog is asked again on the next boot. */
+export function resetAnalyticsSessionDecline(): void {
+  sessionDeclined = false;
+  try { sessionStorage.removeItem(SESSION_DECLINE_KEY); } catch { /* storage disabled */ }
+  emit();
+}
+
+/** True when this session declined analytics — a state distinct from consent. */
+export function hasAnalyticsSessionDecline(): boolean {
+  if (sessionDeclined) return true;
+  try { return sessionStorage.getItem(SESSION_DECLINE_KEY) === '1'; } catch { return false; }
 }
 
 function subscribe(cb: () => void): () => void {

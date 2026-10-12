@@ -22,12 +22,7 @@ const CADLINK_BADGE_COLOR = '#7e57c2';
 
 // Schema loaded from the rv-ODT specification (schema/v1/rv-odt.json, plan-187).
 registerComponentSchema('CADLink', loadSchemaFromSpec('CADLink'), {
-  inspectorVisible: true,
-  hierarchyVisible: true,
-  hoverable: true,   // include the CAD subtree meshes in the grouped raycast BVH
-  selectable: true,  // canvas click selects the import root
-  hoverEnabledByDefault: true, // hover-type gate is snapshotted at model load
-  badgeColor: CADLINK_BADGE_COLOR,
-  filterLabel: null,
+  pick: 'select',    // CAD subtree meshes join the grouped raycast BVH; canvas click selects the import root
+  ui: { badge: CADLINK_BADGE_COLOR, filter: null },
   authorable: false, // stamped by the import flow, never added by hand
 });

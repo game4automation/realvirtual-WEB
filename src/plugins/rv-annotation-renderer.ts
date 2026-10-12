@@ -30,6 +30,7 @@ import {
 } from 'three';
 import type { Camera, Scene } from 'three';
 import type { Annotation } from '../core/types/plugin-types';
+import { applyLabelSpriteContract, createLabelMaterial, createLabelTexture } from '../core/engine/rv-label-sprite';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -153,7 +154,7 @@ export class AnnotationRenderer {
     label.position.set(labelX, labelY, labelZ);
     // Initial scale — will be overridden by updateLOD to maintain constant screen size
     label.scale.set(MAX_SPRITE_SCALE, MAX_SPRITE_SCALE * 0.25, 1);
-    label.layers.set(ANNOTATION_LAYER);
+    applyLabelSpriteContract(label, { layer: ANNOTATION_LAYER, renderOrder: label.renderOrder });
     label.userData.__annotationId = ann.id;
     this.group.add(label);
 
@@ -437,12 +438,10 @@ export class AnnotationRenderer {
     const truncated = text.length > 25 ? text.substring(0, 22) + '...' : text;
     ctx.fillText(truncated, w / 2, h / 2);
 
-    const texture = new CanvasTexture(canvas);
-    const material = new SpriteMaterial({
-      map: texture,
-      transparent: true,
-      depthTest: false,
-    });
+    // Shared label contract (rv-label-sprite.ts). 'linear' — updateLOD keeps
+    // the sprite at constant screen size.
+    const texture = createLabelTexture(canvas, 'linear');
+    const material = createLabelMaterial(texture);
 
     return { texture, material };
   }

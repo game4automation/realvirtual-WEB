@@ -5,12 +5,22 @@ import type { RVViewer } from '../../core/rv-viewer';
 import type { SignalMapping } from '../layout-planner/rv-layout-store';
 import type { SignalBindTarget } from './signal-bind-target';
 import { persistFieldOp } from '../../core/hmi/scene/scene-field-ops';
+import { getActiveEditTarget } from '../../core/hmi/rv-edit-target';
 import { noteSignalMappingsWritten } from './first-link-notice';
 import { isDuplicateSignalName } from '../../core/engine/rv-signal-construction';
 
 export interface SignalBindingPersistenceAdapter {
   read(): SignalMapping[];
   write(mappings: SignalMapping[]): void;
+  /**
+   * `write` as an awaitable document op (plan-512): the same record (the
+   * `carrierSignalName` anchor included), issued through `setFieldAsync` so a
+   * refused op rejects — and, inside a transaction, rolls it back. The local
+   * cache is NOT touched optimistically: the SignalLinks executor syncs it when
+   * the op applies, so a dropped op leaves nothing stale behind. Optional for
+   * hand-built adapters; callers fall back to `write`.
+   */
+  writeAsync?(mappings: SignalMapping[]): Promise<void>;
   subscribe(listener: () => void): () => void;
 }
 
@@ -80,15 +90,28 @@ export function createSignalBindingPersistence(
 
   if (!nodeMappings.has(target.node)) nodeMappings.set(target.node, legacyNodeMappings(target));
   const carrierName = carrierSignalNameFor(viewer, target.nodePath);
+  const prepare = (mappings: readonly SignalMapping[]): { prev: SignalMapping[]; next: SignalMapping[] } => ({
+    prev: (nodeMappings.get(target.node) ?? legacyNodeMappings(target)).map((mapping) => ({ ...mapping })),
+    next: mappings.map((mapping) => (
+      carrierName ? { ...mapping, carrierSignalName: carrierName } : { ...mapping })),
+  });
   return {
     read: () => (nodeMappings.get(target.node) ?? []).map((mapping) => ({ ...mapping })),
     write: (mappings) => {
-      const prev = (nodeMappings.get(target.node) ?? legacyNodeMappings(target))
-        .map((mapping) => ({ ...mapping }));
-      const next = mappings.map((mapping) => (
-        carrierName ? { ...mapping, carrierSignalName: carrierName } : { ...mapping }));
+      const { prev, next } = prepare(mappings);
       syncNodeSignalBindingPersistence(target.node, next);
       persistFieldOp(target.nodePath, 'SignalLinks', 'Mappings', next, prev);
+      noteSignalMappingsWritten(prev.length, next.length);
+    },
+    writeAsync: async (mappings) => {
+      const { prev, next } = prepare(mappings);
+      const editTarget = getActiveEditTarget();
+      if (!editTarget.available) return;
+      if (editTarget.setFieldAsync) {
+        await editTarget.setFieldAsync(target.nodePath, 'SignalLinks', 'Mappings', next, prev);
+      } else {
+        editTarget.setField(target.nodePath, 'SignalLinks', 'Mappings', next, prev);
+      }
       noteSignalMappingsWritten(prev.length, next.length);
     },
     subscribe: (listener) => {

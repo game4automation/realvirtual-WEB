@@ -44,6 +44,7 @@ import { GizmoMaterialCache } from './rv-gizmo-material-cache';
 import { computeSubtreeAABB, traverseMeshesWithDepth } from './rv-traverse-utils';
 import { ISOLATE_FOCUS_LAYER, HIGHLIGHT_OVERLAY_LAYER } from './rv-group-registry';
 import { NO_AO_LAYER } from './rv-constants';
+import { createLabelMaterial, createLabelTexture } from './rv-label-sprite';
 import {
   subscribeOverlayVisibility, getHiddenOverlays,
   registerOverlayProducer, unregisterOverlayProducer,
@@ -85,6 +86,8 @@ export type GizmoShape =
 
 /** Options for creating or updating a gizmo. */
 export interface GizmoOptions {
+  /** Purely descriptive tag for tooling and tests. */
+  kind?: string;
   shape: GizmoShape;
   /** 0xRRGGBB color. For 'text' shape this is the text color. */
   color: number;
@@ -885,14 +888,29 @@ export class GizmoOverlayManager {
     // Cache an EdgesGeometry of the sphere (not the box)
     const geo = _sharedSphereEdgesGeometry ??= new EdgesGeometry(getSphereGeometry());
     const lines = new LineSegments(geo, lineMat);
-    lines.position.copy(entry.cachedCenter);
     const half = entry.cachedSize.length() * 0.5;
     const r = half * entry.size;
-    lines.scale.set(r * 2, r * 2, r * 2);
     lines.renderOrder = entry.renderOrder;
+
+    if (entry.attachToNode) {
+      // Same rule as _buildBox: cachedCenter/cachedSize are WORLD space, so
+      // convert into the node's local frame before parenting under it.
+      // Without this the sphere stayed scene-attached while callers wrote
+      // node-local positions into it — it drifted far off its owner.
+      entry.node.updateWorldMatrix(true, false);
+      const localCenter = entry.node.worldToLocal(entry.cachedCenter.clone());
+      const ws = entry.node.getWorldScale(this._tmpV);
+      lines.position.copy(localCenter);
+      lines.scale.set((r * 2) / (ws.x || 1), (r * 2) / (ws.y || 1), (r * 2) / (ws.z || 1));
+      entry.node.add(lines);
+    } else {
+      lines.position.copy(entry.cachedCenter);
+      lines.scale.set(r * 2, r * 2, r * 2);
+      this.scene.add(lines);
+    }
+
     entry.root = lines;
     entry.material = lineMat;
-    this.scene.add(lines);
   }
 
   /** Sphere with an outer "inverted hull" glow shell — back-faces only,
@@ -1052,15 +1070,11 @@ export class GizmoOverlayManager {
   private _buildText(entry: GizmoEntry): void {
     const label = entry.text ?? '';
     const canvas = makeTextCanvas(label, entry.color);
-    const tex = new CanvasTexture(canvas);
-
-    const mat = new SpriteMaterial({
-      map: tex,
-      transparent: true,
-      opacity: entry.baseOpacity,
-      depthTest: false,
-      depthWrite: false,
-    });
+    // Shared label contract (rv-label-sprite.ts): sRGB + anisotropy on the
+    // texture, toneMapped:false on the material. The layer is assigned by
+    // the common layer logic in _register (overlay or NO_AO).
+    const tex = createLabelTexture(canvas);
+    const mat = createLabelMaterial(tex, entry.baseOpacity);
     const sprite = new Sprite(mat);
 
     // Position: anchored to bbox top (default) or bottom, plus offset
@@ -1161,7 +1175,7 @@ export class GizmoOverlayManager {
     if (entry.shape === 'text' && (textChanged || needRebuildMaterial)) {
       const oldTex = entry.texture;
       const canvas = makeTextCanvas(entry.text ?? '', entry.color);
-      const newTex = new CanvasTexture(canvas);
+      const newTex = createLabelTexture(canvas);
       const spriteMat = entry.material as SpriteMaterial;
       spriteMat.map = newTex;
       spriteMat.opacity = entry.baseOpacity;

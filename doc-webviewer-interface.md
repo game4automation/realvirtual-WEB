@@ -1,5 +1,9 @@
 # realvirtual WEB Industrial Interfaces
 
+> **Applies to:** Community runtime and public extension APIs. Examples of commercial or optional integrations require the corresponding feature or separate product.
+> **Reference baseline:** 6.3.43, documentation reviewed 2026-09-16.
+> See the [edition comparison](README.md#community-edition-vs-commercial) and [getting started](doc-getting-started.md).
+
 Connect realvirtual WEB to real PLCs and controllers via WebSocket or MQTT — independent of Unity. The interface system provides bidirectional signal exchange synchronized with the drive physics loop at 60 Hz.
 
 ## Supported Protocols
@@ -140,6 +144,11 @@ onFixedUpdatePost(dt)             ← called at 60 Hz, AFTER drive physics
 PLC / Controller receives updated values
 ```
 
+Through a CONNECT gateway this last step has a gate: an interface with `allowWebToPlc = false`
+drops every viewer write instead of forwarding it, and CONNECT defaults that flag to `false`. The
+viewer makes the drop visible and offers the one-click fix — see
+[Write gate and silent-PLC prompts](#write-gate-and-silent-plc-prompts-connect).
+
 ### Complete Tick Cycle
 
 Each simulation tick at 60 Hz follows this exact order:
@@ -174,14 +183,14 @@ Each simulation tick at 60 Hz follows this exact order:
 │      └─ dirtyOutgoing → sendSignals()                                 │
 │  16. TickStage.POST callbacks       ← recorders, stats               │
 │                                                                        │
-│  Result: PLC input values (step 5) applied before physics,            │
-│          PLC output values (step 15) sent after physics.              │
+│  Result: Incoming PLC values (step 5) applied before physics,            │
+│          Outgoing feedback (step 15) sent after physics.              │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 This ensures:
-- **Input signals** (from PLC) are applied **before** drive physics computes the next position
-- **Output signals** (to PLC) reflect the drive state **after** physics computation
+- **Incoming to WEB** (`PLCOutput*`, written by the PLC) are applied **before** drive physics computes the next position
+- **Outgoing from WEB** (`PLCInput*`, read by the PLC) reflect the drive state **after** physics computation
 - The 60 Hz fixed timestep matches Unity's FixedUpdate
 
 ## Signal Discovery
@@ -243,16 +252,16 @@ Signal type strings from C# map to:
 | C# Type | SignalType | SignalDirection | Example |
 |---------|-----------|-----------------|---------|
 | `PLCInputBool` | `bool` | `input` | Sensor occupied |
-| `PLCOutputBool` | `bool` | `output` | Motor running feedback |
-| `PLCInputFloat` | `float` | `input` | Drive speed |
+| `PLCOutputBool` | `bool` | `output` | Motor run command |
+| `PLCInputFloat` | `float` | `input` | Simulated drive speed feedback |
 | `PLCOutputFloat` | `float` | `output` | Speed setpoint |
 | `PLCInputInt` | `int` | `input` | Counter value |
 | `PLCOutputInt` | `int` | `output` | Program number |
 
 Direction is named from the **PLC's** point of view, exactly as in Unity:
 
-- **Input** = the PLC reads it, realvirtual writes it (an HMI start button, a setpoint)
-- **Output** = the PLC writes it, realvirtual reads it (an encoder position, a program number)
+- **Input** = the PLC reads it, realvirtual writes it (simulated sensor feedback; in a live-machine HMI, a start button)
+- **Output** = the PLC writes it, realvirtual reads it (a simulated drive command; in a live-machine HMI, PLC-reported position)
 
 Source of truth: `plcTypeForSignalDescriptor()` in `src/interfaces/base-industrial-interface.ts`
 (`direction === 'input' ? 'PLCInput' : 'PLCOutput'`).
@@ -291,6 +300,74 @@ their addresses — `rv/demo/out/OpenDoor` renders as `rv` > `demo` > `out` > si
 - Applies to MQTT interfaces and to addresses that contain `/`. Configured topic entries
   (`ProcessImage` **and** `Single` mode) stay single-level groups, and other protocols (S7,
   Modbus, …) render flat as before.
+
+## PLC binding: the model signal and its address
+
+A model signal is identified by its **symbol name**, and that name is the only thing the two sides
+share. The **address** belongs to the gateway alone — it is `SignalConfig.ProtocolAddress` in
+CONNECT and is never stored in the GLB. Binding a model signal therefore means: give the gateway an
+entry of the same name, and tell it where that name lives on the wire.
+
+The unit of a binding is a **signal place**, not just a name — an interface, optionally a topic and
+its mode, and the signal's own fields (`IfaceSignalSlot`, `src/core/import/rv-iface-signal-slots.ts`).
+That distinction is what makes MQTT work at all: the same name can exist in two topics, and a
+topic's own `signals[]` is a different container from the interface-level `signals[]`. Reads and
+writes both go through the slot, so a topic signal is editable like any other.
+
+Where the address is mandatory is **the gateway's statement, not the UI's guess**. Each
+`GET /interface-types` entry carries `addressRule` per container and, for MQTT, per topic mode:
+
+| Rule | The signal dialog |
+|------|-------------------|
+| `required` | demands an address (S7 DB address, Modbus register, OPC-UA NodeId, ADS symbol, MQTT ProcessImage offset, the legacy MQTT `signals` list where the topic *is* the address) |
+| `name-fallback` | address optional — the worker uses the signal name as the wire name (PLCSIM Advanced, SHM, ABB RobotStudio, WebSocket Realtime, WINMOD Y200, PVI) |
+| `container-topic` | address optional — an MQTT `Single` topic publishes on the topic itself |
+| `none` | no address exists in this mode — an MQTT `Json` topic keys its flat object by the signal name |
+
+**An older gateway that does not send `addressRule` keeps working unchanged:** an absent rule means
+"never said", so nothing is demanded and nothing is warned about. ProcessImage addresses are checked
+for Siemens symbolic syntax (`%IW13`, `%I3.1`) in the browser, because `POST /signals/validate`
+validates an MQTT address as a *topic*.
+
+Two inspector sections do the editing on a PLC signal node: **Signal** (name, type/direction,
+`OriginDataType`, `Comment`) and **PLC binding** (one row per interface, for MQTT per topic, with
+status plus set / change / remove). Without a CONNECT connection the binding section is disabled and
+says why. The name is no inline field: its row opens the rename dialog (`editor.signalRename`,
+plan-590), which previews every by-name reference, the CONNECT changes and the wire effects and
+renames model, overlay, planner, historian and CONNECT together — see `doc-signal-architecture.md`
+§2.6.
+
+## The reconcile report
+
+The report answers, continuously and for every interface, which model signal is bound to what. It is
+**read-only**: it never changes the model and never changes CONNECT — every repair is an action the
+user clicks.
+
+| Category | Meaning |
+|----------|---------|
+| `mapped` | identical name on both sides, compatible type, address where required |
+| `name-variant` | only a quoting variant matches (`"DB".Member` against `DB.Member`) — a suggestion, never a coupling |
+| `missing-in-plc` | a model signal this interface does not carry |
+| `plc-only` | an interface signal no model signal claims |
+| `type-mismatch` | same name, incompatible direction, value kind or data type |
+| `no-address` | same name, but the gateway requires an address this place has not got |
+
+`mapped` means the runtime name equals `SignalConfig.Name` character for character. Nothing is
+matched through a normalisation, because the gateway couples by that exact string — a normalised
+"match" would show a data flow that does not exist. `no-address` appears only where `addressRule` is
+`required`, so an older gateway never produces that warning.
+
+Runs are triggered by model load, placement (`layout-content-added`), CONNECT store changes and
+signal-catalog changes, debounced 250 ms and limited to the interfaces that changed. The output is a
+badge on the interface card, `connect-store.reconcileReports`, and Problems entries under the code
+`signal-reconcile` — one per (interface, category), with the signal list in the detail. From there:
+**Create model signals** for `plc-only` rows (the CONNECT name is taken verbatim, so the result is
+exactly `mapped`; a Text/String signal the model cannot register is shown as `unsupported type`),
+and **Adopt legacy addresses** as a merge-only proposal from a `Comment` prefix or the Unity
+`Metadata`, which never overwrites an existing CONNECT address.
+
+The same report is available read-only over MCP as `web_signal_reconcile`. Architecture and the
+naming rule behind it: [`doc-signal-architecture.md`](doc-signal-architecture.md) §2.4–2.5 and §6.5.
 
 ## Integration with Drives
 
@@ -569,6 +646,241 @@ names the file in `downloadedPath`. The gateway keeps running unchanged; install
 version is the operator's move — stop CONNECT, start the downloaded file. On gateways older than
 this build the swap flow applies instead: success there is the terminal `succeeded`, and a
 reachable `/health` after their restart means only that the connection is back.
+
+## Write gate and silent-PLC prompts (CONNECT)
+
+Two failures used to be completely silent. An interface with `allowWebToPlc = false` — CONNECT's
+default — swallows every viewer write and logs it once; and an interface can report `Connected`
+while not a single PLC output ever arrives, because signals whose tag was never found are
+registered with their default value and the viewer keeps simulating happily. Both are now surfaced,
+and the write gate can be opened from where the operator notices it.
+
+Everything below is driven by `GET /status`. The poll has exactly **one** owner,
+`ConnectStatusPoll` in `connect-plugin.tsx`: it runs every 2 s for as long as the gateway is
+connected — **also while the CONNECT panel is closed**, which is where both prompts live — with a
+5 s abort deadline per request, and answers that arrive after the gateway target moved are
+discarded. The CONNECT panel keeps no timer of its own and only reads the same store.
+
+Both prompts are plugin `overlay` slots with the visibility ids `connect-write-gate-notice` and
+`connect-no-data-notice`, so a deploy can switch either off without a code change. Both are
+non-modal (`role="status"`, no autofocus, Escape dismisses): a modal would block the 3D scene, and
+the viewer stays perfectly usable read-only.
+
+### Write-gate overlay
+
+Appears for an interface when **all** of these hold: the gateway is connected and reachable, the
+interface's `allowWebToPlc` is not `true`, `/status` reports `writesBlockedByGate > 0` for it — i.e.
+a viewer write was really dropped, not merely possible — no "Read only" decision is stored for it,
+and the overlay was not closed for it in this session. At most **one** card is shown (the first
+affected interface); further ones are counted as "+N more interfaces", because answering the first
+usually answers the cause for all of them.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ ⚠ PLCSIM_1 does not accept values from the viewer.                │
+│   BT2_OpMode and 3 more inputs were not sent to the PLC.          │
+│   Allowing writes sends the current input values (42 signals)     │
+│   to PLCSIM Advanced · 192.168.0.10 now.                          │
+│   [Allow writes]  [Read only, don't ask again]                ✕   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The second line counts the **distinct** signal names CONNECT remembers (one signal written 400
+times is one lost input, not 400) and falls back to the raw attempt count when a gateway reports
+only that. The third line is the effect line and it is not decoration: opening the gate restarts
+the CONNECT workers, and the affected worker then writes the viewer's *current* input values to the
+target as part of its connect. That seed is intended — the operator's switch position is supposed
+to arrive — so the target and the number of signals are named **before** the click. There is no
+second confirmation.
+
+Two actions, both commands (`connect.allowWrites`, `connect.readOnly`), so the overlay, the
+interface card and any later surface cannot drift apart on what they mean. Neither has an MCP
+mirror: letting an agent open a PLC write gate on its own is exactly the silent write this feature
+exists to prevent.
+
+- **Allow writes** calls `PUT /config/interfaces/{id}/allow-web-to-plc` with the `configRevision`
+  of the status snapshot **on screen** — never a freshly read one, since the whole point of the
+  comparison is that the gateway refuses the flip when the interface moved since that sentence was
+  written. There is deliberately no fallback to `PUT /config/interfaces/{id}`, which would replace
+  the whole interface from a cached copy and silently revert another client's edits.
+
+  | Outcome | What the overlay does |
+  |---------|-----------------------|
+  | `200` | the gate is open, the interface list is re-read, the card disappears |
+  | `409 revision-mismatch` | "The interface changed - review it first"; `/status` is re-read and the card shows the new state |
+  | `404 interface-not-found` | the question is void — the card closes without an error |
+  | no `configRevision` in the snapshot, `405`, or `404` without a code | "Update CONNECT to allow writes from here" plus an **Open interface settings** button; the request is not even sent when the revision is missing |
+  | network / transport failure | the message, and the card stays |
+
+- **Read only, don't ask again** stores the decision and hides the card for good.
+
+**"Read only" persistence.** The decision is keyed by **gateway and interface** —
+`<serverUrl>|<interfaceId>` — in `localStorage` under `rv-connect-writegate-readonly` (owned by
+`connect-write-gate-store.ts`, listed in the storage reset list). The map holds only the
+*exception* (`true`), so an unknown key reads as "not decided yet" and the overlay still asks once.
+The same id on another CONNECT is another machine and is unaffected. A browser that refuses
+`localStorage` keeps the answer for the session instead of re-asking on every render.
+
+The ✕ and Escape are **not** that decision: they put the question down for this session only, and
+the next session asks again.
+
+**The way back.** A decision without a return path is a trap, so an interface with a stored "Read
+only" and a still-closed gate carries a **"Writes blocked"** chip on its card in the CONNECT panel.
+Clicking it clears the stored decision *and* opens the interface's Edit dialog — leaving the
+decision in place would silence the overlay again the moment the gate stays closed.
+
+### The write-permission question when adding an interface
+
+`AddInterfaceDialog` asks in a second step, after the type was picked:
+
+```
+Add interface → Siemens PLCSIM Advanced →
+  ☑ Allow realvirtual WEB to write inputs to the PLC?
+    Leave on for virtual commissioning. Turn off if the target is a live machine.
+  [Back]  [Create]
+```
+
+The checkbox is **preselected on** — virtual commissioning is what nearly every new interface is
+for, and a viewer that cannot write is the very failure this feature is about — and the answer goes
+into the `addInterface` body as `allowWebToPlc`. CONNECT's own default stays `false`, so the API and
+hand-edited configuration files are unchanged.
+
+Only this path asks. The one-click mirror, the MQTT quick-connect and the tag-table import create
+interfaces too, but none of them is a moment where the user decides what a new PLC link may do:
+they inherit CONNECT's `false` and the write-gate overlay catches them the first time a value is
+actually dropped.
+
+### "Connected, but no PLC outputs received"
+
+The verdict is computed in `connect-no-data-watch.ts` from the `readHealth` block of `/status`
+(`boundReadTags`, `tagsWithValidValue`, `progress`, `workerGeneration`, `progressIsPeriodic`). An
+interface whose worker reports **no** read health — `readHealth` is `null` for every type other
+than PLCSIM Advanced, S7, TwinCAT and OPC UA — is never judged: a wrong "no data" is worse than
+none.
+
+The clock is **`viewer.simTime`, not wall-clock**. A paused simulation produces no viewer writes
+and expects no PLC traffic, so a wall-clock window would accuse the PLC of a silence that is the
+viewer's. The window is **10 s of sim time** (`NO_DATA_WINDOW_S`), per interface **and** per
+`workerGeneration`, starting with the first poll that sees that generation `Connected`.
+
+Two rules:
+
+- **A — "no valid data":** after the window has elapsed, `boundReadTags === 0` → *no readable tags
+  bound*; otherwise `tagsWithValidValue === 0` → *no valid values received*.
+- **B — "data stopped":** progress was observed and then stood still for the window.
+  **Only when `progressIsPeriodic === true`.** On a pure on-change path (TwinCAT `OnChange`, and
+  OPC UA without a single polled signal — there is no OPC-UA keep-alive) a standing value is normal
+  operation, so rule B does not apply there and only rule A can fire.
+
+A PLC in STOP delivers valid constant values and therefore triggers nothing, which is intended.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ ⓘ Connected, but no PLC outputs received.                         │
+│   PLCSIM_1 · no readable tags bound · 12 signal issues            │
+│   [Open log]                                                  ✕   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+One line per silent interface, with the reason and — as context, not as cause — how many configured
+signals the gateway already knows can never decode. **Open log** is the command
+`connect.openLog`, and it does two things in one step: open the CONNECT panel *and* set the log
+flag, because the log dialog only renders inside an open panel while the notice itself appears over
+the 3D view. The log is where the worker already wrote down *why* nothing arrives.
+
+The verdict is recomputed from scratch on every poll, so the notice **disappears by itself** as
+soon as data flows again. ✕ and Escape dismiss it once per interface and worker generation; a
+worker restart (a new `workerGeneration`), a sim reset (`simTime` jumping back), leaving
+`Connected` or a gateway disconnect all start a fresh observation window, and a late-connecting
+second interface gets its own.
+
+## Viewer surface picks and scene scale (plan-515)
+
+Two viewer-side APIs that HMI code and interfaces reading the 3D view can use
+(both exist in `RVViewer` and `RVEmbedViewer`):
+
+- `viewer.raycastManager.raycastSurface(clientX, clientY, out)` — "what surface is
+  under this pixel": same visibility / isolation / allow gates as a selection pick but
+  no hover-type gate; an unselectable opaque blocker counts as a surface
+  (`out.blocked = true`), transparent segments and hidden nodes pass. Writes into a
+  caller-owned `SurfaceHit` (`point`, `distance`, `blocked`, `path`, optional `ray`);
+  `false` = background. Changes no hover state.
+- `viewer.sceneScale.get()` — the one source of the content bounds (`center`,
+  `radius` ≥ 0.5 mm, `maxDim`, `empty`), recomputed after content events and, while the
+  simulation runs, grow-only for moving content every 500 ms; `onChange(cb)` notifies
+  after a change. Navigation near/far and the scale-derived constants (gizmo, ground
+  checker, FPV, shadows) read it — see `doc-webviewer.md` § Camera Controls.
+
+## Render mode (plan-761)
+
+The viewer's shading is ONE command with three views — the toolbar pill, the Visual tab
+dropdown and the MCP tool — all implemented by one core setter:
+
+- `setRenderMode(viewer, mode)` (`src/core/hmi/render-mode-controller.ts`), `mode` =
+  `'simple' | 'default' | 'toon'` (labels Unlit / Shaded / Toon from `RENDER_MODES`). Order:
+  an *applied* editor wireframe is switched off first, the per-mode lighting values are
+  pushed, `renderMode` is persisted (Visual settings), then `viewer.renderMode` is set — which
+  emits `render-mode-changed`. The same mode without an applied wireframe is a true no-op
+  (no material recompile); the same mode with wireframe applied only leaves the wireframe.
+  `wireframe` itself is never persisted.
+- Command `view.renderMode { mode }` (`src/core/hmi/view-commands.ts`, open and eager;
+  `ensureViewCommandsRegistered()`), button key `view.renderMode:<mode>`. It refuses with a
+  reason when the deployment locks the Visual settings (`lockSettings` or
+  `lockedTabs: ['visual']`) and for any other value — `'wireframe'` included: the editor's
+  wireframe view stays with `editor.wireframe` (Shift+Z, `web_editor_shortcut`).
+- MCP: `web_view_render_mode(mode)` is bound to that command (origin `mcp`, afterglow on the
+  matching pill segment); `web_status` reports `renderMode` and `wireframe` (the applied
+  editor view).
+- The pill (`RenderModeGroup`, `src/core/hmi/RenderModeBar.tsx`) sits first in the
+  bottom-right view cluster: three radio segments, plus a Wireframe segment with divider
+  that exists only in the editor workspace. Its active value is
+  `wireframeActive ? 'wireframe' : renderMode` — a UI single axis over the two viewer fields;
+  it re-renders on `render-mode-changed`, `wireframe-changed` and `mode-changed`. With
+  locked Visual settings the pill is not rendered at all.
+
+## Visual quality preset (plan-591)
+
+The SECOND axis of the same menu, and a separate command: shading is *how* the scene is lit,
+the quality preset is *how much* is computed (resolution, antialias, shadow-map size, AO,
+reflection, UI blur). Folding the dials into `setRenderMode` was rejected on purpose — that
+setter stays limited to mode plus lighting.
+
+- `applyVisualPresetByName(viewer, name, source)` (`src/core/hmi/visual-presets.ts`) is the one
+  entry point: it drops an *applied* editor wireframe first (otherwise the per-frame
+  suppression switches shadows / AO / reflection straight back off), bumps the apply epoch,
+  merges the preset over the live settings, persists, and pushes the result through
+  `viewer.applyVisualSettings`. It returns `{ name, source, antialiasNeedsReload }`, or `null`
+  when the name does not exist in that tier.
+- `source` is `'shipped'` (only `public/presets`) or `'any'` (published + browser-local, the
+  default). It travels in the command ARGUMENT all the way to the apply: `listPresets()` lets
+  a local preset win a name clash, so dispatching on the bare name would let a local
+  "Default" hijack the Max Quality row. There is **no fallback** between the tiers — a missing
+  shipped preset is a refusal with a reason, never a silent substitution.
+- Command `view.visualPreset { name, source? }` (`src/core/hmi/view-commands.ts`, open and
+  eager), button key `view.visualPreset:<name>`. `enabled()` and `run()` resolve through the
+  same `presetsForSource(source)`, so the refusal text names exactly the set that would be
+  applied. It refuses on the same lock as `view.renderMode`.
+- MCP: `web_view_visual_preset(name, source?)` is bound to that command. `web_status` reports
+  `visualPreset` (the matching preset name, `null` on "Custom") and `antialiasActive` — the
+  latter is the only observable that proves a reload took effect, since `antialias` is a
+  renderer *constructor* parameter.
+- Views: the two action rows "Max Quality" / "Fast" at the end of the render-mode menu
+  (`source: 'shipped'`, active marking from `matchPreset(listShippedPresets())` — the same
+  list they resolve against) and the Visual tab's preset dropdown (`source: 'any'`).
+- `applyVisualSettings` applies `maxDpr` too, and pushes the renderer's new pixel ratio onto
+  an EXISTING `EffectComposer` (`PostProcessingManager.syncPixelRatio()`): without that the
+  beauty pass turns sharp while the AO / bloom buffers stay coarse. No-op on WebGPU, which
+  has no composer.
+- `subscribeVisualSettings(cb)` (`visual-settings-store.ts`) is notified by every
+  `saveVisualSettings`. It is what keeps the active marking correct after a single slider
+  move (which walks the state to "Custom" without emitting `render-mode-changed`) and what
+  makes the reload hint reactive. Listeners must return PRIMITIVE snapshots.
+- Reload hint: `ReloadHintHost` (`src/core/hmi/reload-hint-store.tsx`), registered in
+  `App.tsx`. Pure derived state (`settings.antialias !== viewer.antialiasActive`) plus a
+  dismiss epoch, so a dismiss lasts exactly until the next apply and a stale hint is
+  impossible. It is **suppressed on touch devices** at both display paths (this host and the
+  Visual tab's own "Reload required"), because `main.ts` vetoes antialias there on every boot
+  and a reload could not resolve the mismatch — plan-592 removes that gate.
 
 ## Unity-Side Setup
 

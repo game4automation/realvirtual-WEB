@@ -80,8 +80,10 @@ export const PROJECT_TREE_ROW_HEIGHT = 22;
 /** Drag-insertion accent — the same Instrument Blue the scene hierarchy uses. */
 const DND_ACCENT = '79, 195, 247';
 
-/** MIME-ish key for the internal drag payload. */
-const DRAG_TYPE = 'application/x-rv-project-tree';
+/** The tree's own drag payload: the dragged node's tree path. Exported so a
+ *  folder TILE can accept a row dragged out of the tree (host wiring). */
+export const PROJECT_TREE_DRAG_TYPE = 'application/x-rv-project-tree';
+const DRAG_TYPE = PROJECT_TREE_DRAG_TYPE;
 
 export interface ProjectTreeProps {
   roots: readonly ProjectTreeNode[];

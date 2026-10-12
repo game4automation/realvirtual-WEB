@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { Object3D, Vector3, Quaternion } from 'three';
+import { Object3D, Quaternion, Vector3 } from 'three';
 import type { RVMovingUnit } from './rv-mu';
 import type { RVSensor } from './rv-sensor';
 import type { RVGripTarget } from './rv-grip-target';
@@ -11,12 +11,22 @@ import { registerComponent, loadSchemaFromSpec } from './rv-component-registry';
 import { wireBoolSignal } from './rv-signal-wiring';
 import { debug } from './rv-debug';
 import { MM_TO_METERS } from './rv-constants';
+import { PHYSICS_FIXED_DT } from './rv-physics-constants';
+import {
+  decideCarrierPlacement, findCarrierByCollider, forEachInLoadTree, loadMu, type MULoadHost,
+} from './rv-mu-load';
+import {
+  alignToGripTarget, detachMU, findNearestGripTarget, holdMU, placeOnGripTarget, sceneRootOf,
+} from './rv-mu-hold';
+import {
+  clearProblem, clearSeatOccupiedProblems, reportSeatOccupied, seatOccupiedProblemId,
+} from '../hmi/problems-store';
 
 // Pre-allocated temps (no GC in hot path)
 const _gripWorldPos = new Vector3();
-const _tmpVec = new Vector3();
-const _tmpQuat = new Quaternion();
-const _tmpParentQuat = new Quaternion();
+// Pose of a part in the grip before a LoadOnCarrier place check (plan-577).
+const _heldPos = new Vector3();
+const _heldQuat = new Quaternion();
 
 /**
  * RVGrip — TypeScript port of Grip.cs
@@ -65,6 +75,12 @@ export class RVGrip implements RVComponent {
   allMUs: (() => (RVMovingUnit | { isInstanced: boolean })[]) | null = null;
   /** All grip targets (set by transport manager) */
   allGripTargets: (() => RVGripTarget[]) | null = null;
+  /** Where loads leave / join the ticked MU set (plan-516) — the transport
+   *  manager; null in standalone setups (the load links still update). */
+  loadHost: MULoadHost | null = null;
+  /** Physics handover seam (plan-525 §2.7) — the transport manager; null in
+   *  standalone setups (PlaceMode Physics then behaves like Static + warning). */
+  physicsHost: GripPhysicsHost | null = null;
 
   // Pick/Place control (set by signal subscriptions or sensor callbacks)
   pickObjects = false;
@@ -77,6 +93,20 @@ export class RVGrip implements RVComponent {
 
   /** SignalPick/SignalPlace store subscriptions + re-apply slots (plan-427 F6). */
   private readonly signalUnsubs: (() => void)[] = [];
+
+  // Grip velocity for the PlaceMode 'Physics' handover (plan-525 §2.7): world
+  // position difference of the grip node over the last two ticks, in m/s.
+  // Pre-allocated — sampled every tick, no allocation.
+  private readonly _velPrev = new Vector3();
+  private readonly _velCur = new Vector3();
+  /** World velocity of the grip node over the last tick (m/s). */
+  readonly velocity = new Vector3();
+  private _velSamples = 0;
+  /** One warning per grip when a Physics place could not hand over. */
+  private _physicsFallbackWarned = false;
+  /** Ids of the "seat occupied" warnings THIS grip raised (plan-577 F8) — a
+   *  successful place clears only these, never another grip's. */
+  private readonly _seatProblemIds = new Set<string>();
 
   constructor(node: Object3D) {
     this.node = node;
@@ -95,6 +125,8 @@ export class RVGrip implements RVComponent {
     this.signalStore = context.signalStore;
     this.allMUs = () => context.transportManager.mus;
     this.allGripTargets = () => context.transportManager.gripTargets;
+    this.loadHost = context.transportManager;
+    this.physicsHost = context.transportManager;
     this.collisionRegistrar = context.collisionManager ?? null;
 
     // Wire signal subscriptions. Both are LEVEL setters — the pick/place flank
@@ -149,31 +181,14 @@ export class RVGrip implements RVComponent {
     // physics-owned MUs; never attach one even if a caller bypasses it.
     if (mu.physicsOwned) return;
 
-    // Free the GripTarget this MU was sitting on (if any). The C# Grip clears the
-    // source Fixer/GripTarget when it picks a part; without this the target stays
-    // occupied forever, which (a) blocks follow-up parts from ever being parented
-    // onto it (so they no longer co-move with a moving target / machine axis), and
-    // (b) leaves parentBeforeGrip pointing at the target node — so a later fallback
-    // release would drop the part right back onto the (moving) target.
-    const sourceTargets = this.allGripTargets?.();
-    if (sourceTargets) {
-      for (const t of sourceTargets) {
-        if (t.occupiedBy === mu) t.clearOccupied();
-      }
-    }
-
-    // Save parent before gripping
-    mu.parentBeforeGrip = mu.node.parent;
-
-    // Three.js attach() preserves world transform while reparenting
-    this.node.attach(mu.node);
-
-    mu.heldBy = 'grip';
-    mu.currentSurface = null;
-    mu.lastSurfaceTickId = undefined;
+    // Attach + owner tag + transport/load/target state: the shared hold
+    // kernel (plan-521) — the grip keeps only its own list.
+    holdMU(mu, this.node, 'grip', {
+      gripTargets: this.allGripTargets?.(),
+      loadHost: this.loadHost,
+      collision: this.collisionRegistrar,
+    });
     this.grippedMUs.push(mu);
-    // The MU now lives in the gripper's subtree — refresh the F16 relation.
-    this.collisionRegistrar?.invalidate();
 
     debug('grip', `Grip "${this.node.name}" picked MU "${mu.getName()}"`);
   }
@@ -192,34 +207,35 @@ export class RVGrip implements RVComponent {
     // physics-owned; ignore the impossible combination defensively instead of
     // re-parenting a body the provider is actively posing.
     if (mu.physicsOwned) return;
+    const target = this.PlaceMode === 'Auto' ? this.findNearestGripTarget() : null;
+    if (target?.LoadOnCarrier) {
+      // plan-577: a refused place keeps the part (and this grip's warning).
+      if (this.placeAtCarrierTarget(mu, target)) this.clearOwnSeatProblems();
+      return;
+    }
+    // Every other place succeeds and retires this grip's "seat occupied" warnings (F8).
+    if (this._seatProblemIds.size > 0) this.clearOwnSeatProblems();
+    if (this.PlaceMode === 'Physics') {
+      this.placePhysics(mu);
+      return;
+    }
     if (this.PlaceMode === 'Auto') {
-      // Priority 0: Find nearest free GripTarget
-      const target = this.findNearestGripTarget();
+      // Priority 0: the nearest free GripTarget
       if (target) {
         this.unfix(mu);
-        if (target.AlignPosition) {
-          target.node.getWorldPosition(_tmpVec);
-          mu.node.position.copy(_tmpVec);
-          mu.node.parent?.worldToLocal(mu.node.position);
-        }
-        if (target.AlignRotation) {
-          // Want the MU's WORLD rotation to equal the GripTarget's after attach()
-          // (which preserves world transform). So set the MU's LOCAL quaternion to
-          // parentWorld⁻¹ ⊗ targetWorld. Copying the target's world quaternion
-          // straight into the (local) quaternion double-rotated the part whenever
-          // the MU's current parent was itself rotated.
-          target.node.getWorldQuaternion(_tmpQuat);
-          mu.node.quaternion.copy(_tmpQuat);
-          if (mu.node.parent) {
-            mu.node.parent.getWorldQuaternion(_tmpParentQuat);
-            mu.node.quaternion.premultiply(_tmpParentQuat.invert());
-          }
-        }
-        // Reparent MU to GripTarget (matches C# Grip.AutoPlace behavior).
-        // If the GripTarget is on a moving object, the MU follows it.
-        target.node.attach(mu.node);
-        target.setOccupied(mu);
+        placeOnGripTarget(mu, target);
         debug('grip', `Grip "${this.node.name}" placed MU "${mu.getName()}" on GripTarget "${target.node.name}"`);
+        return;
+      }
+      // Priority 1 (plan-516): an MU right below the part, by collider (F2) —
+      // the part becomes its passive load and rides along from now on.
+      const mus = this.allMUs?.();
+      const carrier = mus ? findCarrierByCollider(mu, mus) : null;
+      if (carrier) {
+        this.unfix(mu, true);
+        loadMu(mu, carrier, this.loadHost);
+        this.collisionRegistrar?.invalidate();
+        debug('grip', `Grip "${this.node.name}" placed MU "${mu.getName()}" onto MU "${carrier.getName()}"`);
         return;
       }
     }
@@ -230,6 +246,97 @@ export class RVGrip implements RVComponent {
     this.unfix(mu, true);
   }
 
+  /**
+   * The `LoadOnCarrier` place (plan-577 §2.4): align the part at `target`
+   * while it is still in the grip, decide (`decideCarrierPlacement`), then
+   *  - `free` → the part (and what it carries) becomes the carrier's load, the
+   *    target stays free;
+   *  - `noCarrier` → classic target placement;
+   *  - `blocked` → nothing is committed: the moving tree is put back to its
+   *    pose in the grip, the grip keeps it, a "seat occupied" warning is raised.
+   * Returns true when the part was placed.
+   */
+  private placeAtCarrierTarget(mu: RVMovingUnit, target: RVGripTarget): boolean {
+    const node = mu.node;
+    _heldPos.copy(node.position);
+    _heldQuat.copy(node.quaternion);
+    node.parent?.updateWorldMatrix(true, false);
+    alignToGripTarget(mu, target);
+    node.updateWorldMatrix(true, true);
+    const decision = decideCarrierPlacement(mu, this.allMUs?.() ?? []);
+
+    if (decision.kind === 'blocked') {
+      // Nothing committed: the whole moving tree goes back to its pose in the grip.
+      node.position.copy(_heldPos);
+      node.quaternion.copy(_heldQuat);
+      node.updateMatrix(); // also for a frozen node (matrixAutoUpdate false)
+      node.updateWorldMatrix(true, true);
+      mu.updateAABB();
+      forEachInLoadTree(mu, (m) => m.updateAABB());
+      const id = seatOccupiedProblemId(this.node.uuid, target.node.uuid);
+      this._seatProblemIds.add(id);
+      reportSeatOccupied({
+        id,
+        grip: this.node.name,
+        target: target.node.name,
+        part: mu.getName(),
+        carrier: decision.carrier?.getName() ?? null,
+        obstacle: decision.obstacle.getName(),
+        ambiguous: decision.ambiguous,
+      });
+      debug('grip', `Grip "${this.node.name}" refused to place MU "${mu.getName()}" at GripTarget "${target.node.name}": blocked by "${decision.obstacle.getName()}"`);
+      return false;
+    }
+    if (decision.kind === 'free') {
+      this.unfix(mu, true); // world pose (aligned) kept
+      if (loadMu(mu, decision.carrier, this.loadHost)) {
+        this.collisionRegistrar?.invalidate();
+        debug('grip', `Grip "${this.node.name}" placed MU "${mu.getName()}" at GripTarget "${target.node.name}" onto MU "${decision.carrier.getName()}"`);
+        return true;
+      }
+      placeOnGripTarget(mu, target); // load refused (cycle) → never left floating
+      return true;
+    }
+    // No carrier and nothing in the way → classic target placement.
+    this.unfix(mu);
+    placeOnGripTarget(mu, target);
+    debug('grip', `Grip "${this.node.name}" placed MU "${mu.getName()}" on GripTarget "${target.node.name}" (no carrier below)`);
+    return true;
+  }
+
+  private clearOwnSeatProblems(): void {
+    for (const id of this._seatProblemIds) clearProblem(id);
+    this._seatProblemIds.clear();
+  }
+
+  /**
+   * PlaceMode 'Physics' (plan-525 §2.7): release under the stable
+   * StandardParent (world pose kept, rotation included), bring the MU's world
+   * matrix and AABB up to THIS tick — the grip runs before the transport
+   * manager's central AABB update, and a stale AABB would decide the zone test
+   * on last tick's position — then hand it to the physics provider with the
+   * grip's own velocity as start velocity. When physics cannot take it (off,
+   * provider not ready, outside every zone) the part stays where it was
+   * released, exactly like 'Static', with one warning per grip.
+   */
+  private placePhysics(mu: RVMovingUnit): void {
+    this.unfix(mu, true);
+    mu.node.updateWorldMatrix(true, true);
+    mu.updateAABB();
+    const handed = this.physicsHost?.tryHandoverToPhysics(mu, this.velocity) ?? false;
+    if (handed) {
+      debug('grip', `Grip "${this.node.name}" handed MU "${mu.getName()}" to physics`);
+      return;
+    }
+    if (!this._physicsFallbackWarned) {
+      this._physicsFallbackWarned = true;
+      console.warn(
+        `[Grip] "${this.node.name}": PlaceMode Physics could not hand "${mu.getName()}" to physics `
+        + '(physics off, provider not ready or outside every physics zone) — placed like Static',
+      );
+    }
+  }
+
   // Releases the MU. `toStandardParent` mirrors C# AutoPlace: a Place() that did
   // NOT land on a GripTarget reparents to the StandardParent (here the scene root)
   // at the current world position — NOT to parentBeforeGrip, which for a part
@@ -238,27 +345,16 @@ export class RVGrip implements RVComponent {
   // plain release (no auto-place) restores the pre-grip parent.
   private unfix(mu: RVMovingUnit, toStandardParent = false): void {
     // Owner tag (plan-259 O1b): the grip only releases what IT holds — an MU
-    // held by a connection (StopOnExit) is never freed from here.
-    if (mu.heldBy === 'grip') mu.heldBy = null;
-
-    // Reparent preserving world transform.
+    // held by a connection (StopOnExit) or a zone is never freed from here.
+    // Re-parenting and the collision invalidate live in the shared kernel.
     const restoreParent = toStandardParent
       ? this.sceneRoot()
       : (mu.parentBeforeGrip ?? this.node.parent);
-    if (restoreParent) {
-      restoreParent.attach(mu.node);
-    }
-    mu.parentBeforeGrip = null;
+    detachMU(mu, 'grip', restoreParent, this.collisionRegistrar);
 
     // Remove from gripped list
     const idx = this.grippedMUs.indexOf(mu);
     if (idx >= 0) this.grippedMUs.splice(idx, 1);
-
-    // The MU left the gripper's subtree — refresh the F16 relation. autoPlace
-    // may re-parent once more (onto the GripTarget) in the same synchronous
-    // call; the dirty flag is read only at the next tick head, so one
-    // invalidate covers the final hierarchy.
-    this.collisionRegistrar?.invalidate();
 
     debug('grip', `Grip "${this.node.name}" released MU "${mu.getName()}"`);
   }
@@ -267,26 +363,69 @@ export class RVGrip implements RVComponent {
    *  release parts into at their current world position (the StandardParent-null
    *  equivalent of C# ReparentToStandardParent). */
   private sceneRoot(): Object3D {
-    let n: Object3D = this.node;
-    while (n.parent) n = n.parent;
-    return n;
+    return sceneRootOf(this.node);
   }
 
   // ── Detection ──
 
+  /** Shortest distance (m) from the grip point `_gripWorldPos` to an MU's collider box. */
+  private static distanceToGripPoint(mu: RVMovingUnit): number {
+    const aabb = mu.aabb;
+    const dx = Math.max(0, Math.max(aabb.min.x - _gripWorldPos.x, _gripWorldPos.x - aabb.max.x));
+    const dy = Math.max(0, Math.max(aabb.min.y - _gripWorldPos.y, _gripWorldPos.y - aabb.max.y));
+    const dz = Math.max(0, Math.max(aabb.min.z - _gripWorldPos.z, _gripWorldPos.z - aabb.max.z));
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  /**
+   * Candidate search. Active MUs AND, recursively, their passive loads
+   * (plan-516 F5) are tested against their own collider box — a load counts
+   * even when only IT (not its carrier) is inside the grip range or the
+   * `PartToGrip` volume. The smallest collider↔grip-point distance wins.
+   */
   private findNearestMU(): RVMovingUnit | null {
-    // If PartToGrip sensor is set, use its occupiedMU
+    this.node.getWorldPosition(_gripWorldPos);
+
+    // PartToGrip: the sensor's own detection (active MUs) plus every load whose
+    // collider lies in the sensor volume. The sensor's MU is considered first,
+    // so it keeps the pick on a tie.
     if (this.partToGripSensor) {
-      const sensorMU = this.partToGripSensor.occupiedMU;
+      const sensor = this.partToGripSensor;
+      let nearest: RVMovingUnit | null = null;
+      let minDist = Infinity;
+      const sensorMU = sensor.occupiedMU;
       // physicsOwned gate (plan-276 F15): never grab a falling/tumbling
       // physics-owned MU — same exclusion as gripped MUs.
       if (
         sensorMU && !sensorMU.isInstanced &&
         !(sensorMU as RVMovingUnit).isGripped && !sensorMU.physicsOwned
       ) {
-        return sensorMU as RVMovingUnit;
+        nearest = sensorMU as RVMovingUnit;
+        nearest.updateAABB();
+        minDist = RVGrip.distanceToGripPoint(nearest);
       }
-      return null;
+      const roots = this.allMUs?.() ?? (sensorMU ? [sensorMU] : []);
+      let hasLoads = false;
+      for (const r of roots) {
+        if (!r.isInstanced && (r as RVMovingUnit).loadedMus.length > 0) { hasLoads = true; break; }
+      }
+      if (hasLoads) {
+        sensor.updateAABB();
+        const consider = (load: RVMovingUnit): void => {
+          if (load.isGripped || load.physicsOwned || !sensor.accepts(load)) return;
+          load.updateAABB();
+          if (!sensor.aabb.overlaps(load.aabb)) return;
+          const dist = RVGrip.distanceToGripPoint(load);
+          if (dist < minDist) { minDist = dist; nearest = load; }
+        };
+        for (const r of roots) {
+          if (r.isInstanced) continue;
+          const carrier = r as RVMovingUnit;
+          if (carrier.markedForRemoval) continue;
+          this.visitLoads(carrier, consider);
+        }
+      }
+      return nearest;
     }
 
     // Sphere-AABB overlap (matches Unity Physics.OverlapSphere against BoxColliders).
@@ -295,60 +434,52 @@ export class RVGrip implements RVComponent {
     if (!mus) return null;
 
     const rangeM = this.GripRange / MM_TO_METERS;
-    this.node.getWorldPosition(_gripWorldPos);
 
     let nearest: RVMovingUnit | null = null;
     let minDist = Infinity;
-
-    for (const mu of mus) {
-      if (mu.isInstanced) continue;
-      const cloneMU = mu as RVMovingUnit;
+    const consider = (cloneMU: RVMovingUnit): void => {
       // physicsOwned gate (plan-276 F15) — falling/tumbling MUs are the
       // physics provider's; picking one would fight the pose sync.
-      if (cloneMU.markedForRemoval || cloneMU.isGripped || cloneMU.physicsOwned) continue;
-
-      // Ensure AABB is fresh (grips run before MU AABB update in transport loop)
+      if (cloneMU.markedForRemoval || cloneMU.isGripped || cloneMU.physicsOwned) return;
+      // Ensure AABB is fresh (grips run before MU AABB update in transport loop;
+      // a passive load is never updated by the tick at all)
       cloneMU.updateAABB();
-      // Compute shortest distance from grip sphere center to MU AABB surface
-      const aabb = cloneMU.aabb;
-      const dx = Math.max(0, Math.max(aabb.min.x - _gripWorldPos.x, _gripWorldPos.x - aabb.max.x));
-      const dy = Math.max(0, Math.max(aabb.min.y - _gripWorldPos.y, _gripWorldPos.y - aabb.max.y));
-      const dz = Math.max(0, Math.max(aabb.min.z - _gripWorldPos.z, _gripWorldPos.z - aabb.max.z));
-      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
+      const dist = RVGrip.distanceToGripPoint(cloneMU);
       if (dist <= rangeM && dist < minDist) {
         minDist = dist;
         nearest = cloneMU;
       }
+    };
+
+    for (const mu of mus) {
+      if (mu.isInstanced) continue;
+      const cloneMU = mu as RVMovingUnit;
+      consider(cloneMU);
+      if (!cloneMU.markedForRemoval && cloneMU.loadedMus.length > 0) this.visitLoads(cloneMU, consider);
     }
     return nearest;
+  }
+
+  /** Visit the passive load tree below `carrier` (not `carrier` itself). */
+  private visitLoads(carrier: RVMovingUnit, fn: (mu: RVMovingUnit) => void): void {
+    const loads = carrier.loadedMus;
+    for (let i = 0; i < loads.length; i++) {
+      fn(loads[i]);
+      this.visitLoads(loads[i], fn);
+    }
   }
 
   private findNearestGripTarget(): RVGripTarget | null {
     const targets = this.allGripTargets?.();
     if (!targets) return null;
-
-    const rangeM = this.GripTargetSearchRadius / MM_TO_METERS;
     this.node.getWorldPosition(_gripWorldPos);
-
-    let nearest: RVGripTarget | null = null;
-    let minDist = rangeM;
-
-    for (const target of targets) {
-      if (!target.isFree) continue;
-      target.node.getWorldPosition(_tmpVec);
-      const dist = _gripWorldPos.distanceTo(_tmpVec);
-      if (dist < minDist) {
-        minDist = dist;
-        nearest = target;
-      }
-    }
-    return nearest;
+    return findNearestGripTarget(targets, _gripWorldPos, this.GripTargetSearchRadius);
   }
 
   // ── Update ──
 
-  fixedUpdate(): void {
+  fixedUpdate(dt: number = PHYSICS_FIXED_DT): void {
+    this.sampleVelocity(dt);
     // OneBitControl: PlaceObjects = !PickObjects
     if (this.OneBitControl) {
       this.placeObjects = !this.pickObjects;
@@ -366,6 +497,18 @@ export class RVGrip implements RVComponent {
 
     this._pickObjectsBefore = this.pickObjects;
     this._placeObjectsBefore = this.placeObjects;
+  }
+
+  /** Grip velocity = world position change over the last tick (plan-525 §2.7). */
+  private sampleVelocity(dt: number): void {
+    this.node.getWorldPosition(this._velCur);
+    if (this._velSamples > 0 && dt > 0) {
+      this.velocity.subVectors(this._velCur, this._velPrev).divideScalar(dt);
+    } else {
+      this.velocity.set(0, 0, 0);
+    }
+    this._velPrev.copy(this._velCur);
+    if (this._velSamples < 2) this._velSamples++;
   }
 
   // ── Cleanup ──
@@ -392,6 +535,12 @@ export class RVGrip implements RVComponent {
     this.placeObjects = false;
     this._pickObjectsBefore = false;
     this._placeObjectsBefore = false;
+    this._velSamples = 0;
+    this.velocity.set(0, 0, 0);
+    // plan-577 F8: a reset retires every "seat occupied" warning (by code — the
+    // transport manager resets all grips together).
+    this._seatProblemIds.clear();
+    clearSeatOccupiedProblems();
   }
 
   /**
@@ -411,8 +560,15 @@ export class RVGrip implements RVComponent {
     this.signalStore = null;
     this.allMUs = null;
     this.allGripTargets = null;
+    this.loadHost = null;
+    this.physicsHost = null;
     this.collisionRegistrar = null;
   }
+}
+
+/** What a Grip needs for PlaceMode 'Physics' (RVTransportManager implements it). */
+export interface GripPhysicsHost {
+  tryHandoverToPhysics(mu: RVMovingUnit, initialVelocity?: { x: number; y: number; z: number }): boolean;
 }
 
 // Self-register for auto-discovery by scene loader
@@ -421,6 +577,7 @@ registerComponent({
   schema: RVGrip.schema,
   capabilities: {
     authorable: true,   // addable in the asset editor (schema-complete)
+    bake: 'chunk',      // carries picked MUs — a mover (plan-753 §2.3)
   },
   create: (node) => new RVGrip(node),
 });

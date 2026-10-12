@@ -102,7 +102,11 @@ import {
   readScriptRefMigrationMarker,
 } from './rv-project-refs-migration';
 import { knowledgeForDocument, type RvKnowledge } from './rv-project-knowledge';
-import { assertContainedRef, setDocumentRefOn } from './rv-project-refs';
+import {
+  assertContainedRef,
+  setDocumentRefOn,
+  type DocumentRefField,
+} from './rv-project-refs';
 import {
   CONNECT_MIGRATION_HANDOFF,
   migrateConnectRefs,
@@ -113,6 +117,7 @@ import { discoverDeclaredScriptRefs } from '../rv-model-plugin-manager';
 import {
   adoptDiscoveredDocuments as adoptScan,
   applyAdoptDelta,
+  isModelCataloguePath,
   isSidecarMigrated,
   mintReferencedAssets,
   mintableReferences,
@@ -147,20 +152,19 @@ import {
   type DocumentClassification,
 } from './rv-document-classification';
 import { writeDocumentClassification } from './rv-document-classify';
+import { documentInfoCacheEquals, type DocumentInfo } from './rv-document-info';
+import { writeDocumentInfo } from './rv-document-info-write';
 import {
-  classificationOfGlbBlob,
   documentKeyOf,
-  documentOfSceneEntry,
+  documentOfEntry,
   documentsOf,
+  EXTRAS_SCAN_GENERATION,
   readDocuments,
-  assetDocumentsOf,
-  reconcileClassificationCache,
-  sceneDocumentsOf,
-  sectionOfDocument,
+  reconcileSceneExtrasCache,
+  sceneExtrasOfGlbBlob,
   type DocumentStat,
 } from './rv-project-documents';
-import { readRecentProjects, recordRecentProject } from './rv-project-recent';
-import { getWorkspaceHandle } from './rv-project-workspace';
+import { readLinkedProjects, recordLinkedProject } from './rv-project-linked';
 import {
   ensureWorkspaceDefaultManifest,
   isWorkspaceDefaultBackend,
@@ -180,6 +184,7 @@ import {
   type SceneConflictResolution,
 } from './rv-project-conflict';
 import {
+  canonicalNameOf,
   newProject,
   type RvDocumentEntry,
   type RvProject,
@@ -278,6 +283,14 @@ export interface OpenProjectOptions {
 export interface ResolveProjectOptions {
   /** Resolve this project instead of the one recorded last (`?project=`). */
   projectId?: string;
+  /**
+   * plan-759 F4b: the served project is the ONLY answer. When `remoteBaseUrl`
+   * does not yield a manifest, nothing else is tried — not `?project=`, not
+   * the last project of this origin, not a folder grant — so a fetch error on
+   * a hosted deploy shows the error card and never another project behind the
+   * right password (every hosted code shares `web.realvirtual.io`).
+   */
+  remoteRequired?: boolean;
   /** Options for the bundled backend built on demand. */
   bundled?: BundledBackendOptions;
   /** Pre-built DEMO backend. Tests and callers that already made one. */
@@ -333,11 +346,15 @@ export interface ResolvedActiveProject {
   /** Feeds `viewer.availableModels`. */
   models: RvProjectAssetEntry[];
   /**
-   * Scene-section entries of the resolved project.
+   * Every document of the resolved project, typed as the scene entries this
+   * field's consumers used to speak.
    *
    * It used to feed `viewer.availablePublishedScenes` — the second identity
-   * space plan-731 removed. What reads it now is the ordinary document path,
-   * so the comment names the data instead of a consumer that is gone.
+   * space plan-731 removed — and it used to be the SCENE-section subset. Both
+   * are gone: it has no production consumer left, and the subset was wrong
+   * anyway. A browser document's path is its bare id, so once nothing stamped
+   * `section` the scene projection answered "none" for exactly the projects
+   * that have scenes (plan-744 F3).
    */
   scenes: RvProjectSceneEntry[];
   kind: 'bundled' | 'browser' | 'folder';
@@ -526,7 +543,19 @@ function repointToManifestRows(
   return documents.map((doc) => {
     const row = rows.get((doc.path ?? '').replace(/\\/g, '/'));
     if (!row || row === doc) return doc;
-    return { ...doc, ...row, classification: row.classification ?? doc.classification };
+    const merged: RvDocumentEntry = {
+      ...doc, ...row, classification: row.classification ?? doc.classification,
+    };
+    // plan-506 F15, the same rule as `_liveUserDocuments`: a captured row an
+    // extras scan produced knows what the FILE says about its description —
+    // absence included — and a manifest row that has not caught up yet must not
+    // put the stale cache back over it.
+    if (doc.extrasScan === EXTRAS_SCAN_GENERATION) {
+      merged.extrasScan = EXTRAS_SCAN_GENERATION;
+      if (doc.documentInfo) merged.documentInfo = doc.documentInfo;
+      else delete merged.documentInfo;
+    }
+    return merged;
   });
 }
 
@@ -544,6 +573,22 @@ function repointToManifestRows(
 export type ProjectChangeNotifier = () => void;
 
 // ─── Store ──────────────────────────────────────────────────────────────
+
+/**
+ * A write bound to one project (`expectProjectId`) reached the store while a
+ * different project is open (plan-506 F14). Nothing was written into the open
+ * project; the caller keeps its draft.
+ */
+export class ProjectChangedError extends Error {
+  readonly expectedProjectId: string;
+  readonly openProjectId: string | null;
+  constructor(expectedProjectId: string, openProjectId: string | null) {
+    super('The project changed before this edit could be saved — reopen the project to retry.');
+    this.name = 'ProjectChangedError';
+    this.expectedProjectId = expectedProjectId;
+    this.openProjectId = openProjectId;
+  }
+}
 
 export class ProjectStore {
   private _project: RvProject | null = null;
@@ -673,13 +718,67 @@ export class ProjectStore {
   ): Promise<{ project: RvProject; changed: boolean } | null> {
     const dir = this._dir;
     if (!dir) return null;
-    const written = await updateManifestCas(dir, apply);
+    // Every regular write also carries what the open-time scan learnt about the
+    // scene extras (plan-506 F13): the scan itself never writes - opening a
+    // project stays a read - so this is the door the `extrasScan` marker and the
+    // `documentInfo` cache reach the disk through.
+    const written = await updateManifestCas(
+      dir, async current => this._foldScanCache(await apply(current)));
     const changed = written.revision !== written.previousRevision;
     if (opts.notify && changed) this._notifyConnectAsync();
     if (!changed) {
       console.debug(`[project-store] ${reason}: manifest unchanged, nothing announced.`);
     }
     return { project: written.project, changed };
+  }
+
+  /**
+   * Carry the scan-learnt scene-extras cache into a manifest about to be
+   * written (plan-506 F13).
+   *
+   * A row takes the captured `documentInfo` and `extrasScan: 2` only when the
+   * captured row was produced by an extras scan AND its stats are exactly the
+   * row's stats — the marker then truthfully says "these stats belong to the
+   * bytes the cached block was read from". A row whose stats moved away from
+   * the captured ones (the adopt verb refreshed them after a change nobody has
+   * scanned yet) loses the marker instead, so the next open reads it again: a
+   * needless read is cheap, a pre-filter hiding a changed description is not.
+   * `classification` is left to the verbs and the tiers merge — it has its own
+   * rules and this plan does not change them.
+   */
+  private _foldScanCache(project: RvProject): RvProject {
+    const rows = project.documents;
+    if (!Array.isArray(rows) || rows.length === 0 || this._userDocuments.length === 0) return project;
+    const captured = new Map(this._userDocuments.map(d => [documentKeyOf(d), d]));
+    let touched = false;
+    const documents = rows.map(entry => {
+      if (!entry || typeof entry.path !== 'string') return entry;
+      const row = entry as unknown as RvDocumentEntry;
+      const known = captured.get(documentKeyOf(documentOfEntry(entry as unknown as RvProjectSceneEntry)));
+      if (!known) return entry;
+      // The same evidence the pre-filter accepts: an equal digest, or an equal
+      // size AND an equal (present) mtime.
+      const sameStats = (!!known.sha256 && known.sha256 === row.sha256)
+        || (typeof known.sizeBytes === 'number' && known.sizeBytes === row.sizeBytes
+          && typeof known.mtimeMs === 'number' && known.mtimeMs === row.mtimeMs);
+      if (known.extrasScan === EXTRAS_SCAN_GENERATION && sameStats) {
+        if (row.extrasScan === EXTRAS_SCAN_GENERATION
+          && documentInfoCacheEquals(row.documentInfo, known.documentInfo)) return entry;
+        const next: Record<string, unknown> = { ...entry, extrasScan: EXTRAS_SCAN_GENERATION };
+        if (known.documentInfo) next.documentInfo = known.documentInfo;
+        else delete next.documentInfo;
+        touched = true;
+        return next as unknown as typeof entry;
+      }
+      if (row.extrasScan === EXTRAS_SCAN_GENERATION && !sameStats) {
+        const next: Record<string, unknown> = { ...entry };
+        delete next.extrasScan;
+        touched = true;
+        return next as unknown as typeof entry;
+      }
+      return entry;
+    });
+    return touched ? { ...project, documents } : project;
   }
 
   // ─── Subscription ─────────────────────────────────────────────────────
@@ -719,7 +818,7 @@ export class ProjectStore {
    *
    * This is a lazy singleton, and it silently DISCARDS `opts` on every call but
    * the first. There are four call sites with four different options
-   * (`_resolveWorkspaceDemoProject`, two in `main.ts`, one in
+   * (`_resolveLinkedDemoProject`, two in `main.ts`, one in
    * `ProjectsDashboardHost`), so "whoever gets here first decides" was already a
    * sharp edge — and handing it the demo's base path as a caller option would
    * have made it a correctness bug: the demo would read from
@@ -1070,9 +1169,15 @@ export class ProjectStore {
       this._restoreFailure = null;
       try { localStorage.setItem(LS_KEY_LAST_PROJECT, project.id); } catch { /* private mode */ }
       try { await putHandle(dir, projectHandleKey(project.id)); } catch { /* non-fatal */ }
-      // Recents are recorded AFTER the handle is stored: a display row without a
-      // reopenable handle would be a menu entry that does nothing (§4.5).
-      recordRecentProject({ id: project.id, name: project.name, folderName: dir.name });
+      // The link is recorded AFTER the handle is stored: a display row without a
+      // reopenable handle would be a dashboard entry that does nothing (§4.5).
+      recordLinkedProject({
+        id: project.id,
+        name: project.name,
+        slug: project.canonicalName || canonicalNameOf(project.name),
+        folderName: dir.name,
+        opened: true,
+      });
 
       this._publish();
       return true;
@@ -1102,22 +1207,28 @@ export class ProjectStore {
     this._provider = backend;
     this._project = project;
     this._writable = backend.writable;
-    // Both halves come from the BACKEND, not from the manifest field: a folder
-    // project enumerates its models/ folder (every GLB in it belongs to the
-    // project), while the read-only HTTP project has only what the manifest
-    // declares. Reading project.models here would have re-imposed the
-    // manifest-only rule on folders through the back door.
-    const backendModels = await backend.listModels();
     const isBundledBackend = backend.kind === 'bundled';
-    this._bundledModels = isBundledBackend ? backendModels : [];
-    this._userModels = isBundledBackend ? [] : backendModels;
 
     // The one list, split by the same tier rule and reconciled against the
     // files before anybody sees it (§2.5). Failure is non-fatal by design: an
     // out-of-date classification cache is a display detail, and letting it take
     // a project open down would be the worst possible trade.
+    //
+    // ONE call, reused (plan-744 §8): the models projection below used to be a
+    // second `listModels()` against the same backend, which on a folder project
+    // meant a second directory walk per open for a list that is a filter of the
+    // one already in hand.
     const documents = await backend.listDocuments().catch(() => []);
-    const scanned = await this._scanClassifications(backend, documents);
+    const scanned = await this._scanSceneExtras(backend, documents);
+
+    // `_bundledModels`/`_userModels` feed the `?model=` selector catalogue,
+    // which is still a `models/` notion and out of plan-744's scope. What
+    // changed is where the answer comes from: a PLACE filter over the one list
+    // rather than a listing of its own (see `isModelCataloguePath`).
+    const backendModels = scanned
+      .filter(d => isModelCataloguePath(d.path)) as unknown as RvProjectAssetEntry[];
+    this._bundledModels = isBundledBackend ? backendModels : [];
+    this._userModels = isBundledBackend ? [] : backendModels;
     this._bundledDocuments = isBundledBackend ? scanned : [];
     this._userDocuments = isBundledBackend ? [] : scanned;
 
@@ -1263,7 +1374,9 @@ export class ProjectStore {
       }
     }
 
-    const wanted = opts.projectId ?? readLastProjectId();
+    // A hosted boot (F4b) resolves nothing but its served project.
+    const remoteOnly = opts.remoteRequired === true;
+    const wanted = remoteOnly ? null : (opts.projectId ?? readLastProjectId());
 
     // ── `?project=<slug>` naming the bundled demo (plan-726 F7) ───────────
     //
@@ -1280,7 +1393,7 @@ export class ProjectStore {
     // when it was named EXPLICITLY (`opts.projectId`), never from
     // `readLastProjectId()` — a restored session must keep going through the
     // normal resolution so a folder project stays a folder project.
-    if (!backend && opts.projectId) {
+    if (!backend && opts.projectId && !remoteOnly) {
       const named = opts.projectId.trim().toLowerCase();
       if (named === DEMO_PROJECT_SLUG || named === DEMO_PROJECT_ID.toLowerCase()) {
         const manifest = await bundled.readManifest();
@@ -1387,34 +1500,34 @@ export class ProjectStore {
     const hasDeployedManifest = rootBackend.hasDeployedManifest();
 
     if (!backend) {
-      // ── The workspace-folder collision guard (plan-726 F9) ────────────
+      // ── The linked-demo-folder collision guard (plan-726 F9) ──────────
       //
-      // `_resolveWorkspaceDemoProject()` looks for a folder literally named
-      // `demo-realvirtual` in the user's workspace, and that name is not
-      // exotic: it is the folder name this repository uses for the demo
-      // project under `WebViewer-Private~/projects/`. A developer who points
-      // "My Workspace" at that checkout gets a WRITABLE FolderBackend for
-      // `prj_sample` — which silently defeats the read-only contract the demo
-      // is supposed to have (F9), and does it with whatever half-finished
-      // manifest happens to sit in that folder.
+      // `_resolveLinkedDemoProject()` looks for a LINKED project carrying the
+      // demo id, and that collision is not exotic: `demo-realvirtual` is the
+      // folder name this repository uses for the demo project under
+      // `WebViewer-Private~/projects/`. A developer who links that checkout
+      // gets a WRITABLE FolderBackend for `prj_sample` — which silently
+      // defeats the read-only contract the demo is supposed to have (F9), and
+      // does it with whatever half-finished manifest happens to sit in that
+      // folder.
       //
       // The guard is narrow on purpose: it only fires when the deploy itself
       // publishes a `project.json`. In that case the deploy has SAID what the
       // demo is, and a same-named local folder cannot outrank it. Without a
       // root manifest nothing has said anything, and the pre-726 behaviour —
-      // the workspace folder wins, so DemoRealvirtual is editable in a
-      // checkout — is preserved exactly.
+      // the linked folder wins, so DemoRealvirtual is editable in a checkout —
+      // is preserved exactly.
       if (hasDeployedManifest) {
-        const collides = await this._workspaceDemoFolderExists();
+        const collides = await this._linkedDemoFolderExists();
         if (collides) {
           console.warn(
-            '[project] A workspace folder named "'
+            '[project] A linked project folder for "'
             + `${DEMO_PROJECT_FOLDER}" was found, but this deploy publishes its own `
             + 'project.json — opening the read-only deployed demo project instead.',
           );
         }
       } else {
-        const demo = await this._resolveWorkspaceDemoProject();
+        const demo = await this._resolveLinkedDemoProject();
         if (demo) {
           backend = demo.backend;
           project = demo.project;
@@ -1531,11 +1644,20 @@ export class ProjectStore {
     this._pendingDir = dir;
 
     // The manifest first, the folder scan second — same order the pre-413 code
-    // had. A discovered folder whose `models/` has not been scanned yet still
-    // has to show what its manifest declares.
-    const declaredModels = assetDocumentsOf(project, 'models');
-    const models = declaredModels.length > 0 ? declaredModels : await backend.listModels();
-    const scenes = sceneDocumentsOf(project);
+    // had. A discovered folder whose files have not been scanned yet still has
+    // to show what its manifest declares.
+    //
+    // Both halves are PLACE filters over the one list now (plan-744 F1/F3), and
+    // the `scenes` half deliberately is not one: `sceneDocumentsOf()` filtered
+    // on a path heuristic that answers `'library'` for every browser document,
+    // so a boot resolve of a browser project reported no scenes at all. What
+    // the caller wants here is "what can be opened", which is every document.
+    const declaredModels = documentsOf(project).filter(d => isModelCataloguePath(d.path));
+    const models = (declaredModels.length > 0
+      ? declaredModels
+      : (await backend.listDocuments().catch(() => [])).filter(d => isModelCataloguePath(d.path))
+    ) as unknown as RvProjectAssetEntry[];
+    const scenes = documentsOf(project) as unknown as RvProjectSceneEntry[];
     return {
       project,
       backend,
@@ -1583,41 +1705,42 @@ export class ProjectStore {
   }
 
   /**
-   * The DemoRealvirtual folder inside the stored workspace, if it is there.
+   * The demo project's own folder on disk, if the user linked it (plan-726 F9,
+   * rehomed by plan-743).
    *
-   * Never prompts: `getWorkspaceHandle` is asked with `prompt: false`, so a
-   * machine without a workspace (or with a lapsed grant) simply gets null and
-   * falls through to the bundled fallback. When the grant *is* held it covers
-   * every descendant, which is why the folder can be opened writable here
-   * without a second dialog.
+   * Since the workspace root is gone, "the demo folder on disk" means exactly
+   * one thing: a project LINKED under the demo id, whose handle lives at
+   * `projectfolder:<DEMO_PROJECT_ID>`. A demo folder the user never linked is
+   * not known to this build at all, and the bundled demo wins — which is the
+   * documented consequence of dropping the workspace, not a regression of the
+   * guard.
+   *
+   * Never prompts: `prompt: false`, so a lapsed grant is a plain `null` and
+   * falls through to the bundled fallback rather than raising a dialog during
+   * boot.
    */
   /**
-   * Is there a `demo-realvirtual` folder in the stored workspace? (plan-726 F9)
+   * Is the demo project linked as a folder on disk? (plan-726 F9)
    *
    * Read-only reconnaissance for the collision guard: it answers the question
    * WITHOUT constructing a writable `FolderBackend`, which is the whole point —
    * the guard exists so that folder never becomes the active backend when the
-   * deploy publishes its own manifest. Never prompts, and a missing workspace,
-   * a lapsed grant or no such folder are all a plain `false`.
+   * deploy publishes its own manifest.
    */
-  private async _workspaceDemoFolderExists(): Promise<boolean> {
+  private async _linkedDemoFolderExists(): Promise<boolean> {
     try {
-      const workspace = await getWorkspaceHandle({ prompt: false });
-      if (!workspace) return false;
-      await workspace.getDirectoryHandle(DEMO_PROJECT_FOLDER);
-      return true;
+      return (await getFolderHandle(projectHandleKey(DEMO_PROJECT_ID), { prompt: false })) !== null;
     } catch {
       return false;
     }
   }
 
-  private async _resolveWorkspaceDemoProject(): Promise<
+  private async _resolveLinkedDemoProject(): Promise<
     { backend: FolderBackend; project: RvProject; dir: FileSystemDirectoryHandle } | null
   > {
     try {
-      const workspace = await getWorkspaceHandle({ prompt: false });
-      if (!workspace) return null;
-      const dir = await workspace.getDirectoryHandle(DEMO_PROJECT_FOLDER);
+      const dir = await getFolderHandle(projectHandleKey(DEMO_PROJECT_ID), { prompt: false });
+      if (!dir) return null;
       const backend = new FolderBackend(dir, {
         writable: true,
         id: `folder:${DEMO_PROJECT_ID}`,
@@ -1663,7 +1786,13 @@ export class ProjectStore {
       const dir = this._dir;
       const project = resolved.project;
       try { localStorage.setItem(LS_KEY_LAST_PROJECT, project.id); } catch { /* private mode */ }
-      recordRecentProject({ id: project.id, name: project.name, folderName: dir.name });
+      recordLinkedProject({
+        id: project.id,
+        name: project.name,
+        slug: project.canonicalName || canonicalNameOf(project.name),
+        folderName: dir.name,
+        opened: true,
+      });
     }
 
     this._publish();
@@ -1708,7 +1837,13 @@ export class ProjectStore {
   }
 
   private async _reconcileScenes(project: RvProject): Promise<void> {
-    const entries = sceneDocumentsOf(project);
+    // Every document, not a scene-shaped subset (plan-744 F3). What this loop
+    // actually reconciles is "the manifest row against a body in the browser
+    // cache", and since plan-716 ANY document can have one — while the scene
+    // projection it used to ask answered nothing at all for a browser project,
+    // whose paths are bare ids. A document with no cached body falls out one
+    // line down, so widening the input costs a map lookup per row.
+    const entries = documentsOf(project) as unknown as RvProjectSceneEntry[];
     if (entries.length === 0) return;
 
     const conflicts: Array<{
@@ -1913,7 +2048,9 @@ export class ProjectStore {
    * only way to notice is to read it back.
    */
   private async _seedSceneMetas(project: RvProject): Promise<void> {
-    const entries = sceneDocumentsOf(project);
+    // The one list (plan-744 F3) — this only ever looks up ONE id in it, the
+    // project's `activeSceneId`, and that id can name any document.
+    const entries = documentsOf(project);
     if (entries.length === 0) return;
 
     const activeId = typeof project.activeSceneId === 'string' ? project.activeSceneId : null;
@@ -1980,7 +2117,12 @@ export class ProjectStore {
   }
 
   private _sceneEntry(id: string): RvProjectSceneEntry | undefined {
-    return sceneDocumentsOf(this._project).find(e => e.id === id);
+    // By ID over the one list (plan-744 F3). An id is unique across the
+    // manifest, so filtering to a section first could only ever LOSE the row —
+    // which is what happened to every browser document, whose bare-id path the
+    // section heuristic reads as `library`.
+    return documentsOf(this._project).find(e => e.id === id) as
+      unknown as RvProjectSceneEntry | undefined;
   }
 
   // ─── Settings ─────────────────────────────────────────────────────────
@@ -2267,11 +2409,17 @@ export class ProjectStore {
   async rescanDocuments(): Promise<void> {
     const backend = this._backend;
     if (!backend || backend.kind === 'bundled') return;
+    const t0 = performance.now();   // TEMP verb-timing
     const documents = await backend.listDocuments().catch(() => null);
     if (!documents) return;
-    this._userDocuments = await this._scanClassifications(backend, documents);
+    const t1 = performance.now();
+    this._userDocuments = await this._scanSceneExtras(backend, documents);
+    const t2 = performance.now();
     await this._adoptQuietly();
+    const t3 = performance.now();
     this._publish();
+    console.warn(`[verb-timing] rescan: list ${Math.round(t1 - t0)} ms, classify ${Math.round(t2 - t1)} ms, `
+      + `adopt ${Math.round(t3 - t2)} ms, publish ${Math.round(performance.now() - t3)} ms`);
   }
 
   private _mergeDocumentTiers(): TieredDocumentEntry[] {
@@ -2365,13 +2513,26 @@ export class ProjectStore {
     const seen = new Set<string>();
     for (const entry of documentsOf(this._project)) {
       if (!entry || typeof entry.path !== 'string') continue;
-      const doc = documentOfSceneEntry(entry as unknown as RvProjectSceneEntry);
+      const doc = documentOfEntry(entry as unknown as RvProjectSceneEntry);
       const key = documentKeyOf(doc);
       seen.add(key);
       const known = cached.get(key);
-      out.push(known
-        ? { ...known, ...doc, classification: doc.classification ?? known.classification }
-        : doc);
+      if (!known) { out.push(doc); continue; }
+      const merged: RvDocumentEntry = {
+        ...known, ...doc, classification: doc.classification ?? known.classification,
+      };
+      // plan-506 F15: a captured row that an extras scan produced knows what the
+      // FILE says — including that it says nothing. Its `documentInfo` beats the
+      // manifest's, absence included; otherwise the manifest cache stands, with
+      // the capture as the fallback like the classification above.
+      if (known.extrasScan === EXTRAS_SCAN_GENERATION) {
+        merged.extrasScan = EXTRAS_SCAN_GENERATION;
+        if (known.documentInfo) merged.documentInfo = known.documentInfo;
+        else delete merged.documentInfo;
+      } else if (!doc.documentInfo && known.documentInfo) {
+        merged.documentInfo = known.documentInfo;
+      }
+      out.push(merged);
     }
     // Captured rows the manifest does not (yet) list — a document adopted by a
     // scan whose manifest write has not landed. Dropping them would make a
@@ -2394,7 +2555,7 @@ export class ProjectStore {
    * The result is **not** written back here. Persisting it belongs to the next
    * normal manifest write, so opening a project stays a read.
    */
-  private async _scanClassifications(
+  private async _scanSceneExtras(
     backend: ProjectBackend,
     documents: readonly RvDocumentEntry[],
   ): Promise<RvDocumentEntry[]> {
@@ -2408,14 +2569,29 @@ export class ProjectStore {
     if (stats.length === 0) return [...documents];
 
     try {
-      const scanned = await reconcileClassificationCache(documents, {
+      // ONE header-only read per changed document for BOTH cached blocks —
+      // Classification and DocumentInfo (plan-506 risk 5.2). A second scan per
+      // key would double the blob reads of every open.
+      const scanned = await reconcileSceneExtrasCache(documents, {
         stats,
-        readClassification: async path => {
+        readExtras: async path => {
+          // LAZY FIRST (plan-751). `sceneExtrasOfGlbBlob` reads 20 bytes plus
+          // the glTF JSON chunk and slices for exactly that — but a slice can
+          // only stay cheap if what it slices is still a handle. Going through
+          // `readDocumentUrl` means `fetch(url).blob()`, which materialises the
+          // whole file first and hands the slice something it has already paid
+          // for. On a folder project that is every byte of every GLB on every
+          // open; over a network share it is the open.
+          const lazy = await backend.readDocumentBlob?.(path);
+          if (lazy) return await sceneExtrasOfGlbBlob(lazy);
+
+          // Backends that cannot do better (bytes already in memory, or remote
+          // behind a URL) keep the original path — see `readDocumentBlob`.
           const resolved = await backend.readDocumentUrl(path);
           if (!resolved) return null;
           try {
             const blob = await (await fetch(resolved.url)).blob();
-            return await classificationOfGlbBlob(blob);
+            return await sceneExtrasOfGlbBlob(blob);
           } finally {
             resolved.release();
           }
@@ -2454,12 +2630,20 @@ export class ProjectStore {
    * `resolveAssetUrl` survives for the callers that only ever want a string and
    * whose lifetime is a single awaited operation.
    */
-  async resolveAssetSource(relPath: string): Promise<ProjectAssetSource | null> {
+  async resolveAssetSource(
+    relPath: string,
+  ): Promise<(ProjectAssetSource & { revision?: string }) | null> {
     const backend = this._backend;
     if (!backend) return null;
-    const read = (await backend.readDocument(relPath))?.bytes ?? null;
+    const record = await backend.readDocument(relPath);
+    const read = record?.bytes ?? null;
     const bytes = read ? arrayBufferOf(read) : null;
-    if (bytes && isSelfContainedGlb(bytes)) return { kind: 'bytes', bytes };
+    // The revision the backend computed for what it read (plan-546): the file
+    // identity a document draft is stamped with. Carried on BOTH kinds — a URL
+    // source still came from a read whose bytes were hashed — and absent only
+    // when nothing was read, i.e. the URL-only path below.
+    const revision = record?.revision ? { revision: record.revision } : {};
+    if (bytes && isSelfContainedGlb(bytes)) return { kind: 'bytes', bytes, ...revision };
     // Either nothing is stored, or the bytes name sibling files. Falling
     // through to the URL — rather than returning the bytes we already hold —
     // is deliberate: without a base URL the loader cannot fetch those
@@ -2467,7 +2651,7 @@ export class ProjectStore {
     // owned object URL.
     const resolved = await backend.readDocumentUrl(relPath);
     if (!resolved) return null;
-    return { kind: 'url', url: resolved.url, release: resolved.release };
+    return { kind: 'url', url: resolved.url, release: resolved.release, ...revision };
   }
 
   /**
@@ -2526,6 +2710,74 @@ export class ProjectStore {
   }
 
   /**
+   * Change what a document says about itself — its summary and Markdown
+   * description (plan-506 F2/F9/F14).
+   *
+   * Same order as {@link setDocumentClassification}: bundled refused, bytes
+   * first (`writeDocumentInfo`, compare-and-swap), in-memory rows published
+   * before the manifest is awaited, then the manifest cache. The row carries
+   * `extrasScan: 2` from this write on (F13).
+   *
+   * `expectProjectId` binds the call to the project the caller SAW. The
+   * dashboard editor flushes drafts on unmount, which can be after the user
+   * opened another project; without the check that write would land in the new
+   * project's backend under the same document id. It is checked before the
+   * bytes are touched and again before the cache is updated — a project
+   * switched while the write was in flight must not get the old project's row.
+   *
+   * @returns the block the file now carries (stamped), or null when removed.
+   */
+  async setDocumentInfo(
+    documentId: string,
+    info: DocumentInfo | null,
+    opts: { expectProjectId?: string } = {},
+  ): Promise<DocumentInfo | null> {
+    const backend = this._backend;
+    const projectId = this._project?.id ?? null;
+    if (opts.expectProjectId !== undefined && projectId !== opts.expectProjectId) {
+      throw new ProjectChangedError(opts.expectProjectId, projectId);
+    }
+    if (!backend) throw new Error('No project is open.');
+    if (!backend.writable) throw new Error('This project is read-only.');
+    const doc = this._snapshot.documents.find(d => d.id === documentId);
+    if (!doc) throw new Error('That document is no longer part of this project.');
+    if (doc.tier === 'bundled') {
+      throw new Error(`"${doc.name}" is read-only — duplicate it into this project first.`);
+    }
+
+    const result = await writeDocumentInfo(backend, doc, info);
+    if (this._backend !== backend || (this._project?.id ?? null) !== projectId) {
+      // The bytes landed in the right file; the cache of a project that is no
+      // longer open is repaired by its next scan, never written from here.
+      throw new ProjectChangedError(opts.expectProjectId ?? projectId ?? '', this._project?.id ?? null);
+    }
+    const next = result.documentInfo ?? undefined;
+
+    const key = documentKeyOf(doc);
+    const patch = (e: RvDocumentEntry): RvDocumentEntry => {
+      const out: RvDocumentEntry = { ...e, extrasScan: EXTRAS_SCAN_GENERATION };
+      if (next) out.documentInfo = next;
+      else delete out.documentInfo;
+      return out;
+    };
+    const apply = (list: RvDocumentEntry[]) => list.map(e => documentKeyOf(e) === key ? patch(e) : e);
+    this._userDocuments = apply(this._userDocuments);
+    this._bundledDocuments = apply(this._bundledDocuments);
+    this._publish();
+
+    // `notify: false`: a description is not configuration — the gateway has no
+    // use for it, unlike the classification that says what a document IS.
+    await this._commitManifest('setDocumentInfo', current => {
+      const base = current ?? this._project;
+      if (!base) throw new Error('This project has no manifest to update.');
+      const documents = (base.documents ?? []).map(
+        e => documentKeyOf(e) === key ? patch(e as unknown as RvDocumentEntry) as unknown as typeof e : e);
+      return { ...base, documents };
+    }, { notify: false });
+    return result.documentInfo;
+  }
+
+  /**
    * Set or clear one document's CONNECT binding (`documents[].connectRef`,
    * plan-718 §3) — the write half of the hero card's Unity-style reference.
    *
@@ -2545,9 +2797,22 @@ export class ProjectStore {
     return this._setDocumentRefField(documentId, 'knowledgeRef', ref);
   }
 
+  /**
+   * The `scriptRef` twin of {@link setDocumentConnectRef} (plan-479 Phase 0).
+   *
+   * The third of the three reference fields, and the last one that still had to
+   * be written by hand into `project.json`. Same write path, same containment
+   * rule, same notify — the field is the only difference, which is why
+   * {@link _setDocumentRefField} takes {@link DocumentRefField} rather than a
+   * union that has to be extended once per field.
+   */
+  async setDocumentScriptRef(documentId: string, ref: string | null): Promise<void> {
+    return this._setDocumentRefField(documentId, 'scriptRef', ref);
+  }
+
   private async _setDocumentRefField(
     documentId: string,
-    field: 'connectRef' | 'knowledgeRef',
+    field: DocumentRefField,
     ref: string | null,
   ): Promise<void> {
     const backend = this._backend;
@@ -3043,7 +3308,7 @@ export class ProjectStore {
  */
 function projectNameOf(projectId: string): string | undefined {
   if (!projectId) return undefined;
-  const hit = readRecentProjects().find(e => e.id === projectId);
+  const hit = readLinkedProjects().find(e => e.id === projectId);
   const name = hit?.name?.trim();
   return name ? name : undefined;
 }
@@ -3085,7 +3350,10 @@ export function sameDocuments(
       || x.connectRef !== y.connectRef
       || x.scriptRef !== y.scriptRef
       || x.knowledgeRef !== y.knowledgeRef
-      || !classificationEquals(x.classification, y.classification)) return false;
+      || !classificationEquals(x.classification, y.classification)
+      // plan-506 F15: WITH the stamps — a scan that found a newer `updatedAt`
+      // or a removed block is a change the snapshot must carry.
+      || !documentInfoCacheEquals(x.documentInfo, y.documentInfo)) return false;
   }
   return true;
 }

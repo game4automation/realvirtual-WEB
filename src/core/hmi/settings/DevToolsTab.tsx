@@ -1,26 +1,57 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Typography, Box, Button, CircularProgress, Switch, TextField } from '@mui/material';
 import { PlayArrow, CleaningServices } from '@mui/icons-material';
 import { useViewer } from '../../../hooks/use-viewer';
 import { StatRow, BudgetRow, budgetPct, SettingsSection, FieldRow } from './settings-helpers';
 import { isMetadataLoadingEnabled, DISABLE_METADATA_LS_KEY } from '../../engine/rv-dev-load-flags';
 import type { RenderBackendId, RenderBackendStatus } from '../../render-backend/rv-render-backend';
-import { ModelCache } from '../../../plugins/layout-planner/model-cache';
+import { ModelCache } from '../../engine/rv-model-cache';
+import {
+  CACHE_OUTCOMES,
+  cacheOutcomeVersion,
+  clearCacheOutcomes,
+  getCacheOutcomes,
+  getCacheStorageEstimate,
+  type CacheOutcome,
+} from '../../engine/rv-asset-cache-outcomes';
 import { clearCache as clearLibrarySnapCache } from '../../../plugins/snap-point/library-snap-index';
 
 interface DevStats {
-  // Rendering
+  // Rendering — `drawCalls` / `renderTriangles` are the SCENE pass of the
+  // last rendered frame; `frameBreakdown` is the dimmed per-pass line.
   fps: number;
   frameTime: number;
   drawCalls: number;
+  renderTriangles: number;
+  /** "total N · ao N · outline N · shadow N · post N · overlay N …" (only non-zero buckets after total). */
+  frameBreakdown: string;
+  frameTotalTriangles: number;
   geometries: number;
   textures: number;
+  renderTargets: number;
   programs: number;
   heapMB: string;
+  /** `performance.memory.jsHeapSizeLimit` in MB, or 0 when the browser hides it. */
+  heapLimitMB: number;
   renderer: string;
+  // Bake (plan-753 Phase 3: planner placements = BakeRegistry instances)
+  bakeAssets: number;
+  bakeChunks: number;
+  /** From the planner's ModelCache — -1 when no planner is loaded. */
+  bakeVertices: number;
+  bakeTriangles: number;
+  bakeInstances: number;
+  /** Deferred placements of the open layout still materializing (0 = scene complete). */
+  placementsPending: number;
+  placementsTotal: number;
+  /** `cacheOutcomeVersion()` — changes whenever the asset-cache ring does (plan-508). */
+  cacheVersion: number;
+  bakeChunkMeshes: number;
+  bakeKeepMeshes: number;
+  bakeDrawCalls: number;
   // GPU (active adapter + best-effort other adapters; see rv-gpu-info.ts)
   gpuActive: string;
   gpuArchitecture?: string;
@@ -32,7 +63,7 @@ interface DevStats {
   gpuSeverity: 'ok' | 'warning' | 'critical';
   gpuMessage?: string;
   gpuAction?: string;
-  // Scene (from GLB)
+  // Scene (from GLB) — load-time counts, independent of what the frame drew
   triangles: number;
   meshesInGlb: number;
   materialsOriginal: number;
@@ -40,20 +71,15 @@ interface DevStats {
   drives: number;
   glbSize: string;
   loadTime: string;
-  // Optimization pipeline
+  // Optimization pipeline (loader bake of the loaded model, plan-753)
   uberBakedMeshCount: number;
   uberSharedGeometryReuses: number;
   uberClonedGeometryCount: number;
   uberDisposedSourceGeometries: number;
-  staticMergeIn: number;
-  staticMergeOut: number;
-  texBatchIn: number;
-  texBatchOut: number;
-  batchUniqueGeometries: number;
-  batchArenaVertices: number;
-  kinMergeGroups: number;
-  kinMergeIn: number;
-  kinMergeOut: number;
+  loaderBakeChunks: number;
+  loaderBakeKeep: number;
+  loaderBakeSources: number;
+  loaderBakeTriangles: number;
   // Picking & Highlight (pick-path metrics, EMA + last sample, pre-formatted ms)
   pickRaycastMs: string;
   pickRaycastLast: string;
@@ -66,6 +92,13 @@ interface DevStats {
   pickStrategy: string;
   pickCount: number;
   pickHits: number;
+  /** plan-756 gate: p95 ms per ray, '--' until the ring has a sample. */
+  pickP95Ms: string;
+  /** plan-756 gate: pick structures + CSR node table of the live assets (main
+   *  model + planner placements, deduped per asset), in MB. */
+  pickStructureMB: string;
+  /** plan-756 gate: the same sum as a percentage of chunk-geometry bytes (5 % budget). */
+  pickStructurePercent: string;
   pickBvhPending: number;
   pickOverlayObjects: number;
   // Metadata load stats (from LoadResult.metadataStats)
@@ -86,21 +119,131 @@ interface DevStats {
 /** Display label per pick-path highlight strategy id. */
 const PICK_STRATEGY_LABEL: Record<string, string> = {
   'outline': 'OutlinePass',
-  'fill-proxy': 'Fill Proxy',
-  'overlay-legacy': 'Overlay (legacy)',
+  'chunk-overlay': 'Chunk overlay',
+  'overlay': 'Overlay pairs',
   'bbox': 'BBox fallback',
   'mu-overlay': 'MU overlay',
   'none': '—',
 };
 
 const PERF_BUDGETS = {
-  triangles: 2_000_000,
-  drawCalls: 500,
+  triangles: 2_000_000, // scene pass of one frame
+  drawCalls: 500,       // scene pass of one frame
   frameTime: 33.33, // 30fps floor — 60fps (16.7ms) shows ~50% green
-  textures: 200,
-  geometries: 500,
-  heapMB: 512,
+  textures: 200,    // incl. render-target textures
+  geometries: 500,  // GPU-resident BufferGeometry objects
+  heapMB: 512,      // fallback when the browser hides jsHeapSizeLimit
 };
+
+/** Format the per-pass draw-call split as one dimmed line; zero buckets
+ *  after `total` are omitted so an outline-free frame reads "total 12". */
+function formatFrameBreakdown(frame: {
+  total: { calls: number }; ao: { calls: number }; outline: { calls: number }; shadow: { calls: number };
+  reflection: { calls: number };
+  post: { calls: number }; overlay: { calls: number }; plugins: { calls: number }; other: { calls: number };
+}): string {
+  const parts = [`total ${frame.total.calls}`];
+  const push = (label: string, n: number) => { if (n > 0) parts.push(`${label} ${n}`); };
+  push('ao', frame.ao.calls);
+  push('outline', frame.outline.calls);
+  push('shadow', frame.shadow.calls);
+  push('reflection', frame.reflection.calls);
+  push('post', frame.post.calls);
+  push('overlay', frame.overlay.calls);
+  push('plugins', frame.plugins.calls);
+  push('other', frame.other.calls);
+  return parts.join(' · ');
+}
+
+/** A dimmed, right-aligned secondary line under a StatRow. */
+/** Row colour per asset-cache outcome: green = served from cache, blue = network, red = trouble. */
+const CACHE_OUTCOME_COLOR: Record<CacheOutcome, string> = {
+  'hit': '#66bb6a',
+  'offline-hit': '#ffa726',
+  'revalidated': '#66bb6a',
+  'replaced': '#4fc3f7',
+  'miss': '#4fc3f7',
+  'evicted': '#ffa726',
+  'rejected': '#ef5350',
+  'hash-mismatch': '#ef5350',
+};
+
+function formatMB(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(0, Math.round(bytes / 1024))} KB`;
+}
+
+/**
+ * DevTools › Render › Asset cache (plan-508 F7): what the asset blob cache did
+ * — the newest outcomes, counters, storage usage/quota and the persist verdict.
+ * Re-reads the ring only when `version` (polled in the tab's interval) changes.
+ */
+function AssetCacheSection({ version, onClearPersistent, clearing }: {
+  version: number;
+  onClearPersistent: () => void;
+  clearing: boolean;
+}) {
+  const snapshot = useMemo(() => getCacheOutcomes({ last: 12 }), [version]);
+  const [storage, setStorage] = useState<{ usage: number; quota: number } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void getCacheStorageEstimate().then((e) => { if (alive) setStorage(e); });
+    return () => { alive = false; };
+  }, [version]);
+  const counts = CACHE_OUTCOMES
+    .filter((o) => snapshot.counts[o] > 0)
+    .map((o) => `${o} ${snapshot.counts[o]}`)
+    .join(' · ') || 'no requests yet';
+  const persisted = snapshot.persisted === null ? 'not asked' : snapshot.persisted ? 'granted' : 'denied';
+  const buttonSx = { fontSize: 11, textTransform: 'none', borderColor: 'rgba(255,255,255,0.15)', color: 'rgba(255,255,255,0.6)' } as const;
+  return (
+    <SettingsSection id="devtools-asset-cache" title="Asset cache">
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+        <SubRow text={counts} />
+        <StatRow
+          label="Storage"
+          value={storage ? `${formatMB(storage.usage)} / ${formatMB(storage.quota)}` : 'n/a'}
+        />
+        <StatRow label="Persisted" value={persisted} />
+        {snapshot.outcomes.slice().reverse().map((r, i) => (
+          <Box key={`${r.at}-${i}`} sx={{ display: 'flex', gap: 1, fontFamily: 'monospace', fontSize: 10, alignItems: 'baseline' }} title={`${r.url}${r.detail ? `\n${r.detail}` : ''}`}>
+            <span style={{ color: 'rgba(255,255,255,0.35)' }}>{new Date(r.at).toLocaleTimeString()}</span>
+            <span style={{ color: CACHE_OUTCOME_COLOR[r.outcome], minWidth: 88 }}>{r.outcome}</span>
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'rgba(255,255,255,0.7)' }}>
+              {r.url.split('/').pop()}
+            </span>
+            <span style={{ color: 'rgba(255,255,255,0.45)' }}>{r.bytes !== undefined ? formatMB(r.bytes) : ''}</span>
+            <span style={{ color: 'rgba(255,255,255,0.35)', minWidth: 44, textAlign: 'right' }}>{r.ms !== undefined ? `${Math.round(r.ms)}ms` : ''}</span>
+          </Box>
+        ))}
+        <Box sx={{ display: 'flex', gap: 1, mt: 0.5 }}>
+          <Button variant="outlined" size="small" onClick={() => clearCacheOutcomes()} sx={buttonSx}>
+            Clear outcomes
+          </Button>
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={onClearPersistent}
+            disabled={clearing}
+            startIcon={clearing ? <CircularProgress size={12} /> : <CleaningServices sx={{ fontSize: 14 }} />}
+            sx={buttonSx}
+          >
+            Clear persistent cache
+          </Button>
+        </Box>
+      </Box>
+    </SettingsSection>
+  );
+}
+
+function SubRow({ text }: { text: string }) {
+  return (
+    <Typography variant="caption" sx={{ display: 'block', textAlign: 'right', fontFamily: 'monospace', fontSize: 10, color: 'rgba(255,255,255,0.35)', mt: -0.5 }}>
+      {text}
+    </Typography>
+  );
+}
 
 /** Color + label for the GPU tier pill next to the section header. */
 function GPUTierBadge({
@@ -322,12 +465,12 @@ export function DevToolsTab() {
     setBenchRunning(false);
   }, [viewer]);
 
-  // Wipe the persistent GLB byte cache (Cache API bucket `rv-planner-glbs`)
-  // plus the per-GLB snap-index localStorage, then reload. Planner GLBs are
-  // cached by URL, so swapping a library file on disk while keeping its
-  // filename serves stale bytes until these caches are cleared. The reload is
-  // required because the in-memory decoded ModelCache still holds the old
-  // Three.js Groups for the rest of the session.
+  // Wipe the persistent GLB byte cache (Cache API bucket `rv-assets-glb-v2`,
+  // plus the legacy `rv-planner-glbs`) and the per-GLB snap-index localStorage,
+  // then reload. Since plan-508 a catalog with `sha256` keys the bytes by hash,
+  // so a changed library file is picked up on its own; this stays the manual
+  // reset for catalogs without hashes. The reload is required because the
+  // in-memory decoded ModelCache still holds the old Three.js Groups.
   const [clearingCache, setClearingCache] = useState(false);
   const clearLibraryCache = useCallback(async () => {
     setClearingCache(true);
@@ -343,8 +486,18 @@ export function DevToolsTab() {
   useEffect(() => {
     const interval = setInterval(() => {
       const info = viewer.getRendererInfo();
-      const mem = (performance as unknown as { memory?: { usedJSHeapSize?: number } }).memory;
+      const mem = (performance as unknown as { memory?: { usedJSHeapSize?: number; jsHeapSizeLimit?: number } }).memory;
       const heapMB = mem?.usedJSHeapSize ? (mem.usedJSHeapSize / (1024 * 1024)).toFixed(0) : '--';
+      const heapLimitMB = mem?.jsHeapSizeLimit ? Math.round(mem.jsHeapSizeLimit / (1024 * 1024)) : 0;
+      const frameBreakdown = formatFrameBreakdown(info.frame);
+      // Bake stats: the planner's ModelCache knows vertices/triangles of the
+      // baked assets; without a planner the viewer's BakeRegistry still
+      // reports instances / shared chunks / per-instance meshes.
+      const planner = viewer.getPlugin<{ id: string; getBakeStats?: () => { assets: number; chunks: number; vertices: number; triangles: number } }>('layout-planner');
+      const plannerBake = planner?.getBakeStats?.() ?? null;
+      const bake = info.bake;
+      const placementsProgress = viewer.placements.progress;
+      const sceneTriangles = viewer.lastLoadResult?.triangleCount ?? 0;
       const gpu = viewer.getGPUInfo();
       const analysis = viewer.getGPUAnalysis();
       // Compose a single-line label per row. Vendor + device is what
@@ -375,24 +528,52 @@ export function DevToolsTab() {
         resolve: pick.resolveMs.toFixed(2),
         highlight: pick.highlightMs.toFixed(2),
         highlightLast: pick.lastHighlightMs.toFixed(2),
+        p95: pick.raycastP95Samples > 0 ? pick.raycastP95Ms.toFixed(3) : '--',
       };
-      const hash = `${viewer.currentFps}|${info.triangles}|${info.drawCalls}|${info.programs}|${info.materialsUnique}|${heapMB}|${viewer.drives.length}|${gpuActive}|${gpuHighPerf ?? ''}|${gpuLowPower ?? ''}|${analysis?.severity ?? ''}|${analysis?.tier ?? ''}`
+      // plan-756 memory gate: pick structures + CSR node table, summed per
+      // DISTINCT baked asset over the VIEWER's registry — which is the main
+      // model AND the planner placements (the planner shares this registry, so
+      // adding its own stats would double-count). `pickPercent` is the same sum
+      // against the chunk-geometry bytes it accelerates: the 5 % gate.
+      const pickStructureMB = ((bake.pickBytes + bake.nodeTableBytes) / (1024 * 1024)).toFixed(2);
+      const pickStructurePercent = bake.geometryBytes > 0 ? bake.pickPercent.toFixed(2) : '--';
+      const hash = `${viewer.currentFps}|${info.triangles}|${info.drawCalls}|${frameBreakdown}|${info.geometries}|${info.textures}|${info.renderTargets}|${info.programs}|${info.materialsUnique}|${heapMB}|${viewer.drives.length}|${gpuActive}|${gpuHighPerf ?? ''}|${gpuLowPower ?? ''}|${analysis?.severity ?? ''}|${analysis?.tier ?? ''}`
+        + `|${placementsProgress.pending}|${placementsProgress.total}`
+        + `|${bake.instances}|${bake.chunkMeshes}|${bake.keepMeshes}|${plannerBake?.assets ?? -1}|${plannerBake?.triangles ?? -1}|${sceneTriangles}|${info.meshCount}`
         + `|${pickFmt.raycast}|${pickFmt.raycastLast}|${pickFmt.highlight}|${pickFmt.highlightLast}|${pickFmt.resolve}|${pick.strategy}|${pick.raycastCount}|${pick.bvhPending}|${pick.overlayObjects}`
+        + `|${pickFmt.p95}|${pickStructureMB}|${pickStructurePercent}`
         // Alias stats change only on a model load, but they must be IN the hash:
         // without them a load whose other counters happen to match would leave
         // the previous model's alias numbers on screen.
-        + `|${aliasStats?.nodeAliases ?? -1}|${aliasStats?.signalAliases ?? -1}|${aliasStats?.droppedAliases ?? -1}`;
+        + `|${aliasStats?.nodeAliases ?? -1}|${aliasStats?.signalAliases ?? -1}|${aliasStats?.droppedAliases ?? -1}`
+        + `|${cacheOutcomeVersion()}`;
       if (hash === prevStatsHashRef.current) return;
       prevStatsHashRef.current = hash;
       setStats({
         fps: viewer.currentFps,
         frameTime: viewer.currentFrameTime,
         drawCalls: info.drawCalls,
+        renderTriangles: info.triangles,
+        frameBreakdown,
+        frameTotalTriangles: info.frame.total.triangles,
         geometries: info.geometries,
         textures: info.textures,
+        renderTargets: info.renderTargets,
         programs: info.programs,
         heapMB,
+        heapLimitMB,
         renderer: viewer.isWebGPU ? 'WebGPU' : 'WebGL',
+        bakeAssets: plannerBake?.assets ?? bake.assets,
+        bakeChunks: plannerBake?.chunks ?? bake.chunks,
+        bakeVertices: plannerBake?.vertices ?? -1,
+        bakeTriangles: plannerBake?.triangles ?? -1,
+        bakeInstances: bake.instances,
+        placementsPending: placementsProgress.pending,
+        placementsTotal: placementsProgress.total,
+        cacheVersion: cacheOutcomeVersion(),
+        bakeChunkMeshes: bake.chunkMeshes,
+        bakeKeepMeshes: bake.keepMeshes,
+        bakeDrawCalls: bake.drawCalls,
         gpuActive,
         gpuArchitecture: gpu?.active.architecture,
         gpuHighPerf,
@@ -401,8 +582,8 @@ export function DevToolsTab() {
         gpuSeverity: analysis?.severity ?? 'ok',
         gpuMessage: analysis?.message,
         gpuAction: analysis?.action,
-        triangles: info.triangles,
-        meshesInGlb: info.materialsOriginal, // materialsOriginal ≈ meshes in GLB (1 mat per mesh before dedup)
+        triangles: sceneTriangles,
+        meshesInGlb: info.meshCount,
         materialsOriginal: info.materialsOriginal,
         materialsDeduped: info.materialsUnique,
         drives: viewer.drives.length,
@@ -412,15 +593,10 @@ export function DevToolsTab() {
         uberSharedGeometryReuses: info.uberSharedGeometryReuses,
         uberClonedGeometryCount: info.uberClonedGeometryCount,
         uberDisposedSourceGeometries: info.uberDisposedSourceGeometries,
-        staticMergeIn: info.uberMergeOriginal,
-        staticMergeOut: info.uberMergeCreated,
-        texBatchIn: info.texMergeOriginal,
-        texBatchOut: info.texMergeCreated,
-        batchUniqueGeometries: info.batchUniqueGeometries,
-        batchArenaVertices: info.batchArenaVertices,
-        kinMergeGroups: info.kinGroupsMerged,
-        kinMergeIn: info.kinSourceMeshes,
-        kinMergeOut: info.kinChunksCreated,
+        loaderBakeChunks: info.loaderBake.chunks,
+        loaderBakeKeep: info.loaderBake.keep,
+        loaderBakeSources: info.loaderBake.sources,
+        loaderBakeTriangles: info.loaderBake.triangles,
         pickRaycastMs: pickFmt.raycast,
         pickRaycastLast: pickFmt.raycastLast,
         pickStaticMs: pickFmt.static,
@@ -432,6 +608,9 @@ export function DevToolsTab() {
         pickStrategy: PICK_STRATEGY_LABEL[pick.strategy] ?? pick.strategy,
         pickCount: pick.raycastCount,
         pickHits: pick.hitCount,
+        pickP95Ms: pickFmt.p95,
+        pickStructureMB,
+        pickStructurePercent,
         pickBvhPending: pick.bvhPending,
         pickOverlayObjects: pick.overlayObjects,
         metadataNodes: metaStats?.metadataNodes ?? 0,
@@ -452,6 +631,10 @@ export function DevToolsTab() {
 
   const s = stats;
   const heapNum = s ? parseFloat(s.heapMB) || 0 : 0;
+  // Dev mode keeps master copies of every library asset — 512 MB is not a
+  // meaningful ceiling there; measure against the browser's real heap limit
+  // whenever Chrome exposes it.
+  const heapBudget = s && s.heapLimitMB > 0 ? s.heapLimitMB : PERF_BUDGETS.heapMB;
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
@@ -478,14 +661,65 @@ export function DevToolsTab() {
         </FieldRow>
       </SettingsSection>
 
-      {/* Scene (from GLB) */}
+      {/* Rendering — last rendered frame; Draw Calls / Triangles are the SCENE pass */}
+      <SettingsSection id="devtools-rendering" title="Rendering">
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+          <StatRow label="FPS" value={s ? String(s.fps) : '--'} />
+          <StatRow label="Frame" value={s ? `${s.frameTime} ms` : '--'} />
+          <StatRow label="Draw Calls" value={s ? String(s.drawCalls) : '--'} />
+          {s && <SubRow text={s.frameBreakdown} />}
+          <StatRow label="Triangles" value={s ? s.renderTriangles.toLocaleString() : '--'} />
+          {s && s.frameTotalTriangles !== s.renderTriangles && <SubRow text={`total ${s.frameTotalTriangles.toLocaleString()}`} />}
+          <StatRow label="GPU Geometries" value={s ? String(s.geometries) : '--'} />
+          {s && s.bakeInstances > 0 && (
+            <SubRow text={`${s.bakeChunks} chunk geometries shared by ${s.bakeInstances} placements`} />
+          )}
+          <StatRow
+            label="GPU Textures"
+            value={s ? (s.renderTargets > 0 ? `${Math.max(0, s.textures - s.renderTargets)} + ${s.renderTargets} render targets` : String(s.textures)) : '--'}
+          />
+          <StatRow label="Programs" value={s ? String(s.programs) : '--'} />
+          <StatRow label="JS Heap" value={s ? (s.heapLimitMB > 0 ? `${s.heapMB} / ${s.heapLimitMB.toLocaleString()} MB` : `${s.heapMB} MB`) : '--'} />
+          <StatRow label="Renderer" value={s?.renderer ?? '--'} />
+        </Box>
+      </SettingsSection>
+
+      {/* Scene (from GLB) — load-time counts */}
       <SettingsSection id="devtools-scene" title="Scene (from GLB)">
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
           <StatRow label="Triangles" value={s ? s.triangles.toLocaleString() : '--'} />
-          <StatRow label="Meshes" value={s ? s.meshesInGlb.toLocaleString() : '--'} />
+          <StatRow label="Meshes" value={s ? (s.bakeDrawCalls > 0 ? `${s.meshesInGlb.toLocaleString()} + ${s.bakeDrawCalls} placement` : s.meshesInGlb.toLocaleString()) : '--'} />
           <StatRow label="Drives" value={s ? String(s.drives) : '--'} />
           <StatRow label="GLB Size" value={s?.glbSize ?? '--'} />
           <StatRow label="Load Time" value={s?.loadTime ?? '--'} />
+        </Box>
+      </SettingsSection>
+
+      {/* Bake — planner placements as BakeRegistry instances (plan-753 §3.1) */}
+      <SettingsSection id="devtools-bake" title="Bake">
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+          <StatRow label="Assets" value={s ? String(s.bakeAssets) : '--'} />
+          <StatRow label="Chunks" value={s ? String(s.bakeChunks) : '--'} />
+          <StatRow
+            label="Vertices / Tris"
+            value={s ? (s.bakeVertices >= 0 ? `${s.bakeVertices.toLocaleString()} / ${s.bakeTriangles.toLocaleString()}` : 'n/a (no planner)') : '--'}
+          />
+          <StatRow label="Instances" value={s ? String(s.bakeInstances) : '--'} />
+          {s && s.placementsPending > 0 && (
+            <StatRow label="Placements" value={`${s.placementsPending} pending of ${s.placementsTotal}`} />
+          )}
+          <StatRow label="Chunk Meshes" value={s ? String(s.bakeChunkMeshes) : '--'} />
+          <StatRow label="Keep Meshes" value={s ? String(s.bakeKeepMeshes) : '--'} />
+          <StatRow label="Draw Calls" value={s ? String(s.bakeDrawCalls) : '--'} />
+        </Box>
+      </SettingsSection>
+
+      {/* Asset cache — blob-cache outcomes under the bake stats (plan-508 F7) */}
+      <AssetCacheSection version={s?.cacheVersion ?? 0} onClearPersistent={clearLibraryCache} clearing={clearingCache} />
+
+      {/* Load Diagnostics — loader-internal counters, read by other plans; collapsed by default */}
+      <SettingsSection id="devtools-load-diagnostics" title="Load Diagnostics" defaultExpanded={false}>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
           <StatRow label="Metadata Nodes" value={s ? s.metadataNodes.toLocaleString() : '--'} />
           <StatRow label="AABB Build" value={s ? `${s.metadataAabbCount.toLocaleString()} in ${s.metadataAabbMs} ms` : '--'} />
           <StatRow label="Hoverable Ranges" value={s ? s.hoverableRanges.toLocaleString() : '--'} />
@@ -501,17 +735,13 @@ export function DevToolsTab() {
         </Box>
       </SettingsSection>
 
-      {/* Optimization */}
-      <SettingsSection id="devtools-optimization" title="Optimization">
+      {/* Optimization — loader pipeline of the loaded model (plan-753 Phase 4: the bake) */}
+      <SettingsSection id="devtools-optimization" title="Optimization (loader pipeline)">
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
           <PipelineRow
             label="Materials"
             before={s ? s.materialsOriginal.toLocaleString() : '--'}
-            after={s ? String(s.materialsDeduped) : '--'}
-          />
-          <StatRow
-            label="Uber Baked"
-            value={s ? `${s.uberBakedMeshCount.toLocaleString()} meshes` : '--'}
+            after={s ? `${s.materialsDeduped} · ${s.uberBakedMeshCount.toLocaleString()} uber-baked` : '--'}
           />
           <PipelineRow
             label="Geometry Dedup"
@@ -527,38 +757,10 @@ export function DevToolsTab() {
             }
           />
           <PipelineRow
-            label="Static Batch"
-            before={s ? s.staticMergeIn.toLocaleString() : '--'}
-            after={s ? `${s.staticMergeOut} batch` : '--'}
+            label="Bake"
+            before={s ? `${s.loaderBakeSources.toLocaleString()} source meshes · ${s.loaderBakeTriangles.toLocaleString()} tris` : '--'}
+            after={s ? (s.loaderBakeChunks > 0 ? `${s.loaderBakeChunks} chunks · ${s.loaderBakeKeep} keep` : 'not baked') : '--'}
           />
-          <PipelineRow
-            label="Textured Batch"
-            before={s ? s.texBatchIn.toLocaleString() : '--'}
-            after={s ? `${s.texBatchOut} batches` : '--'}
-          />
-          <StatRow
-            label="Arena"
-            value={s ? `${s.batchUniqueGeometries.toLocaleString()} geoms / ${s.batchArenaVertices.toLocaleString()} verts` : '--'}
-          />
-          <PipelineRow
-            label="Kinematic Batch"
-            before={s ? `${s.kinMergeIn.toLocaleString()} (${s.kinMergeGroups} drives)` : '--'}
-            after={s ? `${s.kinMergeOut} batches` : '--'}
-          />
-        </Box>
-      </SettingsSection>
-
-      {/* Rendering */}
-      <SettingsSection id="devtools-rendering" title="Rendering">
-        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
-          <StatRow label="FPS" value={s ? String(s.fps) : '--'} />
-          <StatRow label="Frame" value={s ? `${s.frameTime} ms` : '--'} />
-          <StatRow label="Draw Calls" value={s ? String(s.drawCalls) : '--'} />
-          <StatRow label="Geometries" value={s ? String(s.geometries) : '--'} />
-          <StatRow label="Textures" value={s ? String(s.textures) : '--'} />
-          <StatRow label="Programs" value={s ? String(s.programs) : '--'} />
-          <StatRow label="JS Heap" value={s ? `${s.heapMB} MB` : '--'} />
-          <StatRow label="Renderer" value={s?.renderer ?? '--'} />
         </Box>
       </SettingsSection>
 
@@ -566,14 +768,17 @@ export function DevToolsTab() {
       <SettingsSection id="devtools-picking" title="Picking & Highlight">
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
           <StatRow label="Raycast" value={s ? `${s.pickRaycastMs} ms (last ${s.pickRaycastLast})` : '--'} />
-          <StatRow label="· Static BVH" value={s ? `${s.pickStaticMs} ms` : '--'} />
-          <StatRow label="· Drive BVHs" value={s ? `${s.pickKinematicMs} ms` : '--'} />
+          <StatRow label="· Instance index" value={s ? `${s.pickStaticMs} ms` : '--'} />
+          <StatRow label="· Chunk pick structure" value={s ? `${s.pickKinematicMs} ms` : '--'} />
           <StatRow label="· MU / Aux" value={s ? `${s.pickOtherMs} ms` : '--'} />
           <StatRow label="Resolve" value={s ? `${s.pickResolveMs} ms` : '--'} />
           <StatRow label="Highlight Apply" value={s ? `${s.pickHighlightMs} ms (last ${s.pickHighlightLast})` : '--'} />
           <StatRow label="Strategy" value={s?.pickStrategy ?? '--'} />
+          {/* plan-756 gates: p95 ≤ 1 ms per ray, structures ≤ 5 % of chunk geometry. */}
+          <StatRow label="Pick p95" value={s ? `${s.pickP95Ms} ms` : '--'} />
+          <StatRow label="Pick structure" value={s ? `${s.pickStructureMB} MB (${s.pickStructurePercent}% of geometry)` : '--'} />
           <StatRow
-            label="BVH"
+            label="Editor BVH"
             value={s ? (s.pickBvhPending > 0 ? `${s.pickBvhPending} pending (native fallback)` : 'ready') : '--'}
             color={s ? (s.pickBvhPending > 0 ? '#ffa726' : '#66bb6a') : undefined}
           />
@@ -603,12 +808,12 @@ export function DevToolsTab() {
       <SettingsSection id="devtools-performance-budget" title="Performance Budget">
         <Box sx={{ fontSize: 12, color: 'text.secondary' }}>
           {s && <>
-            <BudgetRow label="Triangles" {...budgetPct(s.triangles, PERF_BUDGETS.triangles)} />
+            <BudgetRow label="Triangles" {...budgetPct(s.renderTriangles, PERF_BUDGETS.triangles)} />
             <BudgetRow label="Draw Calls" {...budgetPct(s.drawCalls, PERF_BUDGETS.drawCalls)} />
             <BudgetRow label="Frame Time" {...budgetPct(s.frameTime, PERF_BUDGETS.frameTime)} />
             <BudgetRow label="Textures" {...budgetPct(s.textures, PERF_BUDGETS.textures)} />
             <BudgetRow label="Geometries" {...budgetPct(s.geometries, PERF_BUDGETS.geometries)} />
-            <BudgetRow label="JS Heap" {...budgetPct(heapNum, PERF_BUDGETS.heapMB)} />
+            <BudgetRow label="JS Heap" {...budgetPct(heapNum, heapBudget)} />
           </>}
         </Box>
       </SettingsSection>

@@ -52,6 +52,21 @@ export interface ComponentActionContext {
 }
 
 /**
+ * plan-499: the command an action is a VIEW of. The section renders such an
+ * action through `useCommandView` — disabled + tooltip = the command's reason,
+ * sim phase + AI afterglow on this button, click = `execute(..., {origin:'ui'})`
+ * — so an MCP tool bound to the same command and the button cannot drift.
+ */
+export interface ComponentActionCommand {
+  /** Command id in the registry (e.g. `drive.jog`). */
+  readonly id: string;
+  /** Command args for this section (evaluated at render and at click). */
+  readonly args: (ctx: ComponentActionContext) => unknown;
+  /** Explicit button key; default: the command's `buttonKey(args)`. */
+  readonly buttonKey?: string;
+}
+
+/**
  * One action button registered against a component type.
  *
  * `isActive` is optional — when it returns `true`, the button renders with
@@ -82,7 +97,29 @@ export interface ComponentAction {
    * used. Accepts any CSS color string.
    */
   readonly color?: string;
-  /** Action handler. Called on button click. */
+  /**
+   * plan-499: the action is a view of this command. The section then renders it
+   * through the command (reason, afterglow) and a click dispatches the command;
+   * `onClick` stays for programmatic callers and must dispatch the SAME command
+   * (see `sim-commands.ts` `commandAction`), so a click is one execution either way.
+   */
+  readonly command?: ComponentActionCommand;
+  /**
+   * Where the action lives (plan-510 fix). `'body'` (default) = a button in the
+   * section's action row — machine operations (Jog, Stop, Toggle). `'menu'` =
+   * an item of the section header's ⋮ menu — component management (Replace…,
+   * Remove, Re-import…), which must never sit next to an operation button.
+   */
+  readonly placement?: 'body' | 'menu';
+  /** Destructive action: rendered in red, at the bottom of the ⋮ menu behind a divider. */
+  readonly danger?: boolean;
+  /**
+   * Segment group: consecutive body actions with the same `group` render as ONE
+   * segmented control (joined borders, equal width, never wraps apart) — e.g.
+   * Jog − | Stop | Jog +.
+   */
+  readonly group?: string;
+  /** Action handler. Called on button click (not by the section when `command` is set). */
   onClick(ctx: ComponentActionContext): void;
 }
 

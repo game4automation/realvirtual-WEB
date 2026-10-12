@@ -49,6 +49,8 @@ export class ControlsFacadeImpl implements ControlsFacade {
     zoomSpeed: number;
     dampingFactor: number;
     enabled: boolean;
+    wheelZoomToCursor: boolean;
+    navigateAroundCursorPoint: boolean;
   }>): void {
     const c = this._viewer.controls;
     if (!c) return;
@@ -57,5 +59,8 @@ export class ControlsFacadeImpl implements ControlsFacade {
     if (cfg.zoomSpeed     !== undefined) c.zoomSpeed     = cfg.zoomSpeed;
     if (cfg.dampingFactor !== undefined) c.dampingFactor = cfg.dampingFactor;
     if (cfg.enabled       !== undefined) c.enabled       = cfg.enabled;
+    const nav = this._viewer.navController;
+    if (cfg.wheelZoomToCursor !== undefined && nav) nav.wheelZoomToCursor = cfg.wheelZoomToCursor;
+    if (cfg.navigateAroundCursorPoint !== undefined && nav) nav.navigateAroundCursorPoint = cfg.navigateAroundCursorPoint;
   }
 }

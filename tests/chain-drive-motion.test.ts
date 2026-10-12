@@ -16,7 +16,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { BufferAttribute, Mesh, MeshStandardMaterial, Object3D, Scene, Vector3 } from 'three';
 import { CoreSubsystems, type CoreSubsystemsHost } from '../src/core/engine/rv-core-subsystems';
 import { constructComponentOnNode } from '../src/core/engine/rv-scene-loader';
-import { isBatchSafe } from '../src/core/engine/rv-batched-render';
+import { bakeFateOf } from './helpers/bake-fate';
 import { freezeStaticMatrices } from '../src/core/engine/rv-freeze-static';
 import { RVChain } from '../src/core/engine/rv-chain';
 import { chainHarness, squareLoopSpline, type ChainHarness } from './chain-fixture';
@@ -214,8 +214,8 @@ describe('reset order — resetAll() must run AFTER the drive resets (F4/R2)', (
 });
 
 describe('loader classification regression (plan-417 sensitivity)', () => {
-  /** One batchable mesh under a node carrying `ownerExtras`. */
-  function batchCandidate(ownerExtras?: Record<string, unknown>): boolean {
+  /** Where one mesh under a node carrying `ownerExtras` lands in the bake. */
+  function batchCandidate(ownerExtras?: Record<string, unknown>): Promise<'static' | 'mover' | 'keep' | 'absent'> {
     const root = new Object3D();
     root.name = 'Root';
     const owner = new Object3D();
@@ -231,24 +231,40 @@ describe('loader classification regression (plan-417 sensitivity)', () => {
     );
     mesh.material = new MeshStandardMaterial();
     owner.add(mesh);
-    return isBatchSafe(mesh, root);
+    return bakeFateOf(mesh, root);
   }
 
-  it('keeps the EXISTING excluded categories excluded', () => {
-    for (const key of ['TransportSurface', 'Source', 'Sink', 'MU', 'Cam', 'MachiningVolume', 'PlacementMeta']) {
-      expect(batchCandidate({ [key]: {} }), `${key} must stay excluded`).toBe(false);
+  it('keeps the runtime-mutated categories out of the chunks (keep), movers in their own chunk', async () => {
+    for (const key of ['Source', 'MU', 'MachiningVolume']) {
+      expect(await batchCandidate({ [key]: {} }), `${key} must be a keep mesh`).toBe('keep');
     }
+    // plan-753 F6: TransportSurface / Cam are movers; a saved planner placement
+    // root (PlacementMeta) is a forced split; Sink is static (merge).
+    for (const key of ['TransportSurface', 'Cam', 'PlacementMeta']) {
+      expect(await batchCandidate({ [key]: {} }), `${key} must be its own mover chunk`).toBe('mover');
+    }
+    expect(await batchCandidate({ Sink: {} })).toBe('static');
   });
 
-  it('keeps ordinary and non-listed component subtrees batchable', () => {
-    expect(batchCandidate()).toBe(true);
-    expect(batchCandidate({ Drive: {} })).toBe(true);       // classified by the planner, not excluded
-    expect(batchCandidate({ EnergyChain: {} })).toBe(true); // NOT a prefix match on 'Chain'
-    expect(batchCandidate({ Sensor: {} })).toBe(true);
+  it('excludes an EnergyChain subtree by its declared role (plan-753)', async () => {
+    // Before plan-753 this was a "NOT a prefix match on 'Chain'" control: the
+    // old key list did not name EnergyChain, so it was batchable — and its
+    // skinned link meshes were only safe because the batcher rejects skinned
+    // geometry mesh by mesh. Now the component declares `bake:'keep'`
+    // (rv-energy-chain.ts: the rig re-poses its links every tick), so the whole
+    // subtree stays out, which is the plan-753 F6 role for the EnergyChain rig.
+    expect(await batchCandidate({ EnergyChain: {} })).toBe('keep');
   });
 
-  it('excludes a Chain subtree (plan-733)', () => {
-    expect(batchCandidate({ Chain: {} })).toBe(false);
+  it('keeps ordinary and non-listed component subtrees baked', async () => {
+    expect(await batchCandidate()).toBe('static');
+    expect(await batchCandidate({ Drive: {} })).toBe('mover');       // `chunk`: its own mover chunk
+    expect(await batchCandidate({ Sensor: {} })).toBe('static');     // `merge`: only its `_sensorViz` mesh is kept
+    expect(await batchCandidate({ NoSuchComponent: {} })).toBe('static'); // unregistered key → no role → merged
+  });
+
+  it('excludes a Chain subtree (plan-733)', async () => {
+    expect(await batchCandidate({ Chain: {} })).toBe('keep');
   });
 
   it('keeps a Chain subtree matrix-dynamic through freezeStaticMatrices', () => {

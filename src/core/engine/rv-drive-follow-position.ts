@@ -150,6 +150,14 @@ export class RVDriveFollowPosition implements IDriveBehavior, RVComponent {
     }
     this.wasLive = drive.liveControlled;
 
+    // Claim the axis for this tick whenever this behavior is actually the one
+    // deciding the position — held, directly commanded, or reading a bound
+    // signal. The drive then skips its own jog / positioning, which would
+    // otherwise integrate straight over what is written just below.
+    if (this.holdPosition !== null || this.directPosition !== null || this.Position) {
+      drive.positionClaimedThisTick = true;
+    }
+
     // Command: follow the PLC position exactly (mirrors Drive.SetPosition()).
     if (this.holdPosition !== null) {
       drive.currentPosition = this.holdPosition;
@@ -194,5 +202,7 @@ export class RVDriveFollowPosition implements IDriveBehavior, RVComponent {
 
 // Register schema so rv-extras-validator auto-derives CONSUMED fields.
 registerComponentSchema('Drive_FollowPosition', RVDriveFollowPosition.schema, {
-  badgeColor: '#29b6f6',
+  bake: 'chunk', // sits on the Drive node it extends — moves with it (plan-753 §2.3)
+  authorable: true, // addable in the asset editor on a node that carries a Drive
+  ui: { badge: '#29b6f6' },
 });

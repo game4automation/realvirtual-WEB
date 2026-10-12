@@ -14,15 +14,27 @@
       "url": "library/catalog.json"
     }
   ],
+  "demos": {
+    "hmi": "doc_demorealvirtualweb_7l7hfw",
+    "planner": "doc_demoplanner_gf4m6v"
+  },
   "documents": [
     {
       "id": "doc_demorealvirtualweb_7l7hfw",
       "name": "realvirtual WEB Demo",
       "path": "DemoRealvirtualWeb.glb",
       "settingsPath": "DemoRealvirtualWeb.settings.json",
-      "sizeBytes": 33906532,
-      "mtimeMs": 1788357225212,
-      "sha256": "d8d746d2ec0e464bf0ab05b31bbe077b791855f24aba6ff5e4f765a14c229c9a"
+      "sizeBytes": 8735212,
+      "mtimeMs": 1790540696798,
+      "sha256": "f3fb6183ce65c3dabb174eab5167e0ca24afb402527a4d316ca793bd7dbda6f1",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Sandbox cell showing realvirtual WEB as a 3D machine information system: what a 3D-HMI does once it is connected to a real machine, for operators and maintenance.",
+        "description": "# realvirtual WEB Demo — 3D machine information system\n\nA sandbox cell that ships with every realvirtual WEB installation. Its purpose is to show what a **3D-HMI** adds once it is connected to a real machine: the same model that runs here in standalone mode becomes a live, browser-based **machine information system** when its signals come from the real controller through realvirtual CONNECT.\n\n## What it demonstrates\n\n- **Live machine state in 3D** — drives, sensors and material follow the real PLC signals, so operators see the machine as it is, not as a schematic.\n- **Signals where the hardware is** — `WebSensor`, signal bindings and `AASLink` markers put values, states and alarms on the part they belong to instead of in a table.\n- **Interaction from the model** — 3D scene buttons and the Signals panel let an operator force inputs, acknowledge states and jog drives directly on the model.\n- **Context for maintenance** — node knowledge, documents and the Ask-AI assistant answer \"what is this part, what does this signal mean, what do I check first\" from the model itself.\n\n## Why it matters\n\nOperators get one picture that matches the floor, faster fault localisation and fewer trips between panel, drawing and machine. Maintenance gets the signal history, the documentation and the 3D context in one place — a better operator experience and shorter downtime.\n\n## What is in the cell\n\nA Fanuc CRX-10iA/L robot with a Schunk EGH80 gripper, transport surfaces with sensors, PLC-style signals (`PLCInputBool` / `PLCOutputBool`, `ConnectSignal` bindings) and a `LogicStep` sequence that runs the cell without an external PLC.\n\n## How to use it\n\nPress **Play** to run the built-in sequence. Open the Signals panel to force inputs, or bind the scene to a live controller to see it follow the real machine. It is a sandbox: jog, force, break it on purpose. If you want to keep changes, copy the document into your own project first (*Save into project…*) — the demo folder may be replaced by a later realvirtual release.",
+        "updatedAt": "2026-09-27T20:24:55.516Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2
     },
     {
       "id": "doc_demoplanner_gf4m6v",
@@ -33,9 +45,17 @@
         "v": 1,
         "level": "scene"
       },
-      "sizeBytes": 6920,
-      "mtimeMs": 1788782723024,
-      "sha256": "fe193fb45f36d980376d28d39a51245a6df18f1089880c46b5cf1fae3a72a919"
+      "sizeBytes": 6800,
+      "mtimeMs": 1790539738820,
+      "sha256": "e0bb241c29bcdc8f565d994ac2fd3c8721c8c49ca2f20d1c5b26538086fab27e",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Layout Planner example: a pallet-handling loop assembled from library conveyors, transfers and turntables via snap points.",
+        "description": "# Layout Planner Demo\n\nA layout built entirely from **library assets** — roll conveyors, chain conveyors, chain transfers, turntables and a loaded Europallet — placed with the Layout Planner and joined at their `Snap-*` ports. The document itself carries no geometry: every element is an `AssetReference` placement that is materialised from the library when the scene loads.\n\n## Try this\n\n- Press **Play**: pallets travel the loop across conveyor, transfer and turntable hand-overs.\n- Open the **Layout** panel to move, rotate or remove placements, or drag new assets from the library onto a free snap point.\n- Use `web_layout_place` / `web_layout_snap_attach` over MCP to extend the line from an agent.\n\nThe loop is the reference layout for the `layout` MCP guide (`web_help(topic=\"layout\")`).",
+        "updatedAt": "2026-09-27T20:08:58.820Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2
     },
     {
       "id": "doc_test-des-turntable-loop_1y3v7m0",
@@ -47,16 +67,80 @@
         "v": 1,
         "level": "scene"
       },
-      "sizeBytes": 2500,
-      "mtimeMs": 1788357225214,
-      "sha256": "22828e57948094c6630e36dbb46f9aab751bf62475009d0e4bc54344afc3a2a9"
+      "sizeBytes": 3080,
+      "mtimeMs": 1790539738823,
+      "sha256": "9ebb31c977d6dc27ce92c7de6bcedc352fc5c4beaccd1d3664361cc6a732d41e",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Developer fixture: a minimal conveyor loop with one turntable for discrete-event simulation (DES) tests.",
+        "description": "# Test DES Turntable Loop\n\nA **dev-only fixture** (not part of delivered installations). Four roll conveyors, one turntable, a loaded Europallet source and a pallet sink form the smallest loop that exercises the DES mode: event-driven material flow, station hand-over and sink statistics.\n\nUsed by the DES feature tests and the `des` MCP guide. Open it in **DES** mode to step events or fast-forward the flow.",
+        "updatedAt": "2026-09-27T20:08:58.822Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2
+    },
+    {
+      "id": "doc_fmu-demo_154b2h4",
+      "name": "FMU Demo (BouncingBall)",
+      "path": "fmu-demo.glb",
+      "sizeBytes": 221176,
+      "mtimeMs": 1790539907838,
+      "sha256": "3326aa95993d2e36a6eb631697cfc9fb2af814ecf88c889127de682a3961d750",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Co-simulation example: a bouncing ball driven by an embedded FMU (Modelica Reference FMUs BouncingBall.fmu).",
+        "description": "# FMU Demo (BouncingBall)\n\nThe smallest possible **FMI co-simulation** scene. The node *Ball* carries an `Fmu` component that embeds the unmodified `BouncingBall.fmu` from the Modelica Reference FMUs v0.0.40 and a `Drive` with `Drive_FollowPosition`, so the ball's height in the 3D scene follows the FMU's `h` output every fixed step.\n\nA small `LogicStep` sequence (*Sequence → RestartBall → Wait*) drops the ball again every 12 s so the demo keeps running.\n\n## What to look at\n\n- The **Signals** panel shows the FMU outputs updating live.\n- Change the restitution parameter `e` in the Fmu component to see the bounce decay differently.\n\nLicense of the embedded FMU: see *fmu-demo.LICENSE.txt* (2-Clause BSD, Modelica Association Project \"FMI\").",
+        "updatedAt": "2026-09-27T00:00:00.000Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2
+    },
+    {
+      "id": "doc_autonox-delta-rl5-1900-6kg_torq7x",
+      "name": "Autonox DELTA RL5-1900-6kg (Kinematics)",
+      "path": "Autonox-DELTA-RL5-1900-6kg.glb",
+      "sizeBytes": 9775416,
+      "mtimeMs": 1790770800000,
+      "sha256": "6a0ffcdb474913bca19365edb668c89100ee325c09f697161524e2e0f090101e",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Autonox DELTA RL5-1900 (6 kg) parallel kinematics robot with a solved mechanism playing back a sampled pick-and-place cycle, drawn coloured by speed.",
+        "description": "# Autonox DELTA RL5-1900-6kg (Kinematics)\n\nA **delta robot** from Autonox with a 1900 mm working diameter and 6 kg payload, prepared as a realvirtual **mechanism**: three rotary `Drive`s on the upper arms, `KinematicJoint`s and `MechanismBody`s for the parallelogram forearms and the travelling plate, and a `KinematicMechanism` that solves the closed loop every step.\n\n## Try this\n\n- Press **Play** — the `DemoCycle` logic step runs the `PickPlace` `MechanismPath`, which plays back the sampled `MechanismTrajectory` `cycle_404_260` (three pick-and-place strokes in 3 s, 2 ms sample table) in a loop. The path is drawn in the viewer, coloured by speed from blue (slow) to red (fast), and the plate follows the solved kinematics.\n- Clear the path's `Trajectory` field to run the waypoints under `DeltaPaths` (`WP_Pick`, `WP_Place`, …) instead.\n- Inspect the mechanism with `web_editor_mechanism_inspect` or the **Mechanism** section in the Property Inspector.\n\nThe nodes carry `NodeKnowledge` notes that explain which axis is which — read them in the inspector or through `web_knowledge_get`.",
+        "updatedAt": "2026-09-30T12:20:00.000Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2
+    },
+    {
+      "id": "doc_laserweldingassemblystation_1n66y05",
+      "name": "Laser Welding Assembly Station",
+      "path": "LaserWeldingAssemblyStation.glb",
+      "sizeBytes": 21867516,
+      "mtimeMs": 1791816831704,
+      "sha256": "50acef5ed888ebdc71e1b4258f7d86f0cb2a6caa2cf63ddf8887286a9077a8db",
+      "documentInfo": {
+        "v": 1,
+        "summary": "Five-station laser welding and assembly line with two lifts and a return conveyor, controlled by eleven IEC 61131-3 Structured Text programs on the included virtual PLC and driven by the station's real TIA tag list - ready for virtual commissioning. Model courtesy of Villette Oh (GrabCAD).",
+        "description": "# Laser Welding Assembly Station\n\nA complete **pallet-circulating assembly line** built from CAD and turned into a running digital twin in realvirtual WEB: fourteen workpiece pallets travel along a main conveyor through five stations, are lowered by a lift onto a return conveyor and lifted back to the start.\n\n## What happens\n\n- **Station 1 — laser welding:** entry and exit shutters close, the laser head advances, the barcode reader window opens, a camera reads the code and the centring chuck clamps for the laser mark.\n- **Station 2 — vision inspection:** a camera checks the part.\n- **Station 3 — turnover unit:** one gantry picks the part, turns it by 180° and places it back; a second gantry transfers the upright valve body from the right to the left jig — the valve is a real part that changes from the pallet to the gripper and back.\n- **Station 4 — curling check:** a probe block moves down and measures.\n- **Station 5 — cap assembly:** the bowl feeder drops real caps onto the linear feeder (only while its inlet is free), the gripper picks the front cap on its closed end position, carries it to the pallet, screws it onto the valve body and checks it with a camera. The caps come off again on the return conveyor in front of Lift01, so every pallet arrives at Station 5 without one.\n- **Lifts:** Lift02 lowers each finished pallet to the return conveyor; Lift01 lifts it back to the main conveyor.\n\n## What it shows\n\n- **One signal path for simulation and commissioning** — all 193 tags of the station's TIA tag list are PLC signals, named like the TIA tags; every cylinder, sensor, stopper, belt, lamp and operator button is bound to them.\n- **Virtual PLC in Structured Text** — the station control runs as eleven IEC 61131-3 Structured Text programs, one per unit (operating modes, transport, both lifts, buffer, entry, five stations), scanned one after another like the blocks of a real PLC. They write only the PLC outputs and read only the inputs, run while no PLC is connected and step aside automatically when one connects; plant behaviour (`Logic_Plant_*`: doors, E-stop chain, camera simulation) keeps running. Open them in the PLC editor to read the code with live values and the active step. The station control exists only as these programs, so the station needs a build with the virtual PLC.\n- **Operating modes** — Auto at start, **BT5** stops at the end of the cycle (tower blue → off), **BT4** starts again, **BT8** or an **E-stop** holds every axis at once (tower red), restart without a reset in three steps: release the E-stops, **BT6** acknowledges, **BT4** Auto start, and every station continues where it stopped.\n- **Pallet flow with `Zone`s** — every stopper releases exactly one pallet, exit sensors report when it has left. Stopper01 (separator) and Stopper02 wait on the return conveyor in front of Lift01; the index lifts of the five stations raise the pallet by 30 mm.\n- **Valve modes** — every cylinder behaves like its valve: double-acting cylinders (5/3 valve) move only while their command is on and hold in between, single-acting ones return by spring.\n\n## How to use it\n\nPress **Play** and watch a pallet go round, or operate it from the **Operator Panel** window (BT1–BT8 with their lamps, signal tower, both E-stops, Simulation / PLC mode). Open the signal panel to watch the TIA tags, force outputs for commissioning, or connect your PLC. The model carries a knowledge note that explains the signal model — read it in the inspector or through `web_knowledge_get`. It is a sandbox: copy it into your own project first (*Save into project…*) if you want to keep changes.\n\n## Credits\n\nThe 3D model is courtesy of **Villette Oh**, who kindly allowed us to use it — thank you! The original model is published on GrabCAD.",
+        "updatedAt": "2026-10-09T00:14:53.635Z",
+        "updatedBy": "realvirtual"
+      },
+      "extrasScan": 2
+    },
+    {
+      "id": "doc_agv-maze_1lhdkja",
+      "name": "AGV Maze",
+      "path": "agv-maze.glb",
+      "devOnly": true,
+      "sizeBytes": 5076120,
+      "mtimeMs": 1788818222546,
+      "sha256": "c26e8569e9ad2ac135283a38426e0be29fbf19fab3882abc9a9b6eca4e0f1ed2"
     },
     {
       "id": "doc_demo-knowledge-md_1bio4kv",
       "name": "About this demo project",
-      "path": "demo.knowledge.md",
-      "missingSince": "2026-09-07T12:04:25.069Z"
+      "path": "demo.knowledge.md"
     }
   ],
-  "modifiedAt": "2026-09-07T12:06:06.333Z"
+  "modifiedAt": "2026-09-30T18:25:00.000Z"
 }

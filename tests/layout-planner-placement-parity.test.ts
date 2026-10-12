@@ -45,6 +45,7 @@ import {
   TINY_PNG,
 } from './_layout-planner-async-harness';
 import type { LayoutPlannerPlugin } from '../src/plugins/layout-planner';
+import { getProblems, resetProblemsForTests } from '../src/core/hmi/problems-store';
 import type {
   LibraryCatalogEntry,
   PlacedComponent,
@@ -225,6 +226,7 @@ describe('plan-376 — placement parity across the five paths', () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    resetProblemsForTests();
     localStorage.removeItem(AUTOSAVE_KEY);
     // `RVAssetBlobCache` fetches every non-blob url. The bytes never reach a
     // real GLTF parser (the harness loader is stubbed), so any body will do.
@@ -236,7 +238,7 @@ describe('plan-376 — placement parity across the five paths', () => {
     fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : input.toString();
       if (url.includes(BROKEN_URL)) throw new TypeError('network down (test)');
-      return new Response(new Blob([new Uint8Array([0])]), {
+      return new Response(new Blob([new Uint8Array([0x67, 0x6c, 0x54, 0x46, 2, 0, 0, 0, 12, 0, 0, 0]) /* a bare `glTF` header — the blob cache refuses anything else */]), {
         status: 200,
         headers: { 'Content-Type': 'model/gltf-binary' },
       });
@@ -343,6 +345,57 @@ describe('plan-376 — placement parity across the five paths', () => {
         'layout-transform-update',
         expect.objectContaining({ position: [5, 1, 6], rotation: [0, 45, 0] }),
       );
+    });
+  });
+
+  // ── plan-758: record is the truth on every record-driven path ─────────
+
+  describe('plan-758 — the record name is kept verbatim on replay', () => {
+    it('placeFromRecord names the node exactly as recorded, whatever siblings exist (undo of a delete)', async () => {
+      const { plugin } = await bootPlanner();
+      // A `Belt` exists; the record being replayed is ALSO `Belt`.
+      const liveId = 'p758-live';
+      await plugin.placeFromRecord({ ...fullRecord(), id: liveId, label: 'Belt' });
+      expect(storeRecord(plugin, liveId)!.label).toBe('Belt');
+      const rec = { ...fullRecord(), label: 'Belt' };
+
+      await plugin.placeFromRecord(rec);
+
+      // Record is the truth: NOT renamed to Belt_1 against the live sibling.
+      expect(placedIn(plugin, rec.id)!.name).toBe('Belt');
+      expect(storeRecord(plugin, rec.id)!.label).toBe('Belt');
+      // The live one is untouched.
+      expect(placedIn(plugin, liveId)!.name).toBe('Belt');
+      // The collision is visible, not silent.
+      const problems = getProblems().filter((p) => p.code === 'placement-name-collision');
+      expect(problems.length).toBe(1);
+      expect(problems[0].id).toBe(`placement-name-collision:${rec.id}`);
+    });
+
+    it('placeFromRecord with a suffixed record name keeps it even when the base is free', async () => {
+      const { plugin } = await bootPlanner();
+      const rec = { ...fullRecord(), label: 'Belt_7' };
+
+      await plugin.placeFromRecord(rec);
+
+      expect(placedIn(plugin, rec.id)!.name).toBe('Belt_7');
+      expect(storeRecord(plugin, rec.id)!.label).toBe('Belt_7');
+      expect(getProblems().filter((p) => p.code === 'placement-name-collision')).toHaveLength(0);
+    });
+
+    it('label === node.name after placeFromRecord, duplicate and paste alike', async () => {
+      const { plugin } = await bootPlanner();
+      await plugin.placeFromRecord(fullRecord());
+      plugin.store.selectComponent('p376-full');
+      const dupId = (await plugin.duplicateSelected())!;
+      plugin.store.selectComponent('p376-full');
+      plugin.copySelected();
+      const [pasteId] = await plugin.pasteClipboard();
+      await flush();
+
+      for (const id of ['p376-full', dupId, pasteId]) {
+        expect(placedIn(plugin, id)!.name, id).toBe(storeRecord(plugin, id)!.label);
+      }
     });
   });
 
@@ -536,7 +589,9 @@ describe('plan-376 — placement parity across the five paths', () => {
       expect(copy.position[2]).toBeCloseTo(2.5, 6);
       expect(copy.rotation).toEqual([0, 90, 0]);
       expect(copy.scale).toEqual([2, 2, 2]);
-      expect(copy.label).toBe('Belt (copy)');
+      // plan-758: the copy takes the next free sibling name; record == node.
+      expect(copy.label).toBe('Belt_1');
+      expect(placedIn(plugin, newId!)!.name).toBe('Belt_1');
     });
 
     it('carries signalMappings into the copy and re-applies the bindings', async () => {
@@ -603,7 +658,8 @@ describe('plan-376 — placement parity across the five paths', () => {
       expect(copy.position[2]).toBeCloseTo(2.5, 6);
       expect(copy.rotation).toEqual([0, 90, 0]);
       expect(copy.scale).toEqual([2, 2, 2]);
-      expect(copy.label).toBe('Belt (copy)');
+      expect(copy.label).toBe('Belt_1');
+      expect(placedIn(plugin, ids[0])!.name).toBe('Belt_1');
     });
 
     it('carries signalMappings into the pasted record and re-applies the bindings', async () => {

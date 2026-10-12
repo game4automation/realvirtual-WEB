@@ -22,7 +22,7 @@ BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 Mesh.prototype.raycast = acceleratedRaycast;
 
-registerComponentSchema('IdxTestType', {}, { hoverable: true, selectable: true });
+registerComponentSchema('IdxTestType', {}, { pick: 'select' });
 
 function makePart(name: string): Mesh {
   const mesh = new Mesh(new BoxGeometry(1, 1, 1), new MeshBasicMaterial());

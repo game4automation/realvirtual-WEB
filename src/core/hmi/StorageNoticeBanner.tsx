@@ -33,6 +33,7 @@ import { onBlobStoreNotice, type BlobStoreNotice } from '../storage/rv-opfs-blob
 import { clearSceneSyncNotice, onSceneSyncEvent, type SceneSyncNotice } from './scene/rv-scene-live-sync';
 import { ISA_AMBER, ISA_RED } from './isa-colors';
 import { useOptionalViewer } from '../../hooks/use-viewer';
+import { getSceneStore } from './scene/scene-store-singleton';
 
 type Severity = 'info' | 'warning' | 'critical';
 
@@ -48,6 +49,12 @@ interface Entry {
    * button that opens a dialog to ask would not be a repair.
    */
   actionLabel?: string;
+  /**
+   * The stale-draft decision (plan-546): Restore / Discard, both bound to the
+   * notice's `documentId`. Restore is offered only where the store can write
+   * drafts — the same rule the autosave follows.
+   */
+  staleDraft?: { documentId: string; canRestore: boolean };
 }
 
 const PERSIST_DISMISS_KEY = 'rv-storage-persist-dismissed';
@@ -118,6 +125,21 @@ export function StorageNoticeBanner() {
       // is no longer true, so a remount must not resurrect it from the replay.
       if (id) clearSceneSyncNotice(id);
     })();
+  };
+
+  /**
+   * Restore or discard the set-aside drafts of the notice's document
+   * (plan-546). The store re-reports or clears the notice itself; the local
+   * copy is dropped only for Discard, where nothing is left to report.
+   */
+  const handleStaleDraft = (verb: 'restore' | 'discard') => {
+    const documentId = entry.staleDraft?.documentId;
+    const store = getSceneStore();
+    if (!documentId || !store) return;
+    void (verb === 'restore'
+      ? store.restoreStaleDraft(documentId)
+      : store.discardStaleDraft(documentId)
+    ).catch((e: unknown) => console.error('[storage-notice] stale draft action failed:', e));
   };
 
   const handleDismiss = () => {
@@ -192,6 +214,26 @@ export function StorageNoticeBanner() {
             {entry.actionLabel}
           </Button>
         )}
+        {entry.staleDraft?.canRestore && (
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => handleStaleDraft('restore')}
+            sx={BANNER_BUTTON_SX}
+          >
+            Restore my changes
+          </Button>
+        )}
+        {entry.staleDraft && (
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => handleStaleDraft('discard')}
+            sx={BANNER_BUTTON_SX}
+          >
+            Discard
+          </Button>
+        )}
         <IconButton
           size="small"
           onClick={handleDismiss}
@@ -214,6 +256,16 @@ export function StorageNoticeBanner() {
  * bindings are about work already saved and merely inactive, and the tab hint
  * is about company, not data.
  */
+/** The outlined white button the banner's actions share. */
+const BANNER_BUTTON_SX = {
+  flexShrink: 0,
+  color: '#fff',
+  borderColor: 'rgba(255,255,255,0.6)',
+  fontSize: 11,
+  textTransform: 'none',
+  '&:hover': { borderColor: '#fff', bgcolor: 'rgba(255,255,255,0.12)' },
+} as const;
+
 const SYNC_RANK: Record<SceneSyncNotice['kind'], number> = {
   // `moved` outranks `conflict` (plan-716 §2.4): both describe a refused save,
   // but this one also knows WHY, and its advice is the opposite one. Showing the
@@ -222,6 +274,9 @@ const SYNC_RANK: Record<SceneSyncNotice['kind'], number> = {
   'moved': -1,
   'conflict': 0,
   'autosave-error': 1,
+  // plan-546 — work at stake: unsaved changes are set aside until the user
+  // decides. Same level as a failed autosave, above every hint below.
+  'stale-draft': 1,
   // Below the "your work is not being kept" notices and above the hints: a
   // broken link is a dead end, not a threat to anything the user is holding.
   'missing-document': 2,
@@ -272,6 +327,17 @@ function pickEntry(
       severity: 'critical',
       message: sync.message,
       action: 'Use Save As to write the scene somewhere it can be kept.',
+    };
+  }
+  if (sync?.kind === 'stale-draft') {
+    return {
+      key: 'stale-draft',
+      severity: 'warning',
+      message: sync.message,
+      staleDraft: {
+        documentId: sync.documentId,
+        canRestore: getSceneStore()?.canWriteDrafts() ?? false,
+      },
     };
   }
   if (sync?.kind === 'missing-document') {

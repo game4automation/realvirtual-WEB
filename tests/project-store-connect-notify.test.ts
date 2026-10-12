@@ -165,6 +165,39 @@ describe('plan-462 B2 — the manifest commit hook decides the CONNECT notify', 
     expect(await readManifestText(h.dir)).toContain('models/linie1.connect.json');
   });
 
+  it('announces a scriptRef binding exactly once, like its two siblings', async () => {
+    // plan-479 Phase 0: the third reference field goes down the SAME write path
+    // — `_setDocumentRefField` is keyed on `DocumentRefField`, not on a union
+    // that has to grow a branch per field. What that buys is exactly this: the
+    // notify, the CAS commit and the containment check come for free.
+    const h = await harness();
+
+    await h.store.setDocumentScriptRef('d1', 'plugins/ribbon-tension-controls-plugin.tsx');
+
+    expect(h.notifications()).toBe(1);
+    expect(await readManifestText(h.dir))
+      .toContain('plugins/ribbon-tension-controls-plugin.tsx');
+  });
+
+  it('clears a scriptRef binding and drops the field from the manifest', async () => {
+    const h = await harness();
+    await h.store.setDocumentScriptRef('d1', 'plugins/index.ts');
+    h.reset();
+
+    await h.store.setDocumentScriptRef('d1', null);
+
+    expect(h.notifications()).toBe(1);
+    expect(await readManifestText(h.dir)).not.toContain('scriptRef');
+  });
+
+  it('refuses a scriptRef that would leave the project', async () => {
+    const h = await harness();
+
+    await expect(h.store.setDocumentScriptRef('d1', '../elsewhere/plugins/index.ts'))
+      .rejects.toThrow();
+    expect(h.notifications()).toBe(0);
+  });
+
   it('stays silent for a marker-driven migration', async () => {
     const h = await harness();
     // The migration's own gate needs a declared module to bind; without one it

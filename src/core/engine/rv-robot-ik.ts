@@ -232,11 +232,8 @@ registerComponent({
   type: 'RobotIK',
   schema: RVRobotIK.schema,
   capabilities: {
-    selectable: true,
-    inspectorVisible: true,
-    hierarchyVisible: true,
-    badgeColor: '#7e57c2',
-    filterLabel: 'Robots',
+    pick: 'select',
+    ui: { badge: '#7e57c2', filter: 'Robots', category: 'robotics' },
   },
   create: (node: Object3D) => new RVRobotIK(node),
 });

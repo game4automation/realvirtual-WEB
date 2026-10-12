@@ -27,6 +27,22 @@ import {
   INSPECTOR_FIELD_MIN,
   INSPECTOR_ROW_GAP,
 } from './layout-constants';
+import { FS, ROW_HOVER } from './shared-sx';
+
+/**
+ * The inspector grid's column template — the ONE definition of where the
+ * label and the value column sit. `InspectorRow` and the other inspector
+ * building blocks (`rv-inspector-blocks.tsx`) share it, so every value, button
+ * row and disclosure summary starts on the same x (plan-510).
+ */
+export function inspectorGridColumns(fullWidthField = false): string {
+  return fullWidthField
+    ? `${INSPECTOR_DOT_GUTTER}px minmax(0, ${INSPECTOR_LABEL_MAX}) 1fr`
+    : `${INSPECTOR_DOT_GUTTER}px minmax(0, ${INSPECTOR_LABEL_MAX}) 1fr minmax(${INSPECTOR_FIELD_MIN}px, ${INSPECTOR_FIELD_MAX})`;
+}
+
+/** Horizontal padding of every inspector row (MUI spacing units). */
+export const INSPECTOR_ROW_PX = 1;
 
 export interface InspectorRowProps {
   /** Field name / label node (left column). */
@@ -55,6 +71,10 @@ export interface InspectorRowProps {
   rowTooltip?: string;
   /** Tighter typography for nested sub-field rows. */
   dense?: boolean;
+  /** Extra attributes on the row element (e.g. `data-rv-button-id` for the AI choreography). */
+  dataAttrs?: Record<string, string>;
+  /** Extra sx merged last onto the row (AI hover/press/afterglow). */
+  sx?: Record<string, unknown>;
 }
 
 export function InspectorRow({
@@ -71,12 +91,12 @@ export function InspectorRow({
   py = 0,
   rowTooltip,
   dense = false,
+  dataAttrs,
+  sx,
 }: InspectorRowProps) {
   // Scalar: gutter · label(≤40%) · spacer(1fr) · field(≤50%).
   // Full-width: gutter · label(≤40%) · field(1fr) — field spans the rest.
-  const gridTemplateColumns = fullWidthField
-    ? `${INSPECTOR_DOT_GUTTER}px minmax(0, ${INSPECTOR_LABEL_MAX}) 1fr`
-    : `${INSPECTOR_DOT_GUTTER}px minmax(0, ${INSPECTOR_LABEL_MAX}) 1fr minmax(${INSPECTOR_FIELD_MIN}px, ${INSPECTOR_FIELD_MAX})`;
+  const gridTemplateColumns = inspectorGridColumns(fullWidthField);
 
   const row = (
     <Box
@@ -85,12 +105,14 @@ export function InspectorRow({
         gridTemplateColumns,
         columnGap: `${INSPECTOR_ROW_GAP}px`,
         alignItems: 'center',
-        px: 1,
+        px: INSPECTOR_ROW_PX,
         py,
         minHeight,
         opacity,
-        '&:hover': { bgcolor: 'rgba(255,255,255,0.02)' },
+        '&:hover': { bgcolor: ROW_HOVER },
+        ...sx,
       }}
+      {...dataAttrs}
     >
       {/* Leading gutter — override / status dot (col 1). */}
       <Box
@@ -110,7 +132,7 @@ export function InspectorRow({
       <Typography
         sx={{
           gridColumn: 2,
-          fontSize: dense ? 10 : 11,
+          fontSize: dense ? FS.micro : FS.label,
           color: labelColor,
           minWidth: 0,
           overflow: 'hidden',

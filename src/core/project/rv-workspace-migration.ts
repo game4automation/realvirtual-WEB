@@ -708,14 +708,12 @@ function documentRowOf(
     id: placed.id,
     path: placed.path,
     name: placed.name,
-    // The transitional stamp (plan-736 Phase 3) — one of exactly two write
-    // sites that still record `section`, and for one reason: this migration
-    // converts the localStorage scene catalogue into browser documents, whose
-    // paths are bare ids. An OLD client meeting a section-less bare-id row runs
-    // it through the pre-plan-736 path heuristic, gets 'library', and routes it
-    // down the blob branch — a storage failure, not a badge. See
-    // `documentOfSceneEntry` for the full note and the removal gate.
-    section: 'scenes',
+    // No `section` stamp (plan-744 Phase 2). It stood here as the transitional
+    // Alt-Client guard of plan-736 Phase 3 — a bare-id browser row that an old
+    // client would otherwise read as `library` and route down the blob branch.
+    // The gate on it (slow delivery channels carrying a client that no longer
+    // reads the field) was declared open; the residual risk is named in
+    // plan-744 §5.4 and accepted, not mitigated.
     createdAt: row.createdAt ?? at,
     modifiedAt: row.modifiedAt ?? at,
     // Kept so a support question ("where did this document come from?") has an

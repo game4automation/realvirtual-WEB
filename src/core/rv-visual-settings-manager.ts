@@ -24,6 +24,7 @@ import {
 import type { ToneMapping as ThreeToneMapping } from 'three';
 import type { Renderer } from 'three/webgpu';
 import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
+import { DEFAULT_ENVIRONMENT_HDR } from './engine/rv-cinematic-hook';
 import type { ToneMappingType, ShadowQuality } from './hmi/visual-settings-store';
 import { getRenderMode, type RenderMode } from './rv-render-modes';
 
@@ -180,6 +181,11 @@ export class VisualSettingsManager {
       this.state.dirLight.shadow.map = null as unknown as typeof this.state.dirLight.shadow.map;
     }
     this.state.dirLight.shadow.camera.updateProjectionMatrix();
+    // A nulled map has to be re-rendered before the next lit draw, exactly
+    // like shadowMapSize below — without the flag every lit material samples
+    // an empty shadow texture and the frame shows sky and floor only.
+    this.state._shadowsDirty = true;
+    this.state._renderDirty = true;
   }
 
   set shadowMapSize(size: number) {
@@ -330,7 +336,7 @@ export class VisualSettingsManager {
   async loadEnvMap(): Promise<void> {
     if (this._envMapTexture) return;
     const loader = new RGBELoader();
-    const hdrTexture = await loader.loadAsync(`${import.meta.env.BASE_URL}envmaps/empty_warehouse_01_1k.hdr`);
+    const hdrTexture = await loader.loadAsync(`${import.meta.env.BASE_URL}${DEFAULT_ENVIRONMENT_HDR}`);
 
     // WebGPU path (plan-271): the classic PMREMGenerator is WebGL-only, but
     // three/webgpu ships its own — use the async variant (waits for backend

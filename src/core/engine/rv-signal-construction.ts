@@ -2,15 +2,13 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 /**
- * Shared signal + drive construction helpers used by both `traverseAndRegister()`
- * and `processExtras()` in rv-scene-loader.ts.
+ * Signal + drive construction primitives of `traverseAndRegister()` — the ONE
+ * traversal in rv-scene-loader.ts (plan-754 F13/D19).
  *
- * The two traversal functions are intentionally kept separate — `traverseAndRegister()`
- * is the rich main-load path (with overlays, renamed-node aliases, validation,
- * MU template + group + kinematic + pipeline + metadata collection), while
- * `processExtras()` is a deliberately leaner re-registration path for dynamically
- * added GLBs (layout planner). Only the *inner* signal and drive construction
- * primitives are shared here — the traversal control flow remains divergent.
+ * There is no second, leaner traversal any more: the main model, a layout
+ * placement and an editor-rebuilt subtree all reach these helpers through
+ * `initSubtree()`, so a malformed extras record is reported wherever the
+ * subtree came from.
  */
 
 import { Object3D } from 'three';
@@ -25,11 +23,18 @@ import { RVDriveFollowPosition } from './rv-drive-follow-position';
 import { RVDriveSpeed } from './rv-drive-speed';
 import { RVDrivePositionSwitch } from './rv-drive-position-switch';
 import { RVDriveSEWMovilink } from './rv-drive-sew-movilink';
+import { RVDriveContinousDestination } from './rv-drive-continous-destination';
+import { RVDriveProfidriveSpeed } from './rv-drive-profidrive-speed';
+import { RVDriveProfidrivePos } from './rv-drive-profidrive-pos';
+import { RVDriveFestoFHPP } from './rv-drive-festo-fhpp';
+import { RVDriveUniDriveMotor } from './rv-drive-unidrive-motor';
+import { RVDriveProportionalValve } from './rv-drive-proportional-valve';
 import { applySchema, getSchemaDefaults, resolveComponentRefs, type RVComponent, type ComponentSchema, type ComponentContext, type PlcSignalType } from './rv-component-registry';
 import type { SignalStore } from './rv-signal-store';
+import { reportSignalNameCollision as reportSignalNameCollisionProblem } from '../hmi/problems-store';
 import type { RVTransportManager } from './rv-transport-manager';
 import { NodeRegistry } from './rv-node-registry';
-import { instanceScopeNode, scopeSignalName } from './rv-instance-scope';
+import { instanceScope, instanceScopeNode, scopeSignalName } from './rv-instance-scope';
 import { getActiveSignalReapplyRegistry } from './rv-signal-reapply-registry';
 
 /** Pending component awaiting resolveComponentRefs + init() in the caller's Step 2 phase. */
@@ -59,6 +64,12 @@ export const DRIVE_BEHAVIOR_MAP: Record<string, { ctor: new (n: Object3D) => RVC
   Drive_Speed: { ctor: RVDriveSpeed, schema: RVDriveSpeed.schema },
   Drive_PositionSwitch: { ctor: RVDrivePositionSwitch, schema: RVDrivePositionSwitch.schema },
   Drive_SEWMovilink: { ctor: RVDriveSEWMovilink, schema: RVDriveSEWMovilink.schema },
+  Drive_ContinousDestination: { ctor: RVDriveContinousDestination, schema: RVDriveContinousDestination.schema },
+  Drive_ProfidriveSpeed: { ctor: RVDriveProfidriveSpeed, schema: RVDriveProfidriveSpeed.schema },
+  Drive_ProfidrivePos: { ctor: RVDriveProfidrivePos, schema: RVDriveProfidrivePos.schema },
+  Drive_FestoFHPP: { ctor: RVDriveFestoFHPP, schema: RVDriveFestoFHPP.schema },
+  Drive_UniDriveMotor: { ctor: RVDriveUniDriveMotor, schema: RVDriveUniDriveMotor.schema },
+  Drive_ProportionalValve: { ctor: RVDriveProportionalValve, schema: RVDriveProportionalValve.schema },
 };
 
 /** Signal type names recognized from GLB extras. */
@@ -129,12 +140,123 @@ export function resetDuplicateSignalNames(store: SignalStore): void {
   _signalNamePaths.delete(store);
 }
 
+// ─── The naming rule + node tracking (plan-589) ──────────────────────────────
+
 /**
- * Register a PLC signal in the SignalStore and the NodeRegistry, identical
- * to the inline logic that previously lived in `traverseAndRegister()` and
- * `processExtras()`.
+ * `rv_extras.<PLC*>` flag: this signal leaf was created by the RUNTIME
+ * (`addSignal`, `registerBehaviorSignals`), not authored in the asset. It
+ * persists into the GLB (see `rv-extras-validator.ts`) because it is what tells
+ * a reload apart: a generated name is instance-scoped, an authored one is not.
+ */
+export const GENERATED_SIGNAL_FIELD = 'Generated';
+
+/** True when `sigData` carries the `Generated` provenance flag. */
+export function isGeneratedSignalData(sigData: Record<string, unknown>): boolean {
+  return sigData[GENERATED_SIGNAL_FIELD] === true;
+}
+
+/**
+ * THE naming rule of a PLC signal node — one function, used by the loader
+ * (`registerSignal`), `addSignal`, `registerBehaviorSignals` and the editor
+ * sync, so a name is scoped exactly once wherever the node came from.
  *
- * Side-effects (must exactly mirror the original inline code):
+ *  - `local`     — the persisted, ASSET-LOCAL symbol: `Name`, else the glTF
+ *                  original name, else the node name.
+ *  - `generated` — provenance from the `Generated` flag in the extras.
+ *  - `runtime`   — the SignalStore key. **Authored signals stay RAW** (the
+ *                  user's decision of 2026-10-11: a placement must not break
+ *                  existing CONNECT configurations — a leading `/` of an
+ *                  authored global is kept verbatim, exactly as before).
+ *                  **Generated signals are scoped exactly once**
+ *                  (`scopeSignalName(instanceScope(node), local)`), so two
+ *                  placed copies of the same asset never collide on a name
+ *                  nobody typed.
+ */
+export function resolveSignalName(
+  node: Object3D,
+  sigData: Record<string, unknown>,
+  signalNameOverride?: string,
+): { local: string; runtime: string; generated: boolean } {
+  const local = (sigData['Name'] as string) || signalNameOverride || node.name;
+  const generated = isGeneratedSignalData(sigData);
+  const runtime = generated ? scopeSignalName(instanceScope(node), local) : local;
+  return { local, runtime, generated };
+}
+
+/** What a signal node is registered as — the snapshot the editor sync diffs against. */
+export interface TrackedSignal {
+  type: string;
+  name: string;
+  path: string;
+  /** The glTF original-name override the registration used (dedup), if any. */
+  override?: string;
+  /** Descriptive metadata of the last registration — the `metaChanged` baseline. */
+  comment?: string;
+  originDataType?: string;
+}
+
+const _tracked = new WeakMap<SignalStore, WeakMap<Object3D, TrackedSignal>>();
+
+/** The registration snapshot of a node in `store` (node IDENTITY, not path). */
+export function trackedSignalOf(store: SignalStore, node: Object3D): TrackedSignal | undefined {
+  return _tracked.get(store)?.get(node);
+}
+
+/** Record (or forget, with `null`) the registration snapshot of a node. */
+export function setTrackedSignal(store: SignalStore, node: Object3D, t: TrackedSignal | null): void {
+  let map = _tracked.get(store);
+  if (!map) { map = new WeakMap(); _tracked.set(store, map); }
+  if (t) map.set(node, t);
+  else map.delete(node);
+}
+
+// ─── Free default names (plan-589) ───────────────────────────────────────────
+
+/**
+ * Is `name` OCCUPIED in `store` — by a value entry, by any canonical
+ * registration path, or by a reservation of the transaction currently running?
+ *
+ * NOT {@link isDuplicateSignalName}: that one answers "is this name used MORE
+ * THAN ONCE" (the fail-closed bind-slot rule) and is therefore `false` for a
+ * name taken exactly once — useless for picking a free default name.
+ *
+ * @param reserved names already handed out in the open transaction, whose ops
+ *   have not reached the store yet (two `addSignal` calls in ONE transaction).
+ */
+export function isSignalNameTaken(
+  store: SignalStore,
+  name: string,
+  reserved?: Iterable<string> | null,
+): boolean {
+  if (!name) return false;
+  if (store.get(name) !== undefined) return true;
+  if (store.registeredPaths(name).length > 0) return true;
+  if (reserved) for (const r of reserved) if (r === name) return true;
+  return false;
+}
+
+/**
+ * First free name of the `base`, `base_1`, `base_2`, … series (the `_N` rule of
+ * `rv-node-naming`), checked with {@link isSignalNameTaken}. The caller adds the
+ * result to `reserved` so the next call in the same transaction skips it.
+ */
+export function freeSignalName(
+  store: SignalStore,
+  base: string,
+  reserved?: Iterable<string> | null,
+): string {
+  if (!isSignalNameTaken(store, base, reserved)) return base;
+  for (let i = 1; i < 10_000; i++) {
+    const candidate = `${base}_${i}`;
+    if (!isSignalNameTaken(store, candidate, reserved)) return candidate;
+  }
+  return `${base}_${Date.now()}`;
+}
+
+/**
+ * Register a PLC signal in the SignalStore and the NodeRegistry.
+ *
+ * Side-effects:
  *  - `signalStore.register(signalName, path, initialValue, sigType)`
  *  - `registry.register(sigType, path, { address: path, signalName })`
  *
@@ -145,9 +267,10 @@ export function resetDuplicateSignalNames(store: SignalStore): void {
  * @param signalStore  Target SignalStore.
  * @param registry  Target NodeRegistry.
  * @param signalNameOverride Optional explicit name; when provided, used as the
- *   second-priority lookup *before* falling back to `node.name`. Used by
- *   `traverseAndRegister()` to inject the original renamed-node name; the
- *   leaner `processExtras()` path passes `undefined`.
+ *   second-priority lookup *before* falling back to `node.name`. Carries the
+ *   original name of a glTF-deduplicated node — `initSubtree` supplies the map
+ *   for every entry point (the parser's for a load, the `_rvOrigName` stamps
+ *   for a placed clone).
  * @returns `true` if a signal was registered, `false` if `sigType` was not
  *          recognized as Bool/Float/Int (defensive: no-op on unknown types).
  */
@@ -161,7 +284,8 @@ export function registerSignal(
   signalNameOverride?: string,
 ): boolean {
   const status = sigData['Status'] as { Value?: boolean | number } | undefined;
-  const signalName = (sigData['Name'] as string) || signalNameOverride || node.name;
+  const resolved = resolveSignalName(node, sigData, signalNameOverride);
+  const signalName = resolved.runtime;
 
   if (sigType.includes('Bool')) {
     signalStore.register(signalName, path, (status?.Value as boolean) ?? false, sigType);
@@ -192,15 +316,72 @@ export function registerSignal(
   }
   paths.add(path);
 
-  // Best-effort descriptive metadata from rv_extras (purely for the HMI tooltip).
-  // Only the comment is meaningful for scene signals — they have no protocol
-  // address (the hierarchy path is their identity). Skip when absent.
-  const comment = sigData['Comment'];
-  if (typeof comment === 'string' && comment.length > 0) {
-    signalStore.setSignalMeta(signalName, { comment });
+  // plan-589: remember WHAT this node is registered as, keyed by the node
+  // object — the editor sync diffs against it after a rename/delete/reparent,
+  // when the node's old path can no longer be recomputed.
+  const comment = typeof sigData['Comment'] === 'string' ? sigData['Comment'] as string : undefined;
+  const originDataType = typeof sigData['OriginDataType'] === 'string'
+    ? sigData['OriginDataType'] as string : undefined;
+  setTrackedSignal(signalStore, node, {
+    type: sigType, name: signalName, path,
+    ...(signalNameOverride ? { override: signalNameOverride } : {}),
+    ...(comment !== undefined ? { comment } : {}),
+    ...(originDataType !== undefined ? { originDataType } : {}),
+  });
+
+  // Best-effort descriptive metadata from rv_extras (purely for the HMI tooltip
+  // and the reconcile report). Only comment + origin data type are meaningful
+  // for scene signals — they have no protocol address (the hierarchy path is
+  // their identity). Absent means absent: clear the field rather than writing
+  // '' (plan-589; `setSignalMeta` merges and cannot delete).
+  if (comment !== undefined && comment.length > 0) signalStore.setSignalMeta(signalName, { comment });
+  else signalStore.clearSignalMetaField(signalName, 'comment');
+  if (originDataType !== undefined && originDataType.length > 0) {
+    signalStore.setSignalMeta(signalName, { originDataType });
+  } else {
+    signalStore.clearSignalMetaField(signalName, 'originDataType');
   }
 
+  reportSignalNameCollision(signalStore, node, signalName, path);
+
   return true;
+}
+
+/**
+ * Warn when a second MODEL path claims the same signal name from a DIFFERENT
+ * placement — the price of keeping authored names raw (user decision
+ * 2026-10-11): two copies of the same asset really do share their authored
+ * symbols, and a binding would then drive the foreign one too.
+ *
+ * ONE problem entry per name, every colliding path in the `detail`. Two
+ * declarations of the same `/`-global symbol are NOT a collision: that is the
+ * documented way to declare a shared E-stop in several assets.
+ *
+ * Deliberate deviation from the plan's wording ("in `register()`"): the store
+ * knows nothing about placements and must not learn it. `registerSignal` is the
+ * ONE funnel every model-side registration goes through and the only one that
+ * has the node — so the rule lives here, and `rv-signal-store.ts` stays free of
+ * both placement knowledge and the problems store.
+ */
+function reportSignalNameCollision(
+  store: SignalStore, node: Object3D, name: string, path: string,
+): void {
+  // Allocation-free early-out: the overwhelming majority of registrations have
+  // exactly one owner, and this runs for every signal of every load.
+  if (store.ownerPathCount(name) < 2) return;
+  // `__iface__/<name>` is the interface placeholder, not a model path (the
+  // literal avoids a value import of the store into this module).
+  const owners = store.registeredPaths(name).filter((p) => !p.startsWith('__iface__/'));
+  if (owners.length < 2) return;
+  const scopeNode = instanceScopeNode(node);
+  if (!scopeNode) return;                       // not inside a placement — nothing to warn about
+  const local = (node.userData?.realvirtual as Record<string, Record<string, unknown>> | undefined);
+  // A `/`-global authored declaration is intentionally shared.
+  for (const key of SIGNAL_TYPES) {
+    const data = local?.[key];
+    if (data && typeof (data['Name']) === 'string' && (data['Name'] as string).startsWith('/')) return;
+  }
+  reportSignalNameCollisionProblem(name, owners, path);
 }
 
 /** Render-free signal container name under a drive node (parity with GLB `Signals`). */
@@ -308,6 +489,13 @@ export interface AddSignalOpts {
    *  component's signals share ONE folder; outside a LayoutObject the owner
    *  node itself. Must be `ownerNode` or one of its ancestors. */
   at?: Object3D;
+  /**
+   * Name of the LEAF node under `Signals/` when it must differ from the signal
+   * name (plan-498): an `Fmu` names its leaf after the FMI variable (`pressure`)
+   * but registers the wire name `<FmuNode>.pressure`, so two FMUs with the same
+   * variable never collide outside a placement. Default: `name`.
+   */
+  leafName?: string;
 }
 
 /**
@@ -340,7 +528,9 @@ export function addSignal(
   // Host of the `Signals` folder: explicit `at`, else the component root
   // (nearest LayoutObject ancestor), else the owner node itself.
   const scopeRoot = instanceScopeNode(ownerNode);
-  const scope = scopeRoot?.name ?? '';
+  // The scope is the full placement CHAIN (`Cell.Conv` for a nested placement),
+  // the container host is the INNERMOST placement root — see rv-instance-scope.
+  const scope = instanceScope(ownerNode);
   const host = opts.at ?? (scopeRoot && scopeRoot !== ownerNode ? scopeRoot : ownerNode);
 
   // Host path = owner path minus the segments between owner and host (works
@@ -353,8 +543,9 @@ export function addSignal(
   }
 
   const container = getOrCreateSignalsContainer(host);
-  const leafName = name;
-  const sigName = scopeSignalName(scope, name);
+  // A global name (`/EStop`) must not put a `/` into the node name — that would
+  // split the hierarchy path (plan-589 spike).
+  const leafName = opts.leafName ?? (name.startsWith('/') ? name.slice(1) : name);
   const sigPath = `${hostPath}/${SIGNALS_CONTAINER_NAME}/${leafName}`;
 
   // Reuse an existing leaf if a previous run already created it (idempotent).
@@ -365,8 +556,17 @@ export function addSignal(
     container.add(leaf);
   }
   // userData.realvirtual[sigType] shape that the hierarchy scan + badge read.
+  // plan-589: the PERSISTED name is ASSET-LOCAL (`name`, a leading `/` kept for
+  // a global) and the leaf is flagged `Generated` — the two together are what
+  // lets a reload re-derive the runtime name with `resolveSignalName` instead
+  // of re-scoping an already-scoped name (the "reload ghost"). The flag also
+  // keeps the leaf apart from an AUTHORED signal in the same `Signals` folder,
+  // whose name must stay raw.
+  const extras: Record<string, unknown> = {
+    Name: name, [GENERATED_SIGNAL_FIELD]: true, Status: { Value: seed },
+  };
   const ud = leaf.userData as { realvirtual?: Record<string, unknown>; rvForceable?: boolean };
-  (ud.realvirtual ??= {})[plcType] = { Name: sigName, Status: { Value: seed } };
+  (ud.realvirtual ??= {})[plcType] = extras;
   ud.rvForceable = opts.forceable ?? true;
 
   // Register the node, then reuse registerSignal for the store + registry +
@@ -375,13 +575,17 @@ export function addSignal(
   registerSignal(
     leaf,
     plcType,
-    { Name: sigName, Status: { Value: seed }, Comment: opts.comment ?? `${plcType} · ${name}` },
+    { ...extras, Comment: opts.comment ?? `${plcType} · ${name}` },
     sigPath,
     signalStore,
     registry,
   );
 
-  return { name: sigName, path: sigPath, node: leaf };
+  return {
+    name: trackedSignalOf(signalStore, leaf)?.name ?? scopeSignalName(scope, name),
+    path: sigPath,
+    node: leaf,
+  };
 }
 
 /** Build the ComponentReference record a Unity GLB export writes for a wired
@@ -392,10 +596,9 @@ export function componentReference(sig: SignalHandle | string, plcType: PlcSigna
 
 /**
  * Construct an `RVDrive` from extras and collect any recognized `Drive_*`
- * behavior components. Mirrors the inline construction that previously lived
- * in both `traverseAndRegister()` and `processExtras()`.
+ * behavior components.
  *
- * Side-effects (must exactly mirror the original inline code):
+ * Side-effects:
  *  - Creates RVDrive(node), applySchema(...)
  *  - Sets drive.Behaviors / drive.BehaviorExtras
  *  - Calls drive.initDrive()
@@ -404,9 +607,9 @@ export function componentReference(sig: SignalHandle | string, plcType: PlcSigna
  *  - Instantiates Drive_* behavior components via DRIVE_BEHAVIOR_MAP +
  *    applySchema and returns them as pending entries
  *
- * Behavior validation (`validateExtras(key, bExtras)`) is intentionally NOT
- * performed here — it is the caller's responsibility, because
- * `traverseAndRegister()` validates while `processExtras()` does not.
+ * Behavior validation (`validateExtras(key, bExtras)`) is not performed here —
+ * it is the caller's, through `onBehaviorExtras`. `traverseAndRegister()`, the
+ * one traversal, always passes it.
  *
  * Auto-provisioning (F2): for a `Drive_DestinationMotor` behavior whose standard
  * signal slots carry no GLB componentRef, the standard signal set is registered
@@ -422,8 +625,8 @@ export function componentReference(sig: SignalHandle | string, plcType: PlcSigna
  * @param registry Target registry.
  * @param signalStore Target SignalStore (retained for caller compatibility).
  * @param onBehaviorExtras Optional callback fired for each discovered Drive_*
- *   behavior name + its extras record — used by `traverseAndRegister()` to run
- *   `validateExtras()` per behavior. `processExtras()` passes `undefined`.
+ *   behavior name + its extras record — `traverseAndRegister()` runs
+ *   `validateExtras()` per behavior through it.
  * @returns the constructed drive + collected pending behavior entries, OR
  *          `null` if `driveData.Direction` is missing/falsy (matching the
  *          original guard).

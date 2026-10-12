@@ -68,7 +68,6 @@ import {
   type DocumentStat,
   findDocumentIdCollisions,
   readDocuments,
-  sectionOfDocument,
   stableDocumentId,
 } from './rv-project-documents';
 
@@ -394,18 +393,78 @@ export const ADOPT_QUARANTINE_MS = 15 * 60 * 1000;
 const ADOPTABLE_EXTENSIONS = ['.glb', '.gltf', '.splat', '.ksplat', '.ply'];
 
 /**
+ * True for a directory or file NAME the project keeps to itself
+ * (`.thumbnails`, `.trash`, `.git`) — **the one dot-segment rule**
+ * (plan-744 Phase 1).
+ *
+ * It was spelled out three times: here, inside `FolderBackend._walkMatching`
+ * and again in `isInternalProjectPath`. Two of them are now this function, and
+ * the third states a superset (internal FILES and folders, not just private
+ * ones) over it. One name, because the moment they disagree a sidecar becomes
+ * a document.
+ */
+export function isPrivateSegment(segment: string): boolean {
+  return segment.startsWith('.');
+}
+
+/** True when any segment of `path` is a {@link isPrivateSegment}. */
+export function hasPrivateSegment(path: string): boolean {
+  return normalisePath(path).split('/').some(isPrivateSegment);
+}
+
+/**
+ * The root-level folder that holds bytes on their way INTO a project.
+ *
+ * A converted CAD file, an Onshape pull, anything a re-sync has to be able to
+ * overwrite at a known path. Staged bytes are not documents: they are listed
+ * by the file tree (they are real files) and skipped by `listDocuments()`, so
+ * an import does not put a half-finished card on the dashboard before anyone
+ * has decided what it is.
+ */
+export const IMPORT_STAGING_FOLDER = 'imports';
+
+/** True for a path under the root-level {@link IMPORT_STAGING_FOLDER}. */
+export function isStagingPath(path: string): boolean {
+  const segments = normalisePath(path).split('/').filter(Boolean);
+  return segments.length > 1 && segments[0]!.toLowerCase() === IMPORT_STAGING_FOLDER;
+}
+
+/**
+ * True for a document the `?model=` SELECTOR catalogue lists.
+ *
+ * The last surviving "model" notion, and deliberately out of plan-744's scope
+ * — it is a URL contract (`?model=`) plus CONNECT's auto-load, and retiring it
+ * is its own plan. What plan-744 changed is only where the answer comes from:
+ * a place filter over `listDocuments()` instead of a `listModels()` listing of
+ * its own.
+ *
+ * Two shapes count, and the second is not a special case. A `models/` path is
+ * the ordinary one — with or without a leading slash, because a deploy
+ * manifest writes root-relative paths. The other is an absolute URL: a bundled
+ * backend reached with `discover: true` folds a FOREIGN deploy's `models.json`
+ * in, and those rows carry the URL the foreign host published
+ * (`https://cdn…/customer/models/Press.glb`). They used to be found because a
+ * stored `section: 'models'` said so.
+ */
+export function isModelCataloguePath(path: unknown): boolean {
+  const p = typeof path === 'string' ? path : '';
+  return /^\/?models\//i.test(p) || /^https?:\/\//i.test(p);
+}
+
+/**
  * True for a scanned path that may become a row.
  *
- * Two exclusions, both of them about not adopting our own bookkeeping: a
- * dot-segment is a private folder (`.thumbnails/`, `.trash/`), and anything
- * that is not an asset file is a sidecar — `library/library.json` is the one
- * that would otherwise show up as a document on the browser backend, where
- * every written blob lands in the same index.
+ * Three exclusions, all of them about not adopting something that is not a
+ * document: a private dot-segment is our own bookkeeping, `imports/` is a
+ * staging area, and anything that is not an asset file is a sidecar —
+ * `library/library.json` is the one that would otherwise show up as a document
+ * on the browser backend, where every written blob lands in the same index.
  */
 export function isAdoptablePath(path: string): boolean {
   const p = normalisePath(path);
   if (p === '') return false;
-  if (p.split('/').some(seg => seg.startsWith('.'))) return false;
+  if (hasPrivateSegment(p)) return false;
+  if (isStagingPath(p)) return false;
   const lower = p.toLowerCase();
   return ADOPTABLE_EXTENSIONS.some(ext => lower.endsWith(ext));
 }

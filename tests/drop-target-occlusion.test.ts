@@ -123,15 +123,9 @@ function makeHarness(opts: {
     x: 0, y: 0, toJSON: () => ({}),
   });
 
-  const staticOccluders = occluders.filter((o) => !o.kinematic);
-  const kinematicOccluders = occluders.filter((o) => o.kinematic);
-  const kinematicGroups = new Map<Object3D, { mesh: Mesh }>();
-  for (const o of kinematicOccluders) kinematicGroups.set(new Object3D(), { mesh: o.mesh });
-
-  const raycastGeometry = opts.noGeometry ? null : {
-    staticGroup: staticOccluders.length > 0 ? { mesh: staticOccluders[0].mesh } : null,
-    kinematicGroups,
-  };
+  // The occlusion meshes stand in for the bake registry's pick meshes
+  // (chunk + keep meshes of every live instance, plan-753 Phase 4b).
+  const pickMeshes: Mesh[] | null = opts.noGeometry ? null : occluders.map((o) => o.mesh);
 
   const gizmoManager = new GizmoOverlayManager(scene, () => null);
   const viewer = {
@@ -146,7 +140,8 @@ function makeHarness(opts: {
     get renderBackend() { return 'three' as const; },
     markRenderDirty: () => {},
     on: () => () => {},
-    raycastManager: { raycastGeometry },
+    raycastManager: {},
+    bakeRegistry: pickMeshes ? { pickMeshes } : undefined,
     contextMenu: new ContextMenuStore(),
   } as unknown as RVViewer;
 
@@ -237,9 +232,7 @@ describe('drop-target magnet — occlusion', () => {
     const wall = new Mesh(new BoxGeometry(0.2, 4, 0.05), new MeshBasicMaterial());
     wall.position.set(0, 0, 5);
     wall.updateMatrixWorld(true);
-    (h.viewer.raycastManager as unknown as { raycastGeometry: unknown }).raycastGeometry = {
-      staticGroup: { mesh: wall }, kinematicGroups: new Map(),
-    };
+    (h.viewer as unknown as { bakeRegistry: unknown }).bakeRegistry = { pickMeshes: [wall] };
 
     const c = new DropTargetOverlayController(h.viewer);
     // Aim between the two, slightly closer to Near.
@@ -258,11 +251,7 @@ describe('drop-target magnet — occlusion', () => {
     const arm = new Mesh(new BoxGeometry(0.2, 4, 0.05), new MeshBasicMaterial());
     arm.position.set(0, 0, 5);
     arm.updateMatrixWorld(true);
-    const groups = new Map<Object3D, { mesh: Mesh }>();
-    groups.set(new Object3D(), { mesh: arm });
-    (h.viewer.raycastManager as unknown as { raycastGeometry: unknown }).raycastGeometry = {
-      staticGroup: null, kinematicGroups: groups,
-    };
+    (h.viewer as unknown as { bakeRegistry: unknown }).bakeRegistry = { pickMeshes: [arm] };
 
     const c = new DropTargetOverlayController(h.viewer);
     const near = screenOf(h.viewer, h.nodes[0]);
@@ -291,9 +280,7 @@ describe('drop-target magnet — occlusion', () => {
     wall.position.set(0, 0, 5);
     wall.updateMatrixWorld(true);
     const raycastSpy = vi.spyOn(wall, 'raycast');
-    (h.viewer.raycastManager as unknown as { raycastGeometry: unknown }).raycastGeometry = {
-      staticGroup: { mesh: wall }, kinematicGroups: new Map(),
-    };
+    (h.viewer as unknown as { bakeRegistry: unknown }).bakeRegistry = { pickMeshes: [wall] };
 
     const c = new DropTargetOverlayController(h.viewer);
     const near = screenOf(h.viewer, h.nodes[0]);

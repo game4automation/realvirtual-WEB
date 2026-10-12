@@ -120,13 +120,32 @@ export function createBridgeServer(opts: BridgeServerOptions = {}): BridgeServer
       // pixels burned into the frame.
       if (result.includes('__rvImage')) {
         try {
-          const img = (JSON.parse(result) as { __rvImage?: Record<string, unknown> }).__rvImage;
+          const envelope = JSON.parse(result) as {
+            __rvImage?: Record<string, unknown>;
+            __rvImages?: Array<Record<string, unknown>>;
+          };
+          const img = envelope.__rvImage;
           const data = img?.data;
           if (img && typeof data === 'string' && data.length > 0) {
             const { data: _d, mimeType, width, height, ...meta } = img;
             const content: Array<
               { type: 'image'; data: string; mimeType: string } | { type: 'text'; text: string }
             > = [{ type: 'image', data, mimeType: (mimeType as string) ?? 'image/png' }];
+            // plan-740 D-A1: `web_eye` renders several ALIGNED channels from one
+            // pose, and they belong in one result. `__rvImages` is the
+            // CONTINUATION of `__rvImage` (disjoint — channel 1 is never in
+            // both), so each extra entry becomes a further image block in the
+            // declared order. A bridge without this branch still shows channel 1
+            // plus the full sidecar; the sidecar's `channels[]` is how the
+            // agent notices the rest went missing.
+            for (const extra of envelope.__rvImages ?? []) {
+              const d = extra?.data;
+              if (typeof d === 'string' && d.length > 0) {
+                content.push({
+                  type: 'image', data: d, mimeType: (extra.mimeType as string) ?? 'image/png',
+                });
+              }
+            }
             if (Object.keys(meta).length > 0) {
               content.push({ type: 'text', text: JSON.stringify({ width, height, ...meta }) });
             }

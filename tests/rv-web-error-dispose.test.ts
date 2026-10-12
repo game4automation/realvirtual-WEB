@@ -43,7 +43,9 @@ describe('RVWebError dispose', () => {
     const { comp, signalStore, mgr } = setup();
     signalStore.set('A/Err', true);
     const before = (mgr as any)._entries.size;
-    expect(before).toBeGreaterThanOrEqual(2); // highlight + badge
+    // a7396494 removed the world-space error badge (the text lives in the error panel only):
+    // without a highlighter the error keeps exactly one gizmo, the legacy glow hull.
+    expect(before).toBeGreaterThanOrEqual(1);
     comp.dispose();
     expect((mgr as any)._entries.size).toBe(0);
   });

@@ -352,8 +352,15 @@ export class MultiuserPlugin extends RVBehavior {
         for (const sink of this.viewer.transportManager.sinks) {
           sink.isOwner = true;
         }
+        // plan-521: zones evaluate their effects locally again.
+        for (const zone of this.viewer.transportManager.zones) {
+          zone.isOwner = true;
+        }
         this._muSyncActive = false;
       }
+      // plan-516: local simulation again — the next sim start (reset) may
+      // activate the pre-placed MUs; nothing starts them behind the user's back.
+      if (this.viewer.transportManager) this.viewer.transportManager.preplacedActivationBlocked = false;
       // Restore drive ownership — drive's onOwnershipChanged handles cleanup
       if (this._driveMap) {
         for (const drive of this.viewer.drives) {
@@ -968,6 +975,16 @@ export class MultiuserPlugin extends RVBehavior {
     const tm = this.viewer.transportManager;
     if (!tm) return;
 
+    // plan-516 guard: pre-placed MUs are not part of the server's MU list
+    // (their sync is plan-519). In a client session they stay static on their
+    // authored pose — deactivated BEFORE the removal pass below would mark
+    // them, and blocked from re-activation (checked per sync, so a model
+    // switch inside the session is covered too).
+    if (!tm.preplacedActivationBlocked) {
+      tm.preplacedActivationBlocked = true;
+      tm.restorePreplaced?.(false);
+    }
+
     // Disable local source spawning on first mu_sync (server is authority)
     if (!this._muSyncActive) {
       this._muSyncActive = true;
@@ -978,7 +995,13 @@ export class MultiuserPlugin extends RVBehavior {
       for (const sink of tm.sinks) {
         sink.isOwner = false;
       }
-      debug('multiuser', 'Disabled local Source/Sink — server is authority for MU lifecycle.');
+      debug('multiuser', 'Disabled local Source/Sink/Zone — server is authority for MU lifecycle.');
+    }
+    // plan-521: zones compute only box + gizmo on a follower — no Detect /
+    // Block / Hold (a zone lets its held MUs go in place by itself). Checked per
+    // sync, so zones of a model switched inside the session are covered too.
+    for (const zone of tm.zones) {
+      if (zone.isOwner) zone.isOwner = false;
     }
 
     // Build O(1) lookup maps for incoming MUs (keyed by last path segment AND name)

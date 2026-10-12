@@ -26,12 +26,33 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { userEvent } from 'vitest/browser';
 import {
   ProjectsDetailPane,
   type DetailAction,
 } from '../src/core/hmi/projects/ProjectsDetailPane';
 
 afterEach(cleanup);
+
+it('saves with the visible button after moving focus from the name field', async () => {
+  const onRename = vi.fn();
+  render(<ProjectsDetailPane title="Belt.glb" onRename={onRename} />);
+  await userEvent.click(screen.getByRole('button', { name: 'Rename' }));
+  fireEvent.change(screen.getByLabelText('Rename'), { target: { value: 'Roll.glb' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Save name' }));
+  expect(onRename).toHaveBeenCalledExactlyOnceWith('Roll.glb');
+  expect(screen.queryByLabelText('Rename')).toBeNull();
+});
+
+it('cancels with the visible button without renaming', async () => {
+  const onRename = vi.fn();
+  render(<ProjectsDetailPane title="Belt.glb" onRename={onRename} />);
+  await userEvent.click(screen.getByRole('button', { name: 'Rename' }));
+  fireEvent.change(screen.getByLabelText('Rename'), { target: { value: 'Roll.glb' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+  expect(onRename).not.toHaveBeenCalled();
+  expect(screen.queryByLabelText('Rename')).toBeNull();
+});
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 

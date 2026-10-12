@@ -6,6 +6,8 @@
  *
  * Parses the XML-like content string and renders each tag as formatted UI elements
  * using the shared SignalBadge for live signal display with Input/Output coloring.
+ * Label → value tags (`<value>`, `<signal>`) are `InspectorRow`s on the one value
+ * column (plan-514); headings and prose sit on the row padding.
  *
  * Self-registers with the fieldRendererRegistry on import.
  */
@@ -16,6 +18,8 @@ import { parseTags, extractAttr } from './tooltip/MetadataTooltipContent';
 import { useSignalValues, SignalBadge } from './rv-signal-badge';
 import { fieldRendererRegistry, type FieldRendererProps } from './rv-field-renderer-registry';
 import { useViewer } from '../../hooks/use-viewer';
+import { InspectorRow, INSPECTOR_ROW_PX } from './rv-inspector-row';
+import { FS, INK_HIGH, INK_LOW, INK_MID, LINK, MONO, WARN } from './shared-sx';
 
 function MetadataContentRenderer({ value }: FieldRendererProps) {
   const viewer = useViewer();
@@ -44,26 +48,26 @@ function MetadataContentRenderer({ value }: FieldRendererProps) {
 
   if (tags.length === 0) {
     return (
-      <Typography sx={{ fontSize: 11, fontFamily: 'monospace', color: 'text.disabled', px: 1, py: 0.5 }}>
+      <Typography sx={{ fontSize: FS.label, fontFamily: MONO, color: 'text.disabled', px: INSPECTOR_ROW_PX, py: 0.5 }}>
         {content || '(empty)'}
       </Typography>
     );
   }
 
   return (
-    <Box sx={{ px: 1, py: 0.5, display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+    <Box sx={{ py: 0.5, display: 'flex', flexDirection: 'column', gap: 0.25 }}>
       {tags.map((t, i) => {
         switch (t.tag) {
           case 'name':
           case 'bold':
             return (
-              <Typography key={i} sx={{ fontSize: 12, fontWeight: 700, color: '#ffa040', lineHeight: 1.4 }}>
+              <Typography key={i} sx={{ px: INSPECTOR_ROW_PX, fontSize: FS.body, fontWeight: 700, color: WARN, lineHeight: 1.4 }}>
                 {t.text}
               </Typography>
             );
           case 'text':
             return (
-              <Typography key={i} sx={{ fontSize: 11, color: 'rgba(255,255,255,0.7)', lineHeight: 1.4 }}>
+              <Typography key={i} sx={{ px: INSPECTOR_ROW_PX, fontSize: FS.label, color: INK_MID, lineHeight: 1.4 }}>
                 {t.text}
               </Typography>
             );
@@ -74,26 +78,23 @@ function MetadataContentRenderer({ value }: FieldRendererProps) {
               const sigName = nestedSignalMatch[1];
               const info = signalValues.get(sigName);
               return (
-                <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1 }}>
-                  <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{label}</Typography>
+                <InspectorRow key={i} label={label} labelTitle={label} labelColor={INK_LOW} alignField="end">
                   <SignalBadge direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} viewer={viewer} signalName={sigName} />
-                </Box>
+                </InspectorRow>
               );
             }
             return (
-              <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', gap: 1 }}>
-                <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{label}</Typography>
-                <Typography sx={{ fontSize: 11, color: '#fff', fontFamily: 'monospace' }}>{t.text}</Typography>
-              </Box>
+              <InspectorRow key={i} label={label} labelTitle={label} labelColor={INK_LOW}>
+                <Typography sx={{ fontSize: FS.label, color: INK_HIGH, fontFamily: MONO, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.text}</Typography>
+              </InspectorRow>
             );
           }
           case 'signal': {
             const info = signalValues.get(t.text);
             return (
-              <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 1 }}>
-                <Typography sx={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>{t.text}</Typography>
+              <InspectorRow key={i} label={t.text} labelTitle={t.text} labelColor={INK_LOW} alignField="end">
                 <SignalBadge direction={info?.direction ?? 'unknown'} plcType={info?.plcType} raw={info?.raw} viewer={viewer} signalName={t.text} />
-              </Box>
+              </InspectorRow>
             );
           }
           case 'link': {
@@ -105,7 +106,7 @@ function MetadataContentRenderer({ value }: FieldRendererProps) {
                 href={url ?? '#'}
                 target="_blank"
                 rel="noopener noreferrer"
-                sx={{ fontSize: 11, color: '#64b5f6', textDecoration: 'underline', cursor: 'pointer', pointerEvents: 'auto' }}
+                sx={{ px: INSPECTOR_ROW_PX, fontSize: FS.label, color: LINK, textDecoration: 'underline', cursor: 'pointer', pointerEvents: 'auto' }}
               >
                 {t.text}
               </Typography>

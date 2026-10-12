@@ -30,6 +30,8 @@
  * task API, not by blocking.
  */
 
+import type { Object3D } from 'three';
+
 export type AgvPhase = 'cruising' | 'driving' | 'servicing' | 'idle';
 
 /** One vehicle command — see the module doc for the semantics. */
@@ -46,6 +48,35 @@ export interface AgvTask {
   data?: unknown;
 }
 
+/**
+ * Live motion snapshot of a vehicle (plan-558) — read by visualizers at
+ * RENDER time (the speed is the plan's speed at the last time the vehicle's
+ * pose was sampled, so it is correct between DES events too). SI units.
+ */
+export interface AgvMotionInfo {
+  /** Speed (m/s). */
+  speed: number;
+  /** Scanner field state. */
+  field: 'clear' | 'warning' | 'protective';
+  /** Protective / warning field length (m) at `speed` (0 without scanner). */
+  protectiveLength: number;
+  warningLength: number;
+  /** Body reach ahead of the root (m) and body width (m). */
+  front: number;
+  width: number;
+  /** The vehicle has scanner fields configured. */
+  scanner: boolean;
+}
+
+/**
+ * `node.userData[AGV_NO_BODY_KEY] === true` — the subtree is an overlay a
+ * visualizer parented to the vehicle root (scanner fields, …), not part of the
+ * vehicle body. The Agv's mesh-bounds footprint skips it; otherwise a
+ * re-configure (mode switch, re-bind) measures the overlay as body and pushes
+ * front/width — and with them the overlay itself — further out each time.
+ */
+export const AGV_NO_BODY_KEY = '_rvAgvNoBody';
+
 /** The per-vehicle control handle the Agv behavior registers. */
 export interface AgvHandle {
   readonly id: string;
@@ -58,19 +89,29 @@ export interface AgvHandle {
   readonly task: AgvTask | null;
   /** Movement phase — 'idle' means parked after a completed task. */
   readonly phase: AgvPhase;
+  /** The vehicle's scene root (visualizers parent overlays to it). */
+  readonly node?: Object3D;
+  /**
+   * Live motion snapshot (plan-558), written into `out` (no allocation per
+   * frame). False while the vehicle is not planned (out untouched).
+   */
+  motion?(out: AgvMotionInfo): boolean;
 }
 
 /** Dumb id-keyed handle registry + an idle notification channel. */
 export class AgvFleet {
   private readonly handles = new Map<string, AgvHandle>();
+  /** Cached handle list for per-frame readers (rebuilt on register / unregister). */
+  private list: AgvHandle[] | null = null;
   private readonly idleSubs = new Set<(agvId: string) => void>();
 
   register(handle: AgvHandle): void {
     this.handles.set(handle.id, handle);
+    this.list = null;
   }
 
   unregister(id: string): void {
-    this.handles.delete(id);
+    if (this.handles.delete(id)) this.list = null;
   }
 
   get(id: string): AgvHandle | null {
@@ -79,6 +120,12 @@ export class AgvFleet {
 
   all(): AgvHandle[] {
     return [...this.handles.values()];
+  }
+
+  /** The registered handles as a STABLE array (no allocation per call) — read only. */
+  get handleList(): readonly AgvHandle[] {
+    this.list ??= [...this.handles.values()];
+    return this.list;
   }
 
   /**
@@ -101,6 +148,7 @@ export class AgvFleet {
   /** Test/model-cleared reset: drop every handle and subscriber. */
   clear(): void {
     this.handles.clear();
+    this.list = null;
     this.idleSubs.clear();
   }
 }

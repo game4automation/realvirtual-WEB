@@ -5,8 +5,9 @@
  * Viewer-mode tests (plan-387).
  *
  * The `viewer` workspace is a pure spectator surface: the model, the running
- * kinematics, Settings and the view/grouping controls — no authoring, no
- * signals, no panels.
+ * kinematics with the Play/Pause/Reset/speed controls to hold them (since
+ * 2026-09-26, same segments as Commissioning), Settings and the view/grouping
+ * controls — no authoring, no signals, no panels.
  *
  * These tests deliberately re-implement the FIVE slot-host filter semantics
  * (see plan-387 §2.2a/B1) instead of rendering each host, because the same
@@ -27,7 +28,8 @@
  * three shipping workspaces, so this file pins the pre-viewer behaviour of every
  * plugin the plan touches.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createTestViewer, type TestViewerHandle } from './helpers/create-test-viewer';
 import {
   ModeManager, modeContext, pluginParticipatesInMode,
   type ModeHost, type ModePluginSets, type ModeId,
@@ -54,6 +56,7 @@ import { SnapPointPlugin } from '../src/plugins/snap-point';
 import { KioskPlugin } from '../src/plugins/kiosk-plugin';
 import { OpenerMessagePlugin } from '../src/plugins/opener-message-plugin';
 import { WebComponentPlugin } from '../src/plugins/web-component-plugin';
+import { DESWorkspacePlugin } from '../src/plugins/des/des-workspace-plugin';
 
 // ─── Harness ──────────────────────────────────────────────────────────────
 
@@ -226,9 +229,12 @@ describe('viewerMode_CorePluginRuntimeStillRuns', () => {
 describe('viewerMode_NoAuthoringEntryPoints', () => {
   const viewerCtx = ctxFor('viewer');
 
-  it('hides the Play/Pause/Reset sim controls', () => {
+  it('keeps the Play/Pause/Reset sim controls — watching includes holding the kinematics', () => {
+    // Deliberately NOT an authoring surface: the same leading segments as in
+    // Commissioning and the Editor's test run (2026-09-26). Pausing and
+    // resetting a running twin is spectating, not authoring.
     const [leading] = entriesFor(new SimControllerPlugin(), 'toolbar-button-leading');
-    expect(slotRendererShows(leading, viewerCtx)).toBe(false);
+    expect(slotRendererShows(leading, viewerCtx)).toBe(true);
   });
 
   it('hides the CONNECT activity-bar entry', () => {
@@ -312,6 +318,84 @@ describe('viewerMode_WelcomeModalDoesNotAutoOpen', () => {
   });
 });
 
+// ─── F4b — the TopBar gate around the leading slot ────────────────────────
+
+/**
+ * TopBar.tsx wraps `toolbar-button-leading` in its OWN gate
+ * (`useUIVisible('toolbar-leading-slot', …)`) plus the mode lock. The slot rule
+ * of the SimControllerToolbar alone is not what the user sees: a `mode:viewer`
+ * on that outer gate hid Play/Pause/Reset in the viewer although the slot rule
+ * kept them (2026-09-26). This block evaluates BOTH layers: the shipped gate
+ * rule read out of the source (`?raw`, as in hmi-mode-regression.test.tsx) AND
+ * every plugin that fills the slot, through the real registry.
+ */
+describe('viewerMode_TopBarShowsSimControls', () => {
+  /** The rule TopBar passes for the leading-slot gate; `undefined` = always visible. */
+  function toolbarLeadingGateRule(): { hiddenIn?: string[] } | undefined {
+    const m = /useUIVisible\('toolbar-leading-slot'(?:,\s*\{\s*hiddenIn:\s*\[([^\]]*)\]\s*\})?\)/
+      .exec(topBarSource);
+    if (!m) throw new Error("no useUIVisible('toolbar-leading-slot'…) in TopBar.tsx");
+    return m[1] === undefined ? undefined : { hiddenIn: [...m[1].matchAll(/'([^']*)'/g)].map((x) => x[1]) };
+  }
+
+  /** Every plugin that registers into `toolbar-button-leading`. The asset
+   *  editor lives in the private tree; its entry is modelled by its contract
+   *  (`modes: ['editor']`, ruleless entry → auto-gated by the registry). */
+  function leadingEntries(): UISlotEntry[] {
+    const reg = new UIPluginRegistry();
+    reg.register(new SimControllerPlugin() as never);
+    reg.register(new DESWorkspacePlugin() as never);
+    reg.register({
+      id: 'asset-editor', modes: ['editor'],
+      slots: [{ slot: 'toolbar-button-leading', component: () => null, order: 10 }],
+    });
+    return reg.getSlotComponents('toolbar-button-leading');
+  }
+
+  /** What TopBar renders in the leading pill for `mode` (unlocked). */
+  function topBarLeadingVisible(mode: ModeId): boolean {
+    const ctx = ctxFor(mode);
+    const rule = toolbarLeadingGateRule();
+    const gateOpen = rule ? evaluateVisibilityRule(rule, ctx) : true;
+    return gateOpen && leadingEntries().some((e) => slotRendererShows(e, ctx));
+  }
+
+  it('the pill is still gated by the leading-slot gate and the mode lock', () => {
+    expect(topBarSource).toMatch(
+      /hasSimControls = useSlot\('toolbar-button-leading'\)\.length > 0 && !modeLocked && showToolbarLeading/,
+    );
+    expect(topBarSource).toContain('<SlotRenderer slot="toolbar-button-leading" />');
+  });
+
+  it('shows the Play/Pause/Reset segments in the viewer', () => {
+    expect(topBarLeadingVisible('viewer')).toBe(true);
+    const shown = leadingEntries().filter((e) => slotRendererShows(e, ctxFor('viewer')));
+    expect(shown.map((e) => e.component)).toEqual([
+      entriesFor(new SimControllerPlugin(), 'toolbar-button-leading')[0].component,
+    ]);
+  });
+
+  it('the leading-slot gate carries no mode rule — the slot rules decide', () => {
+    expect(toolbarLeadingGateRule()?.hiddenIn ?? []).not.toContain(modeContext('viewer'));
+  });
+
+  it('HMI still shows no sim controls; DES and Editor show only their own toolbar', () => {
+    expect(topBarLeadingVisible('hmi')).toBe(false);
+    const sim = entriesFor(new SimControllerPlugin(), 'toolbar-button-leading')[0].component;
+    for (const m of ['des', 'editor'] as ModeId[]) {
+      const shown = leadingEntries().filter((e) => slotRendererShows(e, ctxFor(m)));
+      expect(shown, m).toHaveLength(1);
+      expect(shown[0].component, m).not.toBe(sim);
+    }
+    expect(topBarLeadingVisible('planner')).toBe(true);
+  });
+
+  it('DES and Editor toolbars never reach the viewer — their plugins do not participate', () => {
+    expect(pluginParticipatesInMode(new DESWorkspacePlugin() as ModeGating, 'viewer')).toBe(false);
+    expect(pluginParticipatesInMode({ modes: ['editor'] } as ModeGating, 'viewer')).toBe(false);
+  });
+});
+
 // ─── F6 — the regression guard ────────────────────────────────────────────
 
 describe('otherModes_Unaffected', () => {
@@ -319,7 +403,7 @@ describe('otherModes_Unaffected', () => {
    * Pre-plan-387 visibility per existing mode, per touched plugin+slot.
    * Any change to these numbers is a regression in a SHIPPING workspace.
    */
-  it('sim-controller: leading toolbar stays planner-only', () => {
+  it('sim-controller: leading toolbar stays hidden in hmi / des / editor, shown in planner', () => {
     const [leading] = entriesFor(new SimControllerPlugin(), 'toolbar-button-leading');
     const seen = EXISTING_MODES.map((m) => slotRendererShows(leading, ctxFor(m)));
     expect(seen).toEqual([false, false, true, false]); // hmi, des, planner, editor
@@ -550,4 +634,49 @@ describe('viewerMode_IframeHidesModeSwitcher', () => {
       expect(evaluateVisibilityRule(RULE, ctxFor(m, 'embedded'))).toBe(false);
     }
   });
+});
+
+// ─── plan-761 §9.6 — wireframe contract on a REAL viewer ──────────────────
+
+
+/**
+ * The assumption behind `wireframeActive` (the render-mode pill reads it, not
+ * `wireframe`): leaving the editor drops the APPLIED state and keeps the
+ * toggle, re-entering restores it. A real `RVViewer` (headless WebGL), because
+ * the fake in `tests/helpers/fake-render-viewer.ts` can only assert what it
+ * was told this contract is.
+ */
+describe('viewerMode_WireframeAppliedOnlyInEditor', () => {
+  let handle: TestViewerHandle | undefined;
+
+  afterEach(() => { handle?.dispose(); handle = undefined; });
+
+  it('leaving editor mode drops wireframeActive but keeps the wireframe flag; re-entering restores it', async () => {
+    handle = await createTestViewer('webgl');
+    const viewer = handle.viewer;
+    viewer.modes
+      .register({ id: 'viewer', label: 'Viewer', order: 5 })
+      .register({ id: 'editor', label: 'Editor', order: 40, runtime: 'detached' });
+    const events: string[] = [];
+    viewer.on('wireframe-changed', ({ on }) => events.push(`wireframe:${on}`));
+    viewer.on('mode-changed', ({ to }) => events.push(`mode:${to}`));
+
+    viewer.modes.setMode('editor');
+    expect(viewer.modes.activeMode).toBe('editor');
+    expect(viewer.wireframeActive).toBe(false);
+    viewer.wireframe = true;
+    expect(viewer.wireframe).toBe(true);
+    expect(viewer.wireframeActive).toBe(true);
+
+    viewer.modes.setMode('viewer');
+    expect(viewer.wireframe).toBe(true);          // the toggle is latent...
+    expect(viewer.wireframeActive).toBe(false);   // ...but nothing is drawn as wires
+
+    viewer.modes.setMode('editor');
+    expect(viewer.wireframeActive).toBe(true);
+
+    // A mode switch emits NO wireframe-changed — the pill must subscribe to
+    // `mode-changed` as well to follow the applied state.
+    expect(events).toEqual(['mode:editor', 'wireframe:true', 'mode:viewer', 'mode:editor']);
+  }, 30000);
 });

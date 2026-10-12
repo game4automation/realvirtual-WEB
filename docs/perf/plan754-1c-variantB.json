@@ -1,0 +1,1651 @@
+{
+  "fingerprint": {
+    "timestamp": "2026-09-18T16:34:07.449Z",
+    "host": "LAPTOP-6BCB6EOI",
+    "os": "win32 10.0.26100",
+    "cpu": "Intel(R) Core(TM) i9-14900HX",
+    "logicalCpus": 32,
+    "totalMemoryBytes": 68346380288,
+    "freeMemoryBytes": 17189920768,
+    "node": "v24.14.0",
+    "chromium": "145.0.7632.6",
+    "gitCommit": "baf9c21b83103c9e8173aa114cb68c236f9108a5",
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+    "hardwareConcurrency": 32,
+    "deviceMemoryGiB": 8,
+    "devicePixelRatio": 1,
+    "viewport": {
+      "width": 1600,
+      "height": 900
+    },
+    "longTaskObserver": true,
+    "preciseHeap": true,
+    "gpu": {
+      "vendor": "Google Inc. (Intel)",
+      "renderer": "ANGLE (Intel, Intel(R) UHD Graphics (0x0000A788) Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    }
+  },
+  "variant": "B",
+  "runs": 5,
+  "windowS": 5,
+  "uncapped": false,
+  "localStorage": {
+    "rv.bake.destructive": "1"
+  },
+  "skipped": [],
+  "models": {
+    "demo": {
+      "url": "/demo-realvirtual/DemoRealvirtualWeb.glb",
+      "failed": null,
+      "measuredRuns": 5,
+      "median": {
+        "loadMs": 3.800000011920929,
+        "navToSceneReadyMs": 6553.9000000059605,
+        "fps": 59.9,
+        "frameMs": 16.73,
+        "sceneCalls": 150,
+        "sceneTriangles": 578376,
+        "heapBytes": 261587781,
+        "sceneNodes": 421,
+        "chunkMeshes": 122
+      },
+      "placements": null,
+      "callsPerPlacement": null,
+      "survival": {
+        "assetId": "/demo-realvirtual/DemoRealvirtualWeb.glb",
+        "counts": {
+          "nodes": 487,
+          "survivors": 241,
+          "removed": 246,
+          "removedMeshes": 180,
+          "mergedSurvivorMeshes": 9,
+          "releasableGeometries": 124,
+          "instancedTriangles": 0,
+          "tagOnlyChunkBoundaries": 0,
+          "unresolvedReferences": 11,
+          "unresolvedClaims": 0
+        },
+        "ms": 8,
+        "removalTopsTotal": 125,
+        "removalTopsSample": [
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_1",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_2",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_3",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_4",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_5",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_6",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_7",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_8",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_9",
+          "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_10"
+        ],
+        "unresolvedClaims": [],
+        "g1Violations": []
+      },
+      "runs": [
+        {
+          "loadMs": 3.800000011920929,
+          "navToSceneReadyMs": 6407.9000000059605,
+          "fps": 60.4,
+          "fpsSamples": [
+            64,
+            58,
+            62,
+            62,
+            60,
+            64,
+            58,
+            59,
+            59,
+            58
+          ],
+          "frameMs": 16.62,
+          "scene": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "total": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "heap": 261488672,
+          "sceneNodes": 421,
+          "sceneMeshes": 156,
+          "chunkMeshes": 122,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 21,
+          "loadTriangles": 576320,
+          "loadInfo": {
+            "glbSize": "8.3 MB",
+            "loadTime": "1.7s"
+          },
+          "camera": {
+            "pos": [
+              5.909246990403374,
+              5.645139562286339,
+              5.860581024495214
+            ],
+            "target": [
+              0.6162491460918942,
+              1.2343080253601075,
+              0.1265000264911107
+            ]
+          },
+          "survival": {
+            "assetId": "/demo-realvirtual/DemoRealvirtualWeb.glb",
+            "counts": {
+              "nodes": 487,
+              "survivors": 241,
+              "removed": 246,
+              "removedMeshes": 180,
+              "mergedSurvivorMeshes": 9,
+              "releasableGeometries": 124,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 11,
+              "unresolvedClaims": 0
+            },
+            "ms": 10.799999982118607,
+            "removalTopsTotal": 125,
+            "removalTopsSample": [
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_1",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_2",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_3",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_4",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_5",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_6",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_7",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_8",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_9",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_10"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 6,
+          "navToSceneReadyMs": 6553.9000000059605,
+          "fps": 59.8,
+          "fpsSamples": [
+            59,
+            58,
+            57,
+            65,
+            55,
+            59,
+            59,
+            65,
+            60,
+            61
+          ],
+          "frameMs": 16.790000000000003,
+          "scene": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "total": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "heap": 261819880,
+          "sceneNodes": 421,
+          "sceneMeshes": 156,
+          "chunkMeshes": 122,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 21,
+          "loadTriangles": 576320,
+          "loadInfo": {
+            "glbSize": "8.3 MB",
+            "loadTime": "1.7s"
+          },
+          "camera": {
+            "pos": [
+              5.909246990403374,
+              5.645139562286339,
+              5.860581024495214
+            ],
+            "target": [
+              0.6162491460918942,
+              1.2343080253601075,
+              0.1265000264911107
+            ]
+          },
+          "survival": {
+            "assetId": "/demo-realvirtual/DemoRealvirtualWeb.glb",
+            "counts": {
+              "nodes": 487,
+              "survivors": 241,
+              "removed": 246,
+              "removedMeshes": 180,
+              "mergedSurvivorMeshes": 9,
+              "releasableGeometries": 124,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 11,
+              "unresolvedClaims": 0
+            },
+            "ms": 13.099999994039536,
+            "removalTopsTotal": 125,
+            "removalTopsSample": [
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_1",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_2",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_3",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_4",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_5",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_6",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_7",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_8",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_9",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_10"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 3.5,
+          "navToSceneReadyMs": 6606.600000023842,
+          "fps": 59.8,
+          "fpsSamples": [
+            59,
+            62,
+            59,
+            56,
+            58,
+            59,
+            64,
+            58,
+            56,
+            67
+          ],
+          "frameMs": 16.759999999999998,
+          "scene": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "total": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "heap": 261490856,
+          "sceneNodes": 421,
+          "sceneMeshes": 156,
+          "chunkMeshes": 122,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 21,
+          "loadTriangles": 576320,
+          "loadInfo": {
+            "glbSize": "8.3 MB",
+            "loadTime": "1.7s"
+          },
+          "camera": {
+            "pos": [
+              5.909246990403374,
+              5.645139562286339,
+              5.860581024495214
+            ],
+            "target": [
+              0.6162491460918942,
+              1.2343080253601075,
+              0.1265000264911107
+            ]
+          },
+          "survival": {
+            "assetId": "/demo-realvirtual/DemoRealvirtualWeb.glb",
+            "counts": {
+              "nodes": 487,
+              "survivors": 241,
+              "removed": 246,
+              "removedMeshes": 180,
+              "mergedSurvivorMeshes": 9,
+              "releasableGeometries": 124,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 11,
+              "unresolvedClaims": 0
+            },
+            "ms": 7.9000000059604645,
+            "removalTopsTotal": 125,
+            "removalTopsSample": [
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_1",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_2",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_3",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_4",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_5",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_6",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_7",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_8",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_9",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_10"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 3.9000000059604645,
+          "navToSceneReadyMs": 6133.4000000059605,
+          "fps": 59.9,
+          "fpsSamples": [
+            63,
+            64,
+            61,
+            63,
+            61,
+            56,
+            54,
+            59,
+            54,
+            64
+          ],
+          "frameMs": 16.73,
+          "scene": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "total": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "heap": 261709748,
+          "sceneNodes": 421,
+          "sceneMeshes": 156,
+          "chunkMeshes": 122,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 21,
+          "loadTriangles": 576320,
+          "loadInfo": {
+            "glbSize": "8.3 MB",
+            "loadTime": "1.4s"
+          },
+          "camera": {
+            "pos": [
+              5.909246990403374,
+              5.645139562286339,
+              5.860581024495214
+            ],
+            "target": [
+              0.6162491460918942,
+              1.2343080253601075,
+              0.1265000264911107
+            ]
+          },
+          "survival": {
+            "assetId": "/demo-realvirtual/DemoRealvirtualWeb.glb",
+            "counts": {
+              "nodes": 487,
+              "survivors": 241,
+              "removed": 246,
+              "removedMeshes": 180,
+              "mergedSurvivorMeshes": 9,
+              "releasableGeometries": 124,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 11,
+              "unresolvedClaims": 0
+            },
+            "ms": 7.799999982118607,
+            "removalTopsTotal": 125,
+            "removalTopsSample": [
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_1",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_2",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_3",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_4",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_5",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_6",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_7",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_8",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_9",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_10"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 3.7000000178813934,
+          "navToSceneReadyMs": 6584.700000017881,
+          "fps": 61.5,
+          "fpsSamples": [
+            62,
+            70,
+            58,
+            60,
+            62,
+            60,
+            64,
+            61,
+            59,
+            59
+          ],
+          "frameMs": 16.34,
+          "scene": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "total": {
+            "calls": 150,
+            "triangles": 578376
+          },
+          "heap": 261587781,
+          "sceneNodes": 421,
+          "sceneMeshes": 156,
+          "chunkMeshes": 122,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 21,
+          "loadTriangles": 576320,
+          "loadInfo": {
+            "glbSize": "8.3 MB",
+            "loadTime": "1.7s"
+          },
+          "camera": {
+            "pos": [
+              5.909246990403374,
+              5.645139562286339,
+              5.860581024495214
+            ],
+            "target": [
+              0.6162491460918942,
+              1.2343080253601075,
+              0.1265000264911107
+            ]
+          },
+          "survival": {
+            "assetId": "/demo-realvirtual/DemoRealvirtualWeb.glb",
+            "counts": {
+              "nodes": 487,
+              "survivors": 241,
+              "removed": 246,
+              "removedMeshes": 180,
+              "mergedSurvivorMeshes": 9,
+              "releasableGeometries": 124,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 11,
+              "unresolvedClaims": 0
+            },
+            "ms": 8,
+            "removalTopsTotal": 125,
+            "removalTopsSample": [
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_1",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_2",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_3",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_4",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_5",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_6",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_7",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_8",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_9",
+              "DemoRealvirtualWebglb/Robot/FanucCRX-10iA_L/A1/A2/A3/A4/A5/A6/TCP/SchunkEGH80Gripper/SchunkEGH80Gripper_10"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        }
+      ]
+    },
+    "delta": {
+      "url": "/private-assets/KinematicTest/Autonox-DELTA-RL5-1900-6kg.glb",
+      "failed": null,
+      "measuredRuns": 5,
+      "median": {
+        "loadMs": 3,
+        "navToSceneReadyMs": 5402.5,
+        "fps": 95.3,
+        "frameMs": 10.52,
+        "sceneCalls": 25,
+        "sceneTriangles": 252093,
+        "heapBytes": 203746164,
+        "sceneNodes": 88,
+        "chunkMeshes": 23
+      },
+      "placements": null,
+      "callsPerPlacement": null,
+      "survival": {
+        "assetId": "/private-assets/KinematicTest/Autonox-DELTA-RL5-1900-6kg.glb",
+        "counts": {
+          "nodes": 88,
+          "survivors": 52,
+          "removed": 36,
+          "removedMeshes": 25,
+          "mergedSurvivorMeshes": 0,
+          "releasableGeometries": 25,
+          "instancedTriangles": 0,
+          "tagOnlyChunkBoundaries": 0,
+          "unresolvedReferences": 0,
+          "unresolvedClaims": 0
+        },
+        "ms": 3.699999988079071,
+        "removalTopsTotal": 25,
+        "removalTopsSample": [
+          "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00054870",
+          "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066182",
+          "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066183",
+          "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00050309_2/MT_WST00050309_3",
+          "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00061379_2/MT_WST00061379_3",
+          "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00050309/MT_WST00050309_1",
+          "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00061379/MT_WST00061379_1",
+          "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00050309_4/MT_WST00050309_5",
+          "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00061379_4/MT_WST00061379_5",
+          "Autonox-DELTA-RL5-1900-6kg/PlatformBody/MT_WST00050309_6/MT_WST00050309_7"
+        ],
+        "unresolvedClaims": [],
+        "g1Violations": []
+      },
+      "runs": [
+        {
+          "loadMs": 2.9000000059604645,
+          "navToSceneReadyMs": 5402.5,
+          "fps": 94.9,
+          "fpsSamples": [
+            92,
+            100,
+            100,
+            91,
+            94,
+            90,
+            96,
+            94,
+            95,
+            97
+          ],
+          "frameMs": 10.55,
+          "scene": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "total": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "heap": 203773480,
+          "sceneNodes": 88,
+          "sceneMeshes": 29,
+          "chunkMeshes": 23,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 3,
+          "loadTriangles": 252089,
+          "loadInfo": {
+            "glbSize": "9.3 MB",
+            "loadTime": "0.6s"
+          },
+          "camera": {
+            "pos": [
+              1.570536612970956,
+              2.5729135523534525,
+              1.498241034818243
+            ],
+            "target": [
+              0.18754488852334744,
+              1.4204204486471124,
+              0
+            ]
+          },
+          "survival": {
+            "assetId": "/private-assets/KinematicTest/Autonox-DELTA-RL5-1900-6kg.glb",
+            "counts": {
+              "nodes": 88,
+              "survivors": 52,
+              "removed": 36,
+              "removedMeshes": 25,
+              "mergedSurvivorMeshes": 0,
+              "releasableGeometries": 25,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 0,
+              "unresolvedClaims": 0
+            },
+            "ms": 3.2000000178813934,
+            "removalTopsTotal": 25,
+            "removalTopsSample": [
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00054870",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066182",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066183",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00050309_2/MT_WST00050309_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00061379_2/MT_WST00061379_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00050309/MT_WST00050309_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00061379/MT_WST00061379_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00050309_4/MT_WST00050309_5",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00061379_4/MT_WST00061379_5",
+              "Autonox-DELTA-RL5-1900-6kg/PlatformBody/MT_WST00050309_6/MT_WST00050309_7"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 2.699999988079071,
+          "navToSceneReadyMs": 5411.5,
+          "fps": 95.3,
+          "fpsSamples": [
+            93,
+            94,
+            99,
+            85,
+            94,
+            96,
+            92,
+            105,
+            101,
+            94
+          ],
+          "frameMs": 10.52,
+          "scene": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "total": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "heap": 203708868,
+          "sceneNodes": 88,
+          "sceneMeshes": 29,
+          "chunkMeshes": 23,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 3,
+          "loadTriangles": 252089,
+          "loadInfo": {
+            "glbSize": "9.3 MB",
+            "loadTime": "0.5s"
+          },
+          "camera": {
+            "pos": [
+              1.570536612970956,
+              2.5729135523534525,
+              1.498241034818243
+            ],
+            "target": [
+              0.18754488852334744,
+              1.4204204486471124,
+              0
+            ]
+          },
+          "survival": {
+            "assetId": "/private-assets/KinematicTest/Autonox-DELTA-RL5-1900-6kg.glb",
+            "counts": {
+              "nodes": 88,
+              "survivors": 52,
+              "removed": 36,
+              "removedMeshes": 25,
+              "mergedSurvivorMeshes": 0,
+              "releasableGeometries": 25,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 0,
+              "unresolvedClaims": 0
+            },
+            "ms": 3.300000011920929,
+            "removalTopsTotal": 25,
+            "removalTopsSample": [
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00054870",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066182",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066183",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00050309_2/MT_WST00050309_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00061379_2/MT_WST00061379_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00050309/MT_WST00050309_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00061379/MT_WST00061379_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00050309_4/MT_WST00050309_5",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00061379_4/MT_WST00061379_5",
+              "Autonox-DELTA-RL5-1900-6kg/PlatformBody/MT_WST00050309_6/MT_WST00050309_7"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 3,
+          "navToSceneReadyMs": 5333.5999999940395,
+          "fps": 95,
+          "fpsSamples": [
+            93,
+            98,
+            93,
+            93,
+            98,
+            98,
+            99,
+            98,
+            90,
+            90
+          ],
+          "frameMs": 10.54,
+          "scene": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "total": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "heap": 203756056,
+          "sceneNodes": 88,
+          "sceneMeshes": 29,
+          "chunkMeshes": 23,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 3,
+          "loadTriangles": 252089,
+          "loadInfo": {
+            "glbSize": "9.3 MB",
+            "loadTime": "0.5s"
+          },
+          "camera": {
+            "pos": [
+              1.570536612970956,
+              2.5729135523534525,
+              1.498241034818243
+            ],
+            "target": [
+              0.18754488852334744,
+              1.4204204486471124,
+              0
+            ]
+          },
+          "survival": {
+            "assetId": "/private-assets/KinematicTest/Autonox-DELTA-RL5-1900-6kg.glb",
+            "counts": {
+              "nodes": 88,
+              "survivors": 52,
+              "removed": 36,
+              "removedMeshes": 25,
+              "mergedSurvivorMeshes": 0,
+              "releasableGeometries": 25,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 0,
+              "unresolvedClaims": 0
+            },
+            "ms": 3.0999999940395355,
+            "removalTopsTotal": 25,
+            "removalTopsSample": [
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00054870",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066182",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066183",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00050309_2/MT_WST00050309_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00061379_2/MT_WST00061379_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00050309/MT_WST00050309_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00061379/MT_WST00061379_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00050309_4/MT_WST00050309_5",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00061379_4/MT_WST00061379_5",
+              "Autonox-DELTA-RL5-1900-6kg/PlatformBody/MT_WST00050309_6/MT_WST00050309_7"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 3.0999999940395355,
+          "navToSceneReadyMs": 5388.300000011921,
+          "fps": 95.8,
+          "fpsSamples": [
+            90,
+            97,
+            91,
+            84,
+            98,
+            100,
+            101,
+            98,
+            106,
+            93
+          ],
+          "frameMs": 10.48,
+          "scene": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "total": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "heap": 203722988,
+          "sceneNodes": 88,
+          "sceneMeshes": 29,
+          "chunkMeshes": 23,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 3,
+          "loadTriangles": 252089,
+          "loadInfo": {
+            "glbSize": "9.3 MB",
+            "loadTime": "0.6s"
+          },
+          "camera": {
+            "pos": [
+              1.570536612970956,
+              2.5729135523534525,
+              1.498241034818243
+            ],
+            "target": [
+              0.18754488852334744,
+              1.4204204486471124,
+              0
+            ]
+          },
+          "survival": {
+            "assetId": "/private-assets/KinematicTest/Autonox-DELTA-RL5-1900-6kg.glb",
+            "counts": {
+              "nodes": 88,
+              "survivors": 52,
+              "removed": 36,
+              "removedMeshes": 25,
+              "mergedSurvivorMeshes": 0,
+              "releasableGeometries": 25,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 0,
+              "unresolvedClaims": 0
+            },
+            "ms": 3.699999988079071,
+            "removalTopsTotal": 25,
+            "removalTopsSample": [
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00054870",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066182",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066183",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00050309_2/MT_WST00050309_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00061379_2/MT_WST00061379_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00050309/MT_WST00050309_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00061379/MT_WST00061379_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00050309_4/MT_WST00050309_5",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00061379_4/MT_WST00061379_5",
+              "Autonox-DELTA-RL5-1900-6kg/PlatformBody/MT_WST00050309_6/MT_WST00050309_7"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 4.5,
+          "navToSceneReadyMs": 5631.399999976158,
+          "fps": 96.6,
+          "fpsSamples": [
+            91,
+            104,
+            105,
+            90,
+            97,
+            94,
+            98,
+            94,
+            92,
+            101
+          ],
+          "frameMs": 10.390000000000002,
+          "scene": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "total": {
+            "calls": 25,
+            "triangles": 252093
+          },
+          "heap": 203746164,
+          "sceneNodes": 88,
+          "sceneMeshes": 29,
+          "chunkMeshes": 23,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 3,
+          "loadTriangles": 252089,
+          "loadInfo": {
+            "glbSize": "9.3 MB",
+            "loadTime": "0.7s"
+          },
+          "camera": {
+            "pos": [
+              1.570536612970956,
+              2.5729135523534525,
+              1.498241034818243
+            ],
+            "target": [
+              0.18754488852334744,
+              1.4204204486471124,
+              0
+            ]
+          },
+          "survival": {
+            "assetId": "/private-assets/KinematicTest/Autonox-DELTA-RL5-1900-6kg.glb",
+            "counts": {
+              "nodes": 88,
+              "survivors": 52,
+              "removed": 36,
+              "removedMeshes": 25,
+              "mergedSurvivorMeshes": 0,
+              "releasableGeometries": 25,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 0,
+              "unresolvedReferences": 0,
+              "unresolvedClaims": 0
+            },
+            "ms": 3.699999988079071,
+            "removalTopsTotal": 25,
+            "removalTopsSample": [
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00054870",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066182",
+              "Autonox-DELTA-RL5-1900-6kg/3D-model_A_00808/A_00808_DUMMY/MT_WST00066183",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00050309_2/MT_WST00050309_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_000/MT_WST00061379_2/MT_WST00061379_3",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00050309/MT_WST00050309_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_120/MT_WST00061379/MT_WST00061379_1",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00050309_4/MT_WST00050309_5",
+              "Autonox-DELTA-RL5-1900-6kg/AxisArm_240/MT_WST00061379_4/MT_WST00061379_5",
+              "Autonox-DELTA-RL5-1900-6kg/PlatformBody/MT_WST00050309_6/MT_WST00050309_7"
+            ],
+            "unresolvedClaims": [],
+            "g1Violations": []
+          }
+        }
+      ]
+    },
+    "mauser": {
+      "url": "/private-models/mauser3dhmi/MauserCageline30.glb",
+      "failed": null,
+      "measuredRuns": 5,
+      "median": {
+        "loadMs": 72,
+        "navToSceneReadyMs": 40309.5,
+        "fps": 10,
+        "frameMs": 100,
+        "sceneCalls": 10714,
+        "sceneTriangles": 7473340,
+        "heapBytes": 1383614142,
+        "sceneNodes": 41870,
+        "chunkMeshes": 10737
+      },
+      "placements": null,
+      "callsPerPlacement": null,
+      "survival": {
+        "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+        "counts": {
+          "nodes": 70203,
+          "survivors": 30898,
+          "removed": 39305,
+          "removedMeshes": 27649,
+          "mergedSurvivorMeshes": 11789,
+          "releasableGeometries": 9603,
+          "instancedTriangles": 0,
+          "tagOnlyChunkBoundaries": 1,
+          "unresolvedReferences": 2422,
+          "unresolvedClaims": 1
+        },
+        "ms": 569.9000000059605,
+        "removalTopsTotal": 23955,
+        "removalTopsSample": [
+          "MauserCageline30glb/Errors/CUBE",
+          "MauserCageline30glb/Cube",
+          "MauserCageline30glb/Cube (1)",
+          "MauserCageline30glb/Cube (2)",
+          "MauserCageline30glb/Cube (3)",
+          "MauserCageline30glb/Cube (4)",
+          "MauserCageline30glb/Gearbox_temp",
+          "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22687",
+          "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22688",
+          "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22689"
+        ],
+        "unresolvedClaims": [
+          {
+            "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+            "role": "merge"
+          }
+        ],
+        "g1Violations": []
+      },
+      "runs": [
+        {
+          "loadMs": 73.60000002384186,
+          "navToSceneReadyMs": 41939,
+          "fps": 10,
+          "fpsSamples": [
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "frameMs": 100,
+          "scene": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "total": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "heap": 1384081599,
+          "sceneNodes": 41870,
+          "sceneMeshes": 10812,
+          "chunkMeshes": 10737,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 169,
+          "loadTriangles": 7681013,
+          "loadInfo": {
+            "glbSize": "178.1 MB",
+            "loadTime": "34.2s"
+          },
+          "camera": {
+            "pos": [
+              18.706014904664464,
+              16.324762708990566,
+              14.347615022721666
+            ],
+            "target": [
+              1.1890000092979667,
+              1.7272502961851557,
+              -4.629151113925379
+            ]
+          },
+          "survival": {
+            "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+            "counts": {
+              "nodes": 70203,
+              "survivors": 30898,
+              "removed": 39305,
+              "removedMeshes": 27649,
+              "mergedSurvivorMeshes": 11789,
+              "releasableGeometries": 9603,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 1,
+              "unresolvedReferences": 2422,
+              "unresolvedClaims": 1
+            },
+            "ms": 563,
+            "removalTopsTotal": 23955,
+            "removalTopsSample": [
+              "MauserCageline30glb/Errors/CUBE",
+              "MauserCageline30glb/Cube",
+              "MauserCageline30glb/Cube (1)",
+              "MauserCageline30glb/Cube (2)",
+              "MauserCageline30glb/Cube (3)",
+              "MauserCageline30glb/Cube (4)",
+              "MauserCageline30glb/Gearbox_temp",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22687",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22688",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22689"
+            ],
+            "unresolvedClaims": [
+              {
+                "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+                "role": "merge"
+              }
+            ],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 70.19999998807907,
+          "navToSceneReadyMs": 40309.5,
+          "fps": 10,
+          "fpsSamples": [
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "frameMs": 100,
+          "scene": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "total": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "heap": 1383490127,
+          "sceneNodes": 41870,
+          "sceneMeshes": 10812,
+          "chunkMeshes": 10737,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 169,
+          "loadTriangles": 7681013,
+          "loadInfo": {
+            "glbSize": "178.1 MB",
+            "loadTime": "32.7s"
+          },
+          "camera": {
+            "pos": [
+              18.706014904664464,
+              16.324762708990566,
+              14.347615022721666
+            ],
+            "target": [
+              1.1890000092979667,
+              1.7272502961851557,
+              -4.629151113925379
+            ]
+          },
+          "survival": {
+            "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+            "counts": {
+              "nodes": 70203,
+              "survivors": 30898,
+              "removed": 39305,
+              "removedMeshes": 27649,
+              "mergedSurvivorMeshes": 11789,
+              "releasableGeometries": 9603,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 1,
+              "unresolvedReferences": 2422,
+              "unresolvedClaims": 1
+            },
+            "ms": 561,
+            "removalTopsTotal": 23955,
+            "removalTopsSample": [
+              "MauserCageline30glb/Errors/CUBE",
+              "MauserCageline30glb/Cube",
+              "MauserCageline30glb/Cube (1)",
+              "MauserCageline30glb/Cube (2)",
+              "MauserCageline30glb/Cube (3)",
+              "MauserCageline30glb/Cube (4)",
+              "MauserCageline30glb/Gearbox_temp",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22687",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22688",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22689"
+            ],
+            "unresolvedClaims": [
+              {
+                "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+                "role": "merge"
+              }
+            ],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 71.5,
+          "navToSceneReadyMs": 39098.30000001192,
+          "fps": 10,
+          "fpsSamples": [
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "frameMs": 100,
+          "scene": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "total": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "heap": 1383567055,
+          "sceneNodes": 41870,
+          "sceneMeshes": 10812,
+          "chunkMeshes": 10737,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 169,
+          "loadTriangles": 7681013,
+          "loadInfo": {
+            "glbSize": "178.1 MB",
+            "loadTime": "34.2s"
+          },
+          "camera": {
+            "pos": [
+              18.706014904664464,
+              16.324762708990566,
+              14.347615022721666
+            ],
+            "target": [
+              1.1890000092979667,
+              1.7272502961851557,
+              -4.629151113925379
+            ]
+          },
+          "survival": {
+            "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+            "counts": {
+              "nodes": 70203,
+              "survivors": 30898,
+              "removed": 39305,
+              "removedMeshes": 27649,
+              "mergedSurvivorMeshes": 11789,
+              "releasableGeometries": 9603,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 1,
+              "unresolvedReferences": 2422,
+              "unresolvedClaims": 1
+            },
+            "ms": 564.6999999880791,
+            "removalTopsTotal": 23955,
+            "removalTopsSample": [
+              "MauserCageline30glb/Errors/CUBE",
+              "MauserCageline30glb/Cube",
+              "MauserCageline30glb/Cube (1)",
+              "MauserCageline30glb/Cube (2)",
+              "MauserCageline30glb/Cube (3)",
+              "MauserCageline30glb/Cube (4)",
+              "MauserCageline30glb/Gearbox_temp",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22687",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22688",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22689"
+            ],
+            "unresolvedClaims": [
+              {
+                "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+                "role": "merge"
+              }
+            ],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 73.7000000178814,
+          "navToSceneReadyMs": 37517.30000001192,
+          "fps": 10,
+          "fpsSamples": [
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "frameMs": 100,
+          "scene": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "total": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "heap": 1383614142,
+          "sceneNodes": 41870,
+          "sceneMeshes": 10812,
+          "chunkMeshes": 10737,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 169,
+          "loadTriangles": 7681013,
+          "loadInfo": {
+            "glbSize": "178.1 MB",
+            "loadTime": "30.3s"
+          },
+          "camera": {
+            "pos": [
+              18.706014904664464,
+              16.324762708990566,
+              14.347615022721666
+            ],
+            "target": [
+              1.1890000092979667,
+              1.7272502961851557,
+              -4.629151113925379
+            ]
+          },
+          "survival": {
+            "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+            "counts": {
+              "nodes": 70203,
+              "survivors": 30898,
+              "removed": 39305,
+              "removedMeshes": 27649,
+              "mergedSurvivorMeshes": 11789,
+              "releasableGeometries": 9603,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 1,
+              "unresolvedReferences": 2422,
+              "unresolvedClaims": 1
+            },
+            "ms": 571,
+            "removalTopsTotal": 23955,
+            "removalTopsSample": [
+              "MauserCageline30glb/Errors/CUBE",
+              "MauserCageline30glb/Cube",
+              "MauserCageline30glb/Cube (1)",
+              "MauserCageline30glb/Cube (2)",
+              "MauserCageline30glb/Cube (3)",
+              "MauserCageline30glb/Cube (4)",
+              "MauserCageline30glb/Gearbox_temp",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22687",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22688",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22689"
+            ],
+            "unresolvedClaims": [
+              {
+                "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+                "role": "merge"
+              }
+            ],
+            "g1Violations": []
+          }
+        },
+        {
+          "loadMs": 72,
+          "navToSceneReadyMs": 42308.5,
+          "fps": 10,
+          "fpsSamples": [
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10,
+            10
+          ],
+          "frameMs": 100,
+          "scene": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "total": {
+            "calls": 10714,
+            "triangles": 7473340
+          },
+          "heap": 1386305007,
+          "sceneNodes": 41870,
+          "sceneMeshes": 10812,
+          "chunkMeshes": 10737,
+          "bake": {
+            "assets": 0,
+            "chunks": 0,
+            "vertices": 0,
+            "triangles": 0,
+            "instances": 0,
+            "inflight": 0,
+            "placements": {
+              "instances": 0,
+              "assets": 0,
+              "chunks": 0,
+              "chunkMeshes": 0,
+              "keepMeshes": 0,
+              "drawCalls": 0
+            }
+          },
+          "placements": null,
+          "drives": 169,
+          "loadTriangles": 7681013,
+          "loadInfo": {
+            "glbSize": "178.1 MB",
+            "loadTime": "34.5s"
+          },
+          "camera": {
+            "pos": [
+              18.706014904664464,
+              16.324762708990566,
+              14.347615022721666
+            ],
+            "target": [
+              1.1890000092979667,
+              1.7272502961851557,
+              -4.629151113925379
+            ]
+          },
+          "survival": {
+            "assetId": "/private-models/mauser3dhmi/MauserCageline30.glb",
+            "counts": {
+              "nodes": 70203,
+              "survivors": 30898,
+              "removed": 39305,
+              "removedMeshes": 27649,
+              "mergedSurvivorMeshes": 11789,
+              "releasableGeometries": 9603,
+              "instancedTriangles": 0,
+              "tagOnlyChunkBoundaries": 1,
+              "unresolvedReferences": 2422,
+              "unresolvedClaims": 1
+            },
+            "ms": 569.9000000059605,
+            "removalTopsTotal": 23955,
+            "removalTopsSample": [
+              "MauserCageline30glb/Errors/CUBE",
+              "MauserCageline30glb/Cube",
+              "MauserCageline30glb/Cube (1)",
+              "MauserCageline30glb/Cube (2)",
+              "MauserCageline30glb/Cube (3)",
+              "MauserCageline30glb/Cube (4)",
+              "MauserCageline30glb/Gearbox_temp",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22687",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22688",
+              "MauserCageline30glb/Kinematics/Kinematics_MC01/TubeTurning_MC01/TurningMove_rv1/Volumenkörper1_18506/Volumenkörper1_22689"
+            ],
+            "unresolvedClaims": [
+              {
+                "path": "MauserCageline30glb/3125524_low_qual_071125_CL/3125524iam/3125524iam_1/31221431/31220993/ENG-0487541_3",
+                "role": "merge"
+              }
+            ],
+            "g1Violations": []
+          }
+        }
+      ]
+    }
+  }
+}

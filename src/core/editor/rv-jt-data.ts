@@ -30,11 +30,7 @@ const JTDATA_BADGE_COLOR = '#78909c';
 
 // Schema loaded from the rv-ODT specification (schema/v1/rv-odt.json).
 registerComponentSchema('JTData', loadSchemaFromSpec('JTData'), {
-  inspectorVisible: true,
-  hierarchyVisible: false, // metadata on many nodes — would flood the hierarchy filter
-  hoverable: false,
-  selectable: false,
-  badgeColor: JTDATA_BADGE_COLOR,
-  filterLabel: null,
+  pick: 'none',      // metadata, not an interactive object
+  ui: { badge: JTDATA_BADGE_COLOR, filter: null }, // no filter: metadata on many nodes would flood the dropdown
   authorable: false, // stamped by the JT import, never added by hand
 });

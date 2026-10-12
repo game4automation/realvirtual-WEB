@@ -62,6 +62,19 @@ export interface AssetThumbnailOptions {
   keyParts: ThumbnailKeyParts | null;
   /** Resolves the GLB to render. Called at most once, only on a cache miss. */
   resolve: (() => Promise<ResolvedThumbnailSource | null>) | null;
+  /**
+   * The PERSISTED preview, tried before anything is rendered (plan-744 F5).
+   *
+   * A picture the project already holds — `<project>/.thumbnails/<id>.png` —
+   * beats one this browser renders from 35 MB of geometry, and it is the only
+   * one a fresh machine has at all: the render cache is per-browser, so a
+   * delivered project used to show icons until every card had been looked at
+   * once.
+   *
+   * Returning null is the normal case for a document nobody has saved since
+   * the sidecar convention existed, and it falls through to the render.
+   */
+  sidecar?: (() => Promise<ResolvedThumbnailSource | null>) | null;
   /** Skip when the entry already has a picture of its own. */
   enabled?: boolean;
 }
@@ -89,7 +102,7 @@ export interface AssetThumbnailResult<E extends HTMLElement> {
 export function useAssetThumbnail<E extends HTMLElement>(
   opts: AssetThumbnailOptions,
 ): AssetThumbnailResult<E> {
-  const { service, keyParts, resolve, enabled = true } = opts;
+  const { service, keyParts, resolve, sidecar, enabled = true } = opts;
   const { ref, visible } = useThumbnailVisibility<E>();
   const [url, setUrl] = useState<string | null>(null);
   const [empty, setEmpty] = useState(false);
@@ -110,9 +123,50 @@ export function useAssetThumbnail<E extends HTMLElement>(
 
     let cancelled = false;
     let objectUrl: string | null = null;
+    let sidecarRelease: (() => void) | null = null;
 
-    void service!
-      .enqueue(key, async (): Promise<Object3D> => {
+    /**
+     * The persisted preview, tried BEFORE the render is queued (plan-744 F5).
+     *
+     * Sequential, not racing: the whole point is not to render when the
+     * project already holds a picture. It costs one ~20 KB byte read on the
+     * way to a render that would have decoded megabytes of geometry, and the
+     * resolver behind it carries its own concurrency limit.
+     */
+    const fromSidecar = async (): Promise<boolean> => {
+      if (!sidecar) return false;
+      try {
+        const found = await sidecar();
+        if (!found) return false;
+        if (cancelled) {
+          found.release?.();
+          return false;
+        }
+        sidecarRelease = found.release ?? null;
+        // HTTP backends can resolve a missing sidecar to the SPA's HTML
+        // fallback (even with status 200). Only display a decodable image;
+        // otherwise continue through the normal generated-preview path.
+        const preview = new Image();
+        preview.src = found.url;
+        await preview.decode();
+        if (cancelled) return false;
+        setUrl(found.url);
+        return true;
+      } catch {
+        sidecarRelease?.();
+        sidecarRelease = null;
+        return false;
+      }
+    };
+
+    void fromSidecar().then((done) => {
+      if (done || cancelled) return;
+      return renderQueued();
+    });
+
+    function renderQueued(): Promise<void> {
+      return service!
+        .enqueue(key!, async (): Promise<Object3D> => {
         const source = await resolve!();
         if (!source) throw new Error('asset could not be resolved');
         try {
@@ -149,16 +203,22 @@ export function useAssetThumbnail<E extends HTMLElement>(
           source.release?.();
         }
       })
-      .then((blob) => {
-        if (cancelled || !blob) return;
-        objectUrl = URL.createObjectURL(blob);
-        setUrl(objectUrl);
-      })
-      .catch(() => { /* no preview is a normal outcome — keep the icon */ });
+        .then((blob) => {
+          if (cancelled || !blob) return;
+          objectUrl = URL.createObjectURL(blob);
+          setUrl(objectUrl);
+        })
+        .catch(() => { /* no preview is a normal outcome — keep the icon */ });
+    }
 
     return () => {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
+      // The sidecar's own object URL, where the backend handed one out. It is
+      // a different lifetime from `objectUrl` — that one wraps a rendered
+      // Blob this hook made, this one wraps bytes the backend owns.
+      sidecarRelease?.();
+      sidecarRelease = null;
     };
     // `resolve` is intentionally NOT a dependency: callers build it inline, so
     // a fresh closure per render would re-enqueue forever. The key is what

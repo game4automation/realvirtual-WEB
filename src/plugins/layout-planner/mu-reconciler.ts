@@ -23,6 +23,17 @@
  * (`transportManager.preferCloneMU`) so every MU has a real node; instanced MUs
  * (no per-instance Object3D) are ignored. `reconcile()` runs each frame from the
  * planner's onRender, diffing the live MU list against the registered set.
+ *
+ * Planner-independent (plan-567): the Commissioning MU interaction runs its own
+ * instance. Two rules keep instances from damaging each other or the registry
+ * (SOL #8):
+ *   - a PRE-PLACED MU is already pickable under its document path — it only
+ *     gets the `_muSelectable` / `_muRef` markers, never a synthetic path or aux
+ *     targets (a synthetic path would overwrite its reverse lookup, and its
+ *     removal would wipe the document paths of its subtree);
+ *   - an instance removes only what IT added: the markers only while they carry
+ *     its owner token, the registry entry only as the one synthetic path
+ *     (`unregisterNode`), never the node's subtree.
  */
 
 import type { Object3D, Mesh } from 'three';
@@ -33,10 +44,13 @@ type MovingUnit = RVMovingUnit | InstancedMovingUnit;
 
 export interface MuReconcilerEntry {
   node: Object3D;
-  /** Synthetic registry path (`__mu#<n>`). */
+  /** Synthetic registry path (`__mu#<n>`), or a pre-placed MU's document path. */
   path: string;
   /** Aux raycast meshes registered for this MU (for clean removal). */
   meshes: Mesh[];
+  /** True when `path` is the synthetic `__mu#<n>` key THIS reconciler registered;
+   *  false for a pre-placed MU (its document path, not ours to remove). */
+  synthetic?: boolean;
 }
 
 export interface MuReconcilerDeps {
@@ -51,6 +65,9 @@ export interface MuReconcilerDeps {
 /** Hard cap on simultaneously-registered selectable MUs (runaway guard). */
 const MAX_REGISTERED = 2000;
 
+/** Distinct owner token per reconciler instance (marker ownership, SOL #8). */
+let _nextOwner = 1;
+
 export class MuReconciler {
   private _map = new Map<MovingUnit, MuReconcilerEntry>();
   private _counter = 0;
@@ -58,6 +75,7 @@ export class MuReconciler {
   /** Reused scratch set — no per-frame allocation. */
   private _live = new Set<MovingUnit>();
   private _toRemove: MovingUnit[] = [];
+  private readonly _owner = _nextOwner++;
 
   constructor(private deps: MuReconcilerDeps) {}
 
@@ -115,6 +133,14 @@ export class MuReconciler {
     const node = mu.node;
     node.userData._muSelectable = true;
     node.userData._muRef = mu;
+    node.userData._muOwner = this._owner;
+
+    // Pre-placed: already pickable under its document path — markers only.
+    if (mu.preplaced) {
+      const docPath = viewer.registry?.getPathForNode?.(node) ?? null;
+      this._map.set(mu, { node, path: docPath ?? '', meshes: [], synthetic: false });
+      return;
+    }
 
     const path = `__mu#${this._counter++}`;
     viewer.registry?.registerNode(path, node);
@@ -129,7 +155,7 @@ export class MuReconciler {
       meshes.push(mesh);
     });
 
-    this._map.set(mu, { node, path, meshes });
+    this._map.set(mu, { node, path, meshes, synthetic: true });
   }
 
   private _unregister(mu: MovingUnit): void {
@@ -139,14 +165,23 @@ export class MuReconciler {
     const rm = viewer.raycastManager;
 
     for (const mesh of entry.meshes) rm?.removeAuxRaycastTarget(mesh);
-    viewer.registry?.unregisterSubtree(entry.node);
-    delete entry.node.userData._muSelectable;
-    delete entry.node.userData._muRef;
+    if (entry.synthetic) {
+      // Only the synthetic path — never the subtree (pre-placed loads riding
+      // on a spawned carrier keep their document paths).
+      const reg = viewer.registry;
+      if (reg?.unregisterNode) reg.unregisterNode(entry.path, entry.node);
+      else reg?.unregisterSubtree(entry.node);
+    }
+    if (entry.node.userData._muOwner === this._owner) {
+      delete entry.node.userData._muSelectable;
+      delete entry.node.userData._muRef;
+      delete entry.node.userData._muOwner;
+    }
     this._map.delete(mu);
 
     // If this MU was selected, drop its path so selection/outline stay valid.
     const sel = viewer.selectionManager?.getSnapshot().selectedPaths ?? [];
-    if (sel.includes(entry.path)) {
+    if (entry.path && sel.includes(entry.path)) {
       viewer.selectionManager?.selectPaths(sel.filter((p) => p !== entry.path));
       this.deps.onSelectionDropped?.();
     }

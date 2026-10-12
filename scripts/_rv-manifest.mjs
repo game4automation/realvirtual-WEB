@@ -46,10 +46,11 @@
  * what IT stores. Nothing stamps the field.
  *
  * What survives here is reading a value somebody else wrote — a delivered
- * customer manifest, or the transitional `section: 'scenes'` that the scene
- * branch of `documentOfLegacyEntry` still records so an old client cannot
- * misroute a bare-id browser scene. Delivered manifests keep their values
- * forever; nothing strips them.
+ * customer manifest carries `section` and keeps it forever; nothing strips it.
+ * The transitional `section: 'scenes'` the scene branch of
+ * `documentOfLegacyEntry` used to record is gone with the branch itself
+ * (plan-744 Phase 2), so this module reads the field and no longer has any
+ * way of producing one.
  *
  * Kept deliberately tiny and dependency-free: this is imported by the
  * validator, the deploy library, the offline migrator and their tests, and a
@@ -95,6 +96,28 @@ export function documentsOf(manifest) {
 /** The documents of one section, in manifest order. */
 export function documentsInSection(manifest, section) {
   return documentsOf(manifest).filter(e => sectionOfDocument(e) === section);
+}
+
+/**
+ * `demos` — the document ids the welcome screen's demo links open
+ * (plan-744 F8). Node twin of `RvProject.demos`.
+ *
+ * The delivery pipeline does not USE these ids; it has to know the field
+ * exists so that a validator or a manifest rewrite carries it through instead
+ * of treating it as a stray key. Returns `{}` for a manifest that states none,
+ * which is every project but the demo one.
+ */
+export function projectDemos(manifest) {
+  const raw = manifest && typeof manifest.demos === 'object' && manifest.demos
+    ? manifest.demos
+    : {};
+  const pick = key => (typeof raw[key] === 'string' && raw[key].trim() !== '' ? raw[key] : undefined);
+  const out = {};
+  const hmi = pick('hmi');
+  const planner = pick('planner');
+  if (hmi !== undefined) out.hmi = hmi;
+  if (planner !== undefined) out.planner = planner;
+  return out;
 }
 
 // ─── Reference fields (plan-718 §2.3, Node twin) ────────────────────────
@@ -313,22 +336,26 @@ function assetNameOf(entry) {
   return file.replace(/\.(scene\.)?(glb|gltf|json|splat|ksplat|ply)$/i, '') || path;
 }
 
-/** Lift one legacy array entry into a document. */
-export function documentOfLegacyEntry(entry, section) {
+/**
+ * Lift one legacy array entry into a document — the Node twin of
+ * `documentOfEntry` in `rv-project-documents.ts` (plan-744 F2/F4).
+ *
+ * It took a `section` and branched on it; both are gone. The branch existed
+ * for the transitional `section: 'scenes'` stamp (plan-736 F6), and removing
+ * the stamp removed the only thing the argument decided — a `models[]` entry
+ * and a `scenes[]` entry lift identically, because a place is a path.
+ *
+ * Name precedence is own-name-first for every entry now, matching the TS twin.
+ * The scene branch always had it; the asset branch derived from the filename
+ * even when the row carried a name, which silently undid a rename.
+ */
+export function documentOfLegacyEntry(entry) {
   const id = typeof entry.id === 'string' && entry.id.trim() !== ''
     ? entry.id
     : stableDocumentId(entry.path);
-  const name = section === 'scenes' && typeof entry.name === 'string' && entry.name !== ''
-    ? entry.name
-    : assetNameOf(entry);
-  // Only the SCENE branch still stamps `section`, and only as the transitional
-  // Alt-Client guard described on `documentOfSceneEntry` in
-  // `rv-project-documents.ts` — the TS twin this file must stay identical to
-  // (plan-736 F6). A `models[]`/`library[]` entry carries a real folder in its
-  // path and needs no second copy of that fact.
-  return section === 'scenes'
-    ? { ...entry, id, name, path: entry.path, section }
-    : { ...entry, id, name, path: entry.path };
+  const own = typeof entry.name === 'string' ? entry.name.trim() : '';
+  const name = own !== '' ? own : assetNameOf(entry);
+  return { ...entry, id, name, path: entry.path };
 }
 
 /** The manifest keys a pre-phase-6 project carried and nothing maintains now. */
@@ -436,7 +463,7 @@ export function deriveDocuments(manifest, { now = new Date().toISOString() } = {
       const key = documentKeyOf(entry.path);
       if (seen.has(key)) continue;
       seen.add(key);
-      documents.push(documentOfLegacyEntry(entry, section));
+      documents.push(documentOfLegacyEntry(entry));
       lifted++;
     }
     counts[section] = usable.length;

@@ -2,13 +2,16 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import { useState, useEffect, type ReactNode } from 'react';
-import { Typography, Box, Button, Switch, TextField } from '@mui/material';
+import { Typography, Box, Button, Switch, TextField, Link } from '@mui/material';
 import { useViewer } from '../../../hooks/use-viewer';
 import { useMcpBridge, useMcpBridgeLog } from '../../../hooks/use-mcp-bridge';
 import type { McpBridgePluginAPI } from '../../types/plugin-types';
+import type { McpBridgeFailure, McpBridgeRole } from '../../../plugins/mcp-bridge-plugin';
+import { ERROR, FS, INK_MID, MONO, SUCCESS, WARN } from '../shared-sx';
 import { StatRow, SettingsSection, FieldRow } from './settings-helpers';
 import { ConnectDownloadLinks } from '../ConnectPanel';
 import { RagStatusSection } from './RagStatusSection';
+import { useFollowAgent, setFollowAgent } from '../follow-agent-store';
 
 /** The default transport: realvirtual CONNECT hosts the MCP endpoint itself, so any
  *  MCP client registers ONE http entry and needs neither Node nor Vite (plan-327 AP5). */
@@ -24,6 +27,118 @@ const NODE_FALLBACK_SNIPPET = `"WebViewerMCP": {
 }`;
 
 const BUILD_CMD = 'cd Assets/realvirtual-WebViewer~/mcp-bridge\nnpm run setup';
+
+/** One failure cause as the panel shows it (plan-541 § 3.1). */
+interface FailureText {
+  status: string;
+  hint: string;
+  /** Offer the "open the viewer from CONNECT itself" link. */
+  localLink?: boolean;
+  /** Further lines below the hint. */
+  extra?: string[];
+}
+
+/** Why the bridge is not connected — status + what to do (plan-541 § 3.1). */
+const MCP_FAILURE_TEXT: Readonly<Record<Exclude<McpBridgeFailure, 'none'>, FailureText>> = {
+  'pairing-pending': { status: 'Waiting for approval', hint: 'Confirm in the CONNECT tray icon.' },
+  'pairing-denied': {
+    status: 'Denied by CONNECT',
+    hint: 'Remove the origin under Tray ▸ MCP server ▸ AI Bridge origins.',
+  },
+  'pairing-cooldown': { status: 'Approval timed out', hint: 'Try again in a few minutes.' },
+  'pairing-unavailable': {
+    status: 'Pairing not available',
+    hint: 'This CONNECT has no tray. Add the origin to AllowedOrigins.',
+  },
+  'origin-not-pairable': {
+    status: 'Origin not allowed',
+    hint: 'Use https or open the viewer via http://localhost:5100.',
+    localLink: true,
+  },
+  'bridge-disabled': {
+    status: 'MCP server off',
+    hint: 'Tray ▸ MCP server ▸ Enabled, then restart CONNECT.',
+  },
+  'connect-outdated': {
+    status: 'CONNECT too old',
+    hint: 'Update CONNECT, or add this origin to AllowedOrigins.',
+  },
+  unreachable: {
+    status: 'CONNECT not reachable',
+    hint: 'Is CONNECT running? Allow local network access in the browser. Safari: open http://localhost:5100.',
+    localLink: true,
+    extra: [
+      "If CONNECT restricts AllowedOrigins, add this page's origin.",
+      'A Content Security Policy (connect-src) on this site may block localhost.',
+    ],
+  },
+  'browser-blocked': {
+    status: 'Blocked by the browser',
+    hint: 'This browser does not allow the connection. Use Chrome/Edge or open http://localhost:5100.',
+    localLink: true,
+  },
+  starting: { status: 'CONNECT is starting', hint: 'Connects automatically.' },
+  refused: {
+    status: 'Connection refused',
+    hint: "Check API key, licence and the browser's local-network permission. Safari: open http://localhost:5100.",
+    localLink: true,
+  },
+  'pairing-busy': { status: 'CONNECT is busy', hint: 'Too many approval requests — try again later.' },
+  'bridge-full': {
+    status: 'Too many viewer tabs',
+    hint: 'CONNECT serves at most 8 viewer tabs at once. Close tabs you no longer need.',
+  },
+};
+
+/**
+ * plan-564: the ownership row. CONNECT keeps several tabs connected and lets ONE
+ * of them own the bridge; the rest wait. Transport readiness ("Connected") and
+ * ownership are deliberately separate rows. Null hides the row — a gateway that
+ * predates standby sends no role.
+ */
+export function bridgeRoleLabel(
+  role: McpBridgeRole | null | undefined,
+  claimed = false,
+): { label: string; color: string } | null {
+  if (role === 'active') return { label: claimed ? 'Active (agent tab)' : 'Active', color: SUCCESS };
+  if (role === 'standby') return { label: 'Standby — another tab is in control', color: WARN };
+  return null;
+}
+
+/** The page origin as the CONNECT tray prompt names it. Never throws. */
+function pageOrigin(): string {
+  try { return window.location.origin; } catch { return ''; }
+}
+
+/** Cause block under the status rows: what failed and what to do about it. */
+function FailureHint({ failure, port }: { failure: Exclude<McpBridgeFailure, 'none'>; port: string }) {
+  const text = MCP_FAILURE_TEXT[failure];
+  const localUrl = `http://localhost:${port}`;
+  const captionSx = { color: INK_MID, fontSize: FS.label } as const;
+  return (
+    <Box data-testid="mcp-failure-hint" sx={{
+      display: 'flex', flexDirection: 'column', gap: 0.5, p: 1,
+      borderLeft: `2px solid ${failure === 'pairing-pending' || failure === 'starting' ? WARN : ERROR}`,
+    }}>
+      {failure === 'pairing-pending' ? (
+        <Typography variant="caption" sx={captionSx}>
+          Confirm in the realvirtual CONNECT tray icon: “Allow {pageOrigin()}” — then this page
+          connects automatically.
+        </Typography>
+      ) : null}
+      <Typography variant="caption" sx={captionSx}>{text.hint}</Typography>
+      {text.extra?.map((line) => (
+        <Typography key={line} variant="caption" sx={captionSx}>{line}</Typography>
+      ))}
+      {text.localLink ? (
+        <Link href={localUrl} target="_blank" rel="noopener noreferrer" variant="caption"
+          sx={{ fontFamily: MONO, fontSize: FS.label }}>
+          {localUrl}
+        </Link>
+      ) : null}
+    </Box>
+  );
+}
 
 /** Monospace block with a copy-to-clipboard button. */
 function CodeBlock({ text }: { text: string }) {
@@ -65,6 +180,7 @@ function SetupStep({ n, title, children }: { n: number; title: string; children:
 export function McpTab() {
   const viewer = useViewer();
   const mcp = useMcpBridge();
+  const followAgent = useFollowAgent();
   const log = useMcpBridgeLog();
   const mcpPlugin = viewer.getPlugin<McpBridgePluginAPI>('mcp-bridge');
   const [portInput, setPortInput] = useState(mcp.port);
@@ -73,12 +189,18 @@ export function McpTab() {
   // Sync portInput when mcp.port changes externally
   useEffect(() => { setPortInput(mcp.port); }, [mcp.port]);
 
-  const stateColor = mcp.connected ? '#66bb6a'
-    : mcp.reconnectAttempt > 0 ? '#ffa726'
-    : mcp.enabled ? '#ef5350'
-    : 'rgba(255,255,255,0.5)';
+  // plan-541: a known cause replaces the bare "Reconnecting (N)…".
+  const failure = mcp.enabled && !mcp.connected && mcp.failure !== 'none' ? mcp.failure : null;
+  const failurePending = failure === 'pairing-pending' || failure === 'starting';
+
+  const stateColor = mcp.connected ? SUCCESS
+    : failure ? (failurePending ? WARN : ERROR)
+    : mcp.reconnectAttempt > 0 ? WARN
+    : mcp.enabled ? ERROR
+    : INK_MID;
 
   const stateLabel = mcp.connected ? 'Connected'
+    : failure ? MCP_FAILURE_TEXT[failure].status
     : mcp.reconnectAttempt > 0 ? `Reconnecting (${mcp.reconnectAttempt})...`
     : mcp.enabled ? 'Disconnected'
     : 'Disabled';
@@ -109,6 +231,7 @@ export function McpTab() {
     return `${Math.floor(m / 60)}h ${m % 60}m`;
   };
   const bridgeLabel = ss ? `pid ${ss.pid} · :${ss.port} · up ${fmtUptime(ss.uptimeMs)}` : '—';
+  const role = mcp.connected ? bridgeRoleLabel(mcp.role, mcp.claimed) : null;
 
   const validatePort = (val: string): boolean => {
     const n = Number(val);
@@ -147,12 +270,20 @@ export function McpTab() {
             onChange={(_, v) => mcpPlugin?.setEnabled(v)} />
         </FieldRow>
 
+        {/* plan-520: fly the camera to what the agent edits while the view is idle. */}
+        <FieldRow label="Follow agent" hint="Move the camera to what the AI changes while you are not using the view">
+          <Switch size="small" checked={followAgent}
+            onChange={(_, v) => setFollowAgent(v)} />
+        </FieldRow>
+
         {/* Status — the FULL chain: browser ⟷ bridge ⟷ AI client. "State" is
             only the browser↔bridge WebSocket leg; "AI client" shows whether a
             live Claude is actually attached (and which one), so a connected
             browser on a host-less bridge no longer looks healthy. */}
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
           <StatRow label="Browser → Bridge" value={stateLabel} color={stateColor} />
+          {role && <StatRow label="This tab" value={role.label} color={role.color} />}
+          {mcp.target && <StatRow label="Target" value={mcp.target} />}
           {mcp.connected && ss && (
             <>
               <StatRow label="AI client" value={aiLabel} color={aiColor} />
@@ -163,6 +294,8 @@ export function McpTab() {
           <StatRow label="Port" value={mcp.port} />
           {mcp.connected && ss && <StatRow label="Bridge" value={bridgeLabel} />}
         </Box>
+
+        {failure && <FailureHint failure={failure} port={mcp.port} />}
 
         {/* No transport picker. CONNECT is the MCP server: it hosts the endpoint and owns the web_*
             tools, so this row asked the operator to choose between the one real answer and two
@@ -239,7 +372,8 @@ export function McpTab() {
               <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.65)' }}>
                 Leave the port at <code>5100</code> — that is CONNECT. Running against the Vite dev
                 server works too: open it with <code>?mcpPort=5100</code>, or just leave the
-                default.
+                default. On a hosted page (web.realvirtual.io) the bridge connects to localhost
+                automatically; confirm once in the tray.
               </Typography>
             </SetupStep>
             <SetupStep n={4} title="Fallback only — the local Node bridge">

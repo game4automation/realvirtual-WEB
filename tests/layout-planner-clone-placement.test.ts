@@ -18,6 +18,7 @@
  * the old expectation as a `// war (pre-Phase3): …` comment.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { Group } from 'three';
 import type { Object3D } from 'three';
 
 import {
@@ -126,7 +127,7 @@ describe('plan-376 — duplicate / paste clone contract', () => {
   beforeEach(() => {
     localStorage.removeItem(AUTOSAVE_KEY);
     fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
-      new Response(new Blob([new Uint8Array([0])]), {
+      new Response(new Blob([new Uint8Array([0x67, 0x6c, 0x54, 0x46, 2, 0, 0, 0, 12, 0, 0, 0]) /* a bare `glTF` header — the blob cache refuses anything else */]), {
         status: 200,
         headers: { 'Content-Type': 'model/gltf-binary' },
       }),
@@ -143,7 +144,7 @@ describe('plan-376 — duplicate / paste clone contract', () => {
   // ── Shared clone contract, asserted at both entry points ──────────────
 
   describe('GLB branch', () => {
-    it('duplicateSelected gives a fresh id, a "(copy)" label and a +0.5 X/Z offset', async () => {
+    it('duplicateSelected gives a fresh id, the next free `_N` name and a +0.5 X/Z offset', async () => {
       const { plugin } = await bootPlanner();
       const srcId = await plugin.placeComponent(GLB_ENTRY, [2, 0, 3]);
       plugin.store.selectComponent(srcId);
@@ -154,7 +155,11 @@ describe('plan-376 — duplicate / paste clone contract', () => {
       expect(newId).not.toBe(srcId);
       const src = storeRecord(plugin, srcId)!;
       const copy = storeRecord(plugin, newId!)!;
-      expect(copy.label).toBe(`${src.label} (copy)`);
+      // plan-758: ONE name per placement — `Belt` → `Belt_1`, never "(copy)".
+      expect(src.label).toBe('BeltRoot');
+      expect(copy.label).toBe('BeltRoot_1');
+      expect(copy.label).not.toContain('(copy)');
+      expect(internals(plugin)._objectMap.get(newId!)!.name).toBe(copy.label);
       expect(copy.catalogId).toBe(src.catalogId);
       expect(copy.glbUrl).toBe(src.glbUrl);
       expect(copy.position[0]).toBeCloseTo(src.position[0] + 0.5, 6);
@@ -174,9 +179,103 @@ describe('plan-376 — duplicate / paste clone contract', () => {
       expect(ids[0]).not.toBe(srcId);
       const src = storeRecord(plugin, srcId)!;
       const copy = storeRecord(plugin, ids[0])!;
-      expect(copy.label).toBe(`${src.label} (copy)`);
+      expect(copy.label).toBe('BeltRoot_1');
+      expect(internals(plugin)._objectMap.get(ids[0])!.name).toBe('BeltRoot_1');
       expect(copy.position[0]).toBeCloseTo(src.position[0] + 0.5, 6);
       expect(copy.position[2]).toBeCloseTo(src.position[2] + 0.5, 6);
+    });
+
+    it('a copy series never accumulates suffixes: three pastes → BeltRoot_1, _2, _3 (plan-758)', async () => {
+      const { plugin } = await bootPlanner();
+      const srcId = await plugin.placeComponent(GLB_ENTRY, [2, 0, 3]);
+      plugin.store.selectComponent(srcId);
+      plugin.copySelected();
+
+      const a = await plugin.pasteClipboard();
+      await flush();
+      const b = await plugin.pasteClipboard();
+      await flush();
+      const c = await plugin.pasteClipboard();
+      await flush();
+
+      const labels = [a[0], b[0], c[0]].map((id) => storeRecord(plugin, id)!.label);
+      expect(labels).toEqual(['BeltRoot_1', 'BeltRoot_2', 'BeltRoot_3']);
+      for (const id of [srcId, a[0], b[0], c[0]]) {
+        expect(internals(plugin)._objectMap.get(id)!.name).toBe(storeRecord(plugin, id)!.label);
+      }
+    });
+
+    it('duplicating an already-suffixed copy strips before counting: BeltRoot_2 → BeltRoot_3, not BeltRoot_2_1', async () => {
+      const { plugin } = await bootPlanner();
+      const srcId = await plugin.placeComponent(GLB_ENTRY, [0, 0, 0]);
+      plugin.store.selectComponent(srcId);
+      const firstId = (await plugin.duplicateSelected())!;
+      plugin.store.selectComponent(firstId);
+      const secondId = (await plugin.duplicateSelected())!;   // Belt_2
+      plugin.store.selectComponent(secondId);
+
+      const thirdId = (await plugin.duplicateSelected())!;
+
+      expect(storeRecord(plugin, secondId)!.label).toBe('BeltRoot_2');
+      expect(storeRecord(plugin, thirdId)!.label).toBe('BeltRoot_3');
+    });
+
+    it('a legacy "(copy)" name is left alone and its copy gets a `_1` (decision 6)', async () => {
+      const { plugin } = await bootPlanner();
+      const srcId = await plugin.placeComponent(GLB_ENTRY, [0, 0, 0]);
+      const legacy = { ...storeRecord(plugin, srcId)!, id: 'legacy-copy', label: 'Belt (copy)' };
+      await plugin.placeFromRecord(legacy);
+      expect(internals(plugin)._objectMap.get('legacy-copy')!.name).toBe('Belt (copy)');
+      plugin.store.selectComponent('legacy-copy');
+
+      const newId = (await plugin.duplicateSelected())!;
+
+      expect(storeRecord(plugin, newId)!.label).toBe('Belt (copy)_1');
+      expect(storeRecord(plugin, 'legacy-copy')!.label).toBe('Belt (copy)');
+    });
+
+    it('multi-select paste of placements that live under another parent still gets new names', async () => {
+      // A reloaded document's placements sit one level below the model root;
+      // the copy lands directly under it. Found 2026-09-30: the pasted copies
+      // kept the exact source names because only the root's children were scanned.
+      const { plugin, viewer } = await bootPlanner();
+      const a = await plugin.placeComponent(GLB_ENTRY, [0, 0, 0]);
+      const b = await plugin.placeComponent(GLB_ENTRY, [4, 0, 0]);
+      // Move both one level down, as a reloaded document has them, and
+      // re-register their paths there (the selection resolves through the registry).
+      const sub = new Group();
+      sub.name = 'Layout';
+      viewer.currentModel.add(sub);
+      const paths: string[] = [];
+      for (const id of [a, b]) {
+        const node = internals(plugin)._objectMap.get(id)!;
+        sub.add(node);
+        const path = `Model/Layout/${node.name}`;
+        viewer.registry.registerNode(path, node);
+        paths.push(path);
+      }
+      viewer.selectionManager.selectPaths(paths);
+
+      expect(plugin.copySelected()).toBe(2);
+      const ids = await plugin.pasteClipboard();
+      await flush();
+
+      expect(ids.length).toBe(2);
+      const labels = ids.map((id) => storeRecord(plugin, id)!.label);
+      expect(labels).toEqual(['BeltRoot_2', 'BeltRoot_3']);
+      for (const id of ids) expect(internals(plugin)._objectMap.get(id)!.name).toBe(storeRecord(plugin, id)!.label);
+    });
+
+    it('a second FRESH placement of the same entry is BeltRoot_1 in record AND node', async () => {
+      const { plugin } = await bootPlanner();
+      const first = await plugin.placeComponent(GLB_ENTRY, [0, 0, 0]);
+      const second = await plugin.placeComponent(GLB_ENTRY, [4, 0, 0]);
+
+      // The GLB root name wins over the catalog label (pre-existing rule) and
+      // now flows into the record too: label === node.name.
+      expect(storeRecord(plugin, first)!.label).toBe('BeltRoot');
+      expect(storeRecord(plugin, second)!.label).toBe('BeltRoot_1');
+      expect(internals(plugin)._objectMap.get(second)!.name).toBe('BeltRoot_1');
     });
 
     it('re-drops the copy onto an elevated surface when drop-to-surface is on', async () => {
@@ -226,6 +325,21 @@ describe('plan-376 — duplicate / paste clone contract', () => {
       expect(viewer.splatPlugin!.loadedUrls).toEqual([SPLAT_URL, SPLAT_URL]);
       expect(storeRecord(plugin, newId!)?.splatUrl).toBe(SPLAT_URL);
       expect(internals(plugin)._objectMap.get(newId!)!.userData._isSplat).toBe(true);
+    });
+
+    it('two FRESH drops of the same splat get distinct names, and the copy follows (plan-758 A7)', async () => {
+      const { plugin } = await bootPlanner({ withSplatPlugin: true });
+      const a = await plugin.placeComponent(SPLAT_ENTRY, [0, 0, 0]);
+      const b = await plugin.placeComponent(SPLAT_ENTRY, [3, 0, 0]);
+      plugin.store.selectComponent(b);
+
+      const c = (await plugin.duplicateSelected())!;
+
+      const names = [a, b, c].map((id) => storeRecord(plugin, id)!.label);
+      expect(names).toEqual(['Cloud', 'Cloud_1', 'Cloud_2']);
+      for (const id of [a, b, c]) {
+        expect(internals(plugin)._objectMap.get(id)!.name).toBe(storeRecord(plugin, id)!.label);
+      }
     });
 
     it('duplicateSelected bails out — no autosave, no re-selection — without the plugin', async () => {

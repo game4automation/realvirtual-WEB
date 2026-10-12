@@ -59,12 +59,18 @@ export interface PerfResults {
   probe?: unknown;
   /** Steady-state evidence for the observation window. */
   stationarity?: StationarityResult;
+  /** plan-473 F4: whether the run measured what it claims to (§1.3). */
+  validity?: RunValidity;
   /** Produced-vs-arrived rates for the in-browser load generator. */
   load?: unknown;
   /** What the run was measured IN — every switch that changes the frame. */
   env?: PerfEnvironment;
   /** Seconds spent filling the line before the observation window opened. */
   fillPhaseS?: number;
+  /** plan-492: what the cell matrix cost — placements, bakes, chunks, BVH. */
+  cellMatrix?: unknown;
+  /** plan-492: the per-pass frame counters of the last measured frame. */
+  frameStats?: unknown;
 }
 
 /**
@@ -79,10 +85,137 @@ export interface PerfEnvironment {
   debugPlugins: 'off';
   shadows: 'on' | 'off';
   effects: 'on' | 'off';
+  /** plan-469: the A/B prototypes actually armed for this run (`none` if any). */
+  proto?: string;
+  /** plan-469: whether the region-attribution hooks were installed. */
+  hooks?: 'on' | 'off';
+  /** plan-469 Phase 0d: `primitive` belts or `library` conveyor GLBs. */
+  geometry?: 'primitive' | 'library';
+  /** plan-469 Phase 0d: `primitive` box MU or the `cartonbox` library asset. */
+  muAsset?: 'primitive' | 'cartonbox' | 'pallet';
+  /** plan-469 Phase 0d: six-axis robots standing beside the line. */
+  robots?: number;
+  robotMotion?: 'static' | 'erratic';
+  /** plan-473 F4: the ambient-occlusion backend the frame was rendered with.
+   *  AO is a DEFAULT-ON post pass and was never protocolled, so two reports
+   *  could differ by a full screen-space pass without saying so. */
+  aoMode?: 'off' | 'gtao' | 'n8ao';
   /** `off` = the loaded GLB was cleared before the line was built. */
   model: 'on' | 'off';
   /** Model that was loaded (and possibly cleared again). */
   modelUrl?: string;
+}
+
+// ── plan-473 F4: run validity ───────────────────────────────────────────
+
+/** Occupancy band around the configured target (±10 %, §1.3). */
+export const VALIDITY_OCCUPANCY_TOL = 0.10;
+/** Throughput band, both for source-vs-reference and sink-vs-source (±15 %). */
+export const VALIDITY_RATE_TOL = 0.15;
+/** Share of the observation window that may be lost simulation time (5 %). */
+export const VALIDITY_LOST_SIM_TOL = 0.05;
+
+/** One of the four §1.3 conditions, reported individually. */
+export interface RunValidityCheck {
+  name: 'occupancy' | 'sourceThroughput' | 'sinkThroughput' | 'simTimeLoss';
+  ok: boolean;
+  /** The measured numbers behind the verdict, for the report. */
+  detail: string;
+}
+
+/**
+ * Verdict on whether a run MEASURED WHAT IT CLAIMS TO — the plan-473 F4
+ * replacement for `stationary`.
+ *
+ * The old criterion graded the source against `lanes / sourceIntervalS`, the
+ * rate the configuration ASKS for, while the line physically tops out near half
+ * of that. Every cell therefore reported FAIL and the flag became unreadable.
+ * The four conditions below grade the run against what is ACHIEVABLE instead,
+ * and — unlike a pure occupancy test — a completely stalled line
+ * (`source = sink = 0`) is explicitly invalid.
+ */
+export interface RunValidity {
+  valid: boolean;
+  reason: string;
+  checks: RunValidityCheck[];
+  /** True when no reference rate was supplied, so `sourceThroughput` could only
+   *  be graded as "> 0". A reference run establishes the number (§4 Phase 1);
+   *  later runs pass it in via `?refrate=`. */
+  referenceMissing: boolean;
+}
+
+export interface RunValidityInput {
+  /** Configured MU target of the cell. */
+  targetMUs: number;
+  /** MUs alive at the end of the observation window. */
+  liveMUs: number;
+  /** MUs spawned per second over the window. */
+  spawnRate: number;
+  /** MUs consumed per second over the window. */
+  sinkRate: number;
+  /** Source rate a REFERENCE run of this configuration reached, or `null` when
+   *  none is known yet. Never the configured rate — that is the broken
+   *  criterion this replaces. */
+  referenceSpawnRate: number | null;
+  /** `clampedSeconds + droppedBacklogSeconds` of the window (probe figure). */
+  lostSimSeconds: number;
+  /** Length of the observation window in seconds. */
+  windowS: number;
+}
+
+/**
+ * Grade one run against the four §1.3 conditions. Pure — the unit test in
+ * `tests/perf/run-validity-gate.test.ts` drives it directly.
+ */
+export function evaluateRunValidity(input: RunValidityInput): RunValidity {
+  const { targetMUs, liveMUs, spawnRate, sinkRate, referenceSpawnRate, lostSimSeconds, windowS } = input;
+  const checks: RunValidityCheck[] = [];
+
+  const occLo = targetMUs * (1 - VALIDITY_OCCUPANCY_TOL);
+  const occHi = targetMUs * (1 + VALIDITY_OCCUPANCY_TOL);
+  checks.push({
+    name: 'occupancy',
+    ok: targetMUs > 0 && liveMUs >= occLo && liveMUs <= occHi,
+    detail: `${liveMUs} live vs target ${targetMUs} (band ${occLo.toFixed(0)}..${occHi.toFixed(0)})`,
+  });
+
+  // A stalled line fails HERE: `spawnRate > 0` is a hard precondition, so
+  // `source = sink = 0` can never be graded as a valid steady state.
+  const referenceMissing = referenceSpawnRate === null || !(referenceSpawnRate > 0);
+  const sourceOk = spawnRate > 0 && (referenceMissing
+    || Math.abs(spawnRate - (referenceSpawnRate as number)) <= VALIDITY_RATE_TOL * (referenceSpawnRate as number));
+  checks.push({
+    name: 'sourceThroughput',
+    ok: sourceOk,
+    detail: referenceMissing
+      ? `${spawnRate.toFixed(2)}/s, no reference rate supplied (graded > 0 only)`
+      : `${spawnRate.toFixed(2)}/s vs reference ${(referenceSpawnRate as number).toFixed(2)}/s `
+        + `(±${(VALIDITY_RATE_TOL * 100).toFixed(0)} %)`,
+  });
+
+  checks.push({
+    name: 'sinkThroughput',
+    ok: spawnRate > 0 && Math.abs(sinkRate - spawnRate) <= VALIDITY_RATE_TOL * spawnRate,
+    detail: `${sinkRate.toFixed(2)}/s vs source ${spawnRate.toFixed(2)}/s `
+      + `(±${(VALIDITY_RATE_TOL * 100).toFixed(0)} %)`,
+  });
+
+  checks.push({
+    name: 'simTimeLoss',
+    ok: windowS > 0 && lostSimSeconds <= VALIDITY_LOST_SIM_TOL * windowS,
+    detail: `${lostSimSeconds.toFixed(2)} s lost of ${windowS.toFixed(1)} s window `
+      + `(limit ${(VALIDITY_LOST_SIM_TOL * 100).toFixed(0)} %)`,
+  });
+
+  const failed = checks.filter((c) => !c.ok);
+  return {
+    valid: failed.length === 0,
+    reason: failed.length === 0
+      ? (referenceMissing ? 'valid (no reference rate — source graded > 0 only)' : 'valid')
+      : failed.map((c) => `${c.name} FAIL: ${c.detail}`).join('; '),
+    checks,
+    referenceMissing,
+  };
 }
 
 /** Belt occupancy AND throughput — occupancy alone cannot tell a full line from a dead one. */
@@ -102,7 +235,7 @@ export interface StationarityResult {
 }
 
 interface LineParams {
-  scenario: 'model' | 'line';
+  scenario: 'model' | 'line' | 'cells';
   mode: 'supported' | 'smoke';
   durationS: number;
   load: 'none' | 'browser' | 'connect';
@@ -123,6 +256,27 @@ interface LineParams {
    * control cell is `scenario=model`, which is unaffected.
    */
   keepModel: boolean;
+  /**
+   * `?proto=refslowpick,refaabb,walk,bounds` — A/B switches. Dev-only; empty in
+   * production. `walk`/`bounds` arm a plan-469 prototype; `refslowpick`/`refaabb`
+   * are plan-473 REFERENCE switches that turn a production optimisation off, so
+   * an ABBA pair measures the optimisation's price against the very same build.
+   * `fastpath` and `union` are gone (plan-473 F3).
+   */
+  proto: string[];
+  /** `?hooks=on|off` — plan-469: install the region-attribution hooks (default
+   *  `on`). The `off` cell is what prices the instrumentation itself. */
+  hooks: boolean;
+  /** plan-492 `?cells=` — lanes of the cell matrix (`scenario=cells` only). */
+  cells: number;
+  /** plan-492 `?cellconv=` — conveyors per lane. */
+  cellConv: number;
+  /** plan-492 `?cellmotion=` — none | conveyor | robot | all | sparse. */
+  cellMotion: string;
+  /** `?refrate=<n>` — plan-473 F4: the source rate a REFERENCE run of this exact
+   *  configuration reached, in MU/s. `null` when unknown; the run-validity gate
+   *  then grades the source as "> 0" only and says so in the report. */
+  referenceSpawnRate: number | null;
   cfg: Record<string, unknown>;
 }
 
@@ -138,10 +292,16 @@ declare global {
 }
 
 interface SyntheticLineHookLike {
+  /** plan-469 Phase 0d — must be awaited before `build()` for library assets.
+   *  Optional so an older hook (or a test double) still satisfies the shape. */
+  preload?(cfg?: Record<string, unknown>): Promise<string[]>;
   build(cfg?: Record<string, unknown>): { valid: boolean; reason?: string; fillTimeS: number; sourceIntervalS: number; [k: string]: unknown };
   dispose(): void;
 }
 interface PerfProbeHookLike {
+  /** plan-469: set BEFORE `start()` — false leaves the manager's region hooks
+   *  null, which is the production state and the overhead reference cell. */
+  regionHooksEnabled?: boolean;
   start(): void;
   stop(): void;
   reset(): void;
@@ -163,7 +323,8 @@ function num(params: URLSearchParams, key: string, fallback: number): number {
 /** Read every line parameter off the URL. Exported for the runner's own sanity checks. */
 export function readPerfParams(search: string): LineParams {
   const p = new URLSearchParams(search);
-  const scenario = p.get('scenario') === 'line' ? 'line' : 'model';
+  const rawScenario = p.get('scenario');
+  const scenario = rawScenario === 'line' ? 'line' : rawScenario === 'cells' ? 'cells' : 'model';
   const mode = p.get('mode') === 'smoke' ? 'smoke' : 'supported';
   const loadRaw = p.get('load');
   const load = loadRaw === 'browser' || loadRaw === 'connect' ? loadRaw : 'none';
@@ -176,6 +337,12 @@ export function readPerfParams(search: string): LineParams {
   // avoid, and parking it 1.4 km away just leaves it outside the camera's
   // framing (plan-465 fix 2026-09-06).
   const defaultOrigin = keepModel ? 1000 : 0;
+  const muAssetRaw = p.get('muasset');
+  const muAsset = muAssetRaw === 'cartonbox' ? 'cartonbox' : muAssetRaw === 'pallet' ? 'pallet' : 'primitive';
+  // A library MU is scaled to `mulen` along the belt, so a pallet must default
+  // to its real length (MU_ASSET_PITCH_MM in rv-synthetic-assets.ts) or it would
+  // be a 200 mm pallet. Explicit `mulen`/`mugap` still win.
+  const palletDefaults = muAsset === 'pallet';
   const cfg: Record<string, unknown> = {
     targetMUs: num(p, 'mu', 2400),
     sensorsPerSegment: num(p, 'sensors', 1),
@@ -185,11 +352,18 @@ export function readPerfParams(search: string): LineParams {
     segmentLengthM: num(p, 'seglen', 5),
     speedMmS: num(p, 'speed', 1000),
     muTemplates: num(p, 'templates', 1),
-    muLengthMm: num(p, 'mulen', 200),
-    muGapMm: num(p, 'mugap', 100),
+    muLengthMm: num(p, 'mulen', palletDefaults ? 1200 : 200),
+    muGapMm: num(p, 'mugap', palletDefaults ? 300 : 100),
     seed: num(p, 'seed', 465),
     originX: num(p, 'originx', defaultOrigin),
     originZ: num(p, 'originz', defaultOrigin),
+    // plan-469 Phase 0d realistic-scene axes. Every default reproduces the
+    // plan-465 cell EXACTLY, so an existing invocation measures what it always
+    // measured (regression-free by construction).
+    geometry: p.get('geometry') === 'library' ? 'library' : 'primitive',
+    muAsset,
+    robots: Math.max(0, num(p, 'robots', 0)),
+    robotMotion: p.get('robotmotion') === 'erratic' ? 'erratic' : 'static',
     // A line with no signal source still binds its signals; only `load=none`
     // leaves the belts jogging free, which is the matrix's zero column.
     signalBinding: load === 'none' ? 'none' : load,
@@ -201,6 +375,14 @@ export function readPerfParams(search: string): LineParams {
     load,
     shadows: flag(p, 'shadows', true),
     effects: flag(p, 'effects', true),
+    proto: (p.get('proto') ?? '').split(',').map((x) => x.trim()).filter(Boolean),
+    hooks: flag(p, 'hooks', true),
+    cells: Math.max(1, Math.floor(num(p, 'cells', 4))),
+    cellConv: Math.max(1, Math.floor(num(p, 'cellconv', 3))),
+    cellMotion: p.get('cellmotion') ?? 'none',
+    referenceSpawnRate: p.get('refrate') === null || !Number.isFinite(Number(p.get('refrate')))
+      ? null
+      : Number(p.get('refrate')),
     keepModel,
     cfg,
   };
@@ -217,8 +399,13 @@ export class PerfTestPlugin implements RVViewerPlugin {
   private _overlay: HTMLElement | null = null;
   /** True while a synthetic line is standing — `onDeactivate` must tear it down. */
   private _lineBuilt = false;
+  /** True while a cell matrix is standing — `onDeactivate` must tear it down. */
+  private _cellMatrixBuilt = false;
   private _loadStarted = false;
   private _probeRunning = false;
+  private _cellMatrixViewer: RVViewer | null = null;
+  /** True while a cells run is in flight — see the re-entrancy note in `runCells`. */
+  private _cellsRunning = false;
 
   onModelLoaded(_result: LoadResult, viewer: RVViewer): void {
     // Small delay to let first frames settle (JIT, shader compile, etc.)
@@ -249,6 +436,14 @@ export class PerfTestPlugin implements RVViewerPlugin {
     if (this._probeRunning) { this.probeHook()?.stop(); this._probeRunning = false; }
     if (this._loadStarted) { this.loadHook()?.stop(); this._loadStarted = false; }
     if (this._lineBuilt) { this.lineHook()?.dispose(); this._lineBuilt = false; }
+    if (this._cellMatrixBuilt) {
+      this._cellMatrixBuilt = false;
+      const viewer = this._cellMatrixViewer;
+      this._cellMatrixViewer = null;
+      if (viewer) {
+        void import('../../core/engine/perf/rv-cell-matrix').then((m) => m.disposeCellMatrix(viewer));
+      }
+    }
   }
 
   /** Re-arm the measurement for the model that is still loaded. */
@@ -286,6 +481,10 @@ export class PerfTestPlugin implements RVViewerPlugin {
     const params = readPerfParams(window.location.search);
     if (params.scenario === 'line') {
       await this.runLine(viewer, params);
+      return;
+    }
+    if (params.scenario === 'cells') {
+      await this.runCells(viewer, params);
       return;
     }
     await this.runModel(viewer, params);
@@ -342,15 +541,198 @@ export class PerfTestPlugin implements RVViewerPlugin {
       renderer.shadowMap.enabled = params.shadows;
       renderer.shadowMap.needsUpdate = true;
     }
-    const tm = viewer.transportManager as unknown as { spawnVanishEffects?: boolean } | undefined;
+    const tm = viewer.transportManager as unknown as {
+      spawnVanishEffects?: boolean;
+      refSlowPick?: boolean;
+    } | undefined;
     if (tm) tm.spawnVanishEffects = params.effects;
+    // plan-469 Phase 0c: arm the requested A/B prototypes. Unknown names are
+    // ignored on purpose — a typo must not silently measure something else, so
+    // the applied set is echoed back into the report's `env`.
+    const applied = this.applyPrototypes(tm, params.proto);
     return {
       debugPlugins: 'off',
       shadows: params.shadows ? 'on' : 'off',
       effects: params.effects ? 'on' : 'off',
+      proto: applied.join(',') || 'none',
+      hooks: params.hooks ? 'on' : 'off',
+      aoMode: (viewer as unknown as { aoMode?: 'off' | 'gtao' | 'n8ao' }).aoMode ?? 'off',
+      geometry: params.cfg.geometry as 'primitive' | 'library',
+      muAsset: params.cfg.muAsset as 'primitive' | 'cartonbox' | 'pallet',
+      robots: params.cfg.robots as number,
+      robotMotion: params.cfg.robotMotion as 'static' | 'erratic',
       model: params.keepModel ? 'on' : 'off',
       ...(modelUrl !== undefined ? { modelUrl } : {}),
     };
+  }
+
+  /**
+   * plan-469 Phase 0c — arm the named prototypes and return the names that were
+   * actually recognised. `walk`/`bounds` live below the manager (`rv-mu.ts`), so
+   * they are set through the module-level flag object.
+   */
+  private applyPrototypes(
+    tm: { refSlowPick?: boolean } | undefined,
+    names: readonly string[],
+  ): string[] {
+    const flags = (globalThis as {
+      __rvProtoFlags?: { oneWalk: boolean; poolBounds: boolean; refAabb: boolean };
+    }).__rvProtoFlags;
+    const applied: string[] = [];
+    // Always start from the production state, so a reload without `?proto=`
+    // really measures production.
+    if (tm) tm.refSlowPick = false;
+    if (flags) { flags.oneWalk = false; flags.poolBounds = false; flags.refAabb = false; }
+    for (const name of names) {
+      switch (name) {
+        // plan-473: REFERENCE switches — they turn the production optimisation
+        // OFF so an ABBA pair has a comparison side. `fastpath` and `union` are
+        // gone (F3: the fast path is production, the union cache is deleted).
+        case 'refslowpick': if (tm) { tm.refSlowPick = true; applied.push(name); } break;
+        case 'refaabb': if (flags) { flags.refAabb = true; applied.push(name); } break;
+        case 'walk': if (flags) { flags.oneWalk = true; applied.push(name); } break;
+        case 'bounds': if (flags) { flags.poolBounds = true; applied.push(name); } break;
+        default: console.warn(`[perf] unknown ?proto= name "${name}" — ignored`); break;
+      }
+    }
+    return applied;
+  }
+
+  // ── Scenario: cell matrix (plan-492) ───────────────────────────────────
+
+  /**
+   * Build N customer-shaped cells on the production placement path and price
+   * the result.
+   *
+   * Unlike the line scenario this does NOT go through a dev-only window hook:
+   * the generator is a module under `src/core/engine/perf/`, imported here
+   * dynamically so it stays out of the production bundle exactly like the rest
+   * of this plugin.
+   *
+   * The run opens the EMPTY document first (plan-492 R10). `stripLoadedModel()`
+   * would have been cheaper and is deliberately not used: it leaves a model's
+   * logic engine, IK and robot runtimes ticking, so the "empty" baseline would
+   * quietly contain whatever the previously loaded GLB brought with it.
+   */
+  private async runCells(viewer: RVViewer, params: LineParams): Promise<void> {
+    // RE-ENTRANCY. This run opens the empty document itself, and `loadModel`
+    // fires `onModelLoaded` — which arms this very plugin again one second
+    // later. Without this guard the second arming tears the first run's
+    // document out from under it mid-build, and the first symptom is a null
+    // `bakeRegistry` in an unrelated stack.
+    if (this._cellsRunning) return;
+    this._cellsRunning = true;
+    const generation = this._generation;
+    const aborted = (): boolean => generation !== this._generation;
+    const env = this.applyEnvironment(viewer, { ...params, keepModel: true });
+
+    const [{ buildCellMatrix, cellMatrixStats }, { getEmptyGlbUrl }] = await Promise.all([
+      import('../../core/engine/perf/rv-cell-matrix'),
+      import('../../core/hmi/scene/empty-glb'),
+    ]);
+    if (aborted()) return;
+
+    try {
+      await viewer.loadModel(getEmptyGlbUrl());
+    } catch (err) {
+      this.publish(viewer, {
+        scenario: 'cells', mode: params.mode, pass: false, env,
+        reason: `could not open the empty document: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      this._cellsRunning = false;
+      return;
+    }
+    if (aborted()) { this._cellsRunning = false; return; }
+
+    let stats;
+    try {
+      stats = await buildCellMatrix(viewer, {
+        cells: params.cells,
+        conveyorsPerLane: params.cellConv,
+        motion: params.cellMotion as never,
+      });
+    } catch (err) {
+      this.publish(viewer, {
+        scenario: 'cells', mode: params.mode, pass: false, env,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      this._cellsRunning = false;
+      return;
+    }
+    this._cellMatrixBuilt = true;
+    this._cellMatrixViewer = viewer;
+    if (aborted()) return;
+
+    // The probe is a DEV-only global installed near the end of `main.ts init()`;
+    // on a cold Vite server that can be later than this plugin's first arming.
+    await this.waitForHooks(180_000, aborted);
+    const probe = this.probeHook();
+    probe?.start();
+    this._probeRunning = !!probe;
+
+    // FORCE A CONTINUOUS FRAME RATE for the measurement window. The viewer
+    // renders on demand, so a static matrix (`cellmotion=none`) would render a
+    // handful of frames and every percentile would be computed over a sample of
+    // three — and `renderer.info` would describe whichever frame happened last,
+    // not a frame of the scene under test.
+    const stopPump = this.pumpFrames(viewer, aborted);
+
+    try {
+      // Warmup: shader compilation, the first shadow pass and the BVH hand-over
+      // all land in the first frames.
+      await this.sleep(2000);
+      if (aborted()) return;
+      probe?.reset();
+      await this.sleep(Math.max(1, params.durationS) * 1000);
+      if (aborted()) return;
+    } finally {
+      stopPump();
+      this._cellsRunning = false;
+    }
+
+    probe?.stop();
+    this._probeRunning = false;
+    const probeReport = probe?.reportJSON() ?? {};
+    const frame = (probeReport.frameMs ?? {}) as { p50?: number; p95?: number; p99?: number; max?: number };
+    const final = cellMatrixStats(viewer) ?? stats;
+
+    // The gate the runner grades on lives in the runner; a cell run "passes"
+    // here when the scene it measured is the scene it claims: one bake per
+    // asset, the expected placement count, no sensors and a complete pick
+    // structure on every chunk.
+    const built = final.placements === params.cells * (params.cellConv + 1);
+    const pass = built && final.bakes === 2 && final.activeSensors === 0 && final.pickOk;
+
+    this.publish(viewer, {
+      scenario: 'cells',
+      mode: params.mode,
+      pass,
+      ...(pass ? {} : { reason: `cell matrix invalid: placements=${final.placements} bakes=${final.bakes} sensors=${final.activeSensors} pickOk=${final.pickOk}` }),
+      cellMatrix: final,
+      frameStats: viewer.getRendererInfo?.()?.frame,
+      probe: probeReport,
+      env,
+      frameTime: {
+        min: Math.round(frame.p50 ?? 0),
+        avg: Math.round(frame.p50 ?? 0),
+        max: Math.round(frame.max ?? 0),
+      },
+    });
+  }
+
+  /**
+   * Ask for a rendered frame every animation frame until the returned function
+   * is called. Returns the stopper.
+   */
+  private pumpFrames(viewer: RVViewer, aborted: () => boolean): () => void {
+    let running = true;
+    const tick = (): void => {
+      if (!running || aborted()) return;
+      viewer.markRenderDirty?.();
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return () => { running = false; };
   }
 
   // ── Scenario: synthetic line ───────────────────────────────────────────
@@ -383,6 +765,12 @@ export class PerfTestPlugin implements RVViewerPlugin {
 
     let plan: { valid: boolean; reason?: string; fillTimeS: number; sourceIntervalS: number; [k: string]: unknown };
     try {
+      // Library assets are fetched and parsed BEFORE the build (which is
+      // synchronous) and before the probe starts, so a 15 MB GLB parse is never
+      // charged to the measurement window.
+      if (params.cfg.geometry === 'library' || params.cfg.muAsset !== 'primitive') {
+        await line.preload?.(params.cfg);
+      }
       plan = line.build(params.cfg);
       this._lineBuilt = true;
     } catch (err) {
@@ -401,6 +789,9 @@ export class PerfTestPlugin implements RVViewerPlugin {
       this._loadStarted = true;
     }
 
+    // plan-469: decided BEFORE `start()`, which is where the probe installs (or
+    // does not install) the manager's region hooks.
+    probe.regionHooksEnabled = params.hooks;
     probe.start();
     this._probeRunning = true;
 
@@ -432,9 +823,16 @@ export class PerfTestPlugin implements RVViewerPlugin {
     // the accumulators and the clock are re-baselined.
     probe.reset();
 
-    const windowS = params.mode === 'smoke'
-      ? params.durationS
-      : Math.max(params.durationS, DEFAULT_OBSERVATION_S);
+    // An EXPLICIT `?duration=` is honoured in BOTH modes (plan-469 Phase 0d).
+    // The old 300 s floor guarded against a report claiming the §1.3 verdict
+    // over a window too short to see drift — but `readPerfParams` already
+    // DEFAULTS `durationS` to `DEFAULT_OBSERVATION_S` in supported mode, so the
+    // guard only ever fired against an operator who asked for something shorter
+    // on purpose. A campaign comparing a dozen configurations on one machine
+    // cannot afford 300 s per run, and silently measuring five times longer than
+    // asked is worse than a documented shorter window: `window (s)` is in every
+    // report, so each verdict states the window it was reached over.
+    const windowS = params.durationS;
     const timeoutS = params.mode === 'smoke'
       ? windowS
       : plan.fillTimeS * 2 + DEFAULT_OBSERVATION_S;
@@ -450,6 +848,24 @@ export class PerfTestPlugin implements RVViewerPlugin {
     const frame = (probeReport.frameMs ?? {}) as { p50?: number; p95?: number; p99?: number; max?: number };
     const p95 = frame.p95 ?? Number.POSITIVE_INFINITY;
     const p99 = frame.p99 ?? Number.POSITIVE_INFINITY;
+
+    // plan-473 F4: the run-validity gate. Only now is the probe's lost-sim-time
+    // figure final, so the verdict is formed here and written back onto the
+    // `stationarity` payload the report and the runner already consume.
+    let validity: RunValidity | undefined;
+    if (params.mode !== 'smoke') {
+      validity = evaluateRunValidity({
+        targetMUs: stationarity.targetMUs,
+        liveMUs: stationarity.liveMUs,
+        spawnRate: stationarity.spawnRate,
+        sinkRate: stationarity.sinkRate,
+        referenceSpawnRate: params.referenceSpawnRate,
+        lostSimSeconds: Number(probeReport.lostSimSeconds ?? 0),
+        windowS: stationarity.windowS,
+      });
+      stationarity.reached = validity.valid;
+      stationarity.reason = validity.reason;
+    }
 
     // A smoke run proves the machinery works; it makes NO claim about scale, so
     // it must not be graded against the 30 fps criterion (SOL R2#5).
@@ -471,6 +887,7 @@ export class PerfTestPlugin implements RVViewerPlugin {
       plan,
       probe: probeReport,
       stationarity,
+      ...(validity !== undefined ? { validity } : {}),
       env,
       fillPhaseS,
       ...(loadStats !== undefined ? { load: loadStats } : {}),
@@ -524,24 +941,19 @@ export class PerfTestPlugin implements RVViewerPlugin {
     const spawnRate = elapsedS > 0 ? ((tm?.totalSpawned ?? 0) - spawned0) / elapsedS : 0;
     const sinkRate = elapsedS > 0 ? ((tm?.totalConsumed ?? 0) - consumed0) / elapsedS : 0;
 
-    let reached: boolean;
-    let reason: string;
+    // plan-473 F4: `supported` mode no longer decides here. The verdict needs
+    // the probe's lost-simulation-time figure, which is only final once the
+    // probe is stopped, so `runLine` grades the run via `evaluateRunValidity`
+    // and writes the result back onto this object. Smoke mode keeps its own
+    // wiring criterion — it makes no scale claim and has no target occupancy.
+    let reached = true;
+    let reason = 'graded after the run (plan-473 F4)';
     if (params.mode === 'smoke') {
       // Function criterion only — 30 s is far too short to fill a large line.
       reached = spawnRate > 0 && sensorEverTriggered;
       reason = reached
         ? 'smoke: spawns observed, sensor triggered'
         : `smoke: spawnRate ${spawnRate.toFixed(2)}/s, sensorTriggered ${sensorEverTriggered}`;
-    } else {
-      const occupancyOk = liveMUs >= 0.9 * target && liveMUs <= 1.1 * target;
-      const spawnOk = spawnRate >= 0.9 * requiredSpawnRate;
-      const sinkOk = sinkRate >= 0.9 * spawnRate;
-      reached = occupancyOk && spawnOk && sinkOk;
-      reason = reached
-        ? 'stationary'
-        : `occupancy ${liveMUs}/${target} ${occupancyOk ? 'ok' : 'FAIL'}, `
-          + `spawn ${spawnRate.toFixed(2)}/${requiredSpawnRate.toFixed(2)} per s ${spawnOk ? 'ok' : 'FAIL'}, `
-          + `sink ${sinkRate.toFixed(2)}/${spawnRate.toFixed(2)} per s ${sinkOk ? 'ok' : 'FAIL'}`;
     }
 
     return {

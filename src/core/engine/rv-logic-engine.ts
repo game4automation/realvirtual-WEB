@@ -2,17 +2,28 @@
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
 import type { Object3D } from 'three';
-import type { SignalStore } from './rv-signal-store';
+import { createSignalWriter, type SignalStore, type SignalWriter } from './rv-signal-store';
 import { NodeRegistry, type ComponentRef } from './rv-node-registry';
-import type { ActiveOnly } from './rv-active-only';
+import { isActiveForState, parseActiveOnly, type ActiveOnly } from './rv-active-only';
+import type { RVDrive } from './rv-drive';
+import {
+  describeChannelAuthority,
+  isRemoteOwnershipActive,
+  isSignalLiveControlled,
+  type SignalChannelId,
+} from './rv-slot-authority';
 import {
   type RVLogicStep,
+  type LogicRootContext,
+  parseSignalEdge,
   RVSerialContainer,
+  RVJavaScriptStep,
   RVParallelContainer,
   RVDelay,
   RVSetSignalBool,
   RVWaitForSignalBool,
   RVWaitForSensor,
+  RVWaitForZone,
   RVDriveTo,
   RVSetDriveSpeed,
   RVEnable,
@@ -26,9 +37,11 @@ import {
   StepState,
 } from './rv-logic-step';
 import type { RVGrip } from './rv-grip';
+import { RVZone } from './rv-zone';
 import type { RVIKPath } from './rv-ik-path';
 import { RVIKPathStep } from './rv-ik-path-step';
-import { validateExtras } from './rv-extras-validator';
+import { getLogicStepBuilder } from './rv-logic-step-registry';
+import { validateExtras, logicRootRuleWarnings, type LogicRootRuleInput } from './rv-extras-validator';
 import { debug } from './rv-debug';
 
 // ─── Step State Info (for UI polling) ────────────────────────────
@@ -55,11 +68,70 @@ export interface StepStateInfo {
 }
 
 /**
+ * Per-root lifecycle state (plan-538). One per top-level root; the root's
+ * `Active` (ActiveOnly) is evaluated against the connection state on its own.
+ */
+/** A root runs when its `Active` fits the connection state and nothing suppressed it. */
+function wantsActive(rt: LogicRootRuntime, connected: boolean): boolean {
+  return !rt.suppressed && isActiveForState(rt.activeOnly, connected);
+}
+
+class LogicRootRuntime implements LogicRootContext {
+  /** True while the root runs (it was started and is wanted for the state). */
+  active = false;
+  /** Scratch of the two-phase transition: wanted for the NEW state. */
+  want = false;
+  /**
+   * Suppressed: the root is replaced by something else (a virtual PLC program
+   * that took over its job) and stays inactive in every connection state until
+   * released or the model is reloaded.
+   */
+  suppressed = false;
+  /** Owned outputs: signal address -> GLB start value (captured at build). */
+  readonly ownedOutputs = new Map<string, boolean | number>();
+  /** Drives the root's motion steps reference (validator input). */
+  readonly drives: RVDrive[] = [];
+  /** Steps that start motion without a cancel hook (validator input). */
+  readonly motionWithoutCancel: string[] = [];
+
+  constructor(
+    readonly root: RVLogicStep,
+    readonly activeOnly: ActiveOnly,
+    private readonly engine: RVLogicEngine,
+  ) {}
+
+  noteDriveCommand(drive: RVDrive): void {
+    this.engine._noteDriveCommand(drive, this);
+  }
+
+  isLastCommander(drive: RVDrive): boolean {
+    return this.engine._lastCommanderOf(drive) === this;
+  }
+}
+
+/**
  * RVLogicEngine - Reconstructs LogicStep hierarchies from GLB node trees
  * and runs them in the simulation loop.
  *
  * Each top-level SerialContainer (with autoLoop) runs independently.
  * Engine is updated via fixedUpdate() from the simulation loop.
+ *
+ * plan-538 — per-root `Active` lifecycle. Every top-level root carries its own
+ * `Active` (read from its extras; missing / `DontChange` = `Always`), so a
+ * model can hold a virtual PLC (`Disconnected`) that steps aside as soon as a
+ * real PLC connects:
+ * - a root starts only when it is active for the CURRENT connection state —
+ *   at load, on `addSubtree()` (placements) and after a simulation reset;
+ *   an inactive root stays `Idle` and writes nothing;
+ * - {@link setConnected} (called every tick by `CoreSubsystems.early()`, also
+ *   while the engine-wide {@link activeOnly} guard is closed) processes the
+ *   transitions in TWO phases: every deactivation completes before any
+ *   activation starts;
+ * - deactivation cancels the root's steps (`cancel()` hooks stop the motion
+ *   they started), resets the root to `Idle` and writes the outputs it owns
+ *   back to their GLB start value — never one an active root owns, never one
+ *   that is bound, forced or remote-owned;
+ * - activation restarts the root from step 0.
  */
 export class RVLogicEngine {
   /** All top-level containers that run independently */
@@ -68,8 +140,22 @@ export class RVLogicEngine {
   /** O(1) path-to-step lookup, populated during build() */
   readonly stepByPath = new Map<string, RVLogicStep>();
 
-  /** ActiveOnly mode — defaults to 'Always' since LogicEngine has no single GLB node. */
+  /** Engine-wide ActiveOnly outer guard — defaults to 'Always' (the per-root
+   *  `Active` of plan-538 is evaluated independently of it). */
   activeOnly: ActiveOnly = 'Always';
+
+  /** Load-time warnings of the root rules (plan-538 F1f/F1g), refreshed on every addSubtree. */
+  readonly warnings: string[] = [];
+
+  /** Per-root lifecycle state (plan-538); roots pushed directly get an `Always` entry lazily. */
+  private readonly runtimeByRoot = new Map<RVLogicStep, LogicRootRuntime>();
+  /** Root whose step commanded a drive LAST (plan-538 F1f). */
+  private readonly lastCommander = new Map<RVDrive, LogicRootRuntime>();
+  /** Connection state the roots were last evaluated against. */
+  private connected = false;
+  /** Store + writer for the owned-output reset (set by addSubtree). */
+  private resetStore: SignalStore | null = null;
+  private resetWriter: SignalWriter | null = null;
 
   /** GLB node each root was built from — enables subtree-scoped removal. */
   private readonly rootNodeByStep = new Map<RVLogicStep, Object3D>();
@@ -167,6 +253,11 @@ export class RVLogicEngine {
       }
     };
 
+    if (this.resetStore !== signalStore) {
+      this.resetStore = signalStore;
+      this.resetWriter = createSignalWriter(signalStore, 'component:LogicEngine:owned-output-reset', 'component');
+    }
+
     // Recursively build each top-level step
     let added = 0;
     for (const tl of topLevelNodes) {
@@ -175,11 +266,15 @@ export class RVLogicEngine {
       this.roots.push(step);
       this.rootNodeByStep.set(step, tl.node);
       populateStepByPath(step, tl.node);
-      if (this.started) step.start();
+      const data = (tl.rv[tl.stepType] as Record<string, unknown> | undefined) ?? {};
+      const rt = this.registerRoot(step, parseActiveOnly(data), signalStore);
+      // plan-538 F1b: a root starts only when it is active for the CURRENT state.
+      if (this.started && rt.want) this.activateRoot(rt);
       added++;
-      debug('logic', `Root: "${step.name}" (${tl.stepType})${this.started ? ' [started]' : ''}`);
+      debug('logic', `Root: "${step.name}" (${tl.stepType}, Active=${rt.activeOnly})${this.started && rt.active ? ' [started]' : ''}`);
     }
 
+    if (added > 0) this.refreshWarnings();
     debug('logic', `addSubtree: +${added} root containers from ${stepNodes.length} step nodes (${this.stepByPath.size} paths mapped)`);
     return added;
   }
@@ -220,24 +315,113 @@ export class RVLogicEngine {
         removed++;
       }
     }
-    for (const r of removedRoots) this.rootNodeByStep.delete(r);
+    for (const r of removedRoots) {
+      this.rootNodeByStep.delete(r);
+      const rt = this.runtimeByRoot.get(r);
+      this.runtimeByRoot.delete(r);
+      if (rt) {
+        for (const [drive, owner] of this.lastCommander) if (owner === rt) this.lastCommander.delete(drive);
+      }
+    }
 
     debug('logic', `removeSubtree: -${removed} root containers (${this.stepByPath.size} paths remain)`);
     return removed;
   }
 
-  /** Start all root containers */
-  start(): void {
+  /**
+   * True once {@link start} ran. `RVViewer.resetSimulation()` restarts the
+   * roots only for an engine that was running before the reset, so a reset
+   * never starts logic a gate (signature, plan-757 F6) still holds.
+   */
+  get isStarted(): boolean { return this.started; }
+
+  /** The connection state the roots are evaluated against (plan-538). */
+  get isConnected(): boolean { return this.connected; }
+
+  /**
+   * Start the root containers that are active for the connection state — also
+   * the restart after `reset()` (every such root back to its first step). An
+   * inactive root stays `Idle` (plan-538 F1b). `connected`, when given, is the
+   * CURRENT connection state (known before the first start, so a document
+   * loaded while a PLC is already connected never starts a `Disconnected` root).
+   */
+  start(connected?: boolean): void {
+    if (connected !== undefined) this.connected = connected;
     this.started = true;
-    debug('logic', `LogicEngine.start(): ${this.roots.length} roots`);
+    debug('logic', `LogicEngine.start(): ${this.roots.length} roots (connected=${this.connected})`);
     for (const root of this.roots) {
+      const rt = this.runtimeOf(root);
+      rt.want = wantsActive(rt, this.connected);
+      if (!rt.want) {
+        if (rt.active) this.deactivateRoot(rt);
+        debug('logic', `  Root "${root.name}" inactive (Active=${rt.activeOnly}) — stays Idle`);
+        continue;
+      }
       debug('logic', `  Starting root "${root.name}" (state=${root.state})`);
       root.start();
+      rt.active = true;
       debug('logic', `  After start: "${root.name}" state=${root.state}`);
     }
   }
 
-  /** Update all active or waiting containers */
+  /**
+   * Evaluate every root's `Active` against `connected` (plan-538 F1/F1f).
+   * Called every tick by `CoreSubsystems.early()` — independent of the
+   * engine-wide {@link activeOnly} guard. Before {@link start} it only records
+   * the state. Two phases: ALL deactivations complete before ANY activation
+   * starts, so the result never depends on the order of the roots.
+   * Allocation-free in the steady state (no transition).
+   */
+  setConnected(connected: boolean): void {
+    this.connected = connected;
+    if (!this.started) return;
+    let changes = false;
+    for (let i = 0; i < this.roots.length; i++) {
+      const rt = this.runtimeOf(this.roots[i]);
+      rt.want = wantsActive(rt, connected);
+      if (rt.want !== rt.active) changes = true;
+    }
+    if (!changes) return;
+    for (let i = 0; i < this.roots.length; i++) {
+      const rt = this.runtimeOf(this.roots[i]);
+      if (rt.active && !rt.want) this.deactivateRoot(rt);
+    }
+    for (let i = 0; i < this.roots.length; i++) {
+      const rt = this.runtimeOf(this.roots[i]);
+      if (!rt.active && rt.want) this.activateRoot(rt);
+    }
+  }
+
+  /**
+   * Suppresses (or releases) every top-level root with this name — used when
+   * something else took over its job, e.g. a virtual PLC program that replaces
+   * the sequence. A suppressed root deactivates like on a connection change
+   * (running steps cancelled, outputs it owns back to their start value) and
+   * stays inactive in every connection state and after a simulation reset.
+   * @returns true when at least one root has this name.
+   */
+  setRootSuppressed(name: string, suppressed: boolean): boolean {
+    let found = false;
+    for (const root of this.roots) {
+      if (root.name !== name) continue;
+      found = true;
+      this.runtimeOf(root).suppressed = suppressed;
+    }
+    if (found) this.setConnected(this.connected);
+    return found;
+  }
+
+  /** True when a root with this name is suppressed (see {@link setRootSuppressed}). */
+  isRootSuppressed(name: string): boolean {
+    return this.roots.some((r) => r.name === name && this.runtimeOf(r).suppressed);
+  }
+
+  /** `LogicEngineLike` per-tick hook of `CoreSubsystems.early()` — see {@link setConnected}. */
+  updateConnection(connected: boolean): void {
+    this.setConnected(connected);
+  }
+
+  /** Update all active or waiting containers (an inactive root is Idle and never ticks). */
   fixedUpdate(dt: number): void {
     for (const root of this.roots) {
       if (root.state === StepState.Active || root.state === StepState.Waiting) {
@@ -246,11 +430,178 @@ export class RVLogicEngine {
     }
   }
 
-  /** Reset all containers */
+  /** Reset all containers (every root `Idle`, inactive until the next start). */
   reset(): void {
     for (const root of this.roots) {
       root.reset();
+      const rt = this.runtimeByRoot.get(root);
+      if (rt) rt.active = false;
     }
+  }
+
+  /**
+   * plan-538 F6 — simulation reset: write the outputs owned by every root that
+   * is ACTIVE for the current connection state back to their GLB start value.
+   * Outputs of an inactive root belong to the real PLC and are left alone, as
+   * is every bound, forced or remote-owned signal.
+   *
+   * @returns number of signals written.
+   */
+  resetOwnedOutputs(): number {
+    let written = 0;
+    for (const root of this.roots) {
+      const rt = this.runtimeOf(root);
+      if (!wantsActive(rt, this.connected)) continue;
+      for (const [address, startValue] of rt.ownedOutputs) {
+        if (this.writeStartValue(address, startValue)) written++;
+      }
+    }
+    return written;
+  }
+
+  // --- plan-538 root lifecycle internals ---------------------------
+
+  /** @internal — called through a root's LogicRootContext. */
+  _noteDriveCommand(drive: RVDrive, rt: LogicRootRuntime): void {
+    this.lastCommander.set(drive, rt);
+  }
+
+  /** @internal — called through a root's LogicRootContext. */
+  _lastCommanderOf(drive: RVDrive): LogicRootRuntime | undefined {
+    return this.lastCommander.get(drive);
+  }
+
+  /** The runtime of a root; roots pushed directly onto `roots` get an `Always` entry. */
+  private runtimeOf(root: RVLogicStep): LogicRootRuntime {
+    let rt = this.runtimeByRoot.get(root);
+    if (!rt) {
+      rt = new LogicRootRuntime(root, 'Always', this);
+      rt.active = root.state === StepState.Active || root.state === StepState.Waiting;
+      this.runtimeByRoot.set(root, rt);
+      attachRootContext(root, rt);
+    }
+    return rt;
+  }
+
+  /** Register a freshly built root: Active, owned outputs (with start values), drives. */
+  private registerRoot(root: RVLogicStep, activeOnly: ActiveOnly, signalStore: SignalStore): LogicRootRuntime {
+    const rt = new LogicRootRuntime(root, activeOnly, this);
+    this.runtimeByRoot.set(root, rt);
+    attachRootContext(root, rt);
+    walkSteps(root, (step) => {
+      if (step instanceof RVSetSignalBool || step instanceof RVSetSignalFloat) {
+        const address = step.signalAddress;
+        if (address && !rt.ownedOutputs.has(address)) {
+          const start = signalStore.getByPath(address);
+          rt.ownedOutputs.set(address, start ?? (step instanceof RVSetSignalBool ? false : 0));
+        }
+      }
+      if (step instanceof RVDriveTo || step instanceof RVStartDriveTo || step instanceof RVSetDriveSpeed) {
+        if (step.drive && !rt.drives.includes(step.drive)) rt.drives.push(step.drive);
+      }
+      if (step.startsMotion && typeof step.cancel !== 'function') rt.motionWithoutCancel.push(step.name);
+    });
+    rt.want = wantsActive(rt, this.connected);
+    return rt;
+  }
+
+  /** Inactive -> active: restart the root from step 0 (plan-538 F1c). */
+  private activateRoot(rt: LogicRootRuntime): void {
+    rt.root.reset();
+    rt.root.start();
+    rt.active = true;
+    debug('logic', `Root "${rt.root.name}" activated (Active=${rt.activeOnly}, connected=${this.connected})`);
+  }
+
+  /**
+   * Active -> inactive (plan-538 F1d): cancel the running steps (their hooks
+   * stop the motion they started), reset the root to Idle and write its owned
+   * outputs back to their GLB start value — except those an active (or about
+   * to become active) root owns and those under external control.
+   */
+  private deactivateRoot(rt: LogicRootRuntime): void {
+    walkSteps(rt.root, (step) => { step.cancel?.(); });
+    rt.root.reset();
+    rt.active = false;
+    for (const [address, startValue] of rt.ownedOutputs) {
+      if (this.ownedByWantedRoot(address, rt)) continue;
+      this.writeStartValue(address, startValue);
+    }
+    debug('logic', `Root "${rt.root.name}" deactivated (Active=${rt.activeOnly}, connected=${this.connected})`);
+  }
+
+  /** True when another root that is (or becomes) active owns this output. */
+  private ownedByWantedRoot(address: string, except: LogicRootRuntime): boolean {
+    for (const root of this.roots) {
+      const other = this.runtimeByRoot.get(root);
+      if (!other || other === except || !other.want) continue;
+      if (other.ownedOutputs.has(address)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Write one owned output back to its start value — never when the signal is
+   * bound, forced or remote-owned (checked BEFORE the write, so nothing reaches
+   * subscribers even when the store's write gate only logs in `shadow` mode).
+   */
+  private writeStartValue(address: string, startValue: boolean | number): boolean {
+    const store = this.resetStore;
+    const writer = this.resetWriter;
+    if (!store || !writer) return false;
+    const name = store.nameForPath(address) ?? address;
+    if (isExternallyControlled(store, name)) return false;
+    if (store.getByPath(address) === startValue) return false;
+    writer.setByPath(address, startValue);
+    return true;
+  }
+
+  /** Recompute the root-rule warnings (plan-538 F1f/F1g) and log new ones. */
+  private refreshWarnings(): void {
+    const inputs: LogicRootRuleInput[] = [];
+    for (const root of this.roots) {
+      const rt = this.runtimeOf(root);
+      inputs.push({
+        name: root.name,
+        active: rt.activeOnly,
+        outputs: [...rt.ownedOutputs.keys()],
+        drives: rt.drives,
+        motionWithoutCancel: rt.motionWithoutCancel,
+      });
+    }
+    const next = logicRootRuleWarnings(inputs);
+    for (const w of next) {
+      if (!this.warnings.includes(w)) console.warn(`[LogicEngine] ${w}`);
+    }
+    this.warnings.length = 0;
+    this.warnings.push(...next);
+  }
+
+  /**
+   * plan-502 F13 — push an edited LogicStep field set into the RUNNING step at
+   * `path`, so an Inspector edit (setField / unsetField op → scene or asset
+   * executor → `reapplySchemaForComponent`) takes effect without a reload.
+   * LogicSteps are not registry components, so the generic schema reapply never
+   * reaches them. Covered: `LogicStep_Delay.Duration` (a running delay finishes
+   * as soon as `elapsed >= Duration`, so a shorter value applies to the current
+   * wait already) and `LogicStep_SetSignalBool.SetToTrue`. Other fields keep
+   * their load-time value until the next load.
+   *
+   * @returns true when a running step took the new values.
+   */
+  reapplyStepFields(path: string, stepType: string, data: Record<string, unknown>): boolean {
+    const step = this.stepByPath.get(path);
+    if (!step) return false;
+    if (stepType === 'LogicStep_Delay' && step instanceof RVDelay) {
+      const d = data['Duration'];
+      step.duration = typeof d === 'number' && Number.isFinite(d) && d >= 0 ? d : 1;
+      return true;
+    }
+    if (stepType === 'LogicStep_SetSignalBool' && step instanceof RVSetSignalBool) {
+      step.value = (data['SetToTrue'] as boolean | undefined) ?? true;
+      return true;
+    }
+    return false;
   }
 
   /** Get step info for a given hierarchy path (for UI display) */
@@ -301,6 +652,34 @@ export class RVLogicEngine {
   }
 }
 
+/** Visit a step and (for containers) all its descendants, depth-first. */
+function walkSteps(step: RVLogicStep, visit: (step: RVLogicStep) => void): void {
+  visit(step);
+  if (step instanceof RVSerialContainer || step instanceof RVParallelContainer) {
+    for (const child of step.children) walkSteps(child, visit);
+  }
+}
+
+/** Give every step of a root its root context (plan-538). */
+function attachRootContext(root: RVLogicStep, ctx: LogicRootContext): void {
+  walkSteps(root, (step) => { step.rootContext = ctx; });
+}
+
+/**
+ * True when a signal is under EXTERNAL control (plan-538 F1d/F6): live-bound to
+ * a CONNECT source, operator-forced, claimed bound/forced on its channel, or
+ * pre-empted by a remote session owner. Such a signal is never reset by the
+ * engine — the external owner's value stands. Exported for the virtual PLC,
+ * whose output reset follows the same rule.
+ */
+export function isExternallyControlled(store: SignalStore, name: string): boolean {
+  if (isRemoteOwnershipActive()) return true;
+  if (isSignalLiveControlled(name)) return true;
+  if (store.isForced(name)) return true;
+  const authority = describeChannelAuthority(name as SignalChannelId);
+  return authority !== null && (authority.authority === 'bound' || authority.authority === 'forced');
+}
+
 /**
  * Recursively build an RVLogicStep from a GLB node.
  * `scope` is the subtree the steps were authored in — passed to
@@ -325,6 +704,10 @@ function buildStep(
   let step: RVLogicStep | null = null;
 
   switch (stepType) {
+    case 'LogicStep_JavaScript': {
+      step = new RVJavaScriptStep();
+      break;
+    }
     case 'LogicStep_SerialContainer': {
       const container = new RVSerialContainer([], true); // autoLoop for top-level
       const children = buildChildren(node, nodeStepMap, registry, signalStore, scope, container);
@@ -357,7 +740,8 @@ function buildStep(
       const ref = data?.['Signal'] as ComponentRef | undefined;
       const resolved = registry.resolve(ref, scope);
       const waitForTrue = (data?.['WaitForTrue'] as boolean) ?? true;
-      step = new RVWaitForSignalBool(resolved.signalAddress ?? null, waitForTrue, signalStore);
+      // plan-538 F5: optional edge mode, default Level (today's behaviour).
+      step = new RVWaitForSignalBool(resolved.signalAddress ?? null, waitForTrue, signalStore, parseSignalEdge(data?.['Edge']));
       break;
     }
 
@@ -365,7 +749,21 @@ function buildStep(
       const ref = data?.['Sensor'] as ComponentRef | undefined;
       const resolved = registry.resolve(ref, scope);
       const waitForOccupied = (data?.['WaitForOccupied'] as boolean) ?? true;
-      step = new RVWaitForSensor(resolved.sensor ?? null, waitForOccupied);
+      step = new RVWaitForSensor(resolved.sensor ?? null, waitForOccupied, data?.['WaitForStopped'] === true);
+      break;
+    }
+
+    case 'LogicStep_WaitForZone': {
+      // plan-521 — Zone reference through the generic component branch of the
+      // ONE resolver (asset-relative, three steps).
+      const ref = data?.['Zone'] as ComponentRef | undefined;
+      const resolved = registry.resolve(ref, scope);
+      const zone = resolved.component instanceof RVZone ? resolved.component : null;
+      if (!zone) {
+        console.warn(`[LogicStep] WaitForZone "${node.name}": Zone reference ${ref?.path ? `"${ref.path}" not found` : 'missing'}`);
+      }
+      const waitForOccupied = (data?.['WaitForOccupied'] as boolean) ?? true;
+      step = new RVWaitForZone(zone, waitForOccupied);
       break;
     }
 
@@ -497,9 +895,18 @@ function buildStep(
       break;
     }
 
-    default:
-      console.warn(`[LogicEngine] Unknown step type: "${stepType}" on "${node.name}"`);
-      return null;
+    default: {
+      // Plugin step types (plan-729): a private feature registers its builder
+      // in rv-logic-step-registry.ts — the public core never imports the type.
+      // Without a registration (community build) the old warning stands.
+      const builder = getLogicStepBuilder(stepType);
+      if (!builder) {
+        console.warn(`[LogicEngine] Unknown step type: "${stepType}" on "${node.name}"`);
+        return null;
+      }
+      step = builder({ data: data ?? {}, node, stepType, registry, signalStore, scope });
+      break;
+    }
   }
 
   if (step) {

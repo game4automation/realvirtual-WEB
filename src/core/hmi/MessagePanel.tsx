@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2025 realvirtual GmbH <https://realvirtual.io>
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useSyncExternalStore } from 'react';
 import { Box, IconButton, Tooltip } from '@mui/material';
 import { ChevronRight, ChevronLeft } from '@mui/icons-material';
 import { useViewer } from '../../hooks/use-viewer';
@@ -22,7 +22,7 @@ import { useActiveContexts, evaluateVisibilityRule } from './ui-context-store';
 /** Core layout container for messages (right side). Renders 'messages' slot entries.
  *  When maintenance mode is active, swaps to the MaintenancePanel stepper.
  *  Desktop supports a minimized peek mode that expands individual cards on hover. */
-export function MessagePanel() {
+export function MessagePanel({ alarmsOnly = false }: { alarmsOnly?: boolean }) {
   const viewer = useViewer();
   // Honour `visibilityRule` exactly as ActivityBar and ButtonPanel do. Entries
   // WITHOUT a rule stay always-visible (the documented UISlotEntry invariant);
@@ -33,7 +33,11 @@ export function MessagePanel() {
   // other mode while rendering nothing.
   const contexts = useActiveContexts();
   const allEntries = useSlot('messages');
-  const entries = allEntries.filter(
+  const alarmCount = useSyncExternalStore(
+    (cb) => viewer.errorStore.subscribe(cb),
+    () => viewer.errorStore.getCount(),
+  );
+  const entries = allEntries.filter((e) => !alarmsOnly || e.pluginId === 'web-error').filter(
     (e) => !e.visibilityRule || evaluateVisibilityRule(e.visibilityRule, contexts),
   );
   const isMobile = useMobileLayout();
@@ -44,19 +48,20 @@ export function MessagePanel() {
   const minimized = useMessagePanelMinimized();
   const topOffset = useViewportInsets().top;
 
-  const isMaintenanceActive = maintenanceState.mode !== 'idle';
+  const isMaintenanceActive = !alarmsOnly && maintenanceState.mode !== 'idle';
 
   // Overlay-visibility (plan-250): the right-side message/alarm stack is part of
   // the 'status' category. Content-driven presence (register only while there is
   // something to show), registered BEFORE the visibility gate.
   const catVisible = useOverlayVisible('status');
-  const hasStatusContent = isMaintenanceActive || (messagePanelOpen && entries.length > 0);
+  const hasStatusContent = isMaintenanceActive || (messagePanelOpen && entries.length > 0 && (!alarmsOnly || alarmCount > 0));
   useEffect(() => {
     if (!hasStatusContent) return;
     registerOverlayProducer('status');
     return () => unregisterOverlayProducer('status');
   }, [hasStatusContent]);
 
+  if (alarmsOnly && alarmCount === 0) return null;
   if (!catVisible) return null; // 'status' overlay category switched off
 
   // ── Maintenance Mode: show MaintenancePanel instead of messages ──

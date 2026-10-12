@@ -187,9 +187,12 @@ describe('plan-717 §2.3 baseline — the listing is derived, not declared', () 
       ['models/Press.glb', stableDocumentId('models/Press.glb')],
       ['library/parts/Roll2m.glb', stableDocumentId('library/parts/Roll2m.glb')],
     ]);
-    // Only the scene branch still stamps one — the transitional Alt-Client
-    // guard on `documentOfSceneEntry`. See plan-736 Phase 3.
-    expect(docs.map(d => d.section)).toEqual(['scenes', undefined, undefined]);
+    // NOTHING stamps `section` any more (plan-744 Phase 2). The scene branch
+    // was the last one, carrying the transitional Alt-Client guard of plan-736
+    // Phase 3; its gate — the slow delivery channels shipping a client that no
+    // longer reads the field — was declared open, and with the stamp gone
+    // there is no branch left either: one lift for all three legacy arrays.
+    expect(docs.map(d => d.section)).toEqual([undefined, undefined, undefined]);
   });
 
   it('the derived id is a pure function of the path — no row is created', () => {

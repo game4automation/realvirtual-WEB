@@ -91,25 +91,25 @@ describe('§9.15 — auto-detection (F14, decisions 1 and 2)', () => {
       .toEqual({ kind: 'project', childProjects: [] });
   });
 
-  it('a folder holding child projects is a workspace', async () => {
+  it('a folder holding child projects is a parent to link from', async () => {
     const dir = folder('Workspace', {
       PlantA: { [MANIFEST]: true },
       PlantB: { [MANIFEST]: true },
       Notes: {},
     });
     const target = detectOpenTarget(await probeFolder(dir));
-    expect(target.kind).toBe('workspace');
+    expect(target.kind).toBe('parent');
     expect(target.childProjects.sort()).toEqual(['PlantA', 'PlantB']);
   });
 
   it('a folder that is neither offers to create a project', async () => {
     const dir = folder('Downloads', { Stuff: {} });
     expect(detectOpenTarget(await probeFolder(dir)))
-      .toEqual({ kind: 'empty', childProjects: [] });
+      .toEqual({ kind: 'plain', childProjects: [] });
   });
 
   it('the project wins over its child projects, and they become a hint', async () => {
-    // Decision 2: a folder can legitimately be both. Opening it as a workspace
+    // Decision 2: a folder can legitimately be both. Treating it as a parent
     // would hide the manifest the user actually pointed at.
     const dir = folder('MyPlant', {
       [MANIFEST]: true,
@@ -122,13 +122,13 @@ describe('§9.15 — auto-detection (F14, decisions 1 and 2)', () => {
 
   it('an entirely empty folder is "create one here?", not an error', async () => {
     expect(detectOpenTarget(await probeFolder(folder('Empty', {}))))
-      .toEqual({ kind: 'empty', childProjects: [] });
+      .toEqual({ kind: 'plain', childProjects: [] });
   });
 
   it('is total — every probe shape has an answer', () => {
-    expect(detectOpenTarget({ hasManifest: false }).kind).toBe('empty');
+    expect(detectOpenTarget({ hasManifest: false }).kind).toBe('plain');
     expect(detectOpenTarget({ hasManifest: true }).kind).toBe('project');
-    expect(detectOpenTarget({ hasManifest: false, childProjectFolders: [] }).kind).toBe('empty');
+    expect(detectOpenTarget({ hasManifest: false, childProjectFolders: [] }).kind).toBe('plain');
   });
 });
 

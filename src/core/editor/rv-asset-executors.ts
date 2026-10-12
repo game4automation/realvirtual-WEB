@@ -38,6 +38,7 @@
 import { BufferGeometry, Group, Matrix4, Mesh, Object3D } from 'three';
 import type { Material } from 'three';
 import type { RVViewer } from '../rv-viewer';
+import type { RVDrive } from '../engine/rv-drive';
 import { NodeRegistry } from '../engine/rv-node-registry';
 import { isModelRoot } from '../engine/rv-model-root';
 import {
@@ -53,6 +54,8 @@ import {
   type RuntimeNodeDeps,
 } from '../engine/rv-scene-loader';
 import { DRIVE_BEHAVIOR_MAP } from '../engine/rv-signal-construction';
+import { beginSignalSyncWave, endSignalSyncWave, syncSignalSubtree } from '../engine/rv-signal-editor-sync';
+import { syncPhysicsZoneBounds } from '../engine/rv-physics-zone';
 import {
   computeGroupPartitions,
   computeMeshIslands,
@@ -69,12 +72,14 @@ import {
 import { unsupportedMeshShapeReason } from '../engine/rv-mesh-guards';
 import { debug } from '../engine/rv-debug';
 import { parseGlbSubtree } from '../engine/rv-glb-parse';
+import { compactSharedVertexPools } from './rv-mesh-compact';
 import { GROUP_KEY_RE, syncNodeGroups, syncSubtreeGroups } from '../engine/rv-group-sync';
 import { getCadProvider, cadFormatOfName } from './rv-cad-provider';
 import { ensureMovableTransform, refreshWorldMatricesDeep } from '../engine/rv-node-transform';
 import { getCadGlb } from '../import/rv-cad-glb-cache';
+import { weldImportedGlb } from '../import/rv-glb-weld';
 import { materialForValue } from './rv-asset-material';
-import { assetOpTouchesHierarchy, classifyAssetOpRaycastImpact } from './rv-asset-ops';
+import { assetOpTouchesHierarchy } from './rv-asset-ops';
 import type { RvAssetOp, RvAssetPrimitiveOp, RvNodeTransform } from '../ops/rv-unified-ops';
 import type {
   ImportCadOp,
@@ -209,12 +214,25 @@ interface SeparateRecord {
  * surface it rather than swallow it.
  */
 export class CadGeometryUnavailableError extends Error {
-  constructor(readonly cadlink: CADLinkExtras) {
+  /**
+   * `reason` is the user-facing cause when the CAD provider REFUSED to rebuild the geometry
+   * (plan-561: e.g. "This model was converted with realvirtual CONNECT — start CONNECT …"),
+   * as opposed to simply having no source bytes. Surfaced per file by the re-import prompt.
+   */
+  constructor(readonly cadlink: CADLinkExtras, readonly reason?: string) {
     super(
-      `CAD geometry for ${cadlink.File} (${cadlink.Sha256.slice(0, 8)}…) is not available — re-import the file`,
+      `CAD geometry for ${cadlink.File} (${cadlink.Sha256.slice(0, 8)}…) is not available — re-import the file` +
+      (reason ? ` (${reason})` : ''),
     );
     this.name = 'CadGeometryUnavailableError';
   }
+}
+
+/** An `importCad` whose geometry could not be re-materialised, with the cause when known. */
+export interface MissingCadGeometry {
+  cadlink: CADLinkExtras;
+  /** Why the provider could not rebuild it (absent = cache and source bytes simply gone). */
+  reason?: string;
 }
 
 /**
@@ -346,7 +364,7 @@ export class AssetExecutorContext {
    */
   private readonly _materialTrash = new Map<string, Map<string, Material>>();
   /** importCad ops whose geometry could not be resolved (drained by the plugin). */
-  private _missingCadGeometry: CADLinkExtras[] = [];
+  private _missingCadGeometry: MissingCadGeometry[] = [];
   /** separateMesh ops that did not land on the live tree (drained by the plugin). */
   private _unappliedSeparations: UnappliedSeparation[] = [];
   /** Preview analysis results awaiting their `separateMesh` op (op.id → payload). */
@@ -370,12 +388,11 @@ export class AssetExecutorContext {
   }
 
   /**
-   * Stash the preview's analysis (and, when the user confirmed, the extracted
+   * Stash the partition the document already computed (and, optionally, extracted
    * part geometries) for the matching `separateMesh` op.
    *
    * The executor validates the payload against the LIVE source geometry before
-   * using it — a mesh edited while the dialog was open must not silently get a
-   * stale split.
+   * using it — a mesh edited in between must not silently get a stale split.
    */
   provideSeparatePayload(opId: string, payload: SeparateMeshPayload): void {
     this._separatePayloads.set(opId, payload);
@@ -418,9 +435,10 @@ export class AssetExecutorContext {
    * Take (and clear) the CADLinks whose geometry could not be re-materialised
    * during the last apply/replay. The AssetEditorPlugin drains this after
    * `replayOps` and prompts the user to re-import — geometry silently vanishing
-   * is exactly the failure this replaces.
+   * is exactly the failure this replaces. Each entry carries the provider's
+   * refusal reason when there was one (plan-561).
    */
-  takeMissingCadGeometry(): CADLinkExtras[] {
+  takeMissingCadGeometry(): MissingCadGeometry[] {
     const out = this._missingCadGeometry;
     this._missingCadGeometry = [];
     return out;
@@ -496,21 +514,27 @@ export class AssetExecutorContext {
    * was the mechanism behind "half-rebuilt scene, nothing to undo" (plan-359 Phase 3).
    */
   async applyForward(op: RvAssetOp): Promise<void> {
+    // plan-589 spike: every signal (re-)registration of this op - composites
+    // included - is ONE catalog wave, i.e. one `onCatalogChanged`.
+    beginSignalSyncWave(this.viewer.signalStore);
     try {
       await this._withMatrixBatch(op, () => this._forwardAny(op));
     } finally {
       // Runs on the failure path too: a rolled-back composite touched the graph
       // on its way in and out, so hierarchy/BVH consumers must resync either way.
       this._afterApply(op);
+      endSignalSyncWave(this.viewer.signalStore);
     }
   }
 
   /** Inverse counterpart of {@link applyForward} — same rejection contract. */
   async applyInverse(op: RvAssetOp): Promise<void> {
+    beginSignalSyncWave(this.viewer.signalStore);
     try {
       await this._withMatrixBatch(op, () => this._inverseAny(op));
     } finally {
       this._afterApply(op);
+      endSignalSyncWave(this.viewer.signalStore);
     }
   }
 
@@ -573,22 +597,11 @@ export class AssetExecutorContext {
         this.viewer.emit('editor-structure-changed', { source: 'asset-editor' });
       }
     });
-    // With the instance pick backend (editor default), pick membership is
-    // maintained INLINE at the scene-mutation sites below (trash detach/
-    // restore, import, create, rename/reparent/component epoch bumps) —
-    // transforms and visibility need nothing at all. The classification
-    // path survives only for the legacy merged groups (kill-switch).
-    this._notifyStep(op, 'raycast-resync', () => {
-      if (this.viewer.instancePickIndex) return;
-      const raycastImpact = classifyAssetOpRaycastImpact(op);
-      if (raycastImpact.rebuild) {
-        this.viewer.rebuildGroupedBvh(); // macrotask-coalesced (one per transaction)
-      } else if (raycastImpact.refitPaths.length > 0) {
-        // Pure transforms: position re-bake + BVH refit instead of the full
-        // rebuild (which re-merges every mesh + rebuilds the edge arena).
-        this.viewer.refitRaycastSubtrees(raycastImpact.refitPaths);
-      }
-    });
+    // Pick membership is maintained INLINE at the scene-mutation sites below
+    // (trash detach/restore, import, create, rename/reparent/component epoch
+    // bumps) by the instance pick backend — transforms and visibility need
+    // nothing at all. The merged-group resync that used to sit here went with
+    // the merged pick geometry (plan-753 Phase 4b).
     this._notifyStep(op, 'group-sync', () => {
       if (this._syncGroupOps(op)) this._emitGroupsChanged();
     });
@@ -661,7 +674,9 @@ export class AssetExecutorContext {
       // CONTINUE (the documented exception to the rejection contract) so replaying
       // a draft whose GLB cache was evicted still restores everything else.
       if (e instanceof CadGeometryUnavailableError) {
-        this._missingCadGeometry.push(e.cadlink);
+        this._missingCadGeometry.push(
+          e.reason ? { cadlink: e.cadlink, reason: e.reason } : { cadlink: e.cadlink },
+        );
         console.warn(`[asset-edits] forward apply failed for ${op.kind} (op ${op.id}):`, e);
         return;
       }
@@ -779,12 +794,14 @@ export class AssetExecutorContext {
           writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
         }
         reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+        this._syncSignals(this._node(op.nodePath));
         this.viewer.markRenderDirty();
         return;
       }
       case 'unsetField': {
         writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, op.prev);
         reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+        this._syncSignals(this._node(op.nodePath));
         this.viewer.markRenderDirty();
         return;
       }
@@ -862,16 +879,41 @@ export class AssetExecutorContext {
       // Draft replay / redo after a trash flush. The converted GLB is the single
       // source of truth: read the cached bytes and parse them — no occt, no WASM
       // worker, and no CadGeometryProvider needed (so the public build works).
-      let bytes = await getCadGlb(op.cadlink.Sha256, op.cadlink.Quality);
+      // plan-561: the converter is part of the key — a CONNECT import and a browser
+      // import of the same file are different trees and never share an entry.
+      let bytes = await getCadGlb(op.cadlink.Sha256, op.cadlink.Quality, op.cadlink.Converter);
       if (!bytes) {
         // Cache evicted. A provider that kept the ORIGINAL CAD bytes can rebuild
         // them (and re-populate the GLB cache); the public build cannot.
-        bytes = (await getCadProvider(cadFormatOfName(op.cadlink.File))?.retessellate?.(op.cadlink)) ?? null;
+        try {
+          bytes = (await getCadProvider(cadFormatOfName(op.cadlink.File))?.retessellate?.(op.cadlink)) ?? null;
+        } catch (e) {
+          // The provider REFUSED (plan-561: e.g. the recorded converter is CONNECT and no
+          // gateway is reachable — it never silently switches converters). Recoverable like
+          // a plain miss: record the cause, the rest of the draft keeps replaying.
+          throw new CadGeometryUnavailableError(op.cadlink, e instanceof Error ? e.message : String(e));
+        }
+        // A rebuilt GLB is a fresh conversion and gets the same weld as an import.
+        // Cached bytes are NOT welded here: they replay exactly as they were stored.
+        if (bytes) bytes = weldImportedGlb(bytes, op.cadlink.File);
       }
       if (!bytes) throw new CadGeometryUnavailableError(op.cadlink);
       root = await parseGlbSubtree(bytes);
     }
     this._cadPayloads.delete(op.id);
+
+    // Give every mesh its own vertices. A converter that writes one shared vertex
+    // pool (OBJ → GLB) leaves each mesh with the bounds of the WHOLE pool; a
+    // single-island mesh would keep it forever, since `separateMesh` never touches
+    // it. Runs on fresh imports AND cache replays — it is deterministic, so later
+    // ops address the same triangles in both.
+    const compacted = compactSharedVertexPools(root);
+    if (compacted.compactedMeshes > 0) {
+      console.info(
+        `[asset-editor] "${op.cadlink.File}": gave ${compacted.compactedMeshes} mesh(es) their own vertices ` +
+        '(they indexed into an oversized shared vertex pool).',
+      );
+    }
 
     root.name = leaf(op.rootPath);
     // Unique sibling names BEFORE registration — duplicate CAD part names
@@ -889,6 +931,7 @@ export class AssetExecutorContext {
     assetRoot.add(root);
     root.updateMatrixWorld(true);
     this._registerSubtree(root);
+    this._syncSignals(root);
     // Index the imported meshes + build their local BVHs in the background
     // (native raycast fallback keeps them pickable immediately).
     this.viewer.instancePickIndex?.addSubtree(root);
@@ -920,7 +963,30 @@ export class AssetExecutorContext {
     ensureMovableTransform(node);
     applyTransform(node, { ...t, scale: t.scale ?? node.scale.toArray() as [number, number, number] });
     refreshWorldMatricesDeep(node);
+    this._refreshDriveBase(nodePath);
     this.viewer.markShadowsDirty();
+  }
+
+  /**
+   * Re-cache the home pose of a live Drive whose node an op just moved.
+   *
+   * In the editor the Drive family is constructed live on add (plan-411), and
+   * `RVDrive.initDrive()` caches the node's pose of THAT moment as
+   * `basePosition`/`baseQuaternion`. Every later field edit goes through
+   * `reapplySchemaForComponent` → `reapplyConfig()` → `applyToNode()`, which
+   * rewrites the node FROM that cache. So a pivot set with "Pivot to Object"
+   * (or any transform / reparent op) after the Drive was added was silently
+   * undone by the next Direction change in the inspector — the drive snapped
+   * the node back to its stale base. In the editor the authored transform IS
+   * the base, exactly as the loader treats the GLB pose (it calls the same
+   * refresh after its own re-parenting, Phase 8b). No-op without a live Drive.
+   */
+  private _refreshDriveBase(nodePath: string): void {
+    const comps = this.viewer.registry?.getComponentsAt(nodePath);
+    if (!comps) return;
+    for (const [type, instance] of comps) {
+      if (type === 'Drive') (instance as RVDrive).refreshBaseTransform();
+    }
   }
 
   /**
@@ -949,6 +1015,8 @@ export class AssetExecutorContext {
     node.name = name;
     // Re-key every registered path under this subtree (nodes + components).
     this.viewer.registry?.recomputePathsForSubtrees([node]);
+    // plan-589 spike: the signals of the subtree follow (node identity -> new path).
+    this._syncSignals(node);
     // Cached pick paths are stale — re-resolve lazily on the next hit.
     this.viewer.instancePickIndex?.bumpResolutionEpoch();
     this.viewer.markRenderDirty();
@@ -969,6 +1037,8 @@ export class AssetExecutorContext {
     if (syncSubtreeGroups(this.viewer, node, 'detach')) this._emitGroupsChanged();
     this._ensureTrashGroup().add(node);
     this._trash.set(key, { node, parent, childIndex });
+    // plan-589 spike: the trashed subtree is unregistered -> its signals are released.
+    this._syncSignals(node);
     this.viewer.markShadowsDirty();
   }
 
@@ -984,6 +1054,7 @@ export class AssetExecutorContext {
     arr.splice(Math.min(childIndex, arr.length), 0, node);
     node.updateMatrixWorld(true);
     this._registerSubtree(node);
+    this._syncSignals(node);
     // Fresh index entries resolve lazily on the next pick (epoch 0).
     this.viewer.instancePickIndex?.addSubtree(node);
     // Restored nodes rejoin their groups (memberships derive from extras).
@@ -1226,6 +1297,7 @@ export class AssetExecutorContext {
       const removedPaths = registry.unregisterSubtree(root);
       this._purgeRuntimeCollections(disposed, removedPaths);
     }
+    this._syncSignals(root);
     // MANDATORY: a stale entry would alias a node later built at the same path.
     v.instancePickIndex?.removeSubtree(root);
     if (syncSubtreeGroups(v, root, 'detach')) this._emitGroupsChanged();
@@ -1246,11 +1318,9 @@ export class AssetExecutorContext {
     if (!registry) return;
 
     if (v.drives.length > 0) {
-      const before = v.drives.length;
       // A drive whose node no longer resolves to a path was just unregistered.
+      // (Its meshes left the instance pick index with the subtree detach.)
       v.drives = v.drives.filter((d) => registry.getPathForNode(d.node) !== null);
-      // The removed drives must stop participating in the grouped BVH.
-      if (v.drives.length !== before) v.rebuildGroupedBvh();
     }
 
     const tm = v.transportManager;
@@ -1277,6 +1347,7 @@ export class AssetExecutorContext {
   private _reviveSubtree(root: Object3D, record: { alive: { value: boolean } } | null): void {
     this._registerSubtree(root);
     this._rebuildComponents(root);
+    this._syncSignals(root);
     // After the components: `buildStep` resolves its targets through the
     // registry, so the steps must be built on a fully populated subtree.
     this._rebuildLogic(root);
@@ -1304,14 +1375,13 @@ export class AssetExecutorContext {
     const v = this.viewer;
     if (!v.registry || !v.signalStore || !v.transportManager) return;
     try {
+      // plan-757 F4: the session's ONE init context plus the per-source data.
       const result = processExtras(
-        root, v.registry, v.signalStore, v.transportManager, v.scene,
-        v.gizmoManager, v, v.errorStore, v.instructionStore,
+        root, v.initContext()!,
         // plan-727: this runs on every separateMesh/mergeMesh undo/redo inside a
         // normal editing session. Without the authoring flag it would re-parent
         // kinematic group members live and bake that into the next save.
         { logicRunState: v.logicRunState, preserveAuthoringHierarchy: true },
-        v.outlineManager, v.lampManager, v.energyChainManager, v.sceneButtonManager,
       );
       // The returns are live runtime state, not diagnostics — dropping them
       // would leave drives unsimulated and gated logic never started. The
@@ -1367,7 +1437,7 @@ export class AssetExecutorContext {
     const vertexCount = geometry.getAttribute('position')?.count ?? -1;
     if (payload.sourceGeometry !== geometry || payload.vertexCount !== vertexCount) {
       console.warn(
-        `[asset-edits] separateMesh: the source geometry changed while the dialog was open ` +
+        `[asset-edits] separateMesh: the source geometry changed after it was analyzed ` +
         `(op ${opId}) — recomputing`,
       );
       return null;
@@ -1859,9 +1929,13 @@ export class AssetExecutorContext {
     }
     applyTransform(node, transform);
     this._refreshWorldMatrix(node);
+    // The world-preserving re-parent changed the LOCAL pose a live Drive caches
+    // as home — refresh it while the registry still knows the OLD path.
+    this._refreshDriveBase(nodePath);
     // Re-key registered paths under the moved subtree AND carry every path-based
     // reference (signal bindings, serialized ref paths) across the move.
     this._remapSubtreePaths(node);
+    this._syncSignals(node);
     // Cached pick paths are stale — re-resolve lazily on the next hit.
     this.viewer.instancePickIndex?.bumpResolutionEpoch();
     this.viewer.markShadowsDirty();
@@ -1936,7 +2010,13 @@ export class AssetExecutorContext {
         delete back[componentType];
         ud['realvirtual'] = back;
       }
+      // plan-525 §2.4b: a (re-)added BoxCollider is the volume of a
+      // WebPhysicsZone on the same node — undo of its removal restores the zone.
+      if (instance && isBoxColliderKey(componentType)) {
+        (instance as { notifyZone?: () => void }).notifyZone?.();
+      }
     }
+    this._syncSignals(node);
     // Components change hoverable/CADLink/Drive resolution — re-resolve lazily.
     this.viewer.instancePickIndex?.bumpResolutionEpoch();
     this.viewer.markRenderDirty();
@@ -1969,6 +2049,12 @@ export class AssetExecutorContext {
     const rv = { ...(ud['realvirtual'] as Record<string, unknown> | undefined) };
     delete rv[componentType];
     ud['realvirtual'] = rv;
+    // plan-525 §2.4b: the BoxCollider was the volume of a WebPhysicsZone on the
+    // same node — the zone goes inactive (one warning) until undo re-adds it.
+    if (isBoxColliderKey(componentType) && this.viewer.registry) {
+      syncPhysicsZoneBounds(this.viewer.registry, nodePath, null, null);
+    }
+    this._syncSignals(node);
     // Components change hoverable/CADLink/Drive resolution — re-resolve lazily.
     this.viewer.instancePickIndex?.bumpResolutionEpoch();
     this.viewer.markRenderDirty();
@@ -1979,12 +2065,14 @@ export class AssetExecutorContext {
   private _setField(op: AssetSetFieldOp): void {
     writeUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName, op.value);
     reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+    this._syncSignals(this._node(op.nodePath));
     this.viewer.markRenderDirty();
   }
 
   private _unsetField(op: AssetUnsetFieldOp): void {
     deleteUserDataField(this.viewer, op.nodePath, op.componentType, op.fieldName);
     reapplySchemaForComponent(this.viewer, op.nodePath, op.componentType);
+    this._syncSignals(this._node(op.nodePath));
     this.viewer.markRenderDirty();
   }
 
@@ -2002,6 +2090,17 @@ export class AssetExecutorContext {
       this.viewer.scene.add(this._trashGroup);
     }
     return this._trashGroup;
+  }
+
+  /** plan-589 spike: bring the SignalStore in line with a mutated subtree (node identity). */
+  private _syncSignals(node: Object3D | null): void {
+    if (!node) return;
+    try {
+      syncSignalSubtree(this.viewer, node);
+    } catch (e) {
+      // The scene mutation has landed; a sync failure must not reject the op.
+      console.warn('[asset-edits] signal sync failed:', e);
+    }
   }
 
   private _registerSubtree(root: Object3D): void {
@@ -2022,6 +2121,7 @@ export class AssetExecutorContext {
       transportManager: v.transportManager,
       gizmoManager: v.gizmoManager,
       lampManager: v.lampManager,
+      webLabelManager: v.webLabelManager,
       sceneButtonManager: v.sceneButtonManager,
       errorStore: v.errorStore,
       instructionStore: v.instructionStore,
@@ -2034,6 +2134,11 @@ export class AssetExecutorContext {
 }
 
 // ─── module helpers ───────────────────────────────────────────────────
+
+/** `BoxCollider` (with or without a `_N` dedup suffix). */
+function isBoxColliderKey(componentType: string): boolean {
+  return componentType.replace(/_\d+$/, '') === 'BoxCollider';
+}
 
 /** `Drive` or one of the `Drive_*` behaviors (with or without a `_N` dedup
  *  suffix) — the family whose runtime construction can REFUSE (plan-411). */

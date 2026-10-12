@@ -207,6 +207,12 @@ export interface SharedGlbInfo {
   embeddedOrigins: readonly EmbeddedOrigin[];
   /** `false` only when the provider explicitly disabled it (F14). */
   downloadAllowed: boolean;
+  /**
+   * The link delivered an RVE1 envelope that was opened with a password
+   * (plan-560). The card then says so, the download hands out the ENVELOPE,
+   * and the follow-up actions that would re-fetch `url` without a key are hidden.
+   */
+  encrypted?: boolean;
 }
 
 /** Assemble the card model from the loaded GLB's scene `userData` plus the URL. */
@@ -214,14 +220,18 @@ export function buildSharedGlbInfo(input: {
   url: string;
   userData?: unknown;
   embeddedOrigins?: readonly EmbeddedOrigin[];
+  encrypted?: boolean;
 }): SharedGlbInfo {
   const meta = parseShareMeta(input.userData);
+  const fileName = filenameFromUrl(input.url);
   return {
     url: input.url,
-    name: meta?.name ?? filenameFromUrl(input.url),
+    // `model.rve.glb` is the CLI's envelope name (plan-560); the card names the model.
+    name: meta?.name ?? (input.encrypted ? fileName.replace(/\.rve$/i, '') || fileName : fileName),
     meta,
     originHost: originHostOf(input.url),
     embeddedOrigins: input.embeddedOrigins ?? [],
     downloadAllowed: meta?.allowDownload !== false,
+    ...(input.encrypted ? { encrypted: true } : {}),
   };
 }
