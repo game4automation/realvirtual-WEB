@@ -1,6 +1,6 @@
 {
   "name": "realvirtual-web",
-  "version": "6.4.0",
+  "version": "6.4.1",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -45,7 +45,6 @@
     "postperf": "node scripts/test-lock.mjs release",
     "preperf:matrix": "node scripts/test-lock.mjs acquire",
     "perf:matrix": "node scripts/perf-scale-matrix.mjs",
-    "perf:first-frame": "node scripts/perf/first-frame/series.cjs",
     "postperf:matrix": "node scripts/test-lock.mjs release",
     "preperf:soak": "node scripts/test-lock.mjs acquire",
     "perf:soak": "node scripts/perf-soak.mjs",

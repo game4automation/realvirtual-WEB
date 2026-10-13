@@ -394,15 +394,9 @@ describe('no source declares a second scene list (plan-731 F3)', () => {
     expect(main).not.toContain("import.meta.glob('/public/models/");
     expect(main).not.toContain('import.meta.glob("/public/models/');
     // The channels that DO feed the catalogue are still there — this is a
-    // removal, not an amputation of model discovery. Since plan-598 the
-    // requests live in the boot-discovery module (started early, merged in the
-    // old order), which main.ts drives; the glob ban covers that module too.
-    const discovery = codeOf('src', 'core', 'project', 'rv-boot-discovery.ts');
-    expect(discovery).not.toContain('import.meta.glob(');
-    expect(main).toContain('startBootDiscovery');
-    expect(main).toContain('mergeDiscoveredEntries');
-    expect(discovery).toContain('models.json');
-    expect(discovery).toContain('/__api/private-models');
+    // removal, not an amputation of model discovery.
+    expect(main).toContain('models.json');
+    expect(main).toContain('/__api/private-models');
   });
 
   // ── plan-735 F6 (3b): the synthetic manifest and its feeders are gone ────

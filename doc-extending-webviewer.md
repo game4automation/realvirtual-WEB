@@ -3208,7 +3208,7 @@ Plugins are organized into three tiers:
 >
 > | Entry point | Tier | Reaches |
 > |---|---|---|
-> | `private-plugins.ts` | customer | every build that has the private folder. `main.ts` starts `prefetchPrivateFeatures()` early (imports of the side-effect-free feature adapters, plan-598) and later awaits `registerPrivatePlugins(viewer, mods)`, which registers in the fixed manifest order; the public build resolves both to the no-op stub in `src/private-stubs/`. A feature whose module registers something at load time is marked `loadSideEffects: true` in `tier-manifest.json` and is never prefetched. |
+> | `private-plugins.ts` | customer | every build that has the private folder. `main.ts` awaits `registerPrivatePlugins(viewer)`; the public build resolves it to the no-op stub in `src/private-stubs/`. |
 > | `internal-plugins.ts` | internal | realvirtual-internal builds only, behind a `__RV_INTERNAL__`-gated dynamic import (Omniverse render backend, physics provider, Features tab). |
 >
 > Both must finish registering before the workspace-mode registration in `main.ts`, because they

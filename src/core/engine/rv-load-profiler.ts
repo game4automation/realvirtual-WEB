@@ -41,6 +41,21 @@ export interface LoadProfiler {
   getSelfTimings(): LoadSelfTimings;
 }
 
+/** Called after every mark() of every profiler: the profiler label and the phase just finished. */
+export type LoadPhaseListener = (label: string, phase: string) => void;
+
+const phaseListeners = new Set<LoadPhaseListener>();
+
+/**
+ * Subscribe to the phase marks of all load profilers — the loading splash uses
+ * them to show real progress while the scene is parsed and baked. Returns the
+ * unsubscribe function. Listeners run synchronously inside mark(): keep them cheap.
+ */
+export function onLoadPhase(listener: LoadPhaseListener): () => void {
+  phaseListeners.add(listener);
+  return () => { phaseListeners.delete(listener); };
+}
+
 /**
  * Create a load profiler. Call mark() at each phase boundary (NOT per element)
  * and report() at the end. Uses performance.now() exclusively.
@@ -55,6 +70,7 @@ export function createLoadProfiler(label: string): LoadProfiler {
       const now = performance.now();
       timings.push({ phase, ms: now - last });
       last = now;
+      if (phaseListeners.size) for (const listener of phaseListeners) listener(label, phase);
     },
 
     getTimings(): readonly PhaseTiming[] {

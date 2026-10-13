@@ -9,11 +9,8 @@
  *
  * Order matters on a deployed site (F13): when `settings.json` names a Google
  * Analytics id, `requireAnalyticsConsent()` (src/core/hmi/consent-gate.tsx)
- * shows its dialog over the app. Since plan-598 the boot no longer waits for
- * it — the viewer exists BEHIND the open dialog — so "viewer exists" alone no
- * longer means "no dialog": the gate is answered first (the dialog's root
- * element is in the DOM from the moment it is asked), then the model-loaded
- * condition is awaited,
+ * blocks boot BEFORE the viewer exists — "Decline" keeps it blocked. So the
+ * consent gate is answered first, then the model-loaded condition is awaited,
  * then the startup notices are dismissed. Analytics requests are aborted by
  * {@link blockAnalytics} so a smoke run never counts as a visitor.
  *
@@ -46,9 +43,7 @@ export async function answerConsentGate(page: Page, timeoutMs = 15_000): Promise
       await accept.click();
       return true;
     }
-    // plan-598: the viewer can exist while the (non-blocking) dialog is still up.
-    const booted = await page.evaluate(() => !!(window as unknown as { viewer?: unknown }).viewer
-      && !document.getElementById('rv-consent-gate-root')).catch(() => false);
+    const booted = await page.evaluate(() => !!(window as unknown as { viewer?: unknown }).viewer).catch(() => false);
     if (booted) return false;
     await page.waitForTimeout(250);
   }

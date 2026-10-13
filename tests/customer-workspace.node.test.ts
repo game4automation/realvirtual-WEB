@@ -1794,6 +1794,21 @@ describe('foreign-customer-name guard against project kinds', () => {
     return privateRoot;
   };
 
+  it('a product-named project key is product code inside the source trees, a leak elsewhere', () => {
+    const tree = mkdtempSync(join(tmpdir(), 'rv-product-name-tree-'));
+    temporary.push(tree);
+    write(join(tree, 'realvirtual-web', 'src', 'core', 'engine', 'rv-drive-festo-fhpp.ts'), 'export {};');
+    expect(() => assertWorkspaceGuards(tree, { projectKey: 'other', knownProjectKeys: ['festo'] })).not.toThrow();
+    // The customer's own project may name the vendor too (a Festo AAS plugin of project `toray`).
+    const own = mkdtempSync(join(tmpdir(), 'rv-own-project-tree-'));
+    temporary.push(own);
+    write(join(own, 'projects', 'Toray', 'plugins', 'toray-festo-aas-plugin.ts'), 'export {};');
+    expect(() => assertWorkspaceGuards(own, { projectKey: 'toray', knownProjectKeys: ['festo', 'toray'] })).not.toThrow();
+    write(join(tree, 'projects', 'festo-notes.txt'), 'a foreign project file');
+    expect(() => assertWorkspaceGuards(tree, { projectKey: 'other', knownProjectKeys: ['festo'] }))
+      .toThrow(/Foreign customer name found in projects\/festo-notes\.txt/);
+  });
+
   it('ignores an internal project name and still refuses a customer one', () => {
     const privateRoot = projectsFixture();
     const customerKeys = knownProjectKeys(privateRoot, { kind: 'customer' });

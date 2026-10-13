@@ -587,26 +587,6 @@ report `docs/perf/<date>-cells-baseline.md` (draw calls, triangles and chunk mes
 per placement, the p95 knee per motion). A vsync-capped sweep says so in its header;
 read the draw-call columns as the scaling evidence then, not the frame times.
 
-## 4c-bis. Time to the first plant frame (`npm run perf:first-frame`, plan-598)
-
-```bash
-npm run build && npx vite preview --port 5598 --strictPort      # or a live URL
-npm run perf:first-frame -- "http://localhost:5598/?consent=decline" 5 [--repeat 2] [--report-only]
-```
-
-n cold runs (fresh headless Chromium each, real GPU via `--use-angle=d3d11`), a median
-table and a verdict. The **endpoint** "Bild sichtbar" is the moment the loading overlay
-starts to go away (`fade-out` or `hidden`, whichever comes first); a run is only valid when
-`viewer.renderer.info.render.calls > 0` and `viewer.currentModel` is set at that moment.
-Long tasks count from navigation to the endpoint. Exit code `0` pass, `1` acceptance
-violation (median above `--target-ms`, default 3000, or any valid run with a long task
-> 500 ms), `2` an invalid or aborted run — never filtered out. Each run logs the GPU string
-and the build hash. Results (JSON + `.cpuprofile`) land in `scripts/perf/first-frame/runs/`
-(git-ignored); `categorize.cjs`, `aftercallers.cjs` and `keydiff.cjs` there break a run down
-further — see `scripts/perf/first-frame/README.md`. Perf phase tables are switched on via
-`localStorage rv-debug=perf`, never `?debug=` (that loads eruda from a CDN). Measure the live
-demo with `?consent=decline`.
-
 ## 4d. Recording videos (plan-537)
 
 Demo and marketing videos are recorded **frame by frame**, not in real time: the live loop

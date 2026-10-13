@@ -209,15 +209,7 @@ export class BundledBackend implements ProjectBackend {
   private _discovered = false;
   private _active = false;
   private _manifest: RvProject | null = null;
-  /**
-   * The ONE in-flight-or-settled manifest read (plan-598 F3). A promise, not a
-   * "was read" flag: with a bool the second of two CONCURRENT callers saw the
-   * flag already set and returned the still-empty `_manifest` (`null`) while the
-   * first request was in flight — which is exactly the situation once `main.ts`
-   * starts the demo-manifest read early and `resolveActiveProject()` asks the
-   * same backend later. Every caller now awaits the same request.
-   */
-  private _manifestPromise: Promise<RvProject | null> | null = null;
+  private _manifestRead = false;
   private _hasDeployedManifest = false;
 
   constructor(opts: BundledBackendOptions = {}) {
@@ -275,16 +267,9 @@ export class BundledBackend implements ProjectBackend {
    * `!resp.ok` and the other two are a thrown `fetch`. Naming all three in one
    * sentence is honest; pretending to have diagnosed one of them would not be.
    */
-  readManifest(): Promise<RvProject | null> {
-    if (this._manifestPromise) return this._manifestPromise;
-    const first = this._readManifestOnce();
-    // Same posture as the old flag on a THROWING read: the first caller sees
-    // the error, every later (or concurrent) caller gets the empty answer.
-    this._manifestPromise = first.catch(() => this._manifest);
-    return first;
-  }
-
-  private async _readManifestOnce(): Promise<RvProject | null> {
+  async readManifest(): Promise<RvProject | null> {
+    if (this._manifestRead) return this._manifest;
+    this._manifestRead = true;
     await this._discoverSources();
     const deployed = await this._fetchJson('project.json');
     const parsed = deployed ? migrateManifest(deployed) : null;

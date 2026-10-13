@@ -305,13 +305,7 @@ let _published: VisualPreset[] = [];
 
 /** Fetch the shipped preset manifest (`public/presets/index.json`) and each
  *  referenced `<stem>.preset.json`. Safe to call anytime; a missing manifest
- *  (404) just yields no published presets.
- *
- *  The preset files are fetched in PARALLEL (plan-598 F2): they are independent
- *  and the boot awaits this on a first visit (the seed needs the list), so a
- *  serial loop cost one round trip per preset on the critical path. The ORDER
- *  of the resulting list is still the manifest order — `Promise.all` keeps the
- *  index, and a failed file is dropped exactly as before. */
+ *  (404) just yields no published presets. */
 export async function loadPublishedPresets(): Promise<void> {
   try {
     const base = import.meta.env.BASE_URL ?? '/';
@@ -319,15 +313,17 @@ export async function loadPublishedPresets(): Promise<void> {
     if (!idxResp.ok) return;
     const stems = await idxResp.json();
     if (!Array.isArray(stems)) return;
-    const results = await Promise.all(stems.map(async (stem): Promise<VisualPreset | null> => {
+    const loaded: VisualPreset[] = [];
+    for (const stem of stems) {
       try {
         const r = await fetch(`${base}presets/${encodeURIComponent(String(stem))}.preset.json`, { cache: 'no-store' });
-        if (!r.ok) return null;
-        const p = await r.json();
-        return isValidPreset(p) ? p : null;
-      } catch { return null; /* skip a bad file */ }
-    }));
-    _published = results.filter((p): p is VisualPreset => p !== null);
+        if (r.ok) {
+          const p = await r.json();
+          if (isValidPreset(p)) loaded.push(p);
+        }
+      } catch { /* skip a bad file */ }
+    }
+    _published = loaded;
   } catch { /* no presets dir — fine */ }
 }
 

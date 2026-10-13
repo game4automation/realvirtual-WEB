@@ -25,6 +25,17 @@ export default defineConfig({
     baseURL: `http://localhost:${E2E_PORT}`,
     headless: true,
     viewport: { width: 1280, height: 720 },
+    // Headless Chromium without this flag renders WebGL through SwiftShader, i.e. it
+    // rasterizes every frame on the CPU. Measured 2026-10-13 on a GTX 1060: a
+    // fragment-heavy fullscreen fill ran at 913 fps on SwiftShader vs 15447 fps on the
+    // GPU (~17x). `--enable-gpu` alone is enough; adding `--use-angle=d3d11` (Windows
+    // only) changes nothing. Trade-off: SwiftShader renders bit-identically on every
+    // machine, the GPU does not -- set RV_E2E_SOFTWARE_GL=1 to switch back, e.g. for a
+    // GPU-less CI box or when e2e/hmi-highlight-parity.spec.ts drifts past its diff
+    // ratio on a different driver.
+    launchOptions: {
+      args: process.env.RV_E2E_SOFTWARE_GL ? [] : ['--enable-gpu'],
+    },
   },
   projects: [
     {

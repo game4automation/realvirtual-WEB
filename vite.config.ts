@@ -8,7 +8,7 @@ import react from '@vitejs/plugin-react';
 import { playwright } from '@vitest/browser-playwright';
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, createReadStream, statSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
-import { hostname } from 'node:os';
+import { constants as osConstants, hostname, setPriority } from 'node:os';
 import { parsePrivateAssetUrl, resolvePrivateAsset } from './scripts/_rv-private-assets.mjs';
 import { cinematicAssetsPlugin } from './scripts/_rv-cinematic-assets.mjs';
 // @ts-expect-error — plain JS Node module, no type declarations by design (scripts/lib).
@@ -39,6 +39,14 @@ function privateDependentTestExcludes(): string[] {
   return JSON.parse(readFileSync(list, 'utf-8')) as string[];
 }
 import { exec, execSync } from 'node:child_process';
+
+// A test run must not freeze the developer's machine: the browser suite starts one
+// headless Chromium per worker, each rendering WebGL on the CPU. Only under vitest the
+// process lowers itself to BELOW NORMAL — the Chromium instances it spawns inherit the
+// priority class on Windows. RV_TEST_PRIORITY=normal keeps the default priority.
+if (process.env.VITEST && process.env.RV_TEST_PRIORITY !== 'normal') {
+  try { setPriority(osConstants.priority.PRIORITY_BELOW_NORMAL); } catch { /* not permitted — keep the default */ }
+}
 
 // ─── HMR back-channel through the CONNECT proxy (plan-363 Phase 2) ──────
 // When CONNECT supervises this dev server, the browser talks to the CONNECT port, not to this one:
@@ -915,6 +923,22 @@ function stripImpeccableLivePlugin() {
 }
 
 /**
+ * Vite plugin: Write the version label into the loading splash.
+ *
+ * The splash in index.html is painted before any script runs, so the label is
+ * substituted into the HTML itself (dev serve and build) — same wording as
+ * `formatVersionShort()` in src/core/rv-version.ts.
+ */
+function versionLabelPlugin() {
+  return {
+    name: 'rv-version-label',
+    transformIndexHtml(html: string) {
+      return html.replace('{{RV_VERSION_LABEL}}', `v${RV_VERSION} · build ${RV_WEB_BUILD}`);
+    },
+  };
+}
+
+/**
  * Vite plugin: Strip the web app manifest link from NON-COMMERCIAL builds.
  *
  * The `<link rel="manifest">` (display: standalone) is what makes Chrome/Edge offer
@@ -955,6 +979,7 @@ export default defineConfig(({ command }) => ({
     assetNotFoundGuardPlugin(),
     react(),
     // VitePWA disabled – no service worker, always fresh content
+    versionLabelPlugin(),
     devServerIdentityPlugin(),
     testRunnerPlugin(),
     debugApiPlugin(),
@@ -1214,6 +1239,10 @@ export default defineConfig(({ command }) => ({
     },
   },
   test: {
+    // At most 75 % of the cores run test files in parallel (vitest's default is all
+    // cores but one), so the machine stays usable during a full run.
+    // RV_TEST_MAX_WORKERS overrides it — a count (`4`) or a share (`100%`).
+    maxWorkers: process.env.RV_TEST_MAX_WORKERS || '75%',
     // Tests for private-only subsystems (the CAD importers: STEP, JT, USD, Onshape)
     // live in the private sibling so the public mirror does not carry the shape of
     // modules it cannot build. The glob matches nothing in a public-only checkout.

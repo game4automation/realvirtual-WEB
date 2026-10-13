@@ -78,9 +78,6 @@ import {
   catalogChangedBinaries,
   probePublishedAssets,
   PROBE_MISSING_ASSET,
-  manifestPreloadFor,
-  injectManifestPreload,
-  purgeDeployChanges,
 } from './_bunny-lib.mjs';
 import { generateFragmentSecret, bytesToBase64Url, base64UrlToBytes } from './lib/rv-crypto.mjs';
 import { loadSigningConfig, signGlbFile } from './rv-sign-glb.mjs';
@@ -541,10 +538,6 @@ export async function uploadDirectory(client, localDir, remotePrefix, {
 
   const prefix = (remotePrefix || '').replace(/^\/+|\/+$/g, '');
   let uploaded = 0;
-  // plan-598 Phase 2: the PATHS, not only the counts — the URL purge needs to
-  // know which files changed (uploaded) and which disappeared (deleted).
-  const uploadedRels = [];
-  const deletedRels = [];
   const uploadOne = async (f) => {
     const remotePath = prefix ? `${prefix}/${f.rel}` : f.rel;
     // The REAL predicate, not a second spelling of it. This regex used to list
@@ -559,7 +552,6 @@ export async function uploadDirectory(client, localDir, remotePrefix, {
     try {
       await client.putFile(readFileSync(f.abs), remotePath);
       uploaded++;
-      uploadedRels.push(f.rel);
     } catch (ex) {
       log(`    ${RED}! upload failed${RESET} ${f.rel} ${DIM}${ex?.message ?? ex}${RESET}`);
       throw new Error(
@@ -594,7 +586,6 @@ export async function uploadDirectory(client, localDir, remotePrefix, {
     log(`  ${RED}-${RESET} ${entry.rel} ${DIM}(stale)${RESET}`);
     try {
       await client.deleteFile(remotePath);
-      deletedRels.push(entry.rel);
     } catch (ex) {
       // A stale leftover Bunny refuses to delete (HTTP 400 "Unable to delete
       // file" on some legacy demo/models/* objects) must not abort the deploy:
@@ -610,7 +601,7 @@ export async function uploadDirectory(client, localDir, remotePrefix, {
   }
 
   if (skipped > 0) log(`  ${DIM}= ${skipped} unchanged (skipped)${RESET}`);
-  return { uploaded, skipped, deleted: stale.length - deleteFailures, deleteFailures, uploadedRels, deletedRels };
+  return { uploaded, skipped, deleted: stale.length - deleteFailures, deleteFailures };
 }
 
 // ─── Publish lock (plan-488) ─────────────────────────────────────────────
@@ -942,13 +933,6 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
     log(`${DIM}SEO: noindex injected (non-canonical public path "${seo.prefix}" — canonical is "${seo.canonicalPath}")${RESET}`);
   }
 
-  // plan-598 Phase 2: the manifest preload is written by the DEPLOY — only it
-  // knows which manifest this channel's runtime will fetch (demo folder vs root).
-  const preload = injectManifestPreload(join(distDir, 'index.html'), {
-    href: manifestPreloadFor({ kind: 'public', distDir }), dryRun: opts.dryRun,
-  });
-  log(`${DIM}Manifest preload: ${preload ?? 'none'}${RESET}`);
-
   log('');
   log(`${MAGENTA}realvirtual WebViewer · Bunny Deploy${RESET}`);
   info('mode', opts.demo ? 'demo  (commercial code · public demo content)' : 'public');
@@ -967,7 +951,6 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
   const lock = await acquireDeployLock(cfg, remotePrefix, lockOptions);
   let uploaded;
   let skipped;
-  let changes = { uploadedRels: [], deletedRels: [], deleteFailures: 0 };
   try {
     // plan-508 F2b: inside the lock, before the upload — the catalog published
     // RIGHT NOW is the baseline, and nobody else can change it until we are done.
@@ -975,13 +958,11 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
     // half-published target behind, so the phase file stops saying `build`.
     reportPhase('upload');
     const alwaysUploadRel = opts.force ? [] : await catalogHashDiff(client, distDir, remotePrefix);
-    const result = await uploadDirectory(client, distDir, remotePrefix, {
+    ({ uploaded, skipped } = await uploadDirectory(client, distDir, remotePrefix, {
       ...opts,
       alwaysUploadGlbs: !!signing,
       alwaysUploadRel,
-    });
-    ({ uploaded, skipped } = result);
-    changes = result;
+    }));
 
     // Crawlers only honor /robots.txt at the DOMAIN ROOT — when the canonical
     // deploy lives under a sub-path (demo/), a root copy referencing the absolute
@@ -991,21 +972,7 @@ async function publishPublicBuild(cfg, opts, filtered, { mode, remotePrefix, sle
       await client.putFile(Buffer.from(seo.robots, 'utf8'), 'robots.txt');
     }
 
-    // plan-598 F5: the browser-cache rules of the pull zone (immutable hashed
-    // assets, revalidated HTML/manifests/models/draco), idempotent — a no-op
-    // when the zone already carries them. Before the purge, so every URL the
-    // purge refetches is answered under the rules.
-    await ensureEdgeRulesStep(client, opts);
-    const rootRobots = seo.mode === 'canonical' && seo.prefix && seo.robots
-      ? [`${(process.env.RV_PUBLIC_BASE_URL || PUBLIC_BASE_URL).replace(/\/+$/, '')}/robots.txt`]
-      : [];
-    await maybePurge(client, uploaded, opts, {
-      baseUrl: publicBaseUrlFor(remotePrefix),
-      uploaded: changes.uploadedRels,
-      deleted: changes.deletedRels,
-      extraUrls: rootRobots,
-      partial: changes.deleteFailures > 0,
-    });
+    await maybePurge(client, uploaded, opts);
     // plan-587 F4: the bytes are up and the cache is purged — the build IS live. Everything
     // after this point only CHECKS it, which is exactly why a timeout must not kill it.
     reportPhase('published');
@@ -1173,8 +1140,6 @@ async function publishPrivateBuild(cfg, opts, { project, projectDir, filtered })
   let totalUploaded = 0;
   let totalSkipped = 0;
   let stagingDir = null;
-  // plan-598: what this publish changed, for the URL purge below.
-  const privateChanges = { uploaded: [], deleted: [], partial: false };
   try {
     if (opts.dryRun) {
       log(`${DIM}[dry-run] would stage project + upload to ${project.code}/${RESET}`);
@@ -1202,13 +1167,6 @@ async function publishPrivateBuild(cfg, opts, { project, projectDir, filtered })
       // even in encrypted deploys; only GLBs are encrypted.)
       injectNoindex(join(stagingDir, 'index.html'));
       log(`${DIM}SEO: noindex injected (private deploy)${RESET}`);
-      // plan-598 Phase 2: hosted without password preloads `p/project.json`; a
-      // password deploy preloads NOTHING — its manifest may only be requested
-      // after the password gate, and an HTML preload runs before any script.
-      const preload = injectManifestPreload(join(stagingDir, 'index.html'), {
-        href: manifestPreloadFor({ kind: 'hosted', encrypted: !!encryption }),
-      });
-      log(`${DIM}Manifest preload: ${preload ?? 'none (password deploy)'}${RESET}`);
 
       // ONE pass: runtime + p/ (plan-759 F9). Envelope GLBs must bypass the size
       // diff: a fresh salt gives a new ciphertext at identical size. settings.json
@@ -1228,16 +1186,13 @@ async function publishPrivateBuild(cfg, opts, { project, projectDir, filtered })
       });
       totalUploaded += p1.uploaded;
       totalSkipped += p1.skipped;
-      privateChanges.uploaded.push(...p1.uploadedRels);
-      privateChanges.deleted.push(...p1.deletedRels);
-      if (p1.deleteFailures > 0) privateChanges.partial = true;
 
       // The {code}/ folder is owned in full: whatever the staging did not
       // produce is gone — including a previous layout's models/, models.json
       // and private-assets/ (D8). The snapshot IS the staging listing, never a
       // second rule.
       const expected = expectedHostedSnapshot(stagingDir);
-      const deleted = await reconcileRemoteSnapshot(client, project.code, expected, privateChanges.deleted);
+      const deleted = await reconcileRemoteSnapshot(client, project.code, expected);
       if (deleted > 0) log(`${DIM}Remote reconcile removed ${deleted} file(s) not in this publish.${RESET}`);
 
       // lastPublished only after the reconcile (R9).
@@ -1249,14 +1204,7 @@ async function publishPrivateBuild(cfg, opts, { project, projectDir, filtered })
     }
   }
 
-  // plan-598 F5: cache rules first (idempotent), then the purge of what changed.
-  if (!opts.dryRun) await ensureEdgeRulesStep(client, opts);
-  await maybePurge(client, totalUploaded, opts, {
-    baseUrl: publicBaseUrlFor(project.code),
-    uploaded: privateChanges.uploaded,
-    deleted: privateChanges.deleted,
-    partial: privateChanges.partial,
-  });
+  await maybePurge(client, totalUploaded, opts);
   info('done', `${totalUploaded} uploaded, ${totalSkipped} unchanged`);
   if (encryption) {
     // The fragment secret is HALF the key — it must travel in the link. The
@@ -1357,49 +1305,22 @@ function injectGaIntoSettings(settingsPath, gaId, dryRun) {
   log(`${DIM}GA4 id injected into ${settingsPath}${RESET}`);
 }
 
-//! Purges what the deploy changed (plan-598 Phase 2), unless suppressed
-//! (--no-purge) or nothing changed. With the changed paths (`changes`) it is a
-//! URL purge of the uploaded AND deleted non-hashed files — every other URL of
-//! the zone stays warm on the edges; it falls back to the zone purge for a
-//! partly applied deploy (a stale file that could not be deleted), more than
-//! URL_PURGE_LIMIT URLs, or a failed URL purge. Without `changes` (old callers)
-//! it is the zone purge it always was. Mirrors C# (uploadedCount>0 + creds set).
-export async function maybePurge(client, uploadedCount, opts, changes = null) {
+//! Purges the pull-zone cache once, but only if files were uploaded and purge
+//! isn't suppressed (--no-purge). Mirrors C# (uploadedCount>0 + creds set).
+async function maybePurge(client, uploadedCount, opts) {
   if (opts.noPurge) {
     info('purge', 'skipped (--no-purge)');
     return;
   }
-  const deletedCount = changes?.deleted?.length ?? 0;
-  if (uploadedCount === 0 && deletedCount === 0 && !changes?.partial) {
+  if (uploadedCount <= 0) {
     info('purge', 'skipped (nothing uploaded)');
     return;
   }
-  if (!changes) {
-    const ok = await client.purge();
-    info('purge', ok ? `${GREEN}✓${RESET}` : `${DIM}skipped${RESET}`);
-    return;
-  }
-  if (!client.accountKey || !client.pullZoneId) {
-    info('purge', `${DIM}skipped (no account key / pull zone id)${RESET}`);
-    return;
-  }
-  const result = await purgeDeployChanges(client, { ...changes, log });
-  if (result.mode === 'none') info('purge', `${DIM}nothing to purge (only content-hashed files changed)${RESET}`);
-  else if (result.mode === 'url') info('purge', `${GREEN}✓${RESET} ${result.urls.length} URL(s)`);
-  else info('purge', result.ok ? `${GREEN}✓${RESET} zone` : `${DIM}skipped${RESET}`);
+  const ok = await client.purge();
+  info('purge', ok ? `${GREEN}✓${RESET}` : `${DIM}skipped${RESET}`);
 }
 
-//! plan-598 F5: makes the pull zone carry the browser-cache edge rules. Runs on
-//! every real deploy (idempotent, non-fatal); RV_DEPLOY_EDGE_RULES=0 skips it.
-async function ensureEdgeRulesStep(client, opts) {
-  if ((process.env.RV_DEPLOY_EDGE_RULES || '').trim() === '0') {
-    info('edge', 'skipped (RV_DEPLOY_EDGE_RULES=0)');
-    return;
-  }
-  const r = await client.ensureEdgeRules();
-  if (r) info('edge', `cache rules: ${r.created} created, ${r.updated} updated, ${r.unchanged} unchanged${opts.dryRun ? ' [dry-run]' : ''}`);
-  else info('edge', `${DIM}cache rules not applied (see log)${RESET}`);
-}
+// ─── main ────────────────────────────────────────────────────────────────
 
 async function main() {
   loadDotEnv(); // populate process.env from .env.production / .env (CI env still wins)
@@ -1461,9 +1382,7 @@ export function expectedHostedSnapshot(stagingDir) {
 }
 
 //! Deletes every remote file that is absent from the validated local snapshot manifest.
-//! `deletedOut` (optional) collects the deleted prefix-relative paths — the URL
-//! purge of plan-598 must purge what disappeared, not only what was uploaded.
-export async function reconcileRemoteSnapshot(client, remotePrefix, expectedPaths, deletedOut = null) {
+export async function reconcileRemoteSnapshot(client, remotePrefix, expectedPaths) {
   const entries = await client.listRecursive(remotePrefix);
   const prefix = remotePrefix.replace(/^\/+|\/+$/g, '');
   let deleted = 0;
@@ -1471,7 +1390,6 @@ export async function reconcileRemoteSnapshot(client, remotePrefix, expectedPath
     if (expectedPaths.has(entry.rel.replace(/\\/g, '/').toLowerCase())) continue;
     await client.deleteFile(prefix ? `${prefix}/${entry.rel}` : entry.rel);
     deleted++;
-    if (deletedOut) deletedOut.push(entry.rel.replace(/\\/g, '/'));
   }
   return deleted;
 }

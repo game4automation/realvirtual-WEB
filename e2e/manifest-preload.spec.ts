@@ -4,15 +4,6 @@
 /**
  * plan-731 Phase 5 (F7) — the boot manifest is preloaded, and only once.
  *
- * plan-598 Phase 2: the preload is no longer a STATIC tag in `index.html` — the
- * deploy writes the one matching tag per channel (scripts/_bunny-lib.mjs
- * `manifestPreloadFor`; demo: `demo-realvirtual/project.json`). The dev server
- * therefore serves NO manifest preload, and what stays pinned here is the part
- * that holds on every channel: the boot asks for the demo manifest exactly
- * ONCE (the early discovery and the project resolution share one request,
- * plan-598 F3) and Chrome reports no unused preload. The deploy-time tag itself
- * is pinned in tests/bunny-deploy.node.test.ts and e2e/hosted-preload.spec.ts.
- *
  * ── WHY THIS IS AN E2E AND NOT A UNIT TEST ──────────────────────────────────
  * A `<link rel="preload">` is a claim about a NETWORK TRACE, and nothing below
  * a real browser can check it. Asserting that the tag is in `index.html` would
@@ -65,10 +56,12 @@ test('the boot manifest is preloaded and fetched exactly once', async ({ page })
   await page.goto('/');
   await page.waitForSelector('canvas');
 
-  // 1. plan-598: no STATIC manifest preload in the committed index.html — a
-  //    wrong one ("preloaded but not used") is worse than none; the deploy
-  //    injects the right one per channel.
-  await expect(page.locator('link[rel="preload"][href$="project.json"]')).toHaveCount(0);
+  // 1. The tag is there, with the options that make it usable.
+  const link = page.locator('link[rel="preload"][href="/project.json"]');
+  await expect(link).toHaveCount(1);
+  await expect(link).toHaveAttribute('as', 'fetch');
+  // `crossorigin` with no value is the anonymous mode — the empty string.
+  expect(await link.getAttribute('crossorigin')).not.toBeNull();
 
   // 2. It was actually USED. This is the assertion the whole file exists for:
   //    a mismatched preload produces a second request and this warning.

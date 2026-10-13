@@ -184,8 +184,6 @@
   "tests/plc-standard-fbs.test.ts",
   "tests/plc-station04-st.test.ts",
   "tests/plugin-override-store.node.test.ts",
-  "tests/private-features-prefetch.node.test.ts",
-  "tests/private-features-prefetch.test.ts",
   "tests/private-internal-gate.node.test.ts",
   "tests/quick-edit-authoring-rules.test.ts",
   "tests/react-hooks-after-early-return.node.test.ts",

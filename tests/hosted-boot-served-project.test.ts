@@ -102,10 +102,7 @@ describe('ProjectStore on a hosted boot (F4b)', () => {
 
 describe('main.ts boot order (§9.6): the gate runs before any project or document', () => {
   it('requireHostedPassword is awaited before the project is resolved and before ?doc= opens', () => {
-    // plan-598: the password gate runs as the first step of `runBootGates`, which
-    // the boot awaits (its order is pinned as behaviour in gate-priority.test.ts).
-    const gate = mainSource.indexOf('await runBootGates({');
-    expect(mainSource.slice(gate, gate + 200)).toContain('requirePassword: () => requireHostedPassword(appConfig)');
+    const gate = mainSource.indexOf('await requireHostedPassword(appConfig);');
     const resolve = mainSource.indexOf('resolveActiveProject({');
     const docOpen = mainSource.indexOf('await sceneStore.openDocument(urlDoc);');
     const hosted = mainSource.indexOf('resolveHostedBoot({');
@@ -116,21 +113,5 @@ describe('main.ts boot order (§9.6): the gate runs before any project or docume
     // and the served project comes from the query OR settings.json
     expect(mainSource).toContain('resolveServedProjectUrl(');
     expect(mainSource).toContain('remoteRequired: true');
-  });
-
-  it('plan-598: the early starts (discovery incl. the demo manifest, feature prefetch) come AFTER the gate, and so does the consent question', () => {
-    // All three are arguments of the ONE runBootGates call: the password as
-    // `requirePassword`, the consent as `startConsent`, the network as `startEarly`
-    // — runBootGates runs them in exactly that order (gate-priority.test.ts).
-    const gate = mainSource.indexOf('await runBootGates({');
-    const end = mainSource.indexOf('const { presetsLoaded, privateFeatureMods, discovery } = early;');
-    const call = mainSource.slice(gate, end);
-    expect(gate).toBeGreaterThan(0);
-    expect(call).toMatch(/requirePassword: \(\) => requireHostedPassword\(appConfig\),\s*startConsent: \(\) => startNonBlockingConsent\(/);
-    expect(call).toMatch(/startEarly: \(\) => \{[\s\S]*startBootDiscovery\(\{[\s\S]*preloadDracoDecoder\(\)/);
-    expect(call).toContain('prefetchPrivateFeatures()');
-    // Nothing of it outside the call: no second discovery / prefetch start elsewhere.
-    expect(mainSource.split('startBootDiscovery({').length).toBe(2);
-    expect(mainSource.split('prefetchPrivateFeatures()').length).toBe(2);
   });
 });

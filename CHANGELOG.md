@@ -6,6 +6,17 @@ Maintained by `/release-web`; the contract is described in `Documentation/web/RE
 
 ## Unreleased
 
+## 6.4.1 — 2026-10-13
+
+**Improved**
+- A new loading screen shows a robot cell whose cycle follows the real loading progress.
+- PLC programs show a read-only preview of their Structured Text in the Property
+  Inspector; a click opens the program in the PLC editor.
+
+**Fixed**
+- The viewer starts with the proven startup sequence of 6.3 again; the faster
+  startup that shipped with 6.4.0 is withdrawn.
+
 ## 6.4.0 — 2026-10-12
 
 **New**

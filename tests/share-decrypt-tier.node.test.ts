@@ -81,8 +81,7 @@ describe('share-decrypt tier (plan-560)', () => {
     it('private-plugins.ts registers it in the customer tier, in manifest order', () => {
       const src = readFileSync(resolve(PRIVATE, 'src/private-plugins.ts'), 'utf8');
       const customer = src.split(/if\s*\(\s*__RV_INTERNAL__\s*\)/)[0]!;
-      // plan-598: the call also hands on the prefetched imports (`, mods`).
-      expect(customer).toContain("useFeature(viewer, 'share-decrypt', () => import('./features/share-decrypt.register'), mods)");
+      expect(customer).toContain("useFeature(viewer, 'share-decrypt', () => import('./features/share-decrypt.register'))");
       const manifest = JSON.parse(readFileSync(resolve(PRIVATE, 'tier-manifest.json'), 'utf8')) as {
         registrations: Record<string, unknown>;
       };

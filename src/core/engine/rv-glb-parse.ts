@@ -47,23 +47,6 @@ export function setDracoDecoderPath(path: string): void {
   dracoLoader.setDecoderPath(path);
 }
 
-let _dracoPreloaded = false;
-
-/**
- * Start fetching the Draco decoder (wrapper + wasm) NOW, in parallel with
- * whatever else the boot is waiting for (plan-598 F4). Without this the decoder
- * was requested only when the first compressed mesh was decoded — i.e. strictly
- * AFTER the GLB had finished downloading, one more serial round trip before the
- * first frame. Idempotent (`DRACOLoader` memoises its decoder promise, and so do
- * we). Must run AFTER the final {@link setDracoDecoderPath}: the loader binds the
- * path at the moment the fetch starts.
- */
-export function preloadDracoDecoder(): void {
-  if (_dracoPreloaded) return;
-  _dracoPreloaded = true;
-  dracoLoader.preload();
-}
-
 /** The one GLTFLoader used by `loadGLB` and `parseGlbSubtree` alike. */
 export const gltfLoader = new GLTFLoader();
 gltfLoader.setDRACOLoader(dracoLoader);

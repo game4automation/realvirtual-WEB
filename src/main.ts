@@ -47,14 +47,12 @@ import {
   reportModelLoadStart,
 } from './core/hmi/model-load-progress-store';
 import { setBrandedSplashVisible } from './core/hmi/scene-transition-store';
+import { createSplashRobot } from './core/hmi/rv-splash-robot';
+import { onLoadPhase } from './core/engine/rv-load-profiler';
 
 // Private content (resolves to stubs when private folder is absent)
 import { initHMI } from '@rv-private/custom/hmi-entry';
-import { registerPrivatePlugins, prefetchPrivateFeatures } from '@rv-private/private-plugins';
-import { startNonBlockingConsent } from './core/rv-consent-boot';
-import { runBootGates } from './core/rv-boot-gates';
-import { startBootDiscovery, mergeDiscoveredEntries, type GatewayModelEntry } from './core/project/rv-boot-discovery';
-import { preloadDracoDecoder } from './core/engine/rv-glb-parse';
+import { registerPrivatePlugins } from '@rv-private/private-plugins';
 import { smoothMotionRegistry } from './core/engine/rv-smooth-motion-port';
 
 // Hide AGPL watermark only for explicitly commercial builds (RV_COMMERCIAL=1).
@@ -141,7 +139,7 @@ import {
 // plan-716 §2.4 — an old `?scene=scn_…` link resolves through the alias map onto
 // the document it became, and the address bar is normalised to `?doc=`.
 import { resolveSceneRoute, sceneUrlToDocumentUrl } from './core/project/rv-doc-alias';
-import { documentsOf, findStartDocument, readDocuments } from './core/project/rv-project-documents';
+import { documentsOf, findStartDocument } from './core/project/rv-project-documents';
 import {
   diagnoseKioskBoot, projectStartDocument, resolveResumeTarget, resolveHostedBoot, resolveServedProjectUrl,
 } from './core/project/rv-project-open';
@@ -218,6 +216,41 @@ const loadingError = document.getElementById('loading-error')!;
 const loadingErrorDetail = document.getElementById('loading-error-detail')!;
 const loadingRetryBtn = document.getElementById('loading-retry-btn') as HTMLButtonElement;
 const loadingReloadBtn = document.getElementById('loading-reload-btn') as HTMLButtonElement;
+// The robot cell in the splash: its outfeed belt fills with the real load.
+const splashRobot = createSplashRobot(loadingOverlay, document.getElementById('loading-detail'));
+
+// One overall progress for the splash: the download fills the first 30 %, the
+// scene loader's phase marks (loadGLB profiler) the rest; hide → 100 %.
+// Never moves backwards within a load (nested loads mark phases again).
+// Each entry also names the load STEP it reaches: one step = one robot turn =
+// one box on the splash conveyor (step 1 is start-up, the last is finish()).
+const DOWNLOAD_SHARE = 0.3;
+const LOAD_PHASE_STEPS: Readonly<Record<string, readonly [number, number, string]>> = {
+  'gltf-parse': [0.4, 3, 'Building scene…'],
+  processMeshes: [0.5, 4, 'Baking geometry…'],
+  bake: [0.75, 5, 'Preparing materials…'],
+  applyUberMaterial: [0.82, 5, 'Measuring scene…'],
+  'bvh-setup': [0.88, 5, 'Finalizing scene…'],
+  finalize: [0.92, 5, 'Starting components…'],
+};
+/** Step reached by "reading the model" (download or, without one, the parse start). */
+const READ_STEP = 2;
+let loadingFraction = 0;
+
+function setLoadingStep(fraction: number, step: number, text: string) {
+  if (fraction < loadingFraction) return;
+  loadingFraction = fraction;
+  loadingProgressBar.classList.remove('indeterminate');
+  loadingProgressBar.style.transform = `scaleX(${fraction})`;
+  loadingProgressPct.textContent = text;
+  splashRobot.setStep(step);
+}
+
+onLoadPhase((label, phase) => {
+  if (label !== 'loadGLB' || loadingOverlay.classList.contains('hidden')) return;
+  const step = LOAD_PHASE_STEPS[phase];
+  if (step) setLoadingStep(step[0], step[1], step[2]);
+});
 
 function showLoadingOverlay(modelName: string) {
   loadingLabel.textContent = 'Loading ';
@@ -226,6 +259,8 @@ function showLoadingOverlay(modelName: string) {
   loadingProgressBar.style.transform = '';
   loadingProgressPct.textContent = '';
   hideLoadingError();
+  splashRobot.reset();
+  loadingFraction = 0;
   loadingOverlay.classList.remove('fade-out', 'hidden');
   // ONE loading indicator at a time: this splash owns the load from here. An
   // info overlay shown for the pre-load phase (SceneStore's "Loading …")
@@ -247,6 +282,7 @@ function showLoadingError(detail: string) {
   // The store goes idle — whoever was showing progress (the hero) stops; the
   // splash's own error card with Retry is the one error surface.
   reportModelLoadEnd();
+  splashRobot.fault(true);
   if (loadingProgressWrap) loadingProgressWrap.style.display = 'none';
   loadingStatus.style.display = 'none';
   loadingErrorDetail.textContent = detail;
@@ -256,6 +292,7 @@ function showLoadingError(detail: string) {
 }
 
 function hideLoadingError() {
+  splashRobot.fault(false);
   loadingError.classList.add('hidden');
   loadingStatus.style.display = '';
   if (loadingProgressWrap) loadingProgressWrap.style.display = '';
@@ -278,26 +315,25 @@ function setLoadingProgress(loaded: number, total: number) {
     setLoadingPreparing();
     return;
   }
-  const pct = Math.round((loaded / total) * 100);
   reportModelLoadProgress(loaded, total);
-  loadingProgressBar.classList.remove('indeterminate');
-  loadingProgressBar.style.transform = `scaleX(${pct / 100})`;
   const loadedMB = (loaded / (1024 * 1024)).toFixed(1);
   const totalMB = (total / (1024 * 1024)).toFixed(1);
-  loadingProgressPct.textContent = `${loadedMB} / ${totalMB} MB`;
+  setLoadingStep((loaded / total) * DOWNLOAD_SHARE, READ_STEP, `Downloading ${loadedMB} / ${totalMB} MB`);
 }
 
 // Post-download phase: bytes are in, now parsing the GLB + building the scene.
-// Animated (indeterminate) bar + label so the user knows work is still ongoing.
+// From here the loader's phase marks move the bar (see LOAD_PHASE_STEPS).
 function setLoadingPreparing() {
   reportModelLoadPreparing();
-  loadingProgressBar.classList.add('indeterminate');
-  loadingProgressBar.style.transform = '';
-  loadingProgressPct.textContent = 'Preparing scene…';
+  setLoadingStep(DOWNLOAD_SHARE, READ_STEP, 'Reading model…');
 }
 
 function hideLoadingOverlay() {
   reportModelLoadEnd();
+  // The belt fills at once, so the fade shows the finished cell without
+  // delaying the scene by a frame.
+  splashRobot.finish();
+  if (loadingFraction > 0) setLoadingStep(1, splashRobot.steps, 'Ready');
   loadingOverlay.classList.add('fade-out');
   // Released at the START of the fade, not after it: a transition held through
   // the load ("Opening editor…") may surface under the fading splash rather
@@ -577,62 +613,10 @@ async function init() {
     recomputePhysics();
   }
 
-  // --- Boot gates + early starts (plan-598, order: rv-boot-gates.ts) ---
-  //
-  // 1. Hosted deploy password gate (plan-759 F5): an encrypted deploy shows the
-  //    password overlay HERE — before the viewer, the dashboard and the first
-  //    document fetch. The key is verified against the probe in settings.json
-  //    and held for every fetch of this tab. Resolves at once for an
-  //    unencrypted deploy. Still BLOCKING, and the FIRST gate (plan-598): the
-  //    consent dialog (z-index 30000) is not even mounted before the password
-  //    is accepted, so it can never cover the password overlay.
-  //
-  // 2. Analytics consent (plan-598 F1: NON-blocking). When a tracker is
-  //    configured (settings.json analytics.googleAnalyticsId), GA may not load
-  //    without prior opt-in (GDPR / §25 TDDDG). The dialog is shown exactly as
-  //    before, but the boot no longer waits for it: our own resources load
-  //    behind it, and only the third-party tracker waits — `initAnalytics` runs
-  //    once the user accepts, never on a decline (`?consent=decline`, plan-564).
-  //    A `model_view` that happened before the answer is sent once on the grant
-  //    (rv-consent-boot.ts). Deploys with no tracker id never see the dialog.
-  //
-  // 3. Early starts (plan-598 F2): everything independent begins NOW. Each of
-  //    these used to start only when the step before it had finished; none of
-  //    them depends on the viewer. They are awaited further down, at the exact
-  //    place each result was needed before — the ORDER of registration and
-  //    merge is unchanged, only the network overlaps:
-  //     - presets: one parallel batch; awaited right below only on a first
-  //       visit (the seed needs the list), otherwise the picker re-reads on open;
-  //     - private feature chunks + the smooth-motion wasm (registered later, in
-  //       order, by the private-plugin pass);
-  //     - the catalogue discovery fetches (merged later, in the old order);
-  //     - the Draco decoder — the BASE_URL path is final in the app entry.
-  //    All of it after the password gate on purpose: nothing project-related
-  //    may leave the tab before the key is in.
-  const mayHaveGatewayOrigin = connectEmbedEnabled || isLoopbackOrigin() || import.meta.env.DEV;
-  const { consent: analyticsConsent, early } = await runBootGates({
-    requirePassword: () => requireHostedPassword(appConfig),
-    startConsent: () => startNonBlockingConsent({
-      requireConsent: () => requireAnalyticsConsent(),
-      initAnalytics,
-      track: trackAnalyticsEvent,
-    }),
-    startEarly: () => {
-      const started = {
-        presetsLoaded: loadPublishedPresets(),
-        privateFeatureMods: prefetchPrivateFeatures(),
-        discovery: startBootDiscovery({
-          dev: import.meta.env.DEV,
-          baseUrl: import.meta.env.BASE_URL,
-          mayHaveGatewayOrigin,
-          readDemoManifest: () => getProjectStore().getBundledBackend().readManifest(),
-        }),
-      };
-      preloadDracoDecoder();
-      return started;
-    },
-  });
-  const { presetsLoaded, privateFeatureMods, discovery } = early;
+  // Load shipped visual presets (public/presets/index.json). Non-blocking for
+  // correctness — the preset picker re-reads on open — but awaited here so the
+  // first Settings open already has them. Missing manifest → no-op.
+  await loadPublishedPresets();
 
   // Fresh install: seed the initial visual preset so the viewer boots on it
   // (and the Visual-settings dropdown shows it) instead of "Custom". Weak
@@ -641,10 +625,8 @@ async function init() {
   // get "Fast", everything else "Default", and the auto-quality modal informs
   // the user once. No-op once the user has saved visual settings. Must run
   // after loadPublishedPresets() (needs the preset list) and before the first
-  // loadVisualSettings() below — which is why the preset batch is awaited
-  // here, and ONLY here (a returning visitor never waits for it).
+  // loadVisualSettings() below.
   if (!hasStoredVisualSettings()) {
-    await presetsLoaded;
     const initialQuality = chooseInitialQualityPreset();
     const seeded = seedInitialVisualPreset(initialQuality.name);
     if (seeded && initialQuality.name === FAST_PRESET_NAME && initialQuality.reason) {
@@ -652,6 +634,23 @@ async function init() {
       queueAutoQualityNotice(initialQuality.reason);
     }
   }
+
+  // --- Analytics consent gate ---
+  // When a tracker is configured (settings.json analytics.googleAnalyticsId), GA
+  // may not load without prior opt-in (GDPR / §25 TDDDG). Block boot until the
+  // user accepts — without consent the app does not run. Private deploys with no
+  // tracker id skip the gate entirely (this resolves immediately).
+  const analyticsConsent = await requireAnalyticsConsent();
+  // Inject GA now that consent is in place (no-op when no id is configured). A
+  // session decline (`?consent=decline`, plan-564) starts the app WITHOUT it.
+  if (analyticsConsent !== 'declined') initAnalytics();
+
+  // --- Hosted deploy password gate (plan-759 F5) ---
+  // An encrypted deploy shows the password overlay HERE — before the viewer,
+  // the dashboard and the first document fetch. The key is verified against
+  // the probe in settings.json and held for every fetch of this tab. Resolves
+  // at once for an unencrypted deploy.
+  await requireHostedPassword(appConfig);
 
   // --- Bootstrap context-aware UI visibility (from settings.json `ui` key) ---
   {
@@ -736,8 +735,7 @@ async function init() {
   viewer.on('model-loaded', () => {
     const url = viewer.currentModelUrl ?? '';
     const model = url.split(/[?#]/)[0].split('/').pop()?.replace(/\.glb$/i, '') || 'unknown';
-    // plan-598: held until the (non-blocking) consent answer, then sent once.
-    analyticsConsent.modelView({ model });
+    trackAnalyticsEvent('model_view', { model });
   });
   viewer.on('mode-changed', ({ to }) => {
     trackAnalyticsEvent('workspace_mode', { mode: to });
@@ -938,11 +936,7 @@ async function init() {
   // Awaited: internal-tier features load via a __RV_INTERNAL__-gated dynamic
   // import and must finish registering (modes, components) before the mode
   // registration below and the mode-boot block later in this function.
-  //
-  // plan-598: the side-effect-free feature chunks (and the smooth-motion wasm)
-  // have been downloading since the early-start block above; this pass
-  // consumes those imports and registers in the same fixed order as always.
-  await registerPrivatePlugins(viewer, privateFeatureMods);
+  await registerPrivatePlugins(viewer);
 
   // --- Smooth-motion provider gate (plan-281 Finding #14) ---
   // The jerk-limited drive core must be decided BEFORE the first model loads:
@@ -1045,65 +1039,143 @@ async function init() {
   //
   // `project` is set only for models discovered inside a private project folder
   // (dev). Deploy-root models carry none: a deploy IS one project.
-  //
-  // plan-598 F2: the four network reads below (private models, `models.json`,
-  // the demo manifest, the CONNECT gateway) were started in the early-start
-  // block right after the password gate and have been running while the viewer
-  // and the plugins were set up. They are MERGED here, in exactly the order the
-  // serial code used — see `rv-boot-discovery.ts`, which keeps every rule that
-  // used to be written out here (models.json authoritative, the demo project's
-  // own models additive and deduped, the gateway last and additive) together
-  // with the reasons for it.
-  //
-  // `/__api/private-models` is served ONLY by the dev-time Vite middleware, so
-  // it is requested only in a dev build. `models.json` is a private deploy's
-  // runtime manifest and AUTHORITATIVE where present. The demo project ships as
-  // a FOLDER with a manifest (plan-737), read through the demo backend so the
-  // project resolution below reuses the same request (plan-598 F3). The CONNECT
-  // gateway's `/model/manifest` is a FOREIGN catalogue (plan-413 §2.6) probed
-  // only where a gateway can be the page origin (`mayHaveGatewayOrigin`).
-  const [discoveredPrivate, discoveredModelsJson, demoManifest, gatewayManifest] = await Promise.all([
-    discovery.privateModels,
-    discovery.modelsJson,
-    discovery.demoManifest,
-    discovery.gatewayManifest,
-  ]);
+  const entries: Array<{ filename: string; url: string; project?: string }> = [];
 
-  // Discover local working folder models (File System Access API, Chrome/Edge only).
-  // Local, not network — read here, at its old place in the merge order.
-  const localFiles: Array<{ filename: string; url: string }> = [];
+  // Discover private project models. `/__api/private-models` is served ONLY by
+  // the dev-time Vite middleware (privateModelsPlugin); no deployed build serves
+  // it, so the fetch is dev-only — gating it keeps the public/private builds from
+  // logging a guaranteed 404 on every page load. (Deployed private projects swap
+  // models in via the runtime `models.json` manifest below, not this endpoint.)
+  if (import.meta.env.DEV) {
+    try {
+      const resp = await fetch('/__api/private-models');
+      if (resp.ok) {
+        const privateModels: Array<{ project: string; filename: string; url: string }> = await resp.json();
+        for (const pm of privateModels) {
+          // `project` is carried through: every private project's models come
+          // down this one endpoint, and a model belongs to exactly one of them.
+          // Dropping the tag here is what used to put Toray's and Mauser's GLBs
+          // into the DemoRealvirtual project's Models list.
+          entries.push({ filename: pm.filename, url: pm.url, project: pm.project });
+        }
+      }
+    } catch { /* private models endpoint not available — ignore */ }
+  }
+
+  // Runtime model manifest (generated during private project staging, replaces build-time glob).
+  // If present, the manifest is AUTHORITATIVE — the build-time glob bundles
+  // /public/models/*.glb from the dev environment (e.g. DemoRealvirtualWeb.glb) into every
+  // build, but private deploys swap out the models folder on the server. Keeping the
+  // build-time entries around would leave stale filenames matchable by localStorage, causing
+  // 404s when a returning user had previously opened a model that only exists in another deploy.
+  try {
+    const resp = await fetch(`${import.meta.env.BASE_URL}models.json`, { cache: 'no-store' });
+    if (resp.ok) {
+      const runtimeModels: string[] = await resp.json();
+      entries.length = 0;
+      for (const filename of runtimeModels) {
+        entries.push({ filename, url: `${import.meta.env.BASE_URL}models/${filename}` });
+      }
+    }
+  } catch { /* no manifest — use build-time discovery only */ }
+
+  // ── The demo project's own models (plan-737) ────────────────────────────
+  //
+  // The demo ships as a FOLDER with a manifest in it, so the catalogue reads
+  // that manifest — the same rule as everywhere else since plan-735: a document
+  // exists because a `project.json` says so. This replaces the demo's old share
+  // of `models.json`, which the public deploy used to rewrite from the same
+  // manifest; two derivations of one set is exactly the duplication plan-735
+  // removed, and after the move they no longer even agreed on the URL.
+  //
+  // ADDITIVE, and after `models.json` on purpose. A private deploy's
+  // `models.json` is authoritative about ITS models and clears the list above;
+  // the demo folder is a different project that may sit beside it, so it adds
+  // to the catalogue rather than replacing it. Deduped by filename so a deploy
+  // that carries the demo in both shapes lists it once.
+  //
+  // A deploy without the folder answers 404, the catch keeps boot silent, and
+  // `entries` degrades to whatever else was found — an empty selector, never a
+  // crash.
+  try {
+    const demoBase = `${import.meta.env.BASE_URL}${DEMO_BASE_PATH}`;
+    const resp = await fetch(`${demoBase}project.json`, { cache: 'no-cache' });
+    if (resp.ok) {
+      const manifest = await resp.json() as { documents?: Array<{ path?: unknown; devOnly?: unknown }> };
+      for (const doc of manifest.documents ?? []) {
+        const path = typeof doc?.path === 'string' ? doc.path.replace(/^\.?\//, '') : '';
+        if (!path.toLowerCase().endsWith('.glb')) continue;
+        // `library/` rows are not models — the library is app-level and has its
+        // own browser. (The demo declares none since plan-737; the guard keeps
+        // an older, still-deployed manifest from filling the selector with
+        // component parts.)
+        if (/^library\//i.test(path)) continue;
+        const filename = path.split('/').pop() ?? path;
+        if (entries.some(e => e.filename.toLowerCase() === filename.toLowerCase())) continue;
+        entries.push({ filename, url: `${demoBase}${path}` });
+      }
+    }
+  } catch { /* no demo folder on this deploy — nothing to add */ }
+
+  // Discover local working folder models (File System Access API, Chrome/Edge only)
   if (isFsApiSupported()) {
     try {
-      const files = await listSubfolderFiles('models', ['.glb']);
-      for (const f of files) {
-        localFiles.push({ filename: f.name, url: await readFileAsUrl(f.handle) });
+      const localFiles = await listSubfolderFiles('models', ['.glb']);
+      for (const f of localFiles) {
+        const blobUrl = await readFileAsUrl(f.handle);
+        entries.push({ filename: f.name, url: blobUrl });
       }
     } catch { /* permission denied or handle expired — skip silently */ }
   }
 
-  // Models published to a running CONNECT gateway (plan-365 §2.1) — the
-  // recovery path for every publish this tab did not witness. Canonicalised
-  // here; the revision the gateway reports is what makes a later download ask
-  // for the current bytes instead of whatever the browser cached last week.
-  const gatewayModels: GatewayModelEntry[] = [];
+  // Models published to a running CONNECT gateway (plan-365 §2.1). Laid over the
+  // catalogue resolved above, never replacing it: `models.json` stays authoritative
+  // where it exists, and the embedded models stay in the list (F8).
+  //
+  // Deliberately LAST and deliberately additive — this is the recovery path for
+  // every publish this tab did not witness: a `model_changed` that arrived while
+  // the browser was closed, or while the WebSocket was down, is picked up here on
+  // the next load. A gateway-less deploy answers 404 and the catch below keeps the
+  // boot silent, exactly as the `models.json` probe above already does.
+  //
+  // ## `manifest.models` is a FOREIGN catalogue, not a project manifest (plan-413 §2.6)
+  //
+  // plan-413 replaced `models[]`/`scenes[]`/`library[]` with one `documents[]`
+  // list — in the manifests realvirtual WEB itself writes. This one it does not
+  // write: `/model/manifest` is produced by the CONNECT gateway, a separate
+  // program with its own release cycle, and the shape below is its published
+  // contract. Renaming the field here would only mean reading a key nobody
+  // sends. So this stays a compatibility ADAPTER: CONNECT's `models[]` is
+  // translated into viewer catalogue entries at this boundary and the document
+  // model begins on the other side of it. Same decision plan-397 took for the
+  // plan-700/701 delivery manifests. If CONNECT ever speaks `documents[]`, the
+  // change belongs here and nowhere else.
+  // Probed only where a CONNECT gateway can actually be the page origin: the
+  // embedded bundle (CONNECT serves the page), a loopback origin (local
+  // gateway / dev), or any dev build (the Vite proxy forwards to the gateway,
+  // remote-dev included). A static CDN deploy can never answer this route, and
+  // the guaranteed 404 was a red line in every visitor's console (2026-08-31).
+  const mayHaveGatewayOrigin = connectEmbedEnabled || isLoopbackOrigin() || import.meta.env.DEV;
   try {
-    for (const model of gatewayManifest?.models ?? []) {
-      if (!model.url) continue;
-      const url = canonicalModelUrl(model.url, import.meta.env.BASE_URL);
-      setModelRevision(url, model.revision);
-      gatewayModels.push({ filename: model.name ?? modelFileName(url), url });
+    const resp = mayHaveGatewayOrigin
+      ? await fetch('/model/manifest', { cache: 'no-store' })
+      : null;
+    if (resp?.ok) {
+      const manifest: { models?: Array<{ name?: string; url?: string; revision?: string }> } =
+        await resp.json();
+      for (const model of manifest.models ?? []) {
+        if (!model.url) continue;
+        const url = canonicalModelUrl(model.url, import.meta.env.BASE_URL);
+        const filename = model.name ?? modelFileName(url);
+        // The revision the gateway reports is what makes a later download ask for
+        // the current bytes instead of whatever the browser cached last week.
+        setModelRevision(url, model.revision);
+        if (!entries.some((e) => e.filename.toLowerCase() === filename.toLowerCase())) {
+          entries.push({ filename, url });
+        }
+      }
     }
-  } catch { /* malformed gateway answer — the catalogue above stands */ }
-
-  const entries = mergeDiscoveredEntries({
-    privateModels: discoveredPrivate,
-    modelsJson: discoveredModelsJson,
-    demoDocuments: readDocuments(demoManifest),
-    demoBase: `${import.meta.env.BASE_URL}${DEMO_BASE_PATH}`,
-    baseUrl: import.meta.env.BASE_URL,
-    localFiles,
-    gatewayModels,
-  });
+  } catch { /* no gateway on this origin — the build-time catalogue stands */ }
 
   // Expose discovered models to the HMI model selector.
   // A base entry may be expanded with selectable "model options" (supplier variants)
@@ -1174,13 +1246,6 @@ async function init() {
     // deploy-wide selector list — in dev that includes every private customer
     // project — and handing it to the bundled backend would make each of those
     // GLBs a model *of* the demo project.
-    //
-    // plan-598: the demo backend singleton already exists at this point — the
-    // early discovery read its manifest through it — so these options do not
-    // reach a constructor any more. That is harmless by construction: a bundled
-    // backend consults `models` only with `discover: true`, which the demo
-    // instance never has (bundled-backend.ts `_withDiscoveredModels`). The call
-    // stays so the demo/model relation is still stated in one place.
     const demoModelUrls = new Set(
       entries.filter(e => !e.project || e.project === DEMO_PROJECT_FOLDER).map(e => e.url),
     );

@@ -59,13 +59,7 @@ describe('deployPublic — post-deploy demo smoke (plan-503 §9.2)', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: { method: string }) => {
-      // plan-598: the CDN step is now edge rules (`/pullzone/…`) + one URL purge
-      // per changed file (`/purge?url=…`) — recorded as ONE 'PURGE' phase, since
-      // what is pinned here is its position relative to probe and smoke.
-      if (String(url).startsWith('https://api.bunny.net/')) {
-        if (events[events.length - 1] !== 'PURGE') events.push('PURGE');
-        return reply(200);
-      }
+      if (String(url).startsWith('https://api.bunny.net/')) { events.push('PURGE'); return reply(200); }
       if (init.method === 'GET') return reply(404);
       return reply(init.method === 'PUT' ? 201 : 200);
     }));

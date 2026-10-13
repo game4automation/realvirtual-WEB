@@ -100,7 +100,7 @@ const DELIVERY_CONFIG_KEYS = new Set([
   // repository back, since bundle-rag embeds them into the delivered project-config.json anyway.
   'requestyApiKey', 'requestyBaseUrl',
 ]);
-const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status', 'loadSideEffects']);
+const REGISTRATION_KEYS = new Set(['adapter', 'requires', 'status']);
 // Maturity of a delivered feature, independent of its tier. A feature can be fully entitled
 // and still be young; `beta` says so to the customer without withholding it. Absent means
 // `stable`, so every existing registration keeps its meaning unchanged.
@@ -437,16 +437,7 @@ export function loadTierManifest(manifestPathOrPrivateRoot) {
     if (!REGISTRATION_STATUSES.includes(status)) {
       throw new Error(`${feature}.status must be one of ${REGISTRATION_STATUSES.join(', ')}.`);
     }
-    // plan-598: `loadSideEffects: true` marks an adapter whose module graph
-    // registers something at module top level. Such a feature is never
-    // prefetched — its import stays inside the ordered register pass.
-    if (registration.loadSideEffects !== undefined && typeof registration.loadSideEffects !== 'boolean') {
-      throw new Error(`${feature}.loadSideEffects must be a boolean.`);
-    }
-    registrations[feature] = {
-      adapter: registration.adapter, requires: [...requires], status,
-      loadSideEffects: registration.loadSideEffects === true,
-    };
+    registrations[feature] = { adapter: registration.adapter, requires: [...requires], status };
   }
 
   const rules = manifest.rules.map((rule, index) => {
@@ -917,39 +908,17 @@ function selectedDocumentation(manifest, profile) {
 }
 
 //! Generates the customer-specific private plugin entry point without any internal import.
-//!
-//! plan-598: the same contract as the checked-in private entry and the community
-//! stub (`src/core/rv-private-features.ts`) — `prefetchPrivateFeatures()` starts the
-//! imports of the entitled, side-effect-free features early; `registerPrivatePlugins()`
-//! registers every entitled feature in manifest order and consumes those imports.
-//! Every adapter is imported DYNAMICALLY (one chunk per feature, nothing welded into
-//! the entry), and only the entitled ones appear at all.
 export function generateCustomerPrivatePlugins(manifest, profile) {
   const features = selectedFeatures(manifest, profile);
-  const loader = (feature) => `() => import('${manifest.registrations[feature].adapter}')`;
-  const prefetched = features.filter((feature) => manifest.registrations[feature].loadSideEffects !== true);
-  const prefetchRows = prefetched.map((feature) => `  ['${feature}', ${loader(feature)}],`);
-  const calls = features.map((feature) =>
-    `  await registerPrivateFeature(viewer, '${feature}', ${loader(feature)}, mods);`);
+  const imports = features.map((feature, index) =>
+    `import { register as registerFeature${index} } from '${manifest.registrations[feature].adapter}';`);
+  const calls = features.map((_feature, index) => `  await registerFeature${index}(viewer);`);
   return [
     `import type { RVViewer } from '../../realvirtual-web/src/core/rv-viewer';`,
-    'import {',
-    '  registerPrivateFeature,',
-    '  startPrivateFeatureImports,',
-    '  type PrivateFeatureLoader,',
-    '  type PrivateFeatureModules,',
-    `} from '../../realvirtual-web/src/core/rv-private-features';`,
+    ...imports,
     '',
-    'const PREFETCH_LOADERS: ReadonlyArray<readonly [string, PrivateFeatureLoader]> = [',
-    ...prefetchRows,
-    '];',
-    '',
-    'export function prefetchPrivateFeatures(): PrivateFeatureModules {',
-    '  return startPrivateFeatureImports(PREFETCH_LOADERS);',
-    '}',
-    '',
-    'export async function registerPrivatePlugins(viewer: RVViewer, mods?: PrivateFeatureModules): Promise<void> {',
-    ...(calls.length ? calls : ['  void viewer;', '  void mods;']),
+    'export async function registerPrivatePlugins(viewer: RVViewer): Promise<void> {',
+    ...(calls.length ? calls : ['  void viewer;']),
     '}',
     '',
   ].join('\n');
@@ -2964,6 +2933,13 @@ export function assertNoCrossTierLeak(workspaceRoot, manifest, profile) {
   });
 }
 
+//! Project keys that are also the name of a vendor the product supports (the Festo
+//! FHPP drive profile is `rv-drive-festo-fhpp.ts`). Inside the viewer SOURCE trees and
+//! inside the customer's OWN project folders (a project plugin that reads Festo AAS data)
+//! such a name is the vendor, not a foreign project; everywhere else it is still refused.
+export const PRODUCT_NAME_PROJECT_KEYS = new Set(['festo']);
+const SOURCE_TREE_PREFIXES = ['realvirtual-web/src/', 'realvirtual-web-pro/src/'];
+
 //! Rejects links, nested Git metadata, secrets, foreign projects and oversized files.
 export function assertWorkspaceGuards(workspaceRoot, options = {}) {
   const root = resolve(workspaceRoot);
@@ -2988,7 +2964,11 @@ export function assertWorkspaceGuards(workspaceRoot, options = {}) {
       && (!options.lfsRepoRoot || !hasLfsFilter(options.lfsRepoRoot, rel))) {
       throw new Error(`Oversized delivery file: ${rel}`);
     }
-    if (foreign.some((name) => lower.includes(name))) throw new Error(`Foreign customer name found in ${rel}.`);
+    const inSource = SOURCE_TREE_PREFIXES.some((prefix) => lower.startsWith(prefix))
+      || (segments[0].toLowerCase() === 'projects' && own.has((segments[1] ?? '').toLowerCase()));
+    if (foreign.some((name) => lower.includes(name) && !(inSource && PRODUCT_NAME_PROJECT_KEYS.has(name)))) {
+      throw new Error(`Foreign customer name found in ${rel}.`);
+    }
     const ext = lower.slice(lower.lastIndexOf('.'));
     if (!SECRET_SCAN_EXTENSIONS.has(ext)) return;
     const violation = secretContentViolation(lower, ext, readFileSync(absolute, 'utf8'));

@@ -44,7 +44,6 @@ import {
   type LoadResult,
 } from '../core/engine/rv-scene-loader';
 import { BakeRegistry } from '../core/engine/rv-bake-registry';
-import { preloadDracoDecoder } from '../core/engine/rv-glb-parse';
 import { buildInitContext, type InitContextBase, type InitSubsystems } from '../core/engine/rv-init-context';
 import { collectDeferredPlacements, type PlacementInstancer } from '../core/engine/rv-placement-instancer';
 import { createViewerPlacementInstancer, type PlacementHost } from '../core/engine/rv-placement-integrate';
@@ -435,11 +434,6 @@ export class RVEmbedViewer {
   /** Load or replace a GLB through the production component pipeline. */
   async loadModel(url: string, data?: ArrayBuffer): Promise<LoadResult> {
     this.assertUsable();
-    // plan-598 F4: the decoder downloads in parallel with the GLB. The embed
-    // entry set its module-relative decoder path at import time, so the path is
-    // final here; starting it per load (idempotent) instead of at import keeps an
-    // embed that never becomes visible from fetching anything.
-    preloadDracoDecoder();
     const generation = ++this.loadGeneration;
     this.clearModel();
     resetEmbedEngineRegistries();

@@ -69,37 +69,7 @@ export class BunnyClient {
   purge(): Promise<boolean>;
   getFile(remotePath: string): Promise<Buffer | null>;
   getFileIfExists(remotePath: string): Promise<Buffer | null>;
-  /** plan-598: purge one URL (`POST /purge?url=…&async=true`). Never throws. */
-  purgeUrl(url: string): Promise<boolean>;
-  /** plan-598: purge a URL list; without an account key every URL counts as failed. */
-  purgeUrls(urls: string[], opts?: { concurrency?: number }): Promise<{ purged: string[]; failed: string[] }>;
-  /** plan-598 F5: idempotent browser-cache edge rules; null when it could not run. */
-  ensureEdgeRules(rules?: readonly EdgeRuleSpec[]): Promise<{ created: number; updated: number; unchanged: number } | null>;
 }
-
-// ─── plan-598 Phase 2: CDN caching ───────────────────────────────────────
-export interface EdgeRuleSpec { description: string; patterns: string[]; cacheControl: string }
-export const BUNNY_EDGE_ACTION: Readonly<{ OVERRIDE_CACHE_TIME: number; SET_RESPONSE_HEADER: number; OVERRIDE_BROWSER_CACHE_TIME: number }>;
-export const BUNNY_EDGE_TRIGGER_URL: number;
-export const BUNNY_PATTERN_MATCH_ANY: number;
-export const BUNNY_TRIGGER_MATCH_ANY: number;
-export const IMMUTABLE_CACHE_CONTROL: string;
-export const REVALIDATE_CACHE_CONTROL: string;
-export const RV_EDGE_RULES: readonly EdgeRuleSpec[];
-export function edgeRuleBody(spec: EdgeRuleSpec, guid?: string | null): Record<string, unknown>;
-export function edgeRuleMatches(existing: Record<string, unknown> | null | undefined, spec: EdgeRuleSpec): boolean;
-export function cacheControlForUrl(url: string, rules?: readonly EdgeRuleSpec[]): string | null;
-export const URL_PURGE_LIMIT: number;
-export function isContentHashedRel(rel: string): boolean;
-export function purgeUrlsFor(opts: { baseUrl: string; uploaded?: string[]; deleted?: string[]; extraUrls?: string[] }): string[];
-export function purgeDeployChanges(
-  client: { purge(): Promise<boolean>; purgeUrls(urls: string[]): Promise<{ purged: string[]; failed: string[] }> },
-  opts: { baseUrl: string; uploaded?: string[]; deleted?: string[]; extraUrls?: string[]; partial?: boolean; log?: (msg: string) => void },
-): Promise<{ mode: 'none' | 'url' | 'zone'; urls: string[]; ok: boolean }>;
-export const MANIFEST_PRELOAD_ATTR: string;
-export function manifestPreloadFor(opts: { kind: 'public' | 'hosted'; distDir?: string | null; encrypted?: boolean }): string | null;
-export function withManifestPreload(html: string, href: string | null): string;
-export function injectManifestPreload(indexPath: string, opts?: { href?: string | null; dryRun?: boolean }): string | null;
 
 export interface PrivateProject {
   name: string;

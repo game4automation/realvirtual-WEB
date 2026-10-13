@@ -87,17 +87,9 @@ describe('?consent=decline (plan-564)', () => {
     expect(await requireAnalyticsConsent('?consent=decline')).toBe('granted');
   });
 
-  // plan-598: the boot no longer awaits the question — the "only when not
-  // declined" rule moved into `startNonBlockingConsent` and is pinned there as
-  // BEHAVIOUR (tests/consent-nonblocking.test.ts). What stays pinned on main.ts
-  // is the wiring: the gate is the one that decides, analytics is loaded only
-  // through it, and the boot does not wait for it.
-  it('main.ts routes analytics through the non-blocking consent and never awaits the question', () => {
+  it('main.ts loads analytics only when the question was not declined', () => {
     const main = mainSource;
-    expect(main).toMatch(/startNonBlockingConsent\(\{\s*requireConsent: \(\) => requireAnalyticsConsent\(\),\s*initAnalytics,/);
-    expect(main).not.toMatch(/await requireAnalyticsConsent\(/);
-    // initAnalytics is never called directly — only the consent outcome may load GA.
-    const code = main.replace(/\/\/.*$/gm, '');
-    expect(code).not.toMatch(/\binitAnalytics\(\)/);
+    expect(main).toMatch(/const analyticsConsent = await requireAnalyticsConsent\(\);/);
+    expect(main).toMatch(/if \(analyticsConsent !== 'declined'\) initAnalytics\(\);/);
   });
 });
